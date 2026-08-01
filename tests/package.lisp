@@ -2,9 +2,14 @@
   (:use #:cl)
   (:import-from #:orfeus
                 #:cli-run
+                #:export-settings-jpeg-quality
+                #:export-settings-max-height
+                #:export-settings-max-width
+                #:export-settings-preserve-metadata-p
                 #:invalid-project-data
                 #:lens-profile-aliases-read
                 #:resolve-lens-profile-alias
+                #:make-export-settings
                 #:make-photo-job
                 #:make-processing-settings
                 #:make-project
@@ -20,6 +25,7 @@
                 #:processing-settings-with-overrides
                 #:project->sexp
                 #:project-defaults
+                #:project-export-settings
                 #:project-output-directory
                 #:project-photos
                 #:project-read

@@ -21,6 +21,13 @@
   (grain-amount 0.0)
   (grain-size 1.0))
 
+(defstruct export-settings
+  "Frontend-independent options for encoded photo exports."
+  (jpeg-quality 92 :type (integer 1 100))
+  (max-width nil :type (or null (integer 1)))
+  (max-height nil :type (or null (integer 1)))
+  (preserve-metadata-p t :type boolean))
+
 (defstruct photo-job
   "One input photograph and its optional per-photo setting overrides."
   input-path
@@ -31,6 +38,7 @@
   "A batch of photographs sharing processing defaults and an output directory."
   output-directory
   (defaults (make-processing-settings))
+  (export-settings (make-export-settings))
   (photos '()))
 
 (defun project-invalid (datum control &rest arguments)
@@ -86,6 +94,35 @@
 (defun sexp->processing-settings (sexp)
   (processing-plist-validate sexp)
   (apply #'make-processing-settings sexp))
+
+(defun export-settings->sexp (settings)
+  (list :jpeg-quality (export-settings-jpeg-quality settings)
+        :max-width (export-settings-max-width settings)
+        :max-height (export-settings-max-height settings)
+        :preserve-metadata-p (export-settings-preserve-metadata-p settings)))
+
+(defun sexp->export-settings (sexp)
+  (unless (and (listp sexp)
+               (plist-known-keys-p
+                sexp '(:jpeg-quality :max-width :max-height :preserve-metadata-p)))
+    (project-invalid sexp "expected a property list of export settings"))
+  (let ((quality (getf sexp :jpeg-quality 92))
+        (max-width (getf sexp :max-width))
+        (max-height (getf sexp :max-height))
+        (preserve-metadata-p (getf sexp :preserve-metadata-p t)))
+    (unless (and (integerp quality) (<= 1 quality 100))
+      (project-invalid sexp ":jpeg-quality must be an integer from 1 to 100"))
+    (dolist (entry (list (cons :max-width max-width)
+                         (cons :max-height max-height)))
+      (unless (or (null (rest entry))
+                  (and (integerp (rest entry)) (plusp (rest entry))))
+        (project-invalid sexp "~S must be NIL or a positive integer" (first entry))))
+    (unless (typep preserve-metadata-p 'boolean)
+      (project-invalid sexp ":preserve-metadata-p must be a boolean"))
+    (make-export-settings :jpeg-quality quality
+                          :max-width max-width
+                          :max-height max-height
+                          :preserve-metadata-p preserve-metadata-p)))
 
 (defun photo-job->sexp (photo)
   (list :input (namestring (photo-job-input-path photo))
@@ -148,7 +185,8 @@
   (list :orfeus-project 1
         :output-directory (namestring (project-output-directory project))
         :defaults (processing-settings->sexp (project-defaults project))
-        :photos (mapcar #'photo-job->sexp (project-photos project))))
+         :export-settings (export-settings->sexp (project-export-settings project))
+         :photos (mapcar #'photo-job->sexp (project-photos project))))
 
 (defun sexp->project (sexp)
   "Validate and convert a project S-expression into a PROJECT."
@@ -156,10 +194,11 @@
                (eq (first sexp) :orfeus-project)
                (eql (second sexp) 1)
                (plist-known-keys-p (cddr sexp)
-                                   '(:output-directory :defaults :photos)))
+                                   '(:output-directory :defaults :export-settings :photos)))
     (project-invalid sexp "expected (:ORFEUS-PROJECT 1 ...)"))
   (let ((output-directory (getf (cddr sexp) :output-directory))
         (defaults (getf (cddr sexp) :defaults))
+        (export-settings (getf (cddr sexp) :export-settings))
         (photos (getf (cddr sexp) :photos)))
     (unless (stringp output-directory)
       (project-invalid sexp ":output-directory must be a pathname string"))
@@ -167,6 +206,7 @@
       (project-invalid sexp ":photos must be a list"))
     (make-project :output-directory (pathname output-directory)
                   :defaults (sexp->processing-settings defaults)
+                  :export-settings (sexp->export-settings export-settings)
                   :photos (mapcar #'sexp->photo-job photos))))
 
 (defun project-resolve-pathname (pathname base-directory)

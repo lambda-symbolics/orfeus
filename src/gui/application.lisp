@@ -99,9 +99,10 @@
            (lens-cache (make-hash-table :test #'eq))
            (capture-cache (make-hash-table :test #'eq))
            window menu toolbar toolbar-bottom-rule table before-canvas after-canvas before-caption after-caption
-           inspector tabs basic-page optics-page effects-page
+           inspector tabs basic-page optics-page effects-page export-page
            status progress before-preview-file after-preview-file
            lens-name controls inspector-items lut-name lut-menu wb-choice target-choice
+           export-quality export-max-width export-max-height export-metadata
            debounce-id poll-id comparison-p
            (preview-generation 0)
            (preview-zoom 1d0)
@@ -274,6 +275,44 @@
               table '((:file "File" 230) (:settings "Settings" 90)
                       (:output "Output" 150))
               (project-table-records project)))
+           (sync-export-controls ()
+             (when export-quality
+               (let ((settings (project-export-settings project)))
+                 (setf (cl-fltk:value export-quality)
+                       (format nil "~D" (export-settings-jpeg-quality settings))
+                       (cl-fltk:value export-max-width)
+                       (format nil "~D" (or (export-settings-max-width settings) 0))
+                       (cl-fltk:value export-max-height)
+                       (format nil "~D" (or (export-settings-max-height settings) 0))
+                       (cl-fltk:value export-metadata)
+                       (if (export-settings-preserve-metadata-p settings) "1" "0")))))
+           (export-setting-changed (key widget)
+             (handler-case
+                 (let ((settings (project-export-settings project)))
+                   (ecase key
+                     (:jpeg-quality
+                      (let ((value (round (parse-number (cl-fltk:value widget)))))
+                        (unless (<= 1 value 100)
+                          (error "JPEG quality must be from 1 to 100."))
+                        (setf (export-settings-jpeg-quality settings) value)))
+                     (:max-width
+                      (let ((value (round (parse-number (cl-fltk:value widget)))))
+                        (when (minusp value) (error "Maximum width cannot be negative."))
+                        (setf (export-settings-max-width settings)
+                              (unless (zerop value) value))))
+                     (:max-height
+                      (let ((value (round (parse-number (cl-fltk:value widget)))))
+                        (when (minusp value) (error "Maximum height cannot be negative."))
+                        (setf (export-settings-max-height settings)
+                              (unless (zerop value) value))))
+                     (:preserve-metadata-p
+                      (setf (export-settings-preserve-metadata-p settings)
+                            (gui-boolean-value (cl-fltk:value widget)))))
+                   (sync-export-controls)
+                   (set-status "Export settings updated"))
+               (error (condition)
+                 (sync-export-controls)
+                 (set-status (princ-to-string condition)))))
            (sync-controls ()
              (dolist (entry controls)
                (let ((key (first entry)) (widget (second entry)))
@@ -296,7 +335,8 @@
                      (if capture
                          (format nil "Lens: ~A   |   ~A"
                                  (selected-lens-description) capture)
-                         (format nil "Lens: ~A" (selected-lens-description))))))
+                         (format nil "Lens: ~A" (selected-lens-description)))))
+             (sync-export-controls))
            (replace-project (new-project &optional path)
              (incf preview-generation)
              (clear-previews)
@@ -494,16 +534,34 @@
            (render-selected ()
              (let ((job (selected-job)))
                (when job
-                 (let ((output (gui-photo-output-path model job))
-                       (input (photo-job-input-path job))
-                       (settings (current-settings)))
+                 (let ((output (gui-photo-output-path model job)))
                    (ensure-directories-exist output)
                    (enqueue-gui-task
                     queue :export
                     (lambda ()
-                      (queue-event queue (list :status nil "Rendering export..."))
-                      (render-photo input output settings :if-exists :supersede)
+                      (queue-event queue (list :status nil "Exporting current photo..."))
+                      (render-photo-job project job :if-exists :supersede)
                       (queue-event queue (list :done output))))))))
+           (render-all ()
+             (when (project-photos project)
+               (ensure-directories-exist
+                (merge-pathnames "placeholder" (project-output-directory project)))
+               (enqueue-gui-task
+                queue :export
+                (lambda ()
+                  (queue-event queue (list :status nil "Exporting all photos..."))
+                  (multiple-value-bind (completed failures)
+                      (project-render project :if-exists :supersede :on-error :continue)
+                    (if failures
+                        (queue-event queue
+                                     (list :error
+                                           (format nil "Exported ~D; ~D failed"
+                                                   (length completed)
+                                                   (length failures))))
+                        (queue-event queue
+                                     (list :done
+                                           (format nil "~D photos"
+                                                   (length completed))))))))))
            (choose-lut ()
              (let ((path (cl-fltk:choose-file
                           :title "Choose 3D LUT"
@@ -696,9 +754,14 @@
         (cl-fltk:add-menu-item menu "File/Save Project As" (lambda (&rest ignored)
                                                                (declare (ignore ignored))
                                                                (save-project t)))
-        (cl-fltk:add-menu-item menu "File/Export Selected" (lambda (&rest ignored)
-                                                               (declare (ignore ignored))
-                                                               (render-selected)))
+        (cl-fltk:add-menu-item menu "File/Export Current Photo"
+                               (lambda (&rest ignored)
+                                 (declare (ignore ignored))
+                                 (render-selected)))
+        (cl-fltk:add-menu-item menu "File/Export All Photos"
+                               (lambda (&rest ignored)
+                                 (declare (ignore ignored))
+                                 (render-all)))
         (cl-fltk:add-menu-item menu "File/Quit" (lambda (&rest ignored)
                                                     (declare (ignore ignored))
                                                     (cl-fltk:quit)))
@@ -729,10 +792,14 @@
                                (lambda (&rest ignored)
                                  (declare (ignore ignored))
                                  (schedule-initial-preview)))
-        (cl-fltk:add-menu-item menu "Process/Export Selected"
+        (cl-fltk:add-menu-item menu "Process/Export Current Photo"
                                (lambda (&rest ignored)
                                  (declare (ignore ignored))
                                  (render-selected)))
+        (cl-fltk:add-menu-item menu "Process/Export All Photos"
+                               (lambda (&rest ignored)
+                                 (declare (ignore ignored))
+                                 (render-all)))
         (cl-fltk:add-menu-item menu "Help/About Orfeus"
                                (lambda (&rest ignored)
                                  (declare (ignore ignored))
@@ -775,7 +842,7 @@
           (toolbar-button 48 :folder-open "Open project" #'open-project)
           (toolbar-button 78 :delete "Remove selected photograph" #'remove-selected-photo)
           (rule 112 7 1 24 150 150 150)
-          (toolbar-button 120 :export "Export selected photograph" #'render-selected)
+          (toolbar-button 120 :export "Export current photograph" #'render-selected)
           (toolbar-button 150 :pipeline "Show or hide Before and After" #'toggle-comparison)
           (rule 184 7 1 24 150 150 150)
           (toolbar-text-button 192 28 "−" "Zoom out" (lambda () (zoom-preview .8d0)))
@@ -866,7 +933,32 @@
                                                  :label "Optics")
               effects-page (cl-fltk:make-tab-page :parent tabs :x 2 :y 24
                                                   :width 308 :height 600
-                                                  :label "Effects"))
+                                                  :label "Effects")
+               export-page (cl-fltk:make-tab-page :parent tabs :x 2 :y 24
+                                                  :width 308 :height 600
+                                                  :label "Export"))
+        (flet ((export-integer-field (key label y)
+                 (cl-fltk:field-control
+                  (register-field
+                   (cl-fltk:make-labeled-control
+                    :int :parent export-page :x 8 :y y :width 292 :height 26
+                    :label label :label-width 110
+                    :callback (lambda (widget event value)
+                                (declare (ignore event value))
+                                (export-setting-changed key widget)))
+                   y :page))))
+          (setf export-quality (export-integer-field :jpeg-quality "JPEG quality" 12)
+                export-max-width (export-integer-field :max-width "Maximum width" 48)
+                export-max-height (export-integer-field :max-height "Maximum height" 84)
+                export-metadata
+                (register-inspector
+                 (cl-fltk:make-check-button
+                  :parent export-page :x 110 :y 120 :width 182 :height 26
+                  :label "Preserve metadata"
+                  :callback (lambda (widget event value)
+                              (declare (ignore event value))
+                              (export-setting-changed :preserve-metadata-p widget)))
+                 110 120 :control 26 :page)))
         (setf wb-choice
               (cl-fltk:field-control
                (register-field
@@ -962,7 +1054,7 @@
          12 :action-row :half-left 26)
         (register-inspector
          (cl-fltk:make-button :parent inspector :x 166 :y 674
-                              :width 142 :height 26 :label "Export selected"
+                              :width 142 :height 26 :label "Export current"
                               :callback (lambda (&rest ignored)
                                           (declare (ignore ignored))
                                           (render-selected)))

@@ -12,6 +12,20 @@
                         :type "jpg")
          (project-output-directory project)))))
 
+(defun render-photo-job (project photo &key (if-exists :error))
+  "Render PHOTO using PROJECT's processing and export settings."
+  (let ((export (project-export-settings project)))
+    (render-photo
+     (photo-job-input-path photo)
+     (photo-job-render-output project photo)
+     (processing-settings-with-overrides
+      (project-defaults project) (photo-job-overrides photo))
+     :if-exists if-exists
+     :jpeg-quality (export-settings-jpeg-quality export)
+     :max-width (export-settings-max-width export)
+     :max-height (export-settings-max-height export)
+     :preserve-metadata-p (export-settings-preserve-metadata-p export))))
+
 (defun project-render (project &key (if-exists :error) (on-error :abort)
                                   progress-callback)
   "Render every photo in PROJECT through the shared processing pipeline.
@@ -32,13 +46,7 @@ render starts."
                (funcall progress-callback index (length photos) photo output))
              (handler-case
                  (progn
-                   (render-photo
-                    (photo-job-input-path photo)
-                    output
-                    (processing-settings-with-overrides
-                     (project-defaults project)
-                     (photo-job-overrides photo))
-                    :if-exists if-exists)
+                   (render-photo-job project photo :if-exists if-exists)
                    (push output completed))
                (error (condition)
                  (push (cons photo condition) failures)

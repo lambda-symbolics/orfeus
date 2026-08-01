@@ -26,6 +26,42 @@
          (equal '(:exposure -0.25 :lut-strength 0.8)
                 (photo-job-overrides (first (project-photos decoded)))))))
 
+(defun export-settings-round-trip-p ()
+  (let* ((project (make-project
+                   :output-directory #P"exports/"
+                   :export-settings (make-export-settings
+                                     :jpeg-quality 84
+                                     :max-width 2400
+                                     :max-height 1600
+                                     :preserve-metadata-p nil)))
+         (decoded (sexp->project (project->sexp project)))
+         (settings (project-export-settings decoded)))
+    (and (= 84 (export-settings-jpeg-quality settings))
+         (= 2400 (export-settings-max-width settings))
+         (= 1600 (export-settings-max-height settings))
+         (null (export-settings-preserve-metadata-p settings)))))
+
+(defun old-project-export-defaults-p ()
+  (let* ((decoded
+           (sexp->project
+            '(:orfeus-project 1
+              :output-directory "exports/"
+              :defaults (:exposure 0.0
+                         :white-balance-temperature nil
+                         :white-balance-tint 0.0
+                         :noise-reduction 0.35
+                         :lens-correction-p t
+                         :lens-correction-strength 1.0
+                         :chromatic-aberration-correction-p t
+                         :lut-path nil :lut-strength 1.0
+                         :grain-amount 0.0 :grain-size 1.0)
+              :photos ())))
+         (settings (project-export-settings decoded)))
+    (and (= 92 (export-settings-jpeg-quality settings))
+         (null (export-settings-max-width settings))
+         (null (export-settings-max-height settings))
+         (export-settings-preserve-metadata-p settings))))
+
 (defun project-file-round-trip-p ()
   (let ((pathname (test-temporary-pathname "sexp")))
     (unwind-protect
@@ -262,6 +298,8 @@
                   (plusp (length (orfeus-version)))))
       (check "project S-expressions round trip" (project-round-trip-p))
       (check "project files round trip" (project-file-round-trip-p))
+      (check "export settings round trip" (export-settings-round-trip-p))
+      (check "old projects receive export defaults" (old-project-export-defaults-p))
       (check "project-relative paths resolve beside the project"
              (project-relative-paths-p))
       (check "project reads disable reader evaluation"

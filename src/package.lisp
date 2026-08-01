@@ -24,11 +24,17 @@
    #:dng-extract-original
    #:dng-original-error
    #:dng-original-filename
+   #:export-settings
+   #:export-settings-jpeg-quality
+   #:export-settings-max-height
+   #:export-settings-max-width
+   #:export-settings-preserve-metadata-p
    #:invalid-project-data
    #:lens-profile-aliases-pathname
    #:lens-profile-aliases-read
    #:resolve-lens-profile-alias
    #:main
+   #:make-export-settings
    #:make-photo-job
    #:make-processing-settings
    #:make-project
@@ -62,6 +68,7 @@
    #:photo-job-render-output
    #:project
    #:project-defaults
+   #:project-export-settings
    #:project-output-directory
    #:project-photos
    #:project-read
@@ -70,6 +77,7 @@
    #:project->sexp
    #:raw-render-error
    #:render-photo
+   #:render-photo-job
    #:render-preview
    #:sexp->project))
 
