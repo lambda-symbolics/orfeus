@@ -15,6 +15,7 @@ use rawler::imgop::develop::{Intermediate, ProcessingStep, RawDevelop};
 use rawler::rawsource::RawSource;
 
 use super::Error;
+use super::tone::apply_default_display_tone;
 
 pub const SETTINGS_VERSION: u32 = 1;
 pub const OUTPUT_JPEG: u32 = 1;
@@ -835,6 +836,9 @@ pub fn render(input: &Path, output: &Path, settings: &RenderSettingsV1) -> Resul
     let raw = decoder
         .raw_image(&source, &params, false)
         .map_err(|e| Error::Render(format!("RAW decode: {e}")))?;
+    // Rawler's calibration step uses the camera matrix to convert deliberately
+    // into linear sRGB. Camera metadata such as Olympus Adobe RGB intent does
+    // not change this working/output space, which is tagged with our sRGB ICC.
     let mut steps = vec![
         ProcessingStep::Rescale,
         ProcessingStep::Demosaic,
@@ -887,6 +891,7 @@ pub fn render(input: &Path, output: &Path, settings: &RenderSettingsV1) -> Resul
         settings.luma_noise_reduction,
         settings.chroma_noise_reduction,
     );
+    apply_default_display_tone(&mut image.data);
     srgb_transfer(&mut image);
     if settings.lut_strength > 0.0 {
         let path = unsafe { CStr::from_ptr(settings.lut_path) }

@@ -14,6 +14,7 @@ use flate2::read::ZlibDecoder;
 use md5::{Digest, Md5};
 
 mod render;
+mod tone;
 
 const TAG_ORIGINAL_RAW_FILE_NAME: u16 = 0xc68b;
 const TAG_ORIGINAL_RAW_FILE_DATA: u16 = 0xc68c;
