@@ -97,7 +97,7 @@
                        (photo-job-input-path photo)))
                      (t (uiop:getcwd)))))
            (lens-cache (make-hash-table :test #'eq))
-           window menu toolbar table before-canvas after-canvas before-caption after-caption
+           window menu toolbar toolbar-bottom-rule table before-canvas after-canvas before-caption after-caption
            inspector tabs basic-page optics-page effects-page
            status progress before-preview-file after-preview-file
            lens-name controls inspector-items lut-name lut-menu wb-choice target-choice
@@ -422,9 +422,12 @@
                     (pane-width (floor (- center gutter) 2)))
                (cl-fltk:resize-widget menu :x 0 :y 0 :width width :height 24)
                (cl-fltk:resize-widget toolbar :x 0 :y 24 :width width :height 40)
+                (when toolbar-bottom-rule
+                  (cl-fltk:resize-widget toolbar-bottom-rule :x 0 :y 38
+                                         :width width :height 2))
                (when lens-name
-                 (cl-fltk:resize-widget lens-name :x 174 :y 6
-                                        :width (max 120 (- width 184)) :height 28))
+                 (cl-fltk:resize-widget lens-name :x 160 :y 6
+                                         :width (max 120 (- width 170)) :height 28))
                (cl-fltk:resize-widget table :x 0 :y top :width left :height main-height)
                (if comparison-p
                    (progn
@@ -565,24 +568,37 @@
                                  (declare (ignore ignored))
                                  (cl-fltk:message-box
                                   "Orfeus RAW processor\nOlympus PEN-F and OM-1")))
-        (setf toolbar (cl-fltk:make-group :parent window :x 0 :y 24
-                                          :width 1280 :height 40))
-        (flet ((toolbar-button (x icon tooltip action)
+        (setf toolbar (cl-fltk:make-panel :parent window :x 0 :y 24
+                                          :width 1280 :height 40 :label ""))
+        (cl-fltk:set-box toolbar cl-fltk:+box-flat-box+)
+        (flet ((rule (x y width height red green blue)
+                 (let ((box (cl-fltk:make-box :parent toolbar :x x :y y
+                                              :width width :height height
+                                              :label "")))
+                   (cl-fltk:set-box box cl-fltk:+box-flat-box+)
+                   (cl-fltk:set-color-rgb box :red red :green green :blue blue)
+                   box))
+               (toolbar-button (x icon tooltip action)
                  (let ((button (cl-fltk:make-button
-                                :parent toolbar :x x :y 5 :width 30 :height 30
+                                :parent toolbar :x x :y 5 :width 28 :height 28
                                 :label ""
                                 :callback (lambda (&rest ignored)
                                             (declare (ignore ignored))
                                             (funcall action)))))
+                   (cl-fltk:set-box button cl-fltk:+box-flat-box+)
                    (cl-fltk:set-stock-icon button icon)
                    (cl-fltk:set-tooltip button tooltip)
                    button)))
-          (toolbar-button 6 :open "Open RAW photographs" #'open-photo)
-          (toolbar-button 42 :folder-open "Open project" #'open-project)
-          (toolbar-button 78 :export "Export selected photograph" #'render-selected)
-          (toolbar-button 126 :pipeline "Show or hide Before and After" #'toggle-comparison))
-        (setf lens-name (cl-fltk:make-label :parent toolbar :x 174 :y 6
-                                            :width 1080 :height 28
+          (rule 6 10 2 18 130 130 130)
+          (rule 10 10 2 18 245 245 245)
+          (toolbar-button 18 :open "Open RAW photographs" #'open-photo)
+          (toolbar-button 48 :folder-open "Open project" #'open-project)
+          (rule 82 7 1 24 150 150 150)
+          (toolbar-button 90 :export "Export selected photograph" #'render-selected)
+          (toolbar-button 120 :pipeline "Show or hide Before and After" #'toggle-comparison)
+          (setf toolbar-bottom-rule (rule 0 38 1280 2 145 145 145)))
+        (setf lens-name (cl-fltk:make-label :parent toolbar :x 160 :y 6
+                                            :width 1094 :height 28
                                             :label "Lens: No photograph selected"))
         (cl-fltk:set-label-font lens-name 1)
         (setf table (cl-fltk:make-record-table
