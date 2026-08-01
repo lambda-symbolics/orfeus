@@ -32,7 +32,7 @@
         ];
 
         shellHook = ''
-          export CL_SOURCE_REGISTRY="$PWD//:$PWD/../fltk-sun//:"
+          export CL_SOURCE_REGISTRY="$PWD//:$PWD/../fltk-sun//"
           export ORFEUS_FLTK_SOURCE="$PWD/../fltk-sun"
           export ORFEUS_NATIVE_LIBRARY="$PWD/native/target/release/liborfeus_native.so"
         '';

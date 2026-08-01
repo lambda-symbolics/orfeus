@@ -17,7 +17,7 @@ available when building the GUI.
 
 #+begin_src sh
 cargo build --release --manifest-path native/Cargo.toml
-sbcl --non-interactive \
+sbcl --no-userinit --non-interactive \
   --eval '(require :asdf)' \
   --eval '(asdf:load-asd (truename "orfeus.asd"))' \
   --eval '(asdf:make "orfeus/cli")'
@@ -61,7 +61,7 @@ cargo fmt --check --manifest-path native/Cargo.toml
 cargo clippy --release --all-targets --all-features \
   --manifest-path native/Cargo.toml -- -D warnings
 cargo test --release --manifest-path native/Cargo.toml
-sbcl --non-interactive \
+sbcl --no-userinit --non-interactive \
   --eval '(require :asdf)' \
   --eval '(asdf:load-asd (truename "orfeus.asd"))' \
   --eval '(asdf:test-system "orfeus")'
