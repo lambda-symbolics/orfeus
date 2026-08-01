@@ -70,6 +70,16 @@
                 (uiop:symbol-call '#:orfeus '#:preferred-lens-description
                                   (format nil "None~%Ultron 0.7x~%")))))
 
+(defun capture-description-formatting-p ()
+  (and (string= "OM-1 | ISO 200 | f/5.6 | 1/50"
+                (uiop:symbol-call '#:orfeus '#:capture-description
+                                  "OM-1" "200" "5.6" "1/50"))
+       (string= "PEN-F | ISO 800"
+                (uiop:symbol-call '#:orfeus '#:capture-description
+                                  "PEN-F" "800" "-" "-"))
+       (null (uiop:symbol-call '#:orfeus '#:capture-description
+                               "-" "" "none" "unknown"))))
+
 (defun adapted-lens-aliases-p ()
   (multiple-value-bind (model reducer crop-factor)
       (resolve-lens-profile-alias "Ultron 0.7x")
@@ -260,6 +270,8 @@
              (invalid-project-rejected-p))
       (check "lens metadata skips unidentified values"
              (lens-description-selection-p))
+      (check "capture metadata formats compactly"
+             (capture-description-formatting-p))
       (check "adapted lens nicknames resolve portable Lensfun mappings"
              (adapted-lens-aliases-p))
       (check "lens alias reads disable reader evaluation"

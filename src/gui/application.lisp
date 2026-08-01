@@ -97,6 +97,7 @@
                        (photo-job-input-path photo)))
                      (t (uiop:getcwd)))))
            (lens-cache (make-hash-table :test #'eq))
+           (capture-cache (make-hash-table :test #'eq))
            window menu toolbar toolbar-bottom-rule table before-canvas after-canvas before-caption after-caption
            inspector tabs basic-page optics-page effects-page
            status progress before-preview-file after-preview-file
@@ -129,6 +130,17 @@
                                       (photo-job-input-path job)))
                                    "Lens not identified"))))
                    "No photograph selected")))
+           (selected-capture-description ()
+             (let ((job (selected-job)))
+               (when job
+                 (multiple-value-bind (cached present-p)
+                     (gethash job capture-cache)
+                   (if present-p
+                       cached
+                       (setf (gethash job capture-cache)
+                             (ignore-errors
+                               (photo-capture-description
+                                (photo-job-input-path job)))))))))
            (parse-preview-event (value)
              (let ((parts (remove "" (uiop:split-string (or value "")
                                                        :separator '(#\Space))
@@ -280,7 +292,11 @@
                    (let ((path (gui-model-setting model :lut-path)))
                      (if path (file-namestring path) "No LUT selected")))
              (setf (cl-fltk:label lens-name)
-                   (format nil "Lens: ~A" (selected-lens-description))))
+                   (let ((capture (selected-capture-description)))
+                     (if capture
+                         (format nil "Lens: ~A   |   ~A"
+                                 (selected-lens-description) capture)
+                         (format nil "Lens: ~A" (selected-lens-description))))))
            (replace-project (new-project &optional path)
              (incf preview-generation)
              (clear-previews)

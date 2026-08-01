@@ -39,6 +39,7 @@
    #:orfeus-error
    #:orfeus-version
    #:output-file-exists
+   #:photo-capture-description
    #:photo-extract-embedded-preview
    #:photo-lens-description
    #:photo-job
