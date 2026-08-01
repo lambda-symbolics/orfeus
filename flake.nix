@@ -20,7 +20,7 @@
           cargo
           cmake
           exiftool
-          fltk
+          fltk_1_4
           gnumake
           lcms2
           lensfun

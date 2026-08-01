@@ -15,7 +15,8 @@
                (:file "src/render")
                (:file "src/batch")
                (:file "src/version"))
-  :in-order-to ((test-op (test-op "orfeus/tests"))))
+  :in-order-to ((test-op (test-op "orfeus/tests")
+                         (test-op "orfeus/gui-tests"))))
 
 (asdf:defsystem #:orfeus/gui
   :description "FLTK frontend for Orfeus."
@@ -24,6 +25,7 @@
                 :serial t
                 :components ((:file "package")
                              (:file "model")
+                             (:file "queue")
                              (:file "preview")
                              (:file "application")))))
 

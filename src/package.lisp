@@ -52,6 +52,7 @@
    #:processing-settings-white-balance-temperature
    #:processing-settings-white-balance-tint
    #:processing-settings-with-overrides
+   #:photo-job-render-output
    #:project
    #:project-defaults
    #:project-output-directory

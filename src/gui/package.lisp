@@ -3,6 +3,7 @@
   (:import-from #:orfeus
                 #:make-processing-settings #:photo-job-input-path
                 #:photo-job-output-path #:photo-job-overrides
+                #:photo-job-render-output
                 #:processing-settings-with-overrides #:project #:project-defaults
                 #:project-output-directory #:project-photos #:project-read
                 #:project-write #:render-photo #:render-preview)

@@ -85,6 +85,20 @@
       (when (probe-file pathname)
         (delete-file pathname)))))
 
+(defun photo-job-render-output-semantics-p ()
+  (let* ((project (make-project :output-directory #P"/tmp/orfeus-exports/"))
+         (automatic (make-photo-job :input-path #P"source/photo.orf"))
+         (relative (make-photo-job :input-path #P"source/photo.orf"
+                                   :output-path #P"edited.tiff"))
+         (absolute (make-photo-job :input-path #P"source/photo.orf"
+                                   :output-path #P"/tmp/custom-output.jpg")))
+    (and (equal (photo-job-render-output project automatic)
+                #P"/tmp/orfeus-exports/photo.jpg")
+         (equal (photo-job-render-output project relative)
+                #P"/tmp/orfeus-exports/edited.tiff")
+         (equal (photo-job-render-output project absolute)
+                #P"/tmp/custom-output.jpg"))))
+
 (defun render-rejects-input-as-output-p ()
   (let ((pathname (test-temporary-pathname "orf"))
         (contents "source pixels must survive"))
@@ -196,6 +210,8 @@
              (invalid-project-rejected-p))
       (check "per-photo overrides produce effective settings"
              (processing-overrides-p))
+      (check "photo outputs follow project path semantics"
+             (photo-job-render-output-semantics-p))
       (check "rendering never replaces its input"
              (render-rejects-input-as-output-p))
       (check "preview does not overwrite an existing export"

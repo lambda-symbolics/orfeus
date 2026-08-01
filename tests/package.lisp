@@ -10,6 +10,7 @@
                 #:output-file-exists
                 #:photo-job-input-path
                 #:photo-job-overrides
+                #:photo-job-render-output
                 #:processing-settings-exposure
                 #:processing-settings-grain-amount
                 #:processing-settings-with-overrides

@@ -4,7 +4,7 @@ CXX ?= c++
 GUI_PREVIEW := native/build/liborfeus_gui_preview.so
 GUI_PREVIEW_SRC := native/gui-preview.cpp
 GUI_CXXFLAGS := -std=c++17 -fPIC -O2 -Wall -Wextra $(shell $(FLTK_CONFIG) --cxxflags)
-GUI_LDFLAGS := -shared $(shell $(FLTK_CONFIG) --ldflags) -L$(FLTK_SUN)/build -lcl_fltk_bridge -Wl,-rpath,$(abspath $(FLTK_SUN)/build)
+GUI_LDFLAGS := -shared $(shell $(FLTK_CONFIG) --use-images --ldflags) -L$(FLTK_SUN)/build -lcl_fltk_bridge -Wl,-rpath,$(abspath $(FLTK_SUN)/build)
 
 .PHONY: gui-native clean-gui-native
 

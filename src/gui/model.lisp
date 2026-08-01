@@ -74,3 +74,41 @@
   (let ((job (gui-model-selected-job model)))
     (when job (setf (photo-job-overrides job) '())))
   model)
+
+(defun gui-photo-output-path (model job)
+  "Return JOB's render output using the shared core project semantics."
+  (photo-job-render-output (gui-model-project model) job))
+
+(defun parse-gui-key-event (value)
+  "Parse CL-FLTK's `KEY STATE TEXT` event VALUE.
+
+Returns the numeric key code and entered text. Malformed values return zero and
+an empty string rather than escaping from an FLTK callback."
+  (handler-case
+      (let* ((value (or value ""))
+             (first-space (position #\Space value))
+             (second-space (and first-space
+                                (position #\Space value :start (1+ first-space)))))
+        (values (if first-space
+                    (parse-integer value :end first-space :junk-allowed nil)
+                    0)
+                (if second-space (subseq value (1+ second-space)) "")))
+    (error ()
+      (values 0 ""))))
+
+(defun gui-key-action (value)
+  "Return the GUI command keyword represented by CL-FLTK key event VALUE."
+  (multiple-value-bind (key text) (parse-gui-key-event value)
+    (cond ((or (string-equal text "b") (= key (char-code #\b)) (= key (char-code #\B))) :before-after)
+          ((or (string-equal text "r") (= key (char-code #\r)) (= key (char-code #\R))) :preview)
+          ((or (string-equal text "e") (= key (char-code #\e)) (= key (char-code #\E))) :render)
+          ((member key '(65361 65362)) :previous)
+          ((member key '(65363 65364)) :next))))
+
+(defun gui-preview-event-current-p (model event generation)
+  "Return true when preview completion EVENT still matches MODEL and GENERATION."
+  (let ((job (gui-model-selected-job model)))
+    (and job
+         (= (second event) generation)
+         (= (third event) (gui-model-selected-index model))
+         (eq (fourth event) job))))

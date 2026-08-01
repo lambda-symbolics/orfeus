@@ -1,6 +1,7 @@
 (in-package #:orfeus)
 
 (defun photo-job-render-output (project photo)
+  "Return PHOTO's output pathname using PROJECT's output-directory semantics."
   (let ((specified (photo-job-output-path photo)))
     (if specified
         (if (uiop:absolute-pathname-p specified)

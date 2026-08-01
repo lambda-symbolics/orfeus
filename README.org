@@ -62,9 +62,10 @@ sbcl --eval '(asdf:load-system "orfeus/gui")' \
      --eval '(orfeus/gui:run-gui #P"project.sexp")'
 #+end_src
 
-The GUI renders previews on worker threads and publishes completed JPEGs to the
-FLTK canvas through timer polling. Keyboard basics are =B= (before/after), =R=
-(preview), =E= (export selected), and arrow keys (selection).
+The GUI serializes rendering through one background worker, coalesces superseded
+interactive previews, and publishes only the current selection through FLTK
+timer polling. Keyboard basics are =B= (before/after), =R= (preview), =E=
+(export selected), and arrow keys (selection).
 
 The included test LUT is =data/luts/agfa_precisa_100.cube=. Its provenance and
 license notice are recorded in =THIRD-PARTY.md=.

@@ -1,20 +1,5 @@
 (in-package #:orfeus/gui)
 
-(defstruct gui-queue
-  (lock (sb-thread:make-mutex :name "Orfeus GUI render queue"))
-  (events '())
-  (running 0))
-
-(defun queue-event (queue event)
-  (sb-thread:with-mutex ((gui-queue-lock queue))
-    (setf (gui-queue-events queue)
-          (nconc (gui-queue-events queue) (list event)))))
-
-(defun drain-events (queue)
-  (sb-thread:with-mutex ((gui-queue-lock queue))
-    (prog1 (gui-queue-events queue)
-      (setf (gui-queue-events queue) '()))))
-
 (defun display-number (value)
   (if value (format nil "~G" value) ""))
 
@@ -38,13 +23,25 @@
                                        (file-namestring (photo-job-output-path job)))
                                   "Automatic"))))
 
-(defun preview-pathname (model job)
+(defun make-gui-preview-directory ()
+  "Create and return a private temporary directory for one GUI run."
+  (uiop:ensure-directory-pathname
+   (sb-posix:mkdtemp
+    (namestring (merge-pathnames "orfeus-gui-XXXXXX"
+                                 (uiop:temporary-directory))))))
+
+(defun delete-gui-preview-directory (directory)
+  "Delete the private preview DIRECTORY and all files created in it."
+  (when directory
+    (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore)))
+
+(defun preview-pathname (preview-directory index job)
   (merge-pathnames
-   (make-pathname :name (format nil ".orfeus-preview-~D-~A"
-                                (gui-model-selected-index model)
+   (make-pathname :name (format nil "preview-~D-~A"
+                                index
                                 (pathname-name (photo-job-input-path job)))
                   :type "jpg")
-   (uiop:ensure-directory-pathname (project-output-directory (gui-model-project model)))))
+   preview-directory))
 
 (defun run-gui (project-or-path &key project-path)
   "Open the FLTK frontend for PROJECT-OR-PATH, a PROJECT or project pathname."
@@ -56,9 +53,17 @@
                                                   (unless (typep project-or-path 'project)
                                                     (pathname project-or-path)))))
          (queue (make-gui-queue))
-         window table canvas status progress preview-file controls before-p)
+         (preview-directory (make-gui-preview-directory))
+         window table canvas status progress preview-file controls before-p
+         timeout-id (preview-generation 0))
     (labels ((status (text) (setf (cl-fltk:value status) text))
              (selected-job () (gui-model-selected-job model))
+             (clear-published-preview ()
+               (when preview-file
+                 (forget-preview-file preview-file)
+                 (setf preview-file nil))
+               (when canvas
+                 (cl-fltk:redraw canvas)))
              (update-table ()
                (cl-fltk:table-set-records table
                  '((:file "File" 220) (:settings "Settings" 100)
@@ -75,9 +80,9 @@
              (select-row ()
                (let ((row (cl-fltk:table-selected-row table)))
                  (when (and (>= row 0) (< row (length (project-photos project))))
-                   (setf (gui-model-selected-index model) row preview-file nil)
+                   (setf (gui-model-selected-index model) row)
+                   (clear-published-preview)
                    (sync-controls)
-                   (cl-fltk:redraw canvas)
                    (status (format nil "Selected ~A" (file-namestring (photo-job-input-path (selected-job))))))))
              (move-selection (delta)
                (let* ((count (length (project-photos project)))
@@ -85,45 +90,55 @@
                                   (max 0 (min (1- count) (+ (gui-model-selected-index model) delta))))))
                  (when index
                    (cl-fltk:table-select-row table index)
-                   (setf (gui-model-selected-index model) index preview-file nil)
-                   (sync-controls) (cl-fltk:redraw canvas))))
-             (publish-preview (path) (setf preview-file path) (cl-fltk:redraw canvas))
+                   (setf (gui-model-selected-index model) index)
+                   (clear-published-preview)
+                   (sync-controls))))
+             (publish-preview (path)
+               (when (and preview-file (not (equal preview-file path)))
+                 (forget-preview-file preview-file))
+               (forget-preview-file path)
+               (setf preview-file path)
+               (cl-fltk:redraw canvas))
              (render-one (job preview-p)
-               (let ((output (if preview-p (preview-pathname model job)
-                                 (or (photo-job-output-path job)
-                                     (merge-pathnames (make-pathname :name (pathname-name (photo-job-input-path job)) :type "jpg")
-                                                      (uiop:ensure-directory-pathname (project-output-directory project)))))))
-                 (sb-thread:make-thread
+               (let* ((index (position job (project-photos project) :test #'eq))
+                      (input (photo-job-input-path job))
+                      (output (if preview-p
+                                  (preview-pathname preview-directory index job)
+                                  (gui-photo-output-path model job)))
+                      (settings (if (and preview-p before-p)
+                                    (make-processing-settings)
+                                    (processing-settings-with-overrides
+                                     (project-defaults project)
+                                     (photo-job-overrides job))))
+                      (generation (when preview-p (incf preview-generation))))
+                 (enqueue-gui-task
+                  queue (if preview-p :preview :export)
                   (lambda ()
-                    (incf (gui-queue-running queue))
-                    (queue-event queue (list :status (format nil "Rendering ~A" (file-namestring (photo-job-input-path job)))))
-                    (handler-case
-                        (let ((settings (if (and preview-p before-p)
-                                            (make-processing-settings)
-                                            (processing-settings-with-overrides
-                                             (project-defaults project) (photo-job-overrides job)))))
-                          (if preview-p
-                              (render-preview (photo-job-input-path job) output settings
-                                              :if-exists :supersede)
-                              (render-photo (photo-job-input-path job) output settings
-                                            :if-exists :supersede))
-                          (queue-event queue (list (if preview-p :preview :done) output)))
-                      (error (condition)
-                        (queue-event queue (list :error (princ-to-string condition)))))
-                    (decf (gui-queue-running queue)))
-                  :name "Orfeus background render")))
+                    (queue-event queue (list :status (format nil "Rendering ~A" (file-namestring input))))
+                    (if preview-p
+                        (render-preview input output settings :if-exists :supersede)
+                        (render-photo input output settings :if-exists :supersede))
+                    (queue-event queue (if preview-p
+                                           (list :preview generation index job output)
+                                           (list :done output))))
+                  :replace-kind (and preview-p :preview))))
              (render-selected (&optional (preview-p t))
                (when (selected-job) (render-one (selected-job) preview-p)))
-             (render-all () (dolist (job (project-photos project)) (render-one job nil)))
+             (render-all ()
+               (dolist (job (project-photos project))
+                 (render-one job nil)))
              (poll ()
                (dolist (event (drain-events queue))
                  (ecase (first event)
                    (:status (status (second event)))
-                   (:preview (publish-preview (second event)) (status "Preview ready"))
+                   (:preview
+                    (when (gui-preview-event-current-p model event preview-generation)
+                      (publish-preview (fifth event))
+                      (status "Preview ready")))
                    (:done (status (format nil "Rendered ~A" (file-namestring (second event)))))
                    (:error (status (format nil "Error: ~A" (second event))))))
                (setf (cl-fltk:value progress)
-                     (if (plusp (gui-queue-running queue)) "50" "0"))))
+                     (if (gui-queue-busy-p queue) "50" "0"))))
       (setf window (cl-fltk:make-window :width 1440 :height 900 :label "Orfeus" :app-id "org.orfeus.Orfeus"))
       (cl-fltk:apply-classic-theme)
       (cl-fltk:set-size-range window :min-width 1120 :min-height 720)
@@ -201,18 +216,27 @@
           (cl-fltk:make-button :parent panel :x 165 :y y :width 135 :height 28 :label "Render selected"
                                :callback (lambda (&rest ignored) (declare (ignore ignored)) (render-selected nil)))))
       (cl-fltk:on window
-                  (lambda (widget event key)
+                  (lambda (widget event value)
                     (declare (ignore widget event))
-                    (cond ((member key '("b" "B") :test #'string=)
-                           (setf before-p (not before-p)) (render-selected t))
-                          ((member key '("r" "R") :test #'string=) (render-selected t))
-                          ((member key '("e" "E") :test #'string=) (render-selected nil))
-                          ((member key '("Up" "Left") :test #'string=) (move-selection -1))
-                          ((member key '("Down" "Right") :test #'string=) (move-selection 1))))
+                    (case (gui-key-action value)
+                       (:before-after (setf before-p (not before-p)) (render-selected t))
+                       (:preview (render-selected t))
+                       (:render (render-selected nil))
+                       (:previous (move-selection -1))
+                       (:next (move-selection 1))))
                   :event cl-fltk:+event-key+)
       (setf progress (cl-fltk:make-progress :parent window :x 0 :y 848 :width 240 :height 26 :value "0")
             status (cl-fltk:make-status-bar :parent window :x 240 :y 848 :width 1200 :height 26 :value "Ready"))
       (sync-controls)
-      (cl-fltk:add-timeout 0.1d0 #'poll :repeat t)
-      (cl-fltk:show window)
-      (cl-fltk:run))))
+      (setf timeout-id (cl-fltk:add-timeout 0.1d0 #'poll :repeat t))
+        (unwind-protect
+             (progn
+               (cl-fltk:show window)
+               (cl-fltk:run))
+          (when timeout-id
+            (ignore-errors (cl-fltk:remove-timeout timeout-id)))
+          (stop-gui-queue queue)
+          (clear-preview-cache)
+          (ignore-errors (delete-gui-preview-directory preview-directory))
+          (when window
+            (ignore-errors (cl-fltk:destroy window)))))))

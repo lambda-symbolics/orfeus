@@ -6,7 +6,9 @@
 #include <string>
 #include <unordered_map>
 
-#include "../../fltk-sun/native/cl_fltk_bridge.hpp"
+namespace clfl_bridge {
+Fl_Widget *find_widget(long long id);
+}
 
 namespace {
 std::unordered_map<std::string, std::unique_ptr<Fl_JPEG_Image>> images;
@@ -21,7 +23,7 @@ extern "C" int orfeus_gui_preview_draw(long long widget_id, const char *path) {
         if (image->fail() || image->w() <= 0 || image->h() <= 0) return 0;
         found = images.emplace(path, std::move(image)).first;
     }
-    const Fl_JPEG_Image &source = *found->second;
+    Fl_JPEG_Image &source = *found->second;
     const double scale = std::min(static_cast<double>(widget->w()) / source.w(),
                                   static_cast<double>(widget->h()) / source.h());
     const int width = std::max(1, static_cast<int>(source.w() * scale));

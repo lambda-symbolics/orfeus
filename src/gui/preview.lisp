@@ -23,7 +23,19 @@
 
 (cffi:defcfun ("orfeus_gui_preview_draw" %gui-preview-draw) :int
   (widget-id :long-long) (path :string))
+(cffi:defcfun ("orfeus_gui_preview_forget" %gui-preview-forget) :void
+  (path :string))
 (cffi:defcfun ("orfeus_gui_preview_clear" %gui-preview-clear) :void)
+
+(defun forget-preview-file (pathname)
+  "Evict PATHNAME from the native preview cache after it is overwritten."
+  (when *gui-preview-library-loaded-p*
+    (%gui-preview-forget (namestring pathname))))
+
+(defun clear-preview-cache ()
+  "Release all decoded images held by the native preview adapter."
+  (when *gui-preview-library-loaded-p*
+    (%gui-preview-clear)))
 
 (defun draw-preview-file (canvas pathname)
   (load-gui-preview-library)
