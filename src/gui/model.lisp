@@ -7,9 +7,28 @@
   (edit-target :photo :type (member :photo :defaults))
   project-path)
 
+(defun gui-bundled-lut-paths ()
+  "Return bundled CUBE LUT pathnames in stable display order."
+  (sort (directory (merge-pathnames #P"*.cube"
+                                    (asdf:system-relative-pathname
+                                     "orfeus" #P"data/luts/")))
+        #'string-lessp :key #'file-namestring))
+
+(defun gui-default-lut-path ()
+  "Return the bundled Agfa Precisa 100 LUT pathname, when installed."
+  (find "agfa_precisa_100" (gui-bundled-lut-paths)
+        :test #'string-equal :key #'pathname-name))
+
+(defun gui-default-processing-settings ()
+  (make-processing-settings
+   :lut-path (let ((path (gui-default-lut-path)))
+               (and path (namestring path)))))
+
 (defun gui-empty-project ()
   "Return an empty in-memory project suitable for a newly opened GUI."
-  (make-project :output-directory #P"exports/" :photos '()))
+  (make-project :output-directory #P"exports/"
+                :defaults (gui-default-processing-settings)
+                :photos '()))
 
 (defun gui-photo-project (pathname)
   "Return a one-photo project for PATHNAME with a sibling Orfeus export directory."
@@ -17,6 +36,7 @@
          (directory (uiop:pathname-directory-pathname input))
          (output-directory (merge-pathnames #P"orfeus-exports/" directory)))
     (make-project :output-directory output-directory
+                  :defaults (gui-default-processing-settings)
                   :photos (list (make-photo-job :input-path input)))))
 
 (defun gui-open-kind (pathname)
@@ -85,8 +105,19 @@
     (:grain-size (setf (orfeus:processing-settings-grain-size settings) value)))
   value)
 
+(defun gui-boolean-value (value)
+  "Normalize a frontend checkbox VALUE to a Common Lisp boolean."
+  (not (or (null value)
+           (eql value 0)
+           (and (stringp value)
+                (member value '("" "0" "false" "nil")
+                        :test #'string-equal)))))
+
 (defun gui-model-set-setting (model key value)
   "Set KEY to VALUE at MODEL's current :PHOTO or :DEFAULTS edit target."
+  (when (member key '(:lens-correction-p
+                      :chromatic-aberration-correction-p))
+    (setf value (gui-boolean-value value)))
   (if (eq (gui-model-edit-target model) :defaults)
       (set-default-setting (project-defaults (gui-model-project model)) key value)
       (let ((job (or (gui-model-selected-job model)

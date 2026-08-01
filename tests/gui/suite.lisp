@@ -90,7 +90,23 @@
                   (orfeus:project-output-directory project))
            "Direct photo output directory is not beside the input")
     (check (equal #P"/photos/one.orf" (orfeus:photo-job-input-path job))
-           "Direct photo project changed the input pathname")))
+           "Direct photo project changed the input pathname")
+    (check (search "agfa_precisa_100.cube"
+                   (orfeus:processing-settings-lut-path
+                    (orfeus:project-defaults project)))
+           "Direct photo project did not select the bundled Agfa LUT")))
+
+(defun test-checkbox-normalization ()
+  (let* ((job (orfeus:make-photo-job :input-path #P"one.orf"))
+         (project (orfeus:make-project :output-directory #P"exports/"
+                                       :photos (list job)))
+         (model (orfeus/gui:make-gui-model :project project)))
+    (orfeus/gui:gui-model-set-setting model :lens-correction-p 0)
+    (check (null (getf (orfeus:photo-job-overrides job) :lens-correction-p))
+           "Numeric checkbox zero was not normalized to NIL")
+    (orfeus/gui:gui-model-set-setting model :lens-correction-p 1)
+    (check (eq t (getf (orfeus:photo-job-overrides job) :lens-correction-p))
+           "Numeric checkbox one was not normalized to T")))
 
 (defun test-render-queue ()
   (let ((queue (orfeus/gui::make-gui-queue))
@@ -120,5 +136,6 @@
   (test-preview-job-identity)
   (test-preview-directory)
   (test-direct-open-workflow)
+  (test-checkbox-normalization)
   (test-render-queue)
   t)

@@ -80,7 +80,7 @@
            (queue (make-gui-queue))
            (preview-directory (make-gui-preview-directory))
            window menu toolbar table canvas inspector status progress preview-file
-           controls inspector-items lut-name wb-choice target-choice
+           controls inspector-items lut-name lut-menu wb-choice target-choice
            debounce-id poll-id before-p
            (preview-generation 0))
       (labels
@@ -136,18 +136,18 @@
            (open-photo ()
              (let ((path (cl-fltk:choose-file
                           :title "Open RAW photograph"
-                          :filter "Olympus RAW (*.{orf,ORF,dng,DNG})")))
+                          :filter "RAW photographs\t*.{orf,ORF,dng,DNG}")))
                (when path (replace-project (gui-photo-project path)))))
            (open-project ()
              (let ((path (cl-fltk:choose-file
                           :title "Open Orfeus project"
-                          :filter "Orfeus project (*.sexp)")))
+                          :filter "Orfeus project\t*.sexp")))
                (when path (replace-project (project-read path) (pathname path)))))
            (save-project (&optional choose-p)
              (let ((path (or (and (not choose-p) (gui-model-project-path model))
                              (cl-fltk:choose-save-file
                               :title "Save Orfeus project"
-                              :filter "Orfeus project (*.sexp)"
+                              :filter "Orfeus project\t*.sexp"
                               :preset-file "project.sexp"))))
                (when path
                  (project-write project path)
@@ -242,7 +242,7 @@
                       (queue-event queue (list :done output))))))))
            (choose-lut ()
              (let ((path (cl-fltk:choose-file
-                          :title "Choose 3D LUT" :filter "Cube LUT (*.cube)")))
+                          :title "Choose 3D LUT" :filter "Cube LUT\t*.{cube,CUBE}")))
                (when path
                  (gui-model-set-setting model :lut-path path)
                  (sync-controls)
@@ -270,24 +270,29 @@
            (make-number-field (key label minimum maximum step y)
              (let* ((label-widget
                       (cl-fltk:make-label :parent inspector :x 12 :y y
-                                          :width 112 :height 26 :label label))
+                                          :width 105 :height 26 :label label))
                     (callback (lambda (widget event value)
                                 (declare (ignore event value))
                                 (setting-changed key widget)))
-                    (widget
-                      (if (member key '(:white-balance-temperature :grain-size))
-                          (cl-fltk:make-spinner :parent inspector :x 132 :y y
-                                                :width 176 :height 26
-                                                :callback callback)
-                          (cl-fltk:make-value-slider :parent inspector :x 132 :y y
-                                                     :width 176 :height 26
-                                                     :callback callback))))
-               (cl-fltk:set-range widget minimum maximum)
-               (cl-fltk:set-step widget step)
-               (register-inspector label-widget 12 y 112 26)
-               (register-inspector widget 132 y :control 26)
-               (push (list key widget) controls)
-               widget))
+                    (spinner (cl-fltk:make-spinner
+                              :parent inspector :x 270 :y y
+                              :width 78 :height 26 :callback callback))
+                    (slider (unless (member key '(:white-balance-temperature
+                                                  :grain-size))
+                              (cl-fltk:make-slider
+                               :parent inspector :x 117 :y y
+                               :width 140 :height 26 :callback callback))))
+               (dolist (widget (remove nil (list slider spinner)))
+                 (cl-fltk:set-range widget minimum maximum)
+                 (cl-fltk:set-step widget step)
+                 (push (list key widget) controls))
+               (register-inspector label-widget 12 y 105 26)
+               (if slider
+                   (progn
+                     (register-inspector slider 117 y :slider 26)
+                     (register-inspector spinner 270 y :number 26))
+                   (register-inspector spinner 117 y :control 26))
+               spinner))
            (layout-ui (&optional ignored)
              (declare (ignore ignored))
              (let* ((width (cl-fltk:widget-width window))
@@ -312,14 +317,17 @@
                    (let ((item-width
                            (case width-mode
                              (:control (max 100 (- right 144)))
+                             (:slider (max 80 (- right 217)))
+                             (:number 78)
                              (:fill (max 100 (- right 24)))
                              (:half-left (max 70 (floor (- right 30) 2)))
                              (:half-right (max 70 (floor (- right 30) 2)))
                              (otherwise width-mode)))
                          (item-x
-                           (if (eq width-mode :half-right)
-                               (+ 18 (floor (- right 30) 2))
-                               x)))
+                           (case width-mode
+                             (:number (- right 90))
+                             (:half-right (+ 18 (floor (- right 30) 2)))
+                             (otherwise x))))
                      (cl-fltk:resize-widget
                       widget :x item-x :y y
                       :width item-width :height item-height))))
@@ -377,7 +385,7 @@
                                (lambda (&rest ignored)
                                  (declare (ignore ignored))
                                  (setf (project-defaults project)
-                                       (make-processing-settings))
+                                       (gui-default-processing-settings))
                                  (sync-controls)
                                  (update-table)
                                  (schedule-edited-preview)))
@@ -517,20 +525,30 @@
                                       :width 176 :height 26
                                       :value "No LUT selected")
                  132 358 :control 26))
-          (register-inspector
-           (cl-fltk:make-button :parent inspector :x 12 :y 390
-                                :width 140 :height 26 :label "Choose LUT..."
-                                :callback (lambda (&rest ignored)
-                                            (declare (ignore ignored))
-                                            (choose-lut)))
-           12 390 :half-left 26)
-          (register-inspector
-           (cl-fltk:make-button :parent inspector :x 166 :y 390
-                                :width 142 :height 26 :label "Clear LUT"
-                                :callback (lambda (&rest ignored)
-                                            (declare (ignore ignored))
-                                            (clear-lut)))
-           166 390 :half-right 26)
+          (setf lut-menu
+                (register-inspector
+                 (cl-fltk:make-menu-button :parent inspector :x 12 :y 390
+                                            :width 296 :height 26
+                                            :label "Select LUT")
+                 12 390 :fill 26))
+          (dolist (path (gui-bundled-lut-paths))
+            (let ((selected-path (namestring path))
+                  (label (substitute #\Space #\_ (pathname-name path))))
+              (cl-fltk:add-menu-item
+               lut-menu (format nil "Bundled/~:(~A~)" label)
+               (lambda (&rest ignored)
+                 (declare (ignore ignored))
+                 (gui-model-set-setting model :lut-path selected-path)
+                 (sync-controls)
+                 (schedule-edited-preview)))))
+          (cl-fltk:add-menu-item lut-menu "Browse..."
+                                 (lambda (&rest ignored)
+                                   (declare (ignore ignored))
+                                   (choose-lut)))
+          (cl-fltk:add-menu-item lut-menu "None"
+                                 (lambda (&rest ignored)
+                                   (declare (ignore ignored))
+                                   (clear-lut)))
           (make-number-field :lut-strength "LUT strength" 0 1 0.05 422)
           (make-number-field :grain-amount "Grain amount" 0 1 0.05 454)
           (make-number-field :grain-size "Grain size" 0.25 16 0.25 486)
