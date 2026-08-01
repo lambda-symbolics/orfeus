@@ -13,6 +13,7 @@ use std::ptr;
 use flate2::read::ZlibDecoder;
 use md5::{Digest, Md5};
 
+mod color;
 mod render;
 mod tone;
 
@@ -52,6 +53,7 @@ enum Error {
     Decompression(&'static str),
     DigestMismatch,
     BufferTooSmall { needed: usize },
+    Color(color::ColorError),
     Render(String),
     LensProfileUnavailable(String),
 }
@@ -66,7 +68,7 @@ impl Error {
             Self::Decompression(_) => ORFEUS_STATUS_DECOMPRESSION_ERROR,
             Self::DigestMismatch => ORFEUS_STATUS_DIGEST_MISMATCH,
             Self::BufferTooSmall { .. } => ORFEUS_STATUS_BUFFER_TOO_SMALL,
-            Self::Render(_) => ORFEUS_STATUS_RENDER_ERROR,
+            Self::Color(_) | Self::Render(_) => ORFEUS_STATUS_RENDER_ERROR,
             Self::LensProfileUnavailable(_) => ORFEUS_STATUS_LENS_PROFILE_UNAVAILABLE,
         }
     }
@@ -89,6 +91,7 @@ impl fmt::Display for Error {
                     "result buffer too small (requires {needed} bytes)"
                 )
             }
+            Self::Color(error) => write!(formatter, "RAW color conversion: {error}"),
             Self::Render(message) | Self::LensProfileUnavailable(message) => {
                 formatter.write_str(message)
             }
@@ -588,6 +591,16 @@ mod tests {
     fn reports_current_abi_version() {
         assert_eq!(orfeus_bridge_abi_version(), 1);
         assert_eq!(orfeus_raw_render_capabilities_v1(), 1 | 2 | 4);
+    }
+
+    #[test]
+    fn color_errors_use_the_render_status_and_preserve_context() {
+        let error = Error::Color(color::ColorError::MissingMatrix);
+        assert_eq!(error.status(), ORFEUS_STATUS_RENDER_ERROR);
+        assert_eq!(
+            error.to_string(),
+            "RAW color conversion: RAW has no camera color matrix"
+        );
     }
 
     #[test]

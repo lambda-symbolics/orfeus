@@ -11,10 +11,11 @@ use image::codecs::tiff::TiffEncoder;
 use image::{ColorType, ImageEncoder};
 use lensfun::{Database, Modifier};
 use rawler::decoders::{RawDecodeParams, RawLoader};
-use rawler::imgop::develop::{Intermediate, ProcessingStep, RawDevelop};
+use rawler::imgop::develop::{ProcessingStep, RawDevelop};
 use rawler::rawsource::RawSource;
 
 use super::Error;
+use super::color::intermediate_to_linear_srgb;
 use super::tone::apply_default_display_tone;
 
 pub const SETTINGS_VERSION: u32 = 1;
@@ -836,34 +837,29 @@ pub fn render(input: &Path, output: &Path, settings: &RenderSettingsV1) -> Resul
     let raw = decoder
         .raw_image(&source, &params, false)
         .map_err(|e| Error::Render(format!("RAW decode: {e}")))?;
-    // Rawler's calibration step uses the camera matrix to convert deliberately
-    // into linear sRGB. Camera metadata such as Olympus Adobe RGB intent does
-    // not change this working/output space, which is tagged with our sRGB ICC.
-    let mut steps = vec![
+    // Rawler performs scaling, demosaic, and cropping. Orfeus owns white
+    // balance and the camera-to-sRGB transform so scene-linear highlights remain
+    // unclipped through white adaptation and exposure.
+    let steps = vec![
         ProcessingStep::Rescale,
         ProcessingStep::Demosaic,
         ProcessingStep::CropActiveArea,
-        ProcessingStep::Calibrate,
         ProcessingStep::CropDefault,
     ];
-    if settings.kelvin == 0.0 {
-        steps.insert(3, ProcessingStep::WhiteBalance);
-    }
     let developed = RawDevelop { steps }
         .develop_intermediate(&raw)
         .map_err(|e| Error::Render(format!("RAW development: {e}")))?;
-    let pixels = match developed {
-        Intermediate::ThreeColor(pixels) => pixels,
-        _ => {
-            return Err(Error::Render(
-                "RAW development did not produce three-channel RGB".into(),
-            ));
-        }
+    let white_balance = if settings.kelvin == 0.0 {
+        raw.wb_coeffs
+    } else {
+        [1.0; 4]
     };
+    let linear_srgb = intermediate_to_linear_srgb(developed, &raw.color_matrix, white_balance)
+        .map_err(Error::Color)?;
     let mut image = RgbImage {
-        width: pixels.width,
-        height: pixels.height,
-        data: pixels.into_inner().into_iter().flatten().collect(),
+        width: linear_srgb.width,
+        height: linear_srgb.height,
+        data: linear_srgb.data,
     };
     apply_white_adaptation(&mut image, settings.kelvin, settings.tint);
     apply_exposure(&mut image, settings.exposure_ev);
