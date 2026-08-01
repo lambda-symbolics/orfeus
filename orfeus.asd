@@ -25,7 +25,7 @@
 
 (asdf:defsystem #:orfeus/tests
   :description "Tests for Orfeus."
-  :depends-on (#:orfeus)
+  :depends-on (#:orfeus/cli)
   :serial t
   :components ((:file "tests/package")
                (:file "tests/suite"))

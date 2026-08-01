@@ -1,6 +1,7 @@
 (defpackage #:orfeus/tests
   (:use #:cl)
   (:import-from #:orfeus
+                #:cli-run
                 #:invalid-project-data
                 #:make-photo-job
                 #:make-processing-settings

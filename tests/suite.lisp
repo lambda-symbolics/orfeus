@@ -57,6 +57,23 @@
         nil)
     (invalid-project-data () t)))
 
+(defun cli-version-p ()
+  (let ((output (make-string-output-stream))
+        (errors (make-string-output-stream)))
+    (and (zerop (cli-run '("--version")
+                         :output-stream output
+                         :error-stream errors))
+         (search (orfeus-version) (get-output-stream-string output))
+         (string= "" (get-output-stream-string errors)))))
+
+(defun cli-rejects-unknown-command-p ()
+  (let ((output (make-string-output-stream))
+        (errors (make-string-output-stream)))
+    (and (= 2 (cli-run '("wat")
+                       :output-stream output
+                       :error-stream errors))
+         (search "Unknown command" (get-output-stream-string errors)))))
+
 (defun run-tests ()
   "Run the dependency-free Orfeus test suite."
   (let ((failures 0))
@@ -72,5 +89,7 @@
       (check "project reads disable reader evaluation"
              (project-reader-evaluation-disabled-p))
       (check "invalid project versions are rejected"
-             (invalid-project-rejected-p)))
+             (invalid-project-rejected-p))
+      (check "CLI reports its version" (cli-version-p))
+      (check "CLI rejects unknown commands" (cli-rejects-unknown-command-p)))
     (zerop failures)))

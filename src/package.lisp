@@ -7,6 +7,7 @@
                 #:with-foreign-pointer
                 #:with-foreign-string)
   (:export
+   #:cli-run
    #:dng-extract-original
    #:dng-original-error
    #:dng-original-filename
