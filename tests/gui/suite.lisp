@@ -120,6 +120,34 @@
                     (orfeus:project-defaults project)))
            "Direct photo project did not select the bundled Agfa LUT")))
 
+(defun test-project-photo-mutations ()
+  (let* ((first (orfeus:make-photo-job :input-path #P"/photos/one.orf"))
+         (project (orfeus:make-project :output-directory #P"exports/"
+                                       :photos (list first)))
+         (model (orfeus/gui:make-gui-model :project project)))
+    (multiple-value-bind (count first-index)
+        (orfeus/gui:gui-model-add-photos
+         model (list #P"/photos/one.orf" #P"/photos/two.orf" #P"/photos/three.dng"))
+      (check (= count 2) "Adding photos did not skip the existing path")
+      (check (= first-index 1) "First added photo index was incorrect")
+      (check (= (orfeus/gui:gui-model-selected-index model) 1)
+             "First added photo was not selected")
+      (check (equal '(#P"/photos/one.orf" #P"/photos/two.orf" #P"/photos/three.dng")
+                    (mapcar #'orfeus:photo-job-input-path
+                            (orfeus:project-photos project)))
+             "Adding photos changed order"))
+    (let ((removed (orfeus/gui:gui-model-remove-selected model)))
+      (check (equal #P"/photos/two.orf" (orfeus:photo-job-input-path removed))
+             "Removing selected photo removed the wrong job")
+      (check (= (orfeus/gui:gui-model-selected-index model) 1)
+             "Selection was not clamped to the following photo"))
+    (orfeus/gui:gui-model-remove-selected model)
+    (orfeus/gui:gui-model-remove-selected model)
+    (check (null (orfeus:project-photos project))
+           "Removing all photos left a project entry")
+    (check (= (orfeus/gui:gui-model-selected-index model) 0)
+           "Empty project selection was not reset")))
+
 (defun test-checkbox-normalization ()
   (let* ((job (orfeus:make-photo-job :input-path #P"one.orf"))
          (project (orfeus:make-project :output-directory #P"exports/"
@@ -191,6 +219,7 @@
   (test-preview-status-percent)
   (test-file-filter-syntax)
   (test-direct-open-workflow)
+  (test-project-photo-mutations)
   (test-checkbox-normalization)
   (test-render-queue)
   (test-preview-cache-key)

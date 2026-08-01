@@ -61,6 +61,45 @@
         (gui-model-edit-target model) :photo)
   model)
 
+(defun gui-model-add-photos (model pathnames)
+  "Append unique PATHNAMES to MODEL's project and select the first addition."
+  (let* ((project (gui-model-project model))
+         (photos (project-photos project))
+         (existing (mapcar #'photo-job-input-path photos))
+         (inputs (remove-duplicates (mapcar #'pathname pathnames) :test #'equal))
+         (new-inputs (remove-if (lambda (path) (member path existing :test #'equal))
+                                inputs))
+         (first-index (length photos)))
+    (when new-inputs
+      (when (null photos)
+        (setf (project-output-directory project)
+              (merge-pathnames #P"orfeus-exports/"
+                               (uiop:pathname-directory-pathname
+                                (first new-inputs)))))
+      (setf (project-photos project)
+            (append photos
+                    (mapcar (lambda (input)
+                              (make-photo-job :input-path input))
+                            new-inputs))
+            (gui-model-selected-index model) first-index
+            (gui-model-edit-target model) :photo))
+    (values (length new-inputs) first-index)))
+
+(defun gui-model-remove-selected (model)
+  "Remove and return MODEL's selected photo job, safely clamping selection."
+  (let* ((project (gui-model-project model))
+         (photos (project-photos project))
+         (index (gui-model-selected-index model))
+         (removed (nth index photos)))
+    (when removed
+      (setf (project-photos project)
+            (loop for photo in photos
+                  for photo-index from 0
+                  unless (= photo-index index) collect photo))
+      (setf (gui-model-selected-index model)
+            (max 0 (min index (1- (length (project-photos project)))))))
+    removed))
+
 (defun gui-model-selected-job (model)
   "Return MODEL's selected photo job, or NIL for an empty project."
   (nth (gui-model-selected-index model)

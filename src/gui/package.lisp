@@ -9,7 +9,8 @@
                 #:processing-settings-with-overrides #:project #:project-defaults
                 #:project-output-directory #:project-photos #:project-read
                 #:project-write #:render-photo #:render-preview)
-  (:export #:gui-model #:gui-model-edit-target #:gui-model-project
+  (:export #:gui-model #:gui-model-add-photos #:gui-model-edit-target
+           #:gui-model-project #:gui-model-remove-selected
            #:gui-model-selected-index #:gui-model-setting #:gui-model-set-setting
            #:gui-model-reset-selected #:gui-model-selected-job
            #:gui-model-selected-settings #:main #:make-gui-model #:run-gui))

@@ -309,15 +309,51 @@
                    (cl-fltk:table-select-row table 0)
                    (schedule-initial-preview))
                  (set-status "Open a photograph or project to begin")))
+           (choose-photos (title)
+             (choose-photo-files
+              :title title
+              :filter (fltk-file-filter
+                       "RAW photographs" "*.{orf,ORF,dng,DNG}")
+              :preset-path (picker-preset)))
            (open-photo ()
-             (let ((paths (choose-photo-files
-                           :title "Open RAW photographs"
-                           :filter (fltk-file-filter
-                                    "RAW photographs" "*.{orf,ORF,dng,DNG}")
-                           :preset-path (picker-preset))))
+             (let ((paths (choose-photos "Open RAW photographs")))
                (when paths
                  (remember-picked-path (first paths))
                  (replace-project (gui-photos-project paths)))))
+           (add-photos ()
+             (let ((paths (choose-photos "Add RAW photographs to project")))
+               (when paths
+                 (remember-picked-path (first paths))
+                 (multiple-value-bind (count first-index)
+                     (gui-model-add-photos model paths)
+                   (if (plusp count)
+                       (progn
+                         (incf preview-generation)
+                         (clear-previews)
+                         (update-table)
+                         (sync-controls)
+                         (cl-fltk:table-select-row table first-index)
+                         (schedule-initial-preview)
+                         (set-status (format nil "Added ~D photograph~:P" count)))
+                       (set-status "All selected photographs are already in the project"))))))
+           (remove-selected-photo ()
+             (let ((removed (gui-model-remove-selected model)))
+               (when removed
+                 (incf preview-generation)
+                 (remhash removed lens-cache)
+                 (remhash removed capture-cache)
+                 (clear-previews)
+                 (update-table)
+                 (sync-controls)
+                 (if (selected-job)
+                     (progn
+                       (cl-fltk:table-select-row
+                        table (gui-model-selected-index model))
+                       (schedule-initial-preview)
+                       (set-status (format nil "Removed ~A"
+                                           (file-namestring
+                                            (photo-job-input-path removed)))))
+                     (set-status "Project contains no photographs")))))
            (open-project ()
              (let ((path (cl-fltk:choose-file
                           :title "Open Orfeus project"
@@ -552,8 +588,8 @@
                   (cl-fltk:resize-widget toolbar-bottom-rule :x 0 :y 38
                                          :width width :height 2))
                (when lens-name
-                 (cl-fltk:resize-widget lens-name :x 312 :y 6
-                                        :width (max 120 (- width 322)) :height 28))
+                 (cl-fltk:resize-widget lens-name :x 342 :y 6
+                                        :width (max 120 (- width 352)) :height 28))
                (cl-fltk:resize-widget table :x 0 :y top :width left :height main-height)
                (if comparison-p
                    (progn
@@ -647,6 +683,10 @@
         (cl-fltk:add-menu-item menu "File/Open Photo" (lambda (&rest ignored)
                                                           (declare (ignore ignored))
                                                           (open-photo)))
+        (cl-fltk:add-menu-item menu "File/Add Photos to Project"
+                               (lambda (&rest ignored)
+                                 (declare (ignore ignored))
+                                 (add-photos)))
         (cl-fltk:add-menu-item menu "File/Open Project" (lambda (&rest ignored)
                                                             (declare (ignore ignored))
                                                             (open-project)))
@@ -662,6 +702,10 @@
         (cl-fltk:add-menu-item menu "File/Quit" (lambda (&rest ignored)
                                                     (declare (ignore ignored))
                                                     (cl-fltk:quit)))
+        (cl-fltk:add-menu-item menu "Edit/Remove Selected Photo"
+                               (lambda (&rest ignored)
+                                 (declare (ignore ignored))
+                                 (remove-selected-photo)))
         (cl-fltk:add-menu-item menu "Edit/Reset Photo"
                                (lambda (&rest ignored)
                                  (declare (ignore ignored))
@@ -727,20 +771,21 @@
                    button)))
           (rule 6 10 2 18 130 130 130)
           (rule 10 10 2 18 245 245 245)
-          (toolbar-button 18 :open "Open RAW photographs" #'open-photo)
+          (toolbar-button 18 :open "Add RAW photographs to project" #'add-photos)
           (toolbar-button 48 :folder-open "Open project" #'open-project)
-          (rule 82 7 1 24 150 150 150)
-          (toolbar-button 90 :export "Export selected photograph" #'render-selected)
-          (toolbar-button 120 :pipeline "Show or hide Before and After" #'toggle-comparison)
-          (rule 154 7 1 24 150 150 150)
-          (toolbar-text-button 162 28 "−" "Zoom out" (lambda () (zoom-preview .8d0)))
-          (toolbar-text-button 192 38 "Fit" "Fit preview" #'reset-preview-view)
-          (toolbar-text-button 232 28 "+" "Zoom in" (lambda () (zoom-preview 1.25d0)))
-          (toolbar-text-button 262 38 "1:1" "Show image pixels at 1:1" #'preview-one-to-one)
-          (rule 304 7 1 24 150 150 150)
+          (toolbar-button 78 :delete "Remove selected photograph" #'remove-selected-photo)
+          (rule 112 7 1 24 150 150 150)
+          (toolbar-button 120 :export "Export selected photograph" #'render-selected)
+          (toolbar-button 150 :pipeline "Show or hide Before and After" #'toggle-comparison)
+          (rule 184 7 1 24 150 150 150)
+          (toolbar-text-button 192 28 "−" "Zoom out" (lambda () (zoom-preview .8d0)))
+          (toolbar-text-button 222 38 "Fit" "Fit preview" #'reset-preview-view)
+          (toolbar-text-button 262 28 "+" "Zoom in" (lambda () (zoom-preview 1.25d0)))
+          (toolbar-text-button 292 38 "1:1" "Show image pixels at 1:1" #'preview-one-to-one)
+          (rule 334 7 1 24 150 150 150)
           (setf toolbar-bottom-rule (rule 0 38 1280 2 145 145 145)))
-        (setf lens-name (cl-fltk:make-label :parent toolbar :x 312 :y 6
-                                            :width 942 :height 28
+        (setf lens-name (cl-fltk:make-label :parent toolbar :x 342 :y 6
+                                            :width 912 :height 28
                                             :label "Lens: No photograph selected"))
         (cl-fltk:set-label-font lens-name 1)
         (setf table (cl-fltk:make-record-table
