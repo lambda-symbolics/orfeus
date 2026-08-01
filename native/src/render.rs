@@ -550,6 +550,53 @@ fn find_lens_profile<'a>(
         })
 }
 
+fn lens_auto_crop_scale(valid: &[bool], width: usize, height: usize) -> f32 {
+    let center_x = (width.saturating_sub(1)) as f32 * 0.5;
+    let center_y = (height.saturating_sub(1)) as f32 * 0.5;
+    let mut nearest_invalid_radius = 1.0_f32;
+    for y in 0..height {
+        for x in 0..width {
+            if !valid[y * width + x] {
+                let normalized_x = if center_x > 0.0 {
+                    (x as f32 - center_x).abs() / center_x
+                } else {
+                    0.0
+                };
+                let normalized_y = if center_y > 0.0 {
+                    (y as f32 - center_y).abs() / center_y
+                } else {
+                    0.0
+                };
+                nearest_invalid_radius = nearest_invalid_radius.min(normalized_x.max(normalized_y));
+            }
+        }
+    }
+    if nearest_invalid_radius < 1.0 {
+        1.005 / nearest_invalid_radius.max(0.5)
+    } else {
+        1.0
+    }
+}
+
+fn zoom_center(image: &mut RgbImage, scale: f32) {
+    if scale <= 1.001 {
+        return;
+    }
+    let source = image.clone();
+    let center_x = (image.width.saturating_sub(1)) as f32 * 0.5;
+    let center_y = (image.height.saturating_sub(1)) as f32 * 0.5;
+    for y in 0..image.height {
+        let source_y = center_y + (y as f32 - center_y) / scale;
+        for x in 0..image.width {
+            let source_x = center_x + (x as f32 - center_x) / scale;
+            for channel in 0..3 {
+                image.data[(y * image.width + x) * 3 + channel] =
+                    bilinear(&source, source_x, source_y, channel);
+            }
+        }
+    }
+}
+
 fn apply_lens(
     image: &mut RgbImage,
     make: &str,
@@ -594,6 +641,7 @@ fn apply_lens(
     let source = image.clone();
     let mut geometry = vec![0.0; image.width * 2];
     let mut subpixel = vec![0.0; image.width * 6];
+    let mut valid = vec![true; image.width * image.height];
     for y in 0..image.height {
         if distortion {
             modifier.apply_geometry_distortion(0.0, y as f32, image.width, 1, &mut geometry);
@@ -616,11 +664,20 @@ fn apply_lens(
                 } else {
                     (gx, gy)
                 };
+                let coordinate_valid = sx >= 0.0
+                    && sy >= 0.0
+                    && sx <= (image.width - 1) as f32
+                    && sy <= (image.height - 1) as f32;
+                valid[y * image.width + x] &= coordinate_valid;
                 image.data[(y * image.width + x) * 3 + channel] =
                     bilinear(&source, sx, sy, channel);
             }
         }
     }
+    zoom_center(
+        image,
+        lens_auto_crop_scale(&valid, image.width, image.height),
+    );
     Ok(())
 }
 
@@ -903,11 +960,10 @@ pub fn render(input: &Path, output: &Path, settings: &RenderSettingsV1) -> Resul
     let developed = RawDevelop { steps }
         .develop_intermediate(&raw)
         .map_err(|e| Error::Render(format!("RAW development: {e}")))?;
-    let white_balance = if settings.kelvin == 0.0 {
-        raw.wb_coeffs
-    } else {
-        [1.0; 4]
-    };
+    // Start from the camera's neutral rendering for both as-shot and custom
+    // temperature. Custom Kelvin is a relative chromatic adaptation around D65;
+    // dropping the sensor WB coefficients leaves Bayer green dominant.
+    let white_balance = raw.wb_coeffs;
     let linear_srgb = intermediate_to_linear_srgb(developed, &raw.color_matrix, white_balance)
         .map_err(Error::Color)?;
     let mut image = RgbImage {
@@ -990,6 +1046,33 @@ mod tests {
     }
     fn temp(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("orfeus-test-{}-{name}", std::process::id()))
+    }
+
+    #[test]
+    fn high_kelvin_adaptation_warms_a_neutral_pixel() {
+        let mut image = RgbImage {
+            width: 1,
+            height: 1,
+            data: vec![0.5, 0.5, 0.5],
+        };
+        apply_white_adaptation(&mut image, 15_000.0, 0.0);
+        assert!(image.data[0] > image.data[1]);
+        assert!(image.data[1] > image.data[2]);
+    }
+
+    #[test]
+    fn lens_auto_crop_removes_invalid_borders() {
+        let mut valid = vec![true; 100 * 80];
+        for y in 0..80 {
+            for x in 0..100 {
+                if !(5..95).contains(&x) || !(4..76).contains(&y) {
+                    valid[y * 100 + x] = false;
+                }
+            }
+        }
+        let scale = lens_auto_crop_scale(&valid, 100, 80);
+        assert!(scale > 1.09 && scale < 1.2, "unexpected crop scale {scale}");
+        assert_eq!(1.0, lens_auto_crop_scale(&vec![true; 100 * 80], 100, 80));
     }
 
     #[test]
