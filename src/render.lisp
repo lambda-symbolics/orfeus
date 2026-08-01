@@ -68,6 +68,58 @@
             (delete-file temporary))))
       (funcall function input-pathname)))
 
+(defun photo-extract-embedded-preview (input-pathname output-pathname
+                                       &key (if-exists :error))
+  "Extract INPUT-PATHNAME's largest available embedded JPEG to OUTPUT-PATHNAME.
+
+ExifTool's PreviewImage is preferred, followed by JpgFromRaw and OtherImage.
+The output is published atomically and INPUT-PATHNAME is never modified."
+  (let* ((input-pathname (pathname input-pathname))
+         (output-pathname (pathname output-pathname))
+         (temporary (render-temporary-pathname output-pathname))
+         (last-error "no embedded JPEG preview was found"))
+    (when (pathname-same-file-p input-pathname output-pathname)
+      (error 'raw-render-error
+             :input-pathname input-pathname
+             :output-pathname output-pathname
+             :status 1
+             :message "embedded preview output must not replace the input"))
+    (ensure-directories-exist output-pathname)
+    (when (and (probe-file output-pathname) (eq if-exists :error))
+      (error 'output-file-exists :pathname output-pathname))
+    (unwind-protect
+         (progn
+           (dolist (tag '("PreviewImage" "JpgFromRaw" "OtherImage"))
+             (multiple-value-bind (standard-output error-output status)
+                 (uiop:run-program
+                  (list "exiftool" "-b" (format nil "-~A" tag)
+                        (namestring input-pathname))
+                  :output temporary
+                  :if-output-exists :supersede
+                  :element-type '(unsigned-byte 8)
+                  :error-output :string
+                  :ignore-error-status t)
+               (declare (ignore standard-output))
+               (setf last-error error-output)
+               (when (and (zerop status)
+                          (probe-file temporary)
+                          (plusp (with-open-file
+                                     (stream temporary
+                                             :direction :input
+                                             :element-type '(unsigned-byte 8))
+                                   (file-length stream))))
+                 (render-publish temporary output-pathname if-exists)
+                 (return-from photo-extract-embedded-preview output-pathname))))
+           (error 'raw-render-error
+                  :input-pathname input-pathname
+                  :output-pathname output-pathname
+                  :status 1
+                  :message (if (plusp (length last-error))
+                               last-error
+                               "no embedded JPEG preview was found")))
+      (when (probe-file temporary)
+        (delete-file temporary)))))
+
 (defparameter *metadata-copy-exclusions*
   '("--ICC_Profile" "--Orientation"
     "--ImageWidth" "--ImageHeight" "--ExifImageWidth" "--ExifImageHeight"

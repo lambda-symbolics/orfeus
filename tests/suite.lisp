@@ -148,6 +148,25 @@
         (when (probe-file pathname)
           (delete-file pathname))))))
 
+(defun embedded-preview-rejects-missing-image-p ()
+  (let ((input (test-temporary-pathname "txt"))
+        (output (test-temporary-pathname "jpg")))
+    (unwind-protect
+         (progn
+           (with-open-file (stream input :direction :output
+                                         :if-exists :supersede)
+             (write-string "not a photograph" stream))
+           (and (handler-case
+                    (progn
+                      (photo-extract-embedded-preview input output
+                                                      :if-exists :supersede)
+                      nil)
+                  (raw-render-error () t))
+                (not (probe-file output))))
+      (dolist (pathname (list input output))
+        (when (probe-file pathname)
+          (delete-file pathname))))))
+
 (defun publish-race-does-not-clobber-p ()
   (let ((temporary (test-temporary-pathname "jpg"))
         (output (test-temporary-pathname "jpg")))
@@ -216,6 +235,8 @@
              (render-rejects-input-as-output-p))
       (check "preview does not overwrite an existing export"
              (preview-does-not-overwrite-p))
+      (check "embedded preview extraction rejects files without an image"
+             (embedded-preview-rejects-missing-image-p))
       (check "a racing writer is not clobbered at publish time"
              (publish-race-does-not-clobber-p))
       (check "CLI reports its version" (cli-version-p))

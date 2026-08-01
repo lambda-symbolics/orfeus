@@ -8,6 +8,7 @@
                 #:make-project
                 #:orfeus-version
                 #:output-file-exists
+                #:photo-extract-embedded-preview
                 #:photo-job-input-path
                 #:photo-job-overrides
                 #:photo-job-render-output
