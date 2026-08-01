@@ -21,6 +21,11 @@
   (grain-amount 0.0)
   (grain-size 1.0))
 
+(defstruct processing-preset
+  "A named, portable snapshot of processing settings."
+  (name "" :type string)
+  (settings (make-processing-settings) :type processing-settings))
+
 (defstruct export-settings
   "Frontend-independent options for encoded photo exports."
   (jpeg-quality 92 :type (integer 1 100))
@@ -39,6 +44,7 @@
   output-directory
   (defaults (make-processing-settings))
   (export-settings (make-export-settings))
+  (presets '())
   (photos '()))
 
 (defun project-invalid (datum control &rest arguments)
@@ -94,6 +100,33 @@
 (defun sexp->processing-settings (sexp)
   (processing-plist-validate sexp)
   (apply #'make-processing-settings sexp))
+
+(defun processing-preset->sexp (preset)
+  (list :name (processing-preset-name preset)
+        :settings (processing-settings->sexp
+                   (processing-preset-settings preset))))
+
+(defun sexp->processing-preset (sexp)
+  (unless (and (listp sexp)
+               (plist-known-keys-p sexp '(:name :settings)))
+    (project-invalid sexp "expected a preset property list"))
+  (let ((name (getf sexp :name))
+        (settings (getf sexp :settings)))
+    (unless (and (stringp name)
+                 (plusp (length (string-trim '(#\Space #\Tab) name))))
+      (project-invalid sexp "preset :name must be a nonempty string"))
+    (make-processing-preset :name name
+                            :settings (sexp->processing-settings settings))))
+
+(defun sexp->processing-presets (sexp)
+  (unless (listp sexp)
+    (project-invalid sexp ":presets must be a list"))
+  (let ((presets (mapcar #'sexp->processing-preset sexp)))
+    (unless (= (length presets)
+               (length (remove-duplicates presets :test #'string-equal
+                                                  :key #'processing-preset-name)))
+      (project-invalid sexp "preset names must be unique"))
+    presets))
 
 (defun export-settings->sexp (settings)
   (list :jpeg-quality (export-settings-jpeg-quality settings)
@@ -185,20 +218,23 @@
   (list :orfeus-project 1
         :output-directory (namestring (project-output-directory project))
         :defaults (processing-settings->sexp (project-defaults project))
-         :export-settings (export-settings->sexp (project-export-settings project))
-         :photos (mapcar #'photo-job->sexp (project-photos project))))
+        :export-settings (export-settings->sexp (project-export-settings project))
+        :presets (mapcar #'processing-preset->sexp (project-presets project))
+        :photos (mapcar #'photo-job->sexp (project-photos project))))
 
 (defun sexp->project (sexp)
   "Validate and convert a project S-expression into a PROJECT."
   (unless (and (listp sexp)
                (eq (first sexp) :orfeus-project)
                (eql (second sexp) 1)
-               (plist-known-keys-p (cddr sexp)
-                                   '(:output-directory :defaults :export-settings :photos)))
+               (plist-known-keys-p
+                (cddr sexp)
+                '(:output-directory :defaults :export-settings :presets :photos)))
     (project-invalid sexp "expected (:ORFEUS-PROJECT 1 ...)"))
   (let ((output-directory (getf (cddr sexp) :output-directory))
         (defaults (getf (cddr sexp) :defaults))
         (export-settings (getf (cddr sexp) :export-settings))
+        (presets (getf (cddr sexp) :presets '()))
         (photos (getf (cddr sexp) :photos)))
     (unless (stringp output-directory)
       (project-invalid sexp ":output-directory must be a pathname string"))
@@ -207,6 +243,7 @@
     (make-project :output-directory (pathname output-directory)
                   :defaults (sexp->processing-settings defaults)
                   :export-settings (sexp->export-settings export-settings)
+                  :presets (sexp->processing-presets presets)
                   :photos (mapcar #'sexp->photo-job photos))))
 
 (defun project-resolve-pathname (pathname base-directory)
@@ -228,6 +265,8 @@
          (project-resolve-pathname (project-output-directory project)
                                    base-directory)))
   (project-resolve-lut-path (project-defaults project) base-directory)
+  (dolist (preset (project-presets project))
+    (project-resolve-lut-path (processing-preset-settings preset) base-directory))
   (dolist (photo (project-photos project))
     (setf (photo-job-input-path photo)
           (project-resolve-pathname (photo-job-input-path photo)

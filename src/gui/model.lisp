@@ -4,6 +4,7 @@
   "Frontend state that does not belong in an Orfeus project."
   project
   (selected-index 0 :type fixnum)
+  (selected-indices '() :type list)
   (edit-target :photo :type (member :photo :defaults))
   project-path)
 
@@ -58,8 +59,32 @@
   (setf (gui-model-project model) project
         (gui-model-project-path model) project-path
         (gui-model-selected-index model) 0
+        (gui-model-selected-indices model)
+        (if (project-photos project) '(0) '())
         (gui-model-edit-target model) :photo)
   model)
+
+(defun gui-model-set-selected-indices (model indices)
+  "Set MODEL's valid selected row INDICES and preview anchor."
+  (let* ((count (length (project-photos (gui-model-project model))))
+         (selected (sort (remove-duplicates
+                          (remove-if-not (lambda (index)
+                                           (and (integerp index)
+                                                (<= 0 index)
+                                                (< index count)))
+                                         indices)
+                          :test #'=)
+                         #'<)))
+    (setf (gui-model-selected-indices model) selected)
+    (when selected
+      (setf (gui-model-selected-index model) (first selected)))
+    selected))
+
+(defun gui-model-selected-jobs (model)
+  "Return MODEL's selected photo jobs in project order."
+  (let ((photos (project-photos (gui-model-project model))))
+    (mapcar (lambda (index) (nth index photos))
+            (gui-model-selected-indices model))))
 
 (defun gui-model-add-photos (model pathnames)
   "Append unique PATHNAMES to MODEL's project and select the first addition."
@@ -82,22 +107,28 @@
                               (make-photo-job :input-path input))
                             new-inputs))
             (gui-model-selected-index model) first-index
+            (gui-model-selected-indices model) (list first-index)
             (gui-model-edit-target model) :photo))
     (values (length new-inputs) first-index)))
 
 (defun gui-model-remove-selected (model)
-  "Remove and return MODEL's selected photo job, safely clamping selection."
+  "Remove and return MODEL's selected photo jobs, safely clamping selection."
   (let* ((project (gui-model-project model))
          (photos (project-photos project))
-         (index (gui-model-selected-index model))
-         (removed (nth index photos)))
+         (indices (or (gui-model-selected-indices model)
+                      (list (gui-model-selected-index model))))
+         (removed (loop for photo in photos
+                        for index from 0
+                        when (member index indices) collect photo))
+         (remaining (loop for photo in photos
+                          for index from 0
+                          unless (member index indices) collect photo)))
     (when removed
-      (setf (project-photos project)
-            (loop for photo in photos
-                  for photo-index from 0
-                  unless (= photo-index index) collect photo))
-      (setf (gui-model-selected-index model)
-            (max 0 (min index (1- (length (project-photos project)))))))
+      (let ((next-index (max 0 (min (first indices) (1- (length remaining))))))
+        (setf (project-photos project) remaining
+              (gui-model-selected-index model) next-index
+              (gui-model-selected-indices model)
+              (if remaining (list next-index) '()))))
     removed))
 
 (defun gui-model-selected-job (model)
@@ -113,6 +144,40 @@
         (processing-settings-with-overrides (project-defaults project)
                                             (photo-job-overrides job))
         (project-defaults project))))
+
+(defun gui-model-save-preset (model name)
+  "Save selected effective settings under NAME, replacing a same-named preset."
+  (let* ((trimmed (string-trim '(#\Space #\Tab #\Newline #\Return) name))
+         (project (gui-model-project model)))
+    (unless (plusp (length trimmed))
+      (error "Preset name cannot be empty."))
+    (let* ((preset (make-processing-preset
+                    :name trimmed
+                    :settings (orfeus::copy-processing-settings
+                               (gui-model-selected-settings model))))
+           (existing (project-presets project))
+           (position (position trimmed existing :test #'string-equal
+                                                :key #'processing-preset-name)))
+      (if position
+          (setf (nth position existing) preset)
+          (setf (project-presets project) (append existing (list preset))))
+      preset)))
+
+(defun gui-model-apply-preset (model name)
+  "Apply named preset NAME to all selected photos and return the changed count."
+  (let* ((project (gui-model-project model))
+         (preset (find name (project-presets project)
+                       :test #'string-equal :key #'processing-preset-name)))
+    (unless preset
+      (error "Unknown preset ~S." name))
+    (let ((overrides (orfeus::processing-settings->sexp
+                      (processing-preset-settings preset)))
+          (jobs (or (gui-model-selected-jobs model)
+                    (let ((job (gui-model-selected-job model)))
+                      (and job (list job))))))
+      (dolist (job jobs)
+        (setf (photo-job-overrides job) (copy-list overrides)))
+      (length jobs))))
 
 (defun setting-reader (key)
   (ecase key
@@ -178,9 +243,11 @@
   value)
 
 (defun gui-model-reset-selected (model)
-  "Clear all overrides from MODEL's selected photo."
-  (let ((job (gui-model-selected-job model)))
-    (when job (setf (photo-job-overrides job) '())))
+  "Clear overrides from all selected photos."
+  (dolist (job (or (gui-model-selected-jobs model)
+                   (let ((job (gui-model-selected-job model)))
+                     (and job (list job)))))
+    (setf (photo-job-overrides job) '()))
   model)
 
 (defun gui-photo-output-path (model job)

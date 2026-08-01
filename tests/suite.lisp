@@ -41,6 +41,22 @@
          (= 1600 (export-settings-max-height settings))
          (null (export-settings-preserve-metadata-p settings)))))
 
+(defun processing-presets-round-trip-p ()
+  (let* ((project
+           (make-project
+            :output-directory #P"exports/"
+            :presets (list (make-processing-preset
+                            :name "Night"
+                            :settings (make-processing-settings
+                                       :exposure 1.25
+                                       :noise-reduction 0.8)))))
+         (decoded (sexp->project (project->sexp project)))
+         (preset (first (project-presets decoded))))
+    (and (= 1 (length (project-presets decoded)))
+         (string= "Night" (processing-preset-name preset))
+         (= 1.25 (processing-settings-exposure
+                  (processing-preset-settings preset))))))
+
 (defun old-project-export-defaults-p ()
   (let* ((decoded
            (sexp->project
@@ -60,7 +76,8 @@
     (and (= 92 (export-settings-jpeg-quality settings))
          (null (export-settings-max-width settings))
          (null (export-settings-max-height settings))
-         (export-settings-preserve-metadata-p settings))))
+         (export-settings-preserve-metadata-p settings)
+         (null (project-presets decoded)))))
 
 (defun project-file-round-trip-p ()
   (let ((pathname (test-temporary-pathname "sexp")))
@@ -299,6 +316,7 @@
       (check "project S-expressions round trip" (project-round-trip-p))
       (check "project files round trip" (project-file-round-trip-p))
       (check "export settings round trip" (export-settings-round-trip-p))
+      (check "processing presets round trip" (processing-presets-round-trip-p))
       (check "old projects receive export defaults" (old-project-export-defaults-p))
       (check "project-relative paths resolve beside the project"
              (project-relative-paths-p))

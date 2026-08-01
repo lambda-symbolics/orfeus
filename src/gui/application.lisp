@@ -99,10 +99,11 @@
            (lens-cache (make-hash-table :test #'eq))
            (capture-cache (make-hash-table :test #'eq))
            window menu toolbar toolbar-bottom-rule table before-canvas after-canvas before-caption after-caption
-           inspector tabs basic-page optics-page effects-page export-page
+           inspector tabs basic-page optics-page effects-page export-page presets-page
            status progress before-preview-file after-preview-file
            lens-name controls inspector-items lut-name lut-menu wb-choice target-choice
            export-quality export-max-width export-max-height export-metadata
+           preset-browser preset-name-input preset-apply-button
            debounce-id poll-id comparison-p
            (preview-generation 0)
            (preview-zoom 1d0)
@@ -313,6 +314,42 @@
                (error (condition)
                  (sync-export-controls)
                  (set-status (princ-to-string condition)))))
+           (selected-photo-count ()
+             (length (or (gui-model-selected-indices model)
+                         (and (selected-job) '(0)))))
+           (refresh-preset-browser ()
+             (when preset-browser
+               (cl-fltk:clear preset-browser)
+               (dolist (preset (project-presets project))
+                 (cl-fltk:add-item preset-browser
+                                   (processing-preset-name preset)))))
+           (sync-preset-action-label ()
+             (when preset-apply-button
+               (setf (cl-fltk:label preset-apply-button)
+                     (format nil "Apply to ~D photo~:P"
+                             (selected-photo-count)))))
+           (save-current-preset ()
+             (handler-case
+                 (let ((preset (gui-model-save-preset
+                                model (cl-fltk:value preset-name-input))))
+                   (refresh-preset-browser)
+                   (setf (cl-fltk:value preset-name-input)
+                         (processing-preset-name preset))
+                   (set-status (format nil "Saved preset ~A"
+                                       (processing-preset-name preset))))
+               (error (condition)
+                 (set-status (princ-to-string condition)))))
+           (apply-current-preset ()
+             (handler-case
+                 (let* ((name (cl-fltk:value preset-name-input))
+                        (count (gui-model-apply-preset model name)))
+                   (update-table)
+                   (sync-controls)
+                   (schedule-edited-preview)
+                   (set-status (format nil "Applied ~A to ~D photo~:P"
+                                       name count)))
+               (error (condition)
+                 (set-status (princ-to-string condition)))))
            (sync-controls ()
              (dolist (entry controls)
                (let ((key (first entry)) (widget (second entry)))
@@ -336,13 +373,15 @@
                          (format nil "Lens: ~A   |   ~A"
                                  (selected-lens-description) capture)
                          (format nil "Lens: ~A" (selected-lens-description)))))
-             (sync-export-controls))
+             (sync-export-controls)
+             (sync-preset-action-label))
            (replace-project (new-project &optional path)
              (incf preview-generation)
              (clear-previews)
              (setf project new-project)
              (gui-model-replace-project model new-project path)
              (update-table)
+             (refresh-preset-browser)
              (sync-controls)
              (if (selected-job)
                  (progn
@@ -380,8 +419,9 @@
              (let ((removed (gui-model-remove-selected model)))
                (when removed
                  (incf preview-generation)
-                 (remhash removed lens-cache)
-                 (remhash removed capture-cache)
+                 (dolist (job removed)
+                   (remhash job lens-cache)
+                   (remhash job capture-cache))
                  (clear-previews)
                  (update-table)
                  (sync-controls)
@@ -390,9 +430,8 @@
                        (cl-fltk:table-select-row
                         table (gui-model-selected-index model))
                        (schedule-initial-preview)
-                       (set-status (format nil "Removed ~A"
-                                           (file-namestring
-                                            (photo-job-input-path removed)))))
+                       (set-status (format nil "Removed ~D photograph~:P"
+                                           (length removed))))
                      (set-status "Project contains no photographs")))))
            (open-project ()
              (let ((path (cl-fltk:choose-file
@@ -525,12 +564,14 @@
                    (schedule-edited-preview))
                (error (condition) (set-status (princ-to-string condition)))))
            (select-row ()
-             (let ((row (cl-fltk:table-selected-row table)))
-               (when (and (>= row 0) (< row (length (project-photos project))))
-                 (setf (gui-model-selected-index model) row)
+             (let ((rows (cl-fltk:table-selected-rows table)))
+               (when rows
+                 (gui-model-set-selected-indices model rows)
                  (clear-previews)
                  (sync-controls)
-                 (schedule-initial-preview))))
+                 (schedule-initial-preview)
+                 (when (> (length rows) 1)
+                   (set-status (format nil "~D photos selected" (length rows)))))))
            (render-selected ()
              (let ((job (selected-job)))
                (when job
@@ -765,11 +806,11 @@
         (cl-fltk:add-menu-item menu "File/Quit" (lambda (&rest ignored)
                                                     (declare (ignore ignored))
                                                     (cl-fltk:quit)))
-        (cl-fltk:add-menu-item menu "Edit/Remove Selected Photo"
+        (cl-fltk:add-menu-item menu "Edit/Remove Selected Photos"
                                (lambda (&rest ignored)
                                  (declare (ignore ignored))
                                  (remove-selected-photo)))
-        (cl-fltk:add-menu-item menu "Edit/Reset Photo"
+        (cl-fltk:add-menu-item menu "Edit/Reset Selected Photos"
                                (lambda (&rest ignored)
                                  (declare (ignore ignored))
                                  (gui-model-reset-selected model)
@@ -840,7 +881,7 @@
           (rule 10 10 2 18 245 245 245)
           (toolbar-button 18 :open "Add RAW photographs to project" #'add-photos)
           (toolbar-button 48 :folder-open "Open project" #'open-project)
-          (toolbar-button 78 :delete "Remove selected photograph" #'remove-selected-photo)
+          (toolbar-button 78 :delete "Remove selected photographs" #'remove-selected-photo)
           (rule 112 7 1 24 150 150 150)
           (toolbar-button 120 :export "Export current photograph" #'render-selected)
           (toolbar-button 150 :pipeline "Show or hide Before and After" #'toggle-comparison)
@@ -936,7 +977,10 @@
                                                   :label "Effects")
                export-page (cl-fltk:make-tab-page :parent tabs :x 2 :y 24
                                                   :width 308 :height 600
-                                                  :label "Export"))
+                                                  :label "Export")
+               presets-page (cl-fltk:make-tab-page :parent tabs :x 2 :y 24
+                                                   :width 308 :height 600
+                                                   :label "Presets"))
         (flet ((export-integer-field (key label y)
                  (cl-fltk:field-control
                   (register-field
@@ -959,6 +1003,42 @@
                               (declare (ignore event value))
                               (export-setting-changed :preserve-metadata-p widget)))
                  110 120 :control 26 :page)))
+        (setf preset-browser
+              (register-inspector
+               (cl-fltk:make-browser
+                :parent presets-page :x 8 :y 12 :width 292 :height 230
+                :items nil
+                :callback (lambda (widget event value)
+                            (declare (ignore event value))
+                            (let ((name (cl-fltk:value widget)))
+                              (when (plusp (length name))
+                                (setf (cl-fltk:value preset-name-input) name)))))
+               8 12 :fill 230 :page))
+        (let ((name-field
+                (register-field
+                 (cl-fltk:make-labeled-input
+                  :parent presets-page :x 8 :y 252 :width 292 :height 26
+                  :label "Preset name" :label-width 96)
+                 252 :page)))
+          (setf preset-name-input (cl-fltk:field-control name-field)))
+        (register-inspector
+         (cl-fltk:make-button
+          :parent presets-page :x 8 :y 288 :width 142 :height 26
+          :label "Save current"
+          :callback (lambda (&rest ignored)
+                      (declare (ignore ignored))
+                      (save-current-preset)))
+         8 288 :half-left 26 :page)
+        (setf preset-apply-button
+              (register-inspector
+               (cl-fltk:make-button
+                :parent presets-page :x 158 :y 288 :width 142 :height 26
+                :label "Apply to 1 photo"
+                :callback (lambda (&rest ignored)
+                            (declare (ignore ignored))
+                            (apply-current-preset)))
+               158 288 :half-right 26 :page))
+        (refresh-preset-browser)
         (setf wb-choice
               (cl-fltk:field-control
                (register-field
@@ -1044,7 +1124,7 @@
                            effects-page)
         (register-inspector
          (cl-fltk:make-button :parent inspector :x 12 :y 674
-                              :width 140 :height 26 :label "Reset photo"
+                              :width 140 :height 26 :label "Reset selected"
                               :callback (lambda (&rest ignored)
                                           (declare (ignore ignored))
                                           (gui-model-reset-selected model)
@@ -1065,6 +1145,8 @@
                                                :width 1100 :height 28
                                                :value "Ready"))
         (cl-fltk:on-resize window #'layout-ui)
+        (gui-model-set-selected-indices
+         model (if (project-photos project) '(0) '()))
         (sync-controls)
         (layout-ui)
         (setf poll-id (cl-fltk:add-timeout 0.08d0 #'poll :repeat t))

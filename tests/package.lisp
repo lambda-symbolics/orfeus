@@ -11,6 +11,7 @@
                 #:resolve-lens-profile-alias
                 #:make-export-settings
                 #:make-photo-job
+                #:make-processing-preset
                 #:make-processing-settings
                 #:make-project
                 #:orfeus-version
@@ -19,6 +20,8 @@
                 #:photo-job-input-path
                 #:photo-job-overrides
                 #:photo-job-render-output
+                #:processing-preset-name
+                #:processing-preset-settings
                 #:processing-settings-exposure
                 #:processing-settings-grain-amount
                 #:processing-settings-lens-correction-strength
@@ -28,6 +31,7 @@
                 #:project-export-settings
                 #:project-output-directory
                 #:project-photos
+                #:project-presets
                 #:project-read
                 #:project-write
                 #:raw-render-error

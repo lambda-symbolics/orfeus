@@ -36,6 +36,7 @@
    #:main
    #:make-export-settings
    #:make-photo-job
+   #:make-processing-preset
    #:make-processing-settings
    #:make-project
    #:native-bridge-available-p
@@ -52,6 +53,9 @@
    #:photo-job-input-path
    #:photo-job-output-path
    #:photo-job-overrides
+   #:processing-preset
+   #:processing-preset-name
+   #:processing-preset-settings
    #:processing-settings
    #:processing-settings-chromatic-aberration-correction-p
    #:processing-settings-exposure
@@ -71,6 +75,7 @@
    #:project-export-settings
    #:project-output-directory
    #:project-photos
+   #:project-presets
    #:project-read
    #:project-render
    #:project-write
