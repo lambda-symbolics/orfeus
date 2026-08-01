@@ -38,3 +38,16 @@ None. No private image mutation or user-local init change is active for Orfeus.
   input tests.
 - Removal condition: remove this candidate after direct JPEG viewing works in a
   clean Autolith image.
+
+** Bound child-agent heap use during large repository work
+
+- Problem: detached child-agent work repeatedly exhausted the Autolith Lisp heap
+  while this repository already had large compiler and image-processing state.
+- Current behavior: perform focused work directly and avoid concurrent detached
+  children when the active image is memory-heavy.
+- Scope: Autolith child scheduling and result retention, outside this repository.
+- Verification for a future repair: run two representative repository reviews
+  concurrently while monitoring heap growth, then confirm their results can be
+  collected without exhausting the active image.
+- Removal condition: remove this candidate after bounded child execution remains
+  stable through an equivalent full Orfeus development session.
