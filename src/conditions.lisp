@@ -17,3 +17,17 @@
              (native-library-unavailable-paths condition)
              (native-library-unavailable-cause condition))))
   (:documentation "Signalled when the Rust native bridge cannot be loaded."))
+
+(define-condition invalid-project-data (orfeus-error)
+  ((datum
+    :initarg :datum
+    :reader invalid-project-data-datum)
+   (reason
+    :initarg :reason
+    :reader invalid-project-data-reason))
+  (:report
+   (lambda (condition stream)
+     (format stream "Invalid Orfeus project data ~S: ~A"
+             (invalid-project-data-datum condition)
+             (invalid-project-data-reason condition))))
+  (:documentation "Signalled when project S-expression data fails validation."))

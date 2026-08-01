@@ -10,6 +10,7 @@
   :components ((:file "src/package")
                (:file "src/conditions")
                (:file "src/native")
+               (:file "src/project")
                (:file "src/version"))
   :in-order-to ((test-op (test-op "orfeus/tests"))))
 
