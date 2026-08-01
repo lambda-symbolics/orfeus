@@ -48,6 +48,15 @@ coalesces interactive previews without dropping explicit exports."
       (sb-thread:condition-notify (gui-queue-waitqueue queue))
       t)))
 
+(defun discard-gui-tasks (queue &optional kind)
+  "Discard pending QUEUE tasks, optionally only those whose kind is KIND."
+  (sb-thread:with-mutex ((gui-queue-lock queue))
+    (setf (gui-queue-tasks queue)
+          (if kind
+              (delete kind (gui-queue-tasks queue) :key #'gui-task-kind)
+              '())))
+  t)
+
 (defun gui-queue-worker-loop (queue)
   (loop
     (let ((task

@@ -138,6 +138,35 @@
                   "Queue did not run export task"))
       (orfeus/gui::stop-gui-queue queue))))
 
+(defun test-preview-cache-key ()
+  (let* ((job (orfeus:make-photo-job :input-path #P"one.orf"))
+         (first (orfeus:make-processing-settings :exposure 0.0))
+         (same (orfeus:make-processing-settings :exposure 0.0))
+         (changed (orfeus:make-processing-settings :exposure 1.0))
+         (directory #P"/tmp/"))
+    (check (equal (orfeus/gui::preview-pathname directory 0 job :after first)
+                  (orfeus/gui::preview-pathname directory 0 job :after same))
+           "Equivalent preview settings did not share a cache path")
+    (check (not (equal (orfeus/gui::preview-pathname directory 0 job :after first)
+                       (orfeus/gui::preview-pathname directory 0 job :after changed)))
+           "Edited preview settings reused a stale cache path")
+    (check (not (equal (orfeus/gui::preview-pathname directory 0 job :before first)
+                       (orfeus/gui::preview-pathname directory 0 job :after first)))
+           "Before and After previews shared one cache path")))
+
+(defun test-discard-pending-tasks ()
+  (let ((queue (orfeus/gui::make-gui-queue))
+        (ran-p nil))
+    (unwind-protect
+         (progn
+           (orfeus/gui::enqueue-gui-task queue :blocker (lambda () (sleep 0.1)))
+           (orfeus/gui::enqueue-gui-task queue :background
+                                         (lambda () (setf ran-p t)))
+           (orfeus/gui::discard-gui-tasks queue :background)
+           (sleep 0.2)
+           (check (not ran-p) "Discarded background task still ran"))
+      (orfeus/gui::stop-gui-queue queue))))
+
 (defun run-tests ()
   (test-model-settings)
   (test-output-path-semantics)
@@ -147,4 +176,6 @@
   (test-direct-open-workflow)
   (test-checkbox-normalization)
   (test-render-queue)
+  (test-preview-cache-key)
+  (test-discard-pending-tasks)
   t)

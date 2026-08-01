@@ -45,19 +45,23 @@
   (when directory
     (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore)))
 
-(defun preview-pathname (preview-directory index job kind)
+(defun preview-settings-key (settings)
+  (logand #xffffffff
+          (sxhash (orfeus::processing-settings->sexp settings))))
+
+(defun preview-pathname (preview-directory index job role settings)
   (merge-pathnames
-   (make-pathname :name (format nil "~(~A~)-~D-~A" kind index
+   (make-pathname :name (format nil "~(~A~)-~D-~8,'0X-~A"
+                                role index (preview-settings-key settings)
                                 (pathname-name (photo-job-input-path job)))
                   :type "jpg")
    preview-directory))
 
-(defun preview-status-text (model kind)
+(defun preview-status-text (model)
   (let ((temperature (gui-model-setting model :white-balance-temperature))
         (lut (gui-model-setting model :lut-path))
         (strength (gui-model-setting model :lut-strength)))
-    (format nil "~A preview  |  WB: ~A  |  LUT: ~A"
-            (ecase kind (:embedded "Embedded") (:raw "RAW"))
+    (format nil "RAW preview  |  WB: ~A  |  LUT: ~A"
             (if temperature "Custom" "As shot")
             (if (and lut (plusp strength))
                 (format nil "~A (~D%%)" (file-namestring lut)
@@ -82,6 +86,7 @@
            (model (make-gui-model :project project
                                   :project-path initial-path))
            (queue (make-gui-queue))
+           (background-queue (make-gui-queue))
            (preview-directory (make-gui-preview-directory))
            (picker-directory
              (let ((photo (first (project-photos project))))
@@ -92,10 +97,10 @@
                        (photo-job-input-path photo)))
                      (t (uiop:getcwd)))))
            (lens-cache (make-hash-table :test #'eq))
-           window menu toolbar table canvas inspector status progress preview-file
-           lens-label lens-name controls inspector-items lut-name lut-menu
-           wb-choice target-choice
-           debounce-id poll-id before-p
+           window menu toolbar table before-canvas after-canvas before-caption after-caption
+           inspector status progress before-preview-file after-preview-file
+           lens-name controls inspector-items lut-name lut-menu wb-choice target-choice
+           debounce-id poll-id comparison-p
            (preview-generation 0))
       (labels
           ((picker-preset ()
@@ -122,17 +127,25 @@
              (setf (cl-fltk:value status) text))
            (selected-job ()
              (gui-model-selected-job model))
-           (clear-preview ()
-             (when preview-file
-               (forget-preview-file preview-file)
-               (setf preview-file nil))
-             (when canvas (cl-fltk:redraw canvas)))
-           (publish-preview (path)
-             (when (and preview-file (not (equal preview-file path)))
-               (forget-preview-file preview-file))
-             (forget-preview-file path)
-             (setf preview-file path)
-             (cl-fltk:redraw canvas))
+           (clear-previews ()
+             (dolist (path (list before-preview-file after-preview-file))
+               (when path (forget-preview-file path)))
+             (setf before-preview-file nil
+                   after-preview-file nil)
+             (when before-canvas (cl-fltk:redraw before-canvas))
+             (when after-canvas (cl-fltk:redraw after-canvas)))
+           (publish-preview (role path)
+             (let ((old-path (ecase role
+                               (:before before-preview-file)
+                               (:after after-preview-file))))
+               (when (and old-path (not (equal old-path path)))
+                 (forget-preview-file old-path))
+               (forget-preview-file path)
+               (ecase role
+                 (:before (setf before-preview-file path)
+                          (cl-fltk:redraw before-canvas))
+                 (:after (setf after-preview-file path)
+                         (cl-fltk:redraw after-canvas)))))
            (update-table ()
              (cl-fltk:table-set-records
               table '((:file "File" 230) (:settings "Settings" 90)
@@ -154,12 +167,12 @@
                        "Defaults" "Photo")
                    (cl-fltk:value lut-name)
                    (let ((path (gui-model-setting model :lut-path)))
-                     (if path (file-namestring path) "No LUT selected"))
-                   (cl-fltk:value lens-name)
-                   (selected-lens-description)))
+                     (if path (file-namestring path) "No LUT selected")))
+             (setf (cl-fltk:label lens-name)
+                   (format nil "Lens: ~A" (selected-lens-description))))
            (replace-project (new-project &optional path)
              (incf preview-generation)
-             (clear-preview)
+             (clear-previews)
              (setf project new-project)
              (gui-model-replace-project model new-project path)
              (update-table)
@@ -200,46 +213,72 @@
                  (project-write project path)
                  (setf (gui-model-project-path model) (pathname path))
                  (set-status "Project saved"))))
+           (neutral-preview-settings ()
+             (make-processing-settings
+              :noise-reduction 0.0
+              :lens-correction-p nil
+              :chromatic-aberration-correction-p nil
+              :lut-path nil
+              :grain-amount 0.0))
+           (settings-for-job (job)
+             (processing-settings-with-overrides
+              (project-defaults project)
+              (photo-job-overrides job)))
            (current-settings ()
-             (if before-p
-                 (make-processing-settings)
-                 (processing-settings-with-overrides
-                  (project-defaults project)
-                  (photo-job-overrides (selected-job)))))
+             (settings-for-job (selected-job)))
+           (enqueue-render (target-queue role job index settings generation publish-p)
+             (let* ((input (photo-job-input-path job))
+                    (output (preview-pathname preview-directory index job role settings)))
+               (if (probe-file output)
+                   (when publish-p
+                     (queue-event queue
+                                  (list :preview generation index job role output)))
+                   (enqueue-gui-task
+                    target-queue role
+                    (lambda ()
+                      (when publish-p
+                        (queue-event queue
+                                     (list :status generation
+                                           (format nil "Developing ~A..."
+                                                   (file-namestring input)))))
+                      (render-preview input output settings :if-exists :supersede)
+                      (when publish-p
+                        (queue-event queue
+                                     (list :preview generation index job role output))))))))
+           (enqueue-background-previews (selected-before-p generation)
+             (discard-gui-tasks background-queue)
+             (let ((selected (selected-job)))
+               (when (and selected selected-before-p)
+                 (enqueue-render background-queue :before selected
+                                 (gui-model-selected-index model)
+                                 (neutral-preview-settings) generation t))
+               ;; Make every photograph's useful edited preview ready first;
+               ;; neutral comparison renders follow after that hot path.
+               (loop for job in (project-photos project)
+                     for index from 0
+                     unless (eq job selected)
+                       do (enqueue-render background-queue :after job index
+                                          (settings-for-job job) nil nil))
+               (loop for job in (project-photos project)
+                     for index from 0
+                     unless (eq job selected)
+                       do (enqueue-render background-queue :before job index
+                                          (neutral-preview-settings) nil nil))))
            (enqueue-preview (initial-p)
-             (let* ((job (selected-job))
-                    (index (gui-model-selected-index model))
-                    (generation preview-generation)
-                    (input (and job (photo-job-input-path job)))
-                    (settings (and job (current-settings))))
+             (let ((job (selected-job))
+                   (index (gui-model-selected-index model))
+                   (generation preview-generation))
                (when job
-                 (enqueue-gui-task
-                  queue :preview
-                  (lambda ()
-                    (when initial-p
-                      (let ((embedded (preview-pathname preview-directory index job :embedded)))
-                        (handler-case
-                            (progn
-                              (photo-extract-embedded-preview input embedded
-                                                              :if-exists :supersede)
-                              (queue-event queue
-                                           (list :preview generation index job embedded
-                                                 :embedded)))
-                          (error () nil))))
-                    (queue-event queue
-                                 (list :status generation
-                                       (format nil "Developing ~A..."
-                                               (file-namestring input))))
-                    (let ((raw (preview-pathname preview-directory index job :raw)))
-                      (render-preview input raw settings :if-exists :supersede)
-                      (queue-event queue
-                                   (list :preview generation index job raw :raw))))
-                  :replace-kind :preview))))
+                 (enqueue-render queue :after job index
+                                 (current-settings) generation t)
+                 (enqueue-background-previews initial-p generation))))
            (schedule-initial-preview ()
              (when debounce-id
                (ignore-errors (cl-fltk:remove-timeout debounce-id))
                (setf debounce-id nil))
              (incf preview-generation)
+             (discard-gui-tasks queue :before)
+             (discard-gui-tasks queue :after)
              (enqueue-preview t))
            (schedule-edited-preview ()
              (incf preview-generation)
@@ -250,6 +289,11 @@
                     *preview-debounce-seconds*
                     (lambda ()
                       (setf debounce-id nil)
+                      (discard-gui-tasks queue :after)
+                      (when after-preview-file
+                        (forget-preview-file after-preview-file)
+                        (setf after-preview-file nil)
+                        (cl-fltk:redraw after-canvas))
                       (enqueue-preview nil)))))
            (setting-changed (key widget &optional allow-empty)
              (handler-case
@@ -261,6 +305,7 @@
                      (gui-model-set-setting model
                                             :white-balance-temperature 5500.0))
                    (gui-model-set-setting model key new-value)
+                   (sync-controls)
                    (when (member key '(:white-balance-temperature
                                        :white-balance-tint))
                      (setf (cl-fltk:value wb-choice) "Custom"))
@@ -271,7 +316,7 @@
              (let ((row (cl-fltk:table-selected-row table)))
                (when (and (>= row 0) (< row (length (project-photos project))))
                  (setf (gui-model-selected-index model) row)
-                 (clear-preview)
+                 (clear-previews)
                  (sync-controls)
                  (schedule-initial-preview))))
            (render-selected ()
@@ -310,6 +355,12 @@
                    (gui-model-set-setting model :white-balance-temperature 5500.0)))
              (sync-controls)
              (schedule-edited-preview))
+           (toggle-comparison ()
+             (setf comparison-p (not comparison-p))
+             (layout-ui)
+             (set-status (if comparison-p
+                             "Before and After comparison shown"
+                             "Before and After comparison hidden")))
            (register-inspector (widget x y width-mode height)
              (push (list widget x y width-mode height) inspector-items)
              widget)
@@ -350,17 +401,42 @@
                     (top 64) (bottom 28)
                     (main-height (max 200 (- height top bottom)))
                     (left (min 260 (max 190 (floor width 5))))
-                    (right (min 400 (max 360 (floor width 3))))
-                    (center (max 300 (- width left right))))
+                    (right (min 400 (max 300 (floor width 3))))
+                    (center (max 300 (- width left right)))
+                    (caption-height 22)
+                    (viewer-y (+ top caption-height))
+                    (viewer-height (max 100 (- main-height caption-height)))
+                    (gutter 6)
+                    (pane-width (floor (- center gutter) 2)))
                (cl-fltk:resize-widget menu :x 0 :y 0 :width width :height 24)
                (cl-fltk:resize-widget toolbar :x 0 :y 24 :width width :height 40)
-               (when lens-label
-                 (cl-fltk:resize-widget lens-label :x 520 :y 6
-                                        :width 36 :height 28)
-                 (cl-fltk:resize-widget lens-name :x 558 :y 6
-                                        :width (max 120 (- width 568)) :height 28))
+               (when lens-name
+                 (cl-fltk:resize-widget lens-name :x 174 :y 6
+                                        :width (max 120 (- width 184)) :height 28))
                (cl-fltk:resize-widget table :x 0 :y top :width left :height main-height)
-               (cl-fltk:resize-widget canvas :x left :y top :width center :height main-height)
+               (if comparison-p
+                   (progn
+                     (cl-fltk:show before-caption)
+                     (cl-fltk:show before-canvas)
+                     (cl-fltk:resize-widget before-caption :x left :y top
+                                            :width pane-width :height caption-height)
+                     (cl-fltk:resize-widget before-canvas :x left :y viewer-y
+                                            :width pane-width :height viewer-height)
+                     (cl-fltk:resize-widget after-caption
+                                            :x (+ left pane-width gutter) :y top
+                                            :width (- center pane-width gutter)
+                                            :height caption-height)
+                     (cl-fltk:resize-widget after-canvas
+                                            :x (+ left pane-width gutter) :y viewer-y
+                                            :width (- center pane-width gutter)
+                                            :height viewer-height))
+                   (progn
+                     (cl-fltk:hide before-caption)
+                     (cl-fltk:hide before-canvas)
+                     (cl-fltk:resize-widget after-caption :x left :y top
+                                            :width center :height caption-height)
+                     (cl-fltk:resize-widget after-canvas :x left :y viewer-y
+                                            :width center :height viewer-height)))
                (cl-fltk:resize-widget inspector :x (+ left center) :y top
                                       :width right :height main-height)
                (cl-fltk:resize-widget progress :x 0 :y (+ top main-height)
@@ -386,7 +462,8 @@
                      (cl-fltk:resize-widget
                       widget :x item-x :y y
                       :width item-width :height item-height))))
-               (cl-fltk:redraw canvas)))
+               (cl-fltk:redraw before-canvas)
+               (cl-fltk:redraw after-canvas)))
            (poll ()
              (dolist (event (drain-events queue))
                (case (first event)
@@ -396,8 +473,8 @@
                     (set-status (third event))))
                  (:preview
                   (when (gui-preview-event-current-p model event preview-generation)
-                    (publish-preview (fifth event))
-                    (set-status (preview-status-text model (sixth event)))))
+                    (publish-preview (fifth event) (sixth event))
+                    (set-status (preview-status-text model))))
                  (:done
                   (set-status (format nil "Exported ~A" (second event))))
                  (:error
@@ -447,8 +524,7 @@
         (cl-fltk:add-menu-item menu "View/Before and After"
                                (lambda (&rest ignored)
                                  (declare (ignore ignored))
-                                 (setf before-p (not before-p))
-                                 (schedule-edited-preview)))
+                                 (toggle-comparison)))
         (cl-fltk:add-menu-item menu "View/Refresh Preview"
                                (lambda (&rest ignored)
                                  (declare (ignore ignored))
@@ -464,27 +540,24 @@
                                   "Orfeus RAW processor\nOlympus PEN-F and OM-1")))
         (setf toolbar (cl-fltk:make-group :parent window :x 0 :y 24
                                           :width 1280 :height 40))
-        (flet ((toolbar-button (x width label icon action)
+        (flet ((toolbar-button (x icon tooltip action)
                  (let ((button (cl-fltk:make-button
-                                :parent toolbar :x x :y 6 :width width :height 28
-                                :label label
+                                :parent toolbar :x x :y 5 :width 30 :height 30
+                                :label ""
                                 :callback (lambda (&rest ignored)
                                             (declare (ignore ignored))
                                             (funcall action)))))
                    (cl-fltk:set-stock-icon button icon)
+                   (cl-fltk:set-tooltip button tooltip)
                    button)))
-          (toolbar-button 6 115 "Open photo" :open #'open-photo)
-          (toolbar-button 127 125 "Open project" :folder-open #'open-project)
-          (toolbar-button 258 105 "Export" :export #'render-selected)
-          (toolbar-button 369 135 "Before / after" :reload
-                          (lambda ()
-                            (setf before-p (not before-p))
-                            (schedule-edited-preview))))
-        (setf lens-label (cl-fltk:make-label :parent toolbar :x 520 :y 6
-                                             :width 36 :height 28 :label "Lens")
-              lens-name (cl-fltk:make-output :parent toolbar :x 558 :y 6
-                                             :width 700 :height 28
-                                             :value "No photograph selected"))
+          (toolbar-button 6 :open "Open RAW photographs" #'open-photo)
+          (toolbar-button 42 :folder-open "Open project" #'open-project)
+          (toolbar-button 78 :export "Export selected photograph" #'render-selected)
+          (toolbar-button 126 :pipeline "Show or hide Before and After" #'toggle-comparison))
+        (setf lens-name (cl-fltk:make-label :parent toolbar :x 174 :y 6
+                                            :width 1080 :height 28
+                                            :label "Lens: No photograph selected"))
+        (cl-fltk:set-label-font lens-name 1)
         (setf table (cl-fltk:make-record-table
                      :parent window :x 0 :y 64 :width 240 :height 708
                      :columns '((:file "File" 230) (:settings "Settings" 90)
@@ -493,23 +566,36 @@
                      :callback (lambda (&rest ignored)
                                  (declare (ignore ignored))
                                  (select-row))))
-        (setf canvas
-              (cl-fltk:make-canvas
-               :parent window :x 240 :y 64 :width 720 :height 708
-               :callback
-               (lambda (widget event value)
-                 (declare (ignore event value))
-                 (cl-fltk:draw-color-rgb :red 30 :green 32 :blue 34)
-                 (cl-fltk:draw-filled-rect
-                  (cl-fltk:widget-x widget) (cl-fltk:widget-y widget)
-                  (cl-fltk:widget-width widget) (cl-fltk:widget-height widget))
-                 (if preview-file
-                     (draw-preview-file widget preview-file)
-                     (progn
-                       (cl-fltk:draw-color-rgb :red 205 :green 208 :blue 210)
-                       (cl-fltk:draw-text "Open a RAW photograph"
-                                          (+ (cl-fltk:widget-x widget) 28)
-                                          (+ (cl-fltk:widget-y widget) 42)))))))
+        (setf before-caption
+              (cl-fltk:make-label :parent window :x 240 :y 64
+                                  :width 357 :height 22
+                                  :label "Before · neutral RAW")
+              after-caption
+              (cl-fltk:make-label :parent window :x 603 :y 64
+                                  :width 357 :height 22
+                                  :label "After · current adjustments"))
+        (flet ((make-preview-canvas (role x)
+                 (cl-fltk:make-canvas
+                  :parent window :x x :y 86 :width 357 :height 686
+                  :callback
+                  (lambda (widget event value)
+                    (declare (ignore event value))
+                    (cl-fltk:draw-color-rgb :red 30 :green 32 :blue 34)
+                    (cl-fltk:draw-filled-rect
+                     (cl-fltk:widget-x widget) (cl-fltk:widget-y widget)
+                     (cl-fltk:widget-width widget) (cl-fltk:widget-height widget))
+                    (let ((path (ecase role
+                                  (:before before-preview-file)
+                                  (:after after-preview-file))))
+                      (if path
+                          (draw-preview-file widget path)
+                          (progn
+                            (cl-fltk:draw-color-rgb :red 205 :green 208 :blue 210)
+                            (cl-fltk:draw-text "Developing RAW preview..."
+                                               (+ (cl-fltk:widget-x widget) 20)
+                                               (+ (cl-fltk:widget-y widget) 36)))))))))
+          (setf before-canvas (make-preview-canvas :before 240)
+                after-canvas (make-preview-canvas :after 603)))
         (setf inspector (cl-fltk:make-panel :parent window :x 960 :y 64
                                             :width 320 :height 708
                                             :label "Develop"))
@@ -646,6 +732,7 @@
           (when poll-id (ignore-errors (cl-fltk:remove-timeout poll-id)))
           (when debounce-id (ignore-errors (cl-fltk:remove-timeout debounce-id)))
           (stop-gui-queue queue)
+          (stop-gui-queue background-queue)
           (clear-preview-cache)
           (ignore-errors (delete-gui-preview-directory preview-directory))
           (when window (ignore-errors (cl-fltk:destroy window))))))))

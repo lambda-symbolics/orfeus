@@ -628,7 +628,10 @@ fn apply_lens(
         camera.crop_factor,
         image.width as u32,
         image.height as u32,
-        true,
+        // Lensfun's coordinate API maps corrected output pixels back into the
+        // distorted source when reverse is false. Reverse=true simulates the
+        // lens distortion and visibly overcorrects real RAW photographs.
+        false,
     );
     let distortion =
         flags & FLAG_LENS_DISTORTION != 0 && modifier.enable_distortion_correction(lens);
@@ -714,6 +717,14 @@ fn orient(image: RgbImage, orientation: u16) -> RgbImage {
         }
     }
     output
+}
+
+fn native_downscale_bounds(orientation: u16, max_width: u32, max_height: u32) -> (u32, u32) {
+    if (5..=8).contains(&orientation) {
+        (max_height, max_width)
+    } else {
+        (max_width, max_height)
+    }
 }
 
 fn downscale(image: RgbImage, max_width: u32, max_height: u32) -> RgbImage {
@@ -973,8 +984,10 @@ pub fn render(input: &Path, output: &Path, settings: &RenderSettingsV1) -> Resul
     };
     apply_white_adaptation(&mut image, settings.kelvin, settings.tint);
     apply_exposure(&mut image, settings.exposure_ev);
-    image = orient(image, metadata.exif.orientation.unwrap_or(1));
-    image = downscale(image, settings.max_width, settings.max_height);
+    let orientation = metadata.exif.orientation.unwrap_or(1);
+    let (native_max_width, native_max_height) =
+        native_downscale_bounds(orientation, settings.max_width, settings.max_height);
+    image = downscale(image, native_max_width, native_max_height);
     let lens_name = metadata
         .lens
         .as_ref()
@@ -992,6 +1005,7 @@ pub fn render(input: &Path, output: &Path, settings: &RenderSettingsV1) -> Resul
         focal,
         settings.flags,
     )?;
+    image = orient(image, orientation);
     apply_noise_reduction(
         &mut image,
         settings.luma_noise_reduction,
@@ -1109,6 +1123,27 @@ mod tests {
     }
 
     #[test]
+    fn lensfun_correction_maps_barrel_distorted_source_in_the_correct_direction() {
+        let db = Database::load_bundled().unwrap();
+        let camera = find_camera_profile(&db, "OM Digital Solutions", "OM-1").unwrap();
+        let lens = find_lens_profile(
+            &db,
+            camera,
+            "Olympus M.Zuiko Digital ED 12-45mm F4.0 Pro",
+            12.0,
+        )
+        .unwrap();
+        let mut modifier = Modifier::new(lens, 12.0, camera.crop_factor, 1600, 1200, false);
+        assert!(modifier.enable_distortion_correction(lens));
+        let mut coordinate = [0.0; 2];
+        assert!(modifier.apply_geometry_distortion(0.0, 0.0, 1, 1, &mut coordinate));
+        assert!(
+            coordinate[0] > 0.0 && coordinate[1] > 0.0,
+            "corrected output must sample inward from a barrel-distorted source: {coordinate:?}"
+        );
+    }
+
+    #[test]
     fn validates_unknown_flags_and_non_finite_as_invalid_argument() {
         let settings = RenderSettingsV1 {
             flags: 4,
@@ -1147,6 +1182,8 @@ mod tests {
     fn orientation_six_rotates_dimensions() {
         let result = orient(image(), 6);
         assert_eq!((result.width, result.height), (3, 2));
+        assert_eq!(native_downscale_bounds(6, 1600, 1200), (1200, 1600));
+        assert_eq!(native_downscale_bounds(1, 1600, 1200), (1600, 1200));
     }
 
     #[test]

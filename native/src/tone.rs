@@ -1,5 +1,6 @@
 //! Default scene-linear to display-linear tone mapping.
 
+const CURVE_INPUT_GAIN: f32 = 1.6;
 const CURVE_NUMERATOR: f32 = 8.75;
 const CURVE_DENOMINATOR: f32 = 1.46;
 const SRGB_LUMINANCE: [f32; 3] = [0.212_672_9, 0.715_152_2, 0.072_175];
@@ -10,8 +11,8 @@ const SRGB_LUMINANCE: [f32; 3] = [0.212_672_9, 0.715_152_2, 0.072_175];
 /// outside display-linear sRGB are then compressed along their direction from a
 /// neutral pixel at that luminance. This keeps the tone target and hue direction
 /// while reducing saturation only as much as the output gamut requires. The
-/// scalar curve has unit slope at black, so this is not a hidden exposure
-/// multiplier. Explicit exposure compensation remains a separate earlier step.
+/// scalar curve lifts deep shadows and midtones to a practical display baseline.
+/// Explicit user exposure compensation remains a separate earlier step.
 pub(crate) fn apply_default_display_tone(linear_rgb: &mut [f32]) {
     let (pixels, remainder) = linear_rgb.as_chunks_mut::<3>();
     assert!(remainder.is_empty(), "RGB data must contain triplets");
@@ -46,7 +47,7 @@ pub(crate) fn apply_default_display_tone(linear_rgb: &mut [f32]) {
 }
 
 fn default_display_tone(value: f32) -> f32 {
-    let value = value.max(0.0);
+    let value = value.max(0.0) * CURVE_INPUT_GAIN;
     let numerator = value * (1.0 + CURVE_NUMERATOR * value);
     let denominator = 1.0 + CURVE_DENOMINATOR * value + CURVE_NUMERATOR * value * value;
     numerator / denominator
@@ -76,11 +77,11 @@ mod tests {
         for (input, expected) in [
             (-0.1, 0.0),
             (0.0, 0.0),
-            (0.18, 0.299_747_8),
-            (0.5, 0.686_024_25),
-            (1.0, 0.869_759_14),
-            (2.0, 0.950_668_04),
-            (4.0, 0.980_659_25),
+            (0.18, 0.472_342_34),
+            (0.5, 0.823_892_9),
+            (1.0, 0.932_545_84),
+            (2.0, 0.974_053_2),
+            (4.0, 0.989_304_24),
         ] {
             close(default_display_tone(input), expected);
         }
@@ -98,9 +99,9 @@ mod tests {
     }
 
     #[test]
-    fn curve_has_no_constant_exposure_gain_at_black() {
+    fn curve_has_calibrated_display_lift_at_black() {
         let input = 0.000_1;
-        close(default_display_tone(input) / input, 1.000_728_8);
+        close(default_display_tone(input) / input, 1.601_865_4);
     }
 
     #[test]
@@ -111,7 +112,7 @@ mod tests {
 
         assert!(minus_one_ev < middle_gray);
         assert!(middle_gray < plus_one_ev);
-        close(plus_one_ev, 0.561_738_6);
+        close(plus_one_ev, 0.733_355_8);
     }
 
     #[test]
@@ -119,10 +120,10 @@ mod tests {
         let mut values = [0.18, 0.18, 0.18, 4.0, 4.0, 4.0];
         apply_default_display_tone(&mut values);
         for value in &values[..3] {
-            close(*value, 0.299_747_8);
+            close(*value, 0.472_342_34);
         }
         for value in &values[3..] {
-            close(*value, 0.980_659_25);
+            close(*value, 0.989_304_24);
         }
     }
 
