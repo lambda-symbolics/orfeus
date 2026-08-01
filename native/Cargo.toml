@@ -10,7 +10,10 @@ crate-type = ["cdylib"]
 
 [dependencies]
 flate2 = { version = "=1.1.2", default-features = false, features = ["rust_backend"] }
+image = { version = "=0.25.10", default-features = false, features = ["jpeg", "tiff"] }
+lensfun = "=0.7.0"
 md-5 = "=0.10.6"
+rawler = "=0.7.2"
 
 [profile.release]
 lto = "thin"

@@ -13,6 +13,8 @@ use std::ptr;
 use flate2::read::ZlibDecoder;
 use md5::{Digest, Md5};
 
+mod render;
+
 const TAG_ORIGINAL_RAW_FILE_NAME: u16 = 0xc68b;
 const TAG_ORIGINAL_RAW_FILE_DATA: u16 = 0xc68c;
 const TAG_ORIGINAL_RAW_FILE_DIGEST: u16 = 0xc71d;
@@ -33,6 +35,10 @@ pub const ORFEUS_STATUS_DECOMPRESSION_ERROR: i32 = 5;
 pub const ORFEUS_STATUS_DIGEST_MISMATCH: i32 = 6;
 /// A caller-provided result buffer was too small.
 pub const ORFEUS_STATUS_BUFFER_TOO_SMALL: i32 = 7;
+/// RAW decoding, processing, or encoding failed.
+pub const ORFEUS_STATUS_RENDER_ERROR: i32 = 8;
+/// Lens correction was requested but no conservative matching calibration exists.
+pub const ORFEUS_STATUS_LENS_PROFILE_UNAVAILABLE: i32 = 9;
 /// A Rust panic was contained at the ABI boundary.
 pub const ORFEUS_STATUS_PANIC: i32 = 255;
 
@@ -45,6 +51,8 @@ enum Error {
     Decompression(&'static str),
     DigestMismatch,
     BufferTooSmall { needed: usize },
+    Render(String),
+    LensProfileUnavailable(String),
 }
 
 impl Error {
@@ -57,6 +65,8 @@ impl Error {
             Self::Decompression(_) => ORFEUS_STATUS_DECOMPRESSION_ERROR,
             Self::DigestMismatch => ORFEUS_STATUS_DIGEST_MISMATCH,
             Self::BufferTooSmall { .. } => ORFEUS_STATUS_BUFFER_TOO_SMALL,
+            Self::Render(_) => ORFEUS_STATUS_RENDER_ERROR,
+            Self::LensProfileUnavailable(_) => ORFEUS_STATUS_LENS_PROFILE_UNAVAILABLE,
         }
     }
 }
@@ -77,6 +87,9 @@ impl fmt::Display for Error {
                     formatter,
                     "result buffer too small (requires {needed} bytes)"
                 )
+            }
+            Self::Render(message) | Self::LensProfileUnavailable(message) => {
+                formatter.write_str(message)
             }
         }
     }
@@ -456,11 +469,55 @@ pub unsafe extern "C" fn orfeus_dng_extract_original(
     }
 }
 
+/// Report version 1 render/export capabilities.
+///
+/// The returned bit set intentionally omits source EXIF/XMP preservation: the
+/// selected encoders cannot accept arbitrary source metadata. Callers must not
+/// claim metadata preservation when that bit is absent.
+#[unsafe(no_mangle)]
+pub extern "C" fn orfeus_raw_render_capabilities_v1() -> u32 {
+    1 | 2 | 4 // physical orientation, 16-bit TIFF, embedded sRGB ICC
+}
+
+/// Decode, process, and export one Olympus ORF using version 1 render settings.
+///
+/// Export applies source orientation physically and embeds an sRGB ICC profile,
+/// but does not preserve source EXIF/XMP metadata. Output is created through a
+/// same-directory temporary file, synced, then atomically renamed.
+///
+/// # Safety
+///
+/// Path pointers and a non-null `settings.lut_path` must be readable
+/// NUL-terminated strings for the duration of this call. `settings` must point
+/// to a readable `OrfeusRenderSettingsV1`. The error buffer, when non-null, must
+/// be writable for its stated capacity.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn orfeus_raw_render_v1(
+    input_path: *const c_char,
+    output_path: *const c_char,
+    settings: *const render::RenderSettingsV1,
+    error_buffer: *mut c_char,
+    error_capacity: usize,
+) -> i32 {
+    // SAFETY: Pointer validation and dereferences remain inside the panic boundary.
+    unsafe {
+        ffi_result(error_buffer, error_capacity, || {
+            if settings.is_null() {
+                return Err(Error::InvalidArgument("render settings pointer is null"));
+            }
+            let input = path_from_c(input_path)?;
+            let output = path_from_c(output_path)?;
+            render::render(input, output, &*settings)
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use flate2::Compression;
     use flate2::write::ZlibEncoder;
+    use std::ffi::CString;
     use std::io::Write;
 
     fn embedded_container(original: &[u8]) -> Vec<u8> {
@@ -529,6 +586,32 @@ mod tests {
     #[test]
     fn reports_current_abi_version() {
         assert_eq!(orfeus_bridge_abi_version(), 1);
+        assert_eq!(orfeus_raw_render_capabilities_v1(), 1 | 2 | 4);
+    }
+
+    #[test]
+    fn render_abi_rejects_same_input_without_modifying_it() {
+        let path =
+            std::env::temp_dir().join(format!("orfeus-abi-same-input-{}", std::process::id()));
+        fs::write(&path, b"not a raw, but must survive").unwrap();
+        let c_path = CString::new(path.as_os_str().as_bytes()).unwrap();
+        let settings = render::RenderSettingsV1 {
+            flags: 0,
+            ..render::RenderSettingsV1::default()
+        };
+        let mut error = [0_i8; 256];
+        let status = unsafe {
+            orfeus_raw_render_v1(
+                c_path.as_ptr(),
+                c_path.as_ptr(),
+                &settings,
+                error.as_mut_ptr(),
+                error.len(),
+            )
+        };
+        assert_eq!(status, ORFEUS_STATUS_INVALID_ARGUMENT);
+        assert_eq!(fs::read(&path).unwrap(), b"not a raw, but must survive");
+        fs::remove_file(path).unwrap();
     }
 
     #[test]
