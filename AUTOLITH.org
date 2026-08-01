@@ -1,0 +1,40 @@
+#+title: Autolith project adaptations
+
+* Purpose
+
+This voluntary file records reusable ways Autolith adapts itself to this
+project. It supplements AGENTS.md and never overrides repository policy, user
+instructions, or capability boundaries. It contains documentation, not
+executable Lisp.
+
+* Project profile
+
+- Run Lisp checks through the Nix development shell with SBCL =--no-userinit=
+  so machine-local Quicklisp and ASDF configuration cannot mask missing inputs.
+- Visually inspect generated photographs after converting JPEG output to PNG
+  when Autolith's local image viewer cannot determine valid JPEG dimensions.
+- Keep native Rust, Common Lisp core, CLI, and FLTK GUI checks separate enough
+  that failures retain a clear subsystem boundary.
+
+* Active adaptations
+
+None. No private image mutation or user-local init change is active for Orfeus.
+
+* Candidates
+
+** Repair JPEG dimension detection in Autolith's image viewer
+
+- Problem: =fs.view-image= repeatedly rejects valid Orfeus JPEG exports with
+  "no valid pixel dimensions" while ImageMagick reads and converts them.
+- Current behavior: convert generated JPEGs to temporary PNG files before visual
+  inspection. This is a request-local workaround, not tracked Orfeus behavior.
+- Evidence: the failure recurred across valid PEN-F and OM-1 render outputs.
+- Prior experiment: an exploratory JPEG parser redefinition passed a synthetic
+  assertion but did not repair real attachments. It was discarded; no mutation
+  remains active.
+- Scope: Autolith's JPEG input dimension parser, outside this repository.
+- Verification for a future repair: attach the original generated JPEGs
+  directly, verify dimensions and rendering, then run Autolith's complete image
+  input tests.
+- Removal condition: remove this candidate after direct JPEG viewing works in a
+  clean Autolith image.
