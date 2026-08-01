@@ -64,7 +64,7 @@
     (format nil "RAW preview  |  WB: ~A  |  LUT: ~A"
             (if temperature "Custom" "As shot")
             (if (and lut (plusp strength))
-                (format nil "~A (~D%%)" (file-namestring lut)
+                (format nil "~A (~D%)" (file-namestring lut)
                         (round (* 100 strength)))
                 "Off"))))
 

@@ -77,6 +77,18 @@
         (orfeus/gui::delete-gui-preview-directory first))
       (orfeus/gui::delete-gui-preview-directory second))))
 
+(defun test-preview-status-percent ()
+  (let* ((settings (orfeus:make-processing-settings
+                    :lut-path #P"look.cube" :lut-strength 1.0))
+         (project (orfeus:make-project :output-directory #P"exports/"
+                                       :defaults settings))
+         (model (orfeus/gui:make-gui-model :project project))
+         (text (orfeus/gui::preview-status-text model)))
+    (check (search "look.cube (100%)" text)
+           "Preview status did not use one literal percent sign")
+    (check (null (search "100%%" text))
+           "Preview status contains a C-style doubled percent sign")))
+
 (defun test-file-filter-syntax ()
   (let ((filter (orfeus/gui::fltk-file-filter "RAW photographs" "*.orf")))
     (check (char= #\Tab (char filter (length "RAW photographs")))
@@ -172,6 +184,7 @@
   (test-output-path-semantics)
   (test-preview-job-identity)
   (test-preview-directory)
+  (test-preview-status-percent)
   (test-file-filter-syntax)
   (test-direct-open-workflow)
   (test-checkbox-normalization)
