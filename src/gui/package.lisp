@@ -1,7 +1,8 @@
 (defpackage #:orfeus/gui
   (:use #:cl)
   (:import-from #:orfeus
-                #:make-processing-settings #:photo-job-input-path
+                #:make-photo-job #:make-processing-settings #:make-project
+                #:photo-extract-embedded-preview #:photo-job-input-path
                 #:photo-job-output-path #:photo-job-overrides
                 #:photo-job-render-output
                 #:processing-settings-with-overrides #:project #:project-defaults
@@ -10,6 +11,6 @@
   (:export #:gui-model #:gui-model-edit-target #:gui-model-project
            #:gui-model-selected-index #:gui-model-setting #:gui-model-set-setting
            #:gui-model-reset-selected #:gui-model-selected-job
-           #:gui-model-selected-settings #:make-gui-model #:run-gui))
+           #:gui-model-selected-settings #:main #:make-gui-model #:run-gui))
 
 (in-package #:orfeus/gui)

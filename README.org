@@ -52,20 +52,19 @@ Projects contain shared defaults and per-photo overrides for exposure, white
 balance, noise reduction, lens/TCA correction, CUBE LUTs, and film grain. They
 are read with =*read-eval*= disabled.
 
-Load the FLTK frontend after building the sibling bridge and the Orfeus preview
-adapter:
+Launch the FLTK frontend directly with an optional photograph or project:
 
 #+begin_src sh
-make -C ../fltk-sun cl-fltk-bridge
-make gui-native
-sbcl --eval '(asdf:load-system "orfeus/gui")' \
-     --eval '(orfeus/gui:run-gui #P"project.sexp")'
+./orfeus-gui
+./orfeus-gui photograph.dng
+./orfeus-gui project.sexp
 #+end_src
 
-The GUI serializes rendering through one background worker, coalesces superseded
-interactive previews, and publishes only the current selection through FLTK
-timer polling. Keyboard basics are =B= (before/after), =R= (preview), =E=
-(export selected), and arrow keys (selection).
+The launcher enters the Nix development environment and builds missing native
+bridges when necessary. The GUI can also open photographs and projects from its
+File menu. It shows the embedded camera JPEG first, develops the RAW preview in
+the background, and coalesces superseded edits. White-balance mode, LUT state,
+and preview source remain visible in the status bar.
 
 The included test LUT is =data/luts/agfa_precisa_100.cube=. Its provenance and
 license notice are recorded in =THIRD-PARTY.md=.
