@@ -104,6 +104,37 @@
                     :output-path (when output (pathname output))
                     :overrides overrides)))
 
+(defun processing-settings-with-overrides (settings overrides)
+  "Return a copy of SETTINGS with validated OVERRIDES applied."
+  (processing-plist-validate overrides)
+  (let ((result (copy-processing-settings settings)))
+    (loop for (key value) on overrides by #'cddr
+          do (ecase key
+               (:exposure
+                (setf (processing-settings-exposure result) value))
+               (:white-balance-temperature
+                (setf (processing-settings-white-balance-temperature result)
+                      value))
+               (:white-balance-tint
+                (setf (processing-settings-white-balance-tint result) value))
+               (:noise-reduction
+                (setf (processing-settings-noise-reduction result) value))
+               (:lens-correction-p
+                (setf (processing-settings-lens-correction-p result) value))
+               (:chromatic-aberration-correction-p
+                (setf (processing-settings-chromatic-aberration-correction-p
+                       result)
+                      value))
+               (:lut-path
+                (setf (processing-settings-lut-path result) value))
+               (:lut-strength
+                (setf (processing-settings-lut-strength result) value))
+               (:grain-amount
+                (setf (processing-settings-grain-amount result) value))
+               (:grain-size
+                (setf (processing-settings-grain-size result) value))))
+    result))
+
 (defun project->sexp (project)
   "Convert PROJECT to its portable, versioned S-expression representation."
   (list :orfeus-project 1
@@ -130,6 +161,38 @@
                   :defaults (sexp->processing-settings defaults)
                   :photos (mapcar #'sexp->photo-job photos))))
 
+(defun project-resolve-pathname (pathname base-directory)
+  (if (uiop:absolute-pathname-p pathname)
+      pathname
+      (merge-pathnames pathname base-directory)))
+
+(defun project-resolve-lut-path (settings base-directory)
+  (let ((lut-path (processing-settings-lut-path settings)))
+    (when lut-path
+      (setf (processing-settings-lut-path settings)
+            (namestring
+             (project-resolve-pathname (pathname lut-path) base-directory)))))
+  settings)
+
+(defun project-resolve-relative-paths (project base-directory)
+  (setf (project-output-directory project)
+        (uiop:ensure-directory-pathname
+         (project-resolve-pathname (project-output-directory project)
+                                   base-directory)))
+  (project-resolve-lut-path (project-defaults project) base-directory)
+  (dolist (photo (project-photos project))
+    (setf (photo-job-input-path photo)
+          (project-resolve-pathname (photo-job-input-path photo)
+                                    base-directory))
+    (let ((overrides (copy-list (photo-job-overrides photo))))
+      (when (getf overrides :lut-path)
+        (setf (getf overrides :lut-path)
+              (namestring
+               (project-resolve-pathname
+                (pathname (getf overrides :lut-path)) base-directory))))
+      (setf (photo-job-overrides photo) overrides)))
+  project)
+
 (defun project-write (project pathname)
   "Write PROJECT readably to PATHNAME, replacing an existing file."
   (with-open-file (stream pathname
@@ -137,13 +200,19 @@
                           :if-exists :supersede
                           :if-does-not-exist :create)
     (with-standard-io-syntax
-      (let ((*print-pretty* t))
+      (let ((*print-pretty* t)
+            (*print-readably* nil)
+            (*print-escape* t))
         (write (project->sexp project) :stream stream)
         (terpri stream))))
   pathname)
 
 (defun project-read (pathname)
-  "Read and validate one project from PATHNAME with reader evaluation disabled."
-  (with-open-file (stream pathname :direction :input)
-    (let ((*read-eval* nil))
-      (sexp->project (read stream t nil nil)))))
+  "Read and validate one project, resolving relative paths beside PATHNAME."
+  (let* ((absolute (truename pathname))
+         (base-directory (uiop:pathname-directory-pathname absolute)))
+    (with-open-file (stream absolute :direction :input)
+      (let ((*read-eval* nil))
+        (project-resolve-relative-paths
+         (sexp->project (read stream t nil nil))
+         base-directory)))))

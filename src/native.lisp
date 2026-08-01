@@ -18,6 +18,35 @@
   (error-buffer :pointer)
   (error-capacity :size))
 
+(defcstruct render-settings-v1
+  (struct-size :uint32)
+  (version :uint32)
+  (flags :uint32)
+  (output-format :uint32)
+  (kelvin :float)
+  (tint :float)
+  (exposure-ev :float)
+  (chroma-noise-reduction :float)
+  (luma-noise-reduction :float)
+  (lut-strength :float)
+  (grain-amount :float)
+  (grain-size :float)
+  (grain-seed :uint64)
+  (max-width :uint32)
+  (max-height :uint32)
+  (jpeg-quality :uint32)
+  (lut-path :pointer))
+
+(defcfun ("orfeus_raw_render_capabilities_v1"
+          %raw-render-capabilities-v1) :uint32)
+
+(defcfun ("orfeus_raw_render_v1" %raw-render-v1) :int32
+  (input-path :string)
+  (output-path :string)
+  (settings (:pointer (:struct render-settings-v1)))
+  (error-buffer :pointer)
+  (error-capacity :size))
+
 (defparameter *native-error-buffer-size* 1024
   "Bytes reserved for a diagnostic returned by the Rust bridge.")
 
@@ -65,6 +94,95 @@
 
 (defun native-error-message (buffer)
   (foreign-string-to-lisp buffer :encoding :utf-8))
+
+(defparameter *required-render-capabilities* #b111
+  "Render features required by the Common Lisp core.")
+
+(defun native-render-require-compatible ()
+  (let ((capabilities
+          (handler-case
+              (%raw-render-capabilities-v1)
+            (error (condition)
+              (error 'native-library-incompatible
+                     :message (format nil
+                                      "render capability query failed: ~A"
+                                      condition))))))
+    (unless (= *required-render-capabilities*
+               (logand capabilities *required-render-capabilities*))
+      (error 'native-library-incompatible
+             :message (format nil "capabilities 0x~X lack required mask 0x~X"
+                              capabilities *required-render-capabilities*)))
+    capabilities))
+
+(defun native-raw-render (input-pathname output-pathname
+                          &key exposure kelvin tint noise-reduction
+                            lens-correction-p
+                            chromatic-aberration-correction-p
+                            lut-path lut-strength grain-amount grain-size
+                            (grain-seed 0) (max-width 0) (max-height 0)
+                            (jpeg-quality 92) output-format)
+  (native-library-load)
+  (native-render-require-compatible)
+  (labels ((invoke (lut-pointer)
+             (with-foreign-object (settings '(:struct render-settings-v1))
+               (flet ((setting (name value)
+                        (setf (foreign-slot-value
+                               settings '(:struct render-settings-v1) name)
+                              value)))
+                 (setting 'struct-size
+                          (foreign-type-size '(:struct render-settings-v1)))
+                 (setting 'version 1)
+                 (setting 'flags
+                          (logior (if lens-correction-p 1 0)
+                                  (if chromatic-aberration-correction-p 2 0)))
+                 (setting 'output-format (ecase output-format
+                                           (:jpeg 1)
+                                           (:tiff 2)))
+                 (setting 'kelvin (float (or kelvin 0.0) 0.0))
+                 (setting 'tint (float tint 0.0))
+                 (setting 'exposure-ev (float exposure 0.0))
+                 (setting 'chroma-noise-reduction
+                          (float noise-reduction 0.0))
+                 (setting 'luma-noise-reduction
+                          (float (* noise-reduction 0.5) 0.0))
+                 (setting 'lut-strength
+                          (float (if lut-path lut-strength 0.0) 0.0))
+                 (setting 'grain-amount (float grain-amount 0.0))
+                 (setting 'grain-size (float grain-size 0.0))
+                 (setting 'grain-seed grain-seed)
+                 (setting 'max-width max-width)
+                 (setting 'max-height max-height)
+                 (setting 'jpeg-quality jpeg-quality)
+                 (setting 'lut-path lut-pointer))
+               (with-foreign-pointer (error-buffer *native-error-buffer-size*)
+                 (let ((status
+                         #+sbcl
+                         (sb-int:with-float-traps-masked
+                             (:invalid :divide-by-zero :overflow
+                              :underflow :inexact)
+                           (%raw-render-v1
+                            (namestring input-pathname)
+                            (namestring output-pathname)
+                            settings error-buffer
+                            *native-error-buffer-size*))
+                         #-sbcl
+                         (%raw-render-v1
+                          (namestring input-pathname)
+                          (namestring output-pathname)
+                          settings error-buffer
+                          *native-error-buffer-size*)))
+                   (unless (zerop status)
+                     (error 'raw-render-error
+                            :input-pathname input-pathname
+                            :output-pathname output-pathname
+                            :status status
+                            :message (native-error-message error-buffer))))))))
+    (if lut-path
+        (with-foreign-string (lut-pointer (namestring lut-path)
+                                          :encoding :utf-8)
+          (invoke lut-pointer))
+        (invoke (null-pointer))))
+  output-pathname)
 
 (defun dng-original-filename (pathname)
   "Return the embedded original filename recorded by DNG PATHNAME."

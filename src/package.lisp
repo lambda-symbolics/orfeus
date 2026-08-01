@@ -2,10 +2,23 @@
   (:use #:cl)
   (:import-from #:cffi
                 #:defcfun
+                #:defcstruct
+                #:foreign-slot-value
                 #:foreign-string-to-lisp
+                #:foreign-type-size
                 #:load-foreign-library
+                #:null-pointer
+                #:with-foreign-object
                 #:with-foreign-pointer
                 #:with-foreign-string)
+  (:import-from #:sb-posix
+                #:eexist
+                #:link
+                #:stat
+                #:stat-dev
+                #:stat-ino
+                #:syscall-errno
+                #:syscall-error)
   (:export
    #:cli-run
    #:dng-extract-original
@@ -18,9 +31,11 @@
    #:make-project
    #:native-bridge-available-p
    #:native-bridge-version
+   #:native-library-incompatible
    #:native-library-unavailable
    #:orfeus-error
    #:orfeus-version
+   #:output-file-exists
    #:photo-job
    #:photo-job-input-path
    #:photo-job-output-path
@@ -36,13 +51,18 @@
    #:processing-settings-noise-reduction
    #:processing-settings-white-balance-temperature
    #:processing-settings-white-balance-tint
+   #:processing-settings-with-overrides
    #:project
    #:project-defaults
    #:project-output-directory
    #:project-photos
    #:project-read
+   #:project-render
    #:project-write
    #:project->sexp
+   #:raw-render-error
+   #:render-photo
+   #:render-preview
    #:sexp->project))
 
 (in-package #:orfeus)

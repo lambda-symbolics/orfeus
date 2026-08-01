@@ -64,3 +64,49 @@
      (format stream "Output file already exists: ~A"
              (output-file-exists-pathname condition))))
   (:documentation "Signalled before an existing output file would be replaced."))
+
+(define-condition raw-render-error (orfeus-error)
+  ((input-pathname
+    :initarg :input-pathname
+    :reader raw-render-error-input-pathname)
+   (output-pathname
+    :initarg :output-pathname
+    :reader raw-render-error-output-pathname)
+   (status
+    :initarg :status
+    :reader raw-render-error-status)
+   (message
+    :initarg :message
+    :reader raw-render-error-message))
+  (:report
+   (lambda (condition stream)
+     (format stream "Could not render ~A to ~A (~D): ~A"
+             (raw-render-error-input-pathname condition)
+             (raw-render-error-output-pathname condition)
+             (raw-render-error-status condition)
+             (raw-render-error-message condition))))
+  (:documentation "Signalled when native RAW rendering fails."))
+
+(define-condition lens-profile-unavailable (warning)
+  ((input-pathname
+    :initarg :input-pathname
+    :reader lens-profile-unavailable-input-pathname)
+   (message
+    :initarg :message
+    :reader lens-profile-unavailable-message))
+  (:report
+   (lambda (condition stream)
+     (format stream "Lens correction skipped for ~A: ~A"
+             (lens-profile-unavailable-input-pathname condition)
+             (lens-profile-unavailable-message condition))))
+  (:documentation "Warns that requested automatic lens correction is unavailable."))
+
+(define-condition native-library-incompatible (orfeus-error)
+  ((message
+    :initarg :message
+    :reader native-library-incompatible-message))
+  (:report
+   (lambda (condition stream)
+     (format stream "The loaded Orfeus native bridge is incompatible: ~A"
+             (native-library-incompatible-message condition))))
+  (:documentation "Signalled when the native bridge lacks required render ABI features."))

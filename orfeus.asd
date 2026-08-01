@@ -5,12 +5,15 @@
   :version "0.1.0"
   :depends-on (#:cffi
                #:ironclad
+               #:sb-posix
                #:uiop)
   :serial t
   :components ((:file "src/package")
                (:file "src/conditions")
                (:file "src/native")
                (:file "src/project")
+               (:file "src/render")
+               (:file "src/batch")
                (:file "src/version"))
   :in-order-to ((test-op (test-op "orfeus/tests"))))
 

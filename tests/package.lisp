@@ -7,13 +7,21 @@
                 #:make-processing-settings
                 #:make-project
                 #:orfeus-version
+                #:output-file-exists
+                #:photo-job-input-path
                 #:photo-job-overrides
                 #:processing-settings-exposure
+                #:processing-settings-grain-amount
+                #:processing-settings-with-overrides
                 #:project->sexp
                 #:project-defaults
+                #:project-output-directory
                 #:project-photos
                 #:project-read
                 #:project-write
+                #:raw-render-error
+                #:render-photo
+                #:render-preview
                 #:sexp->project)
   (:export #:run-tests))
 
