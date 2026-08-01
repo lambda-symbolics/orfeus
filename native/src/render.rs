@@ -9,7 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use image::codecs::jpeg::JpegEncoder;
 use image::codecs::tiff::TiffEncoder;
 use image::{ColorType, ImageEncoder};
-use lensfun::{Database, Modifier};
+use lensfun::{Camera, Database, Lens, Modifier};
 use rawler::decoders::{RawDecodeParams, RawLoader};
 use rawler::imgop::develop::{ProcessingStep, RawDevelop};
 use rawler::rawsource::RawSource;
@@ -472,6 +472,84 @@ fn normalized_name(value: &str) -> String {
         .collect()
 }
 
+fn normalized_alias_matches<'a>(requested: &str, aliases: impl Iterator<Item = &'a str>) -> bool {
+    let requested = normalized_name(requested);
+    aliases.map(normalized_name).any(|candidate| {
+        candidate == requested
+            || (candidate.len() >= 5
+                && (candidate.contains(&requested) || requested.contains(&candidate)))
+    })
+}
+
+fn find_camera_profile<'a>(db: &'a Database, make: &str, model: &str) -> Option<&'a Camera> {
+    db.cameras.iter().find(|camera| {
+        normalized_alias_matches(
+            make,
+            std::iter::once(camera.maker.as_str())
+                .chain(camera.maker_localized.values().map(String::as_str)),
+        ) && normalized_alias_matches(
+            model,
+            std::iter::once(camera.model.as_str())
+                .chain(camera.model_localized.values().map(String::as_str)),
+        )
+    })
+}
+
+fn camera_mount_compatible(db: &Database, camera: &Camera, lens: &Lens) -> bool {
+    if lens.mounts.is_empty()
+        || lens
+            .mounts
+            .iter()
+            .any(|mount| mount.eq_ignore_ascii_case(&camera.mount))
+    {
+        return true;
+    }
+    db.mounts
+        .iter()
+        .find(|mount| mount.name.eq_ignore_ascii_case(&camera.mount))
+        .is_some_and(|mount| {
+            mount.compat.iter().any(|compatible| {
+                lens.mounts
+                    .iter()
+                    .any(|lens_mount| lens_mount.eq_ignore_ascii_case(compatible))
+            })
+        })
+}
+
+fn lens_name_matches(lens: &Lens, requested: &str) -> bool {
+    normalized_alias_matches(
+        requested,
+        std::iter::once(lens.model.as_str())
+            .chain(lens.model_localized.values().map(String::as_str)),
+    )
+}
+
+fn find_lens_profile<'a>(
+    db: &'a Database,
+    camera: &Camera,
+    lens_name: &str,
+    focal: f32,
+) -> Option<&'a Lens> {
+    db.lenses
+        .iter()
+        .filter(|lens| camera_mount_compatible(db, camera, lens))
+        .filter(|lens| {
+            (lens.focal_min <= 0.0 || focal >= lens.focal_min - 0.1)
+                && (lens.focal_max <= 0.0 || focal <= lens.focal_max + 0.1)
+        })
+        .filter(|lens| lens_name_matches(lens, lens_name))
+        .max_by_key(|lens| {
+            std::iter::once(&lens.model)
+                .chain(lens.model_localized.values())
+                .map(|name| normalized_name(name))
+                .map(|candidate| {
+                    usize::from(candidate == normalized_name(lens_name)) * 2 + candidate.len()
+                })
+                .max()
+                .unwrap_or_default()
+        })
+}
+
 fn apply_lens(
     image: &mut RgbImage,
     make: &str,
@@ -489,38 +567,14 @@ fn apply_lens(
         ));
     }
     let db = lens_database()?;
-    let requested_make = normalized_name(make);
-    let camera = db
-        .find_cameras(Some(make), model)
-        .into_iter()
-        .find(|camera| {
-            let candidate_make = normalized_name(&camera.maker);
-            camera.model.eq_ignore_ascii_case(model)
-                && (candidate_make == requested_make
-                    || (candidate_make.len() >= 5
-                        && (candidate_make.contains(&requested_make)
-                            || requested_make.contains(&candidate_make))))
-        })
-        .ok_or_else(|| {
-            Error::LensProfileUnavailable(format!(
-                "no exact lensfun camera profile for {make} {model}"
-            ))
-        })?;
-    let requested = normalized_name(lens_name);
-    let lens = db
-        .find_lenses(Some(camera), lens_name)
-        .into_iter()
-        .find(|lens| {
-            let candidate = normalized_name(&lens.model);
-            (candidate == requested
-                || (candidate.len() > 8
-                    && (candidate.contains(&requested) || requested.contains(&candidate))))
-                && focal >= lens.focal_min - 0.1
-                && focal <= lens.focal_max + 0.1
-        })
-        .ok_or_else(|| {
-            Error::LensProfileUnavailable(format!("no conservative lensfun match for {lens_name}"))
-        })?;
+    let camera = find_camera_profile(db, make, model).ok_or_else(|| {
+        Error::LensProfileUnavailable(format!(
+            "no exact lensfun camera profile for {make} {model}"
+        ))
+    })?;
+    let lens = find_lens_profile(db, camera, lens_name, focal).ok_or_else(|| {
+        Error::LensProfileUnavailable(format!("no conservative lensfun match for {lens_name}"))
+    })?;
     let mut modifier = Modifier::new(
         lens,
         focal,
@@ -532,7 +586,7 @@ fn apply_lens(
     let distortion =
         flags & FLAG_LENS_DISTORTION != 0 && modifier.enable_distortion_correction(lens);
     let tca = flags & FLAG_LENS_TCA != 0 && modifier.enable_tca_correction(lens);
-    if (flags & FLAG_LENS_DISTORTION != 0 && !distortion) || (flags & FLAG_LENS_TCA != 0 && !tca) {
+    if !distortion && !tca {
         return Err(Error::LensProfileUnavailable(format!(
             "lensfun profile for {lens_name} lacks requested calibration"
         )));
@@ -936,6 +990,39 @@ mod tests {
     }
     fn temp(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("orfeus-test-{}-{name}", std::process::id()))
+    }
+
+    #[test]
+    fn matches_common_micro_four_thirds_lens_aliases() {
+        let db = Database::load_bundled().unwrap();
+        for (make, model, lens_name, focal) in [
+            (
+                "OLYMPUS CORPORATION",
+                "PEN-F",
+                "Leica DG Summilux 25mm F1.4 Asph.",
+                25.0,
+            ),
+            (
+                "OLYMPUS CORPORATION",
+                "PEN-F",
+                "Leica DG Macro-Elmarit 45mm F2.8 Asph. Mega OIS",
+                45.0,
+            ),
+            (
+                "OM Digital Solutions",
+                "OM-1",
+                "Olympus M.Zuiko Digital ED 12-45mm F4.0 Pro",
+                25.0,
+            ),
+        ] {
+            let camera = find_camera_profile(&db, make, model)
+                .unwrap_or_else(|| panic!("camera profile missing for {make} {model}"));
+            let lens = find_lens_profile(&db, camera, lens_name, focal)
+                .unwrap_or_else(|| panic!("lens profile missing for {lens_name}"));
+            assert!(camera_mount_compatible(&db, camera, lens));
+        }
+        let camera = find_camera_profile(&db, "OLYMPUS CORPORATION", "PEN-F").unwrap();
+        assert!(find_lens_profile(&db, camera, "Ultron 0.7x", 28.4).is_none());
     }
 
     #[test]

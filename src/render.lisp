@@ -34,6 +34,40 @@
                     :status 2
                     :message "could not allocate a temporary output name"))))
 
+(defun dng-input-pathname-p (pathname)
+  (string-equal (or (pathname-type pathname) "") "dng"))
+
+(defun render-source-temporary-pathname (input-pathname)
+  (let* ((original-name (dng-original-filename input-pathname))
+         (type (or (pathname-type (pathname original-name)) "orf")))
+    (loop repeat 100
+          for candidate =
+             (merge-pathnames
+              (make-pathname :name (format nil "orfeus-source-~D-~D"
+                                            (get-universal-time)
+                                            (random most-positive-fixnum))
+                             :type type)
+              (uiop:temporary-directory))
+          unless (probe-file candidate)
+            return candidate
+          finally
+             (error 'raw-render-error
+                    :input-pathname input-pathname
+                    :output-pathname input-pathname
+                    :status 2
+                    :message "could not allocate a temporary embedded original"))))
+
+(defun call-with-render-source (input-pathname function)
+  (if (dng-input-pathname-p input-pathname)
+      (let ((temporary (render-source-temporary-pathname input-pathname)))
+        (unwind-protect
+             (progn
+               (dng-extract-original input-pathname temporary)
+               (funcall function temporary))
+          (when (probe-file temporary)
+            (delete-file temporary))))
+      (funcall function input-pathname)))
+
 (defparameter *metadata-copy-exclusions*
   '("--ICC_Profile" "--Orientation"
     "--ImageWidth" "--ImageHeight" "--ExifImageWidth" "--ExifImageHeight"
@@ -104,7 +138,8 @@
      "metadata color-space normalization")))
 
 (defun render-native-photo (input-pathname output-pathname settings
-                            &key max-width max-height jpeg-quality grain-seed)
+                            &key max-width max-height jpeg-quality grain-seed
+                              (report-input-pathname input-pathname))
   (labels ((invoke (effective-settings)
              (native-raw-render
               input-pathname output-pathname
@@ -137,7 +172,7 @@
                       settings)))
             (progn
               (warn 'lens-profile-unavailable
-                    :input-pathname input-pathname
+                    :input-pathname report-input-pathname
                     :message (raw-render-error-message condition))
               (let ((fallback (copy-processing-settings settings)))
                 (setf (processing-settings-lens-correction-p fallback) nil
@@ -179,12 +214,16 @@ output dimensions; zero leaves a dimension unconstrained."
     (let ((temporary (render-temporary-pathname output-pathname)))
       (unwind-protect
            (progn
-             (render-native-photo
-              input-pathname temporary settings
-              :grain-seed grain-seed
-              :max-width max-width
-              :max-height max-height
-              :jpeg-quality jpeg-quality)
+             (call-with-render-source
+              input-pathname
+              (lambda (render-input-pathname)
+                (render-native-photo
+                 render-input-pathname temporary settings
+                 :report-input-pathname input-pathname
+                 :grain-seed grain-seed
+                 :max-width max-width
+                 :max-height max-height
+                 :jpeg-quality jpeg-quality)))
              (when preserve-metadata-p
                (render-copy-metadata input-pathname temporary))
              (render-publish temporary output-pathname publish-policy)
