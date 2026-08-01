@@ -102,7 +102,12 @@
            status progress before-preview-file after-preview-file
            lens-name controls inspector-items lut-name lut-menu wb-choice target-choice
            debounce-id poll-id comparison-p
-           (preview-generation 0))
+           (preview-generation 0)
+           (preview-zoom 1d0)
+           (preview-center-x .5d0)
+           (preview-center-y .5d0)
+           preview-drag-p preview-drag-x preview-drag-y
+           preview-drag-center-x preview-drag-center-y)
       (labels
           ((picker-preset ()
              (namestring picker-directory))
@@ -124,11 +129,116 @@
                                       (photo-job-input-path job)))
                                    "Lens not identified"))))
                    "No photograph selected")))
+           (parse-preview-event (value)
+             (let ((parts (remove "" (uiop:split-string (or value "")
+                                                       :separator '(#\Space))
+                                  :test #'string=)))
+               (when (= (length parts) 5)
+                 (handler-case
+                     (values-list (mapcar #'parse-integer parts))
+                   (error () nil)))))
+           (preview-path-for-canvas (canvas)
+             (if (eq canvas before-canvas)
+                 before-preview-file
+                 after-preview-file))
+           (redraw-previews ()
+             (when before-canvas (cl-fltk:redraw before-canvas))
+             (when after-canvas (cl-fltk:redraw after-canvas)))
+           (reset-preview-view ()
+             (setf preview-zoom 1d0
+                   preview-center-x .5d0
+                   preview-center-y .5d0)
+             (redraw-previews)
+             (set-status "Preview fitted to window"))
+           (preview-scaled-size (canvas path zoom)
+             (multiple-value-bind (source-width source-height)
+                 (preview-file-size path)
+               (when source-width
+                 (let ((fit (min (/ (cl-fltk:widget-width canvas)
+                                    (float source-width 1d0))
+                                 (/ (cl-fltk:widget-height canvas)
+                                    (float source-height 1d0)))))
+                   (let ((scale (min (max fit 2d0) (* fit zoom))))
+                     (values (* source-width scale)
+                             (* source-height scale)
+                             fit))))))
+           (zoom-preview (factor &optional canvas pointer-x pointer-y)
+             (let* ((old-zoom preview-zoom)
+                    (new-zoom (min 32d0 (max 1d0 (* old-zoom factor))))
+                    (path (and canvas (preview-path-for-canvas canvas))))
+               (when (and path pointer-x pointer-y (/= old-zoom new-zoom))
+                 (multiple-value-bind (old-width old-height)
+                     (preview-scaled-size canvas path old-zoom)
+                   (when old-width
+                     (let* ((canvas-center-x (+ (cl-fltk:widget-x canvas)
+                                                (/ (cl-fltk:widget-width canvas) 2d0)))
+                            (canvas-center-y (+ (cl-fltk:widget-y canvas)
+                                                (/ (cl-fltk:widget-height canvas) 2d0)))
+                            (source-x (+ preview-center-x
+                                         (/ (- pointer-x canvas-center-x) old-width)))
+                            (source-y (+ preview-center-y
+                                         (/ (- pointer-y canvas-center-y) old-height)))
+                            (ratio (/ old-zoom new-zoom)))
+                       (setf preview-center-x
+                             (- source-x (* (- source-x preview-center-x) ratio))
+                             preview-center-y
+                             (- source-y (* (- source-y preview-center-y) ratio)))))))
+               (setf preview-zoom new-zoom)
+               (redraw-previews)
+               (set-status (format nil "Preview zoom: ~,0F%" (* 100 new-zoom)))))
+           (preview-one-to-one ()
+             (let ((path (or after-preview-file before-preview-file)))
+               (when path
+                 (multiple-value-bind (scaled-width scaled-height fit)
+                     (preview-scaled-size after-canvas path 1d0)
+                   (declare (ignore scaled-width scaled-height))
+                   (when fit
+                     (setf preview-zoom (min 32d0 (max 1d0 (/ fit)))
+                           preview-center-x .5d0
+                           preview-center-y .5d0)
+                     (redraw-previews)
+                     (set-status "Preview at 1:1 pixels"))))))
+           (handle-preview-mouse (canvas event value)
+             (multiple-value-bind (x y button dx dy)
+                 (parse-preview-event value)
+               (declare (ignore dx))
+               (when x
+                 (case event
+                   (#.cl-fltk:+event-push+
+                    (when (or (= button 1) (= button 2))
+                      (setf preview-drag-p t
+                            preview-drag-x x
+                            preview-drag-y y
+                            preview-drag-center-x preview-center-x
+                            preview-drag-center-y preview-center-y)))
+                   (#.cl-fltk:+event-drag+
+                    (when preview-drag-p
+                      (let ((path (preview-path-for-canvas canvas)))
+                        (when path
+                          (multiple-value-bind (width height)
+                              (preview-scaled-size canvas path preview-zoom)
+                            (when width
+                              (setf preview-center-x
+                                    (- preview-drag-center-x
+                                       (/ (- x preview-drag-x) width))
+                                    preview-center-y
+                                    (- preview-drag-center-y
+                                       (/ (- y preview-drag-y) height)))
+                              (redraw-previews)))))))
+                   (#.cl-fltk:+event-release+
+                    (setf preview-drag-p nil))
+                   (#.cl-fltk:+event-wheel+
+                    (zoom-preview (if (minusp dy) 1.25d0 .8d0)
+                                  canvas x y))))))
            (set-status (text)
              (setf (cl-fltk:value status) text))
            (selected-job ()
              (gui-model-selected-job model))
            (clear-previews ()
+             (setf preview-zoom 1d0
+                   preview-center-x .5d0
+                   preview-center-y .5d0
+                   preview-drag-p nil)
              (dolist (path (list before-preview-file after-preview-file))
                (when path (forget-preview-file path)))
              (setf before-preview-file nil
@@ -426,8 +536,8 @@
                   (cl-fltk:resize-widget toolbar-bottom-rule :x 0 :y 38
                                          :width width :height 2))
                (when lens-name
-                 (cl-fltk:resize-widget lens-name :x 160 :y 6
-                                         :width (max 120 (- width 170)) :height 28))
+                 (cl-fltk:resize-widget lens-name :x 312 :y 6
+                                        :width (max 120 (- width 322)) :height 28))
                (cl-fltk:resize-widget table :x 0 :y top :width left :height main-height)
                (if comparison-p
                    (progn
@@ -588,6 +698,16 @@
                    (cl-fltk:set-box button cl-fltk:+box-flat-box+)
                    (cl-fltk:set-stock-icon button icon)
                    (cl-fltk:set-tooltip button tooltip)
+                   button))
+               (toolbar-text-button (x width label tooltip action)
+                 (let ((button (cl-fltk:make-button
+                                :parent toolbar :x x :y 5 :width width :height 28
+                                :label label
+                                :callback (lambda (&rest ignored)
+                                            (declare (ignore ignored))
+                                            (funcall action)))))
+                   (cl-fltk:set-box button cl-fltk:+box-flat-box+)
+                   (cl-fltk:set-tooltip button tooltip)
                    button)))
           (rule 6 10 2 18 130 130 130)
           (rule 10 10 2 18 245 245 245)
@@ -596,9 +716,15 @@
           (rule 82 7 1 24 150 150 150)
           (toolbar-button 90 :export "Export selected photograph" #'render-selected)
           (toolbar-button 120 :pipeline "Show or hide Before and After" #'toggle-comparison)
+          (rule 154 7 1 24 150 150 150)
+          (toolbar-text-button 162 28 "−" "Zoom out" (lambda () (zoom-preview .8d0)))
+          (toolbar-text-button 192 38 "Fit" "Fit preview" #'reset-preview-view)
+          (toolbar-text-button 232 28 "+" "Zoom in" (lambda () (zoom-preview 1.25d0)))
+          (toolbar-text-button 262 38 "1:1" "Show image pixels at 1:1" #'preview-one-to-one)
+          (rule 304 7 1 24 150 150 150)
           (setf toolbar-bottom-rule (rule 0 38 1280 2 145 145 145)))
-        (setf lens-name (cl-fltk:make-label :parent toolbar :x 160 :y 6
-                                            :width 1094 :height 28
+        (setf lens-name (cl-fltk:make-label :parent toolbar :x 312 :y 6
+                                            :width 942 :height 28
                                             :label "Lens: No photograph selected"))
         (cl-fltk:set-label-font lens-name 1)
         (setf table (cl-fltk:make-record-table
@@ -631,14 +757,26 @@
                                   (:before before-preview-file)
                                   (:after after-preview-file))))
                       (if path
-                          (draw-preview-file widget path)
+                          (draw-preview-file widget path
+                                             :zoom preview-zoom
+                                             :center-x preview-center-x
+                                             :center-y preview-center-y)
                           (progn
                             (cl-fltk:draw-color-rgb :red 205 :green 208 :blue 210)
                             (cl-fltk:draw-text "Developing RAW preview..."
                                                (+ (cl-fltk:widget-x widget) 20)
                                                (+ (cl-fltk:widget-y widget) 36)))))))))
           (setf before-canvas (make-preview-canvas :before 240)
-                after-canvas (make-preview-canvas :after 603)))
+                after-canvas (make-preview-canvas :after 603))
+          (dolist (canvas (list before-canvas after-canvas))
+            (dolist (event (list cl-fltk:+event-push+
+                                 cl-fltk:+event-drag+
+                                 cl-fltk:+event-release+
+                                 cl-fltk:+event-wheel+))
+              (cl-fltk:on canvas
+                          (lambda (widget callback-event value)
+                            (handle-preview-mouse widget callback-event value))
+                          :event event))))
         (setf inspector (cl-fltk:make-panel :parent window :x 960 :y 64
                                             :width 320 :height 708
                                             :label ""))
