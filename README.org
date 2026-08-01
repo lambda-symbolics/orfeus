@@ -1,0 +1,68 @@
+#+title: Orfeus
+
+Orfeus is a fast Common Lisp RAW processor for Olympus PEN-F and OM-1 files.
+The same processing core is used by its command-line and FLTK frontends.
+
+* Enter the development environment
+
+#+begin_src sh
+nix develop
+#+end_src
+
+The flake provides SBCL, Rust, LibRaw/Lensfun-related native dependencies,
+ExifTool, JPEG/TIFF support, and FLTK. Keep the sibling =../fltk-sun= checkout
+available when building the GUI.
+
+* Build
+
+#+begin_src sh
+cargo build --release --manifest-path native/Cargo.toml
+sbcl --non-interactive \
+  --eval '(require :asdf)' \
+  --eval '(asdf:load-asd (truename "orfeus.asd"))' \
+  --eval '(asdf:make "orfeus/cli")'
+#+end_src
+
+* Basic use
+
+Inspect or extract the original ORF embedded in a DNG:
+
+#+begin_src sh
+./orfeus info photograph.dng
+./orfeus extract photograph.dng photograph.orf
+#+end_src
+
+Render a preview or full JPEG/TIFF with default settings:
+
+#+begin_src sh
+./orfeus preview photograph.orf preview.jpg
+./orfeus render photograph.orf export.tiff
+#+end_src
+
+Create and run an editable S-expression batch project:
+
+#+begin_src sh
+./orfeus init project.sexp exports/ first.orf second.orf
+$EDITOR project.sexp
+./orfeus batch project.sexp
+#+end_src
+
+Projects contain shared defaults and per-photo overrides for exposure, white
+balance, noise reduction, lens/TCA correction, CUBE LUTs, and film grain. They
+are read with =*read-eval*= disabled.
+
+The included test LUT is =data/luts/agfa_precisa_100.cube=. Its provenance and
+license notice are recorded in =THIRD-PARTY.md=.
+
+* Test
+
+#+begin_src sh
+cargo fmt --check --manifest-path native/Cargo.toml
+cargo clippy --release --all-targets --all-features \
+  --manifest-path native/Cargo.toml -- -D warnings
+cargo test --release --manifest-path native/Cargo.toml
+sbcl --non-interactive \
+  --eval '(require :asdf)' \
+  --eval '(asdf:load-asd (truename "orfeus.asd"))' \
+  --eval '(asdf:test-system "orfeus")'
+#+end_src

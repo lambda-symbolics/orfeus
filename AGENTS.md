@@ -19,6 +19,9 @@ than disguising it as finished behavior.
 - Store projects, presets, batch jobs, and per-photo overrides as portable
   S-expressions read with `*read-eval*` bound to `nil`.
 - Keep native dependencies behind narrow adapters with structured conditions.
+- Keep general-purpose components as focused subsystems with narrow APIs and
+  dependency boundaries so they can later become standalone free libraries
+  without major rewrites. Do not split them out before Orfeus proves the API.
 - Preserve source pixels and metadata unless an operation explicitly transforms
   them. Never modify input photographs in place.
 - Stream or tile large images where practical. Avoid unnecessary copies,
