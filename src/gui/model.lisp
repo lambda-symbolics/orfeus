@@ -30,14 +30,22 @@
                 :defaults (gui-default-processing-settings)
                 :photos '()))
 
-(defun gui-photo-project (pathname)
-  "Return a one-photo project for PATHNAME with a sibling Orfeus export directory."
-  (let* ((input (pathname pathname))
-         (directory (uiop:pathname-directory-pathname input))
+(defun gui-photos-project (pathnames)
+  "Return one project containing PATHNAMES in selection order."
+  (let* ((inputs (mapcar #'pathname pathnames))
+         (first-input (or (first inputs)
+                          (error "At least one photograph is required.")))
+         (directory (uiop:pathname-directory-pathname first-input))
          (output-directory (merge-pathnames #P"orfeus-exports/" directory)))
     (make-project :output-directory output-directory
                   :defaults (gui-default-processing-settings)
-                  :photos (list (make-photo-job :input-path input)))))
+                  :photos (mapcar (lambda (input)
+                                    (make-photo-job :input-path input))
+                                  inputs))))
+
+(defun gui-photo-project (pathname)
+  "Return a one-photo project for PATHNAME."
+  (gui-photos-project (list pathname)))
 
 (defun gui-open-kind (pathname)
   "Classify PATHNAME as :PROJECT, :PHOTO, or NIL for an unsupported extension."

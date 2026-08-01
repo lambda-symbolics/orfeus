@@ -3,6 +3,10 @@
 (defparameter *preview-debounce-seconds* 0.25d0
   "Delay used to coalesce interactive control changes.")
 
+(defun fltk-file-filter (label pattern)
+  "Build FLTK's LABEL<TAB>PATTERN native file chooser syntax."
+  (format nil "~A~C~A" label #\Tab pattern))
+
 (defun display-number (value)
   (cond ((null value) "")
         ((integerp value) (format nil "~D" value))
@@ -79,12 +83,42 @@
                                   :project-path initial-path))
            (queue (make-gui-queue))
            (preview-directory (make-gui-preview-directory))
+           (picker-directory
+             (let ((photo (first (project-photos project))))
+               (cond (initial-path
+                      (uiop:pathname-directory-pathname initial-path))
+                     (photo
+                      (uiop:pathname-directory-pathname
+                       (photo-job-input-path photo)))
+                     (t (uiop:getcwd)))))
+           (lens-cache (make-hash-table :test #'eq))
            window menu toolbar table canvas inspector status progress preview-file
-           controls inspector-items lut-name lut-menu wb-choice target-choice
+           lens-label lens-name controls inspector-items lut-name lut-menu
+           wb-choice target-choice
            debounce-id poll-id before-p
            (preview-generation 0))
       (labels
-          ((set-status (text)
+          ((picker-preset ()
+             (namestring picker-directory))
+           (remember-picked-path (path)
+             (when path
+               (setf picker-directory
+                     (uiop:pathname-directory-pathname (pathname path))))
+             path)
+           (selected-lens-description ()
+             (let ((job (selected-job)))
+               (if job
+                   (multiple-value-bind (cached present-p)
+                       (gethash job lens-cache)
+                     (if present-p
+                         cached
+                         (setf (gethash job lens-cache)
+                               (or (ignore-errors
+                                     (photo-lens-description
+                                      (photo-job-input-path job)))
+                                   "Lens not identified"))))
+                   "No photograph selected")))
+           (set-status (text)
              (setf (cl-fltk:value status) text))
            (selected-job ()
              (gui-model-selected-job model))
@@ -120,7 +154,9 @@
                        "Defaults" "Photo")
                    (cl-fltk:value lut-name)
                    (let ((path (gui-model-setting model :lut-path)))
-                     (if path (file-namestring path) "No LUT selected"))))
+                     (if path (file-namestring path) "No LUT selected"))
+                   (cl-fltk:value lens-name)
+                   (selected-lens-description)))
            (replace-project (new-project &optional path)
              (incf preview-generation)
              (clear-preview)
@@ -134,22 +170,33 @@
                    (schedule-initial-preview))
                  (set-status "Open a photograph or project to begin")))
            (open-photo ()
-             (let ((path (cl-fltk:choose-file
-                          :title "Open RAW photograph"
-                          :filter "RAW photographs\t*.{orf,ORF,dng,DNG}")))
-               (when path (replace-project (gui-photo-project path)))))
+             (let ((paths (choose-photo-files
+                           :title "Open RAW photographs"
+                           :filter (fltk-file-filter
+                                    "RAW photographs" "*.{orf,ORF,dng,DNG}")
+                           :preset-path (picker-preset))))
+               (when paths
+                 (remember-picked-path (first paths))
+                 (replace-project (gui-photos-project paths)))))
            (open-project ()
              (let ((path (cl-fltk:choose-file
                           :title "Open Orfeus project"
-                          :filter "Orfeus project\t*.sexp")))
-               (when path (replace-project (project-read path) (pathname path)))))
+                          :filter (fltk-file-filter "Orfeus project" "*.sexp")
+                          :preset-file (picker-preset))))
+               (when path
+                 (remember-picked-path path)
+                 (replace-project (project-read path) (pathname path)))))
            (save-project (&optional choose-p)
              (let ((path (or (and (not choose-p) (gui-model-project-path model))
                              (cl-fltk:choose-save-file
                               :title "Save Orfeus project"
-                              :filter "Orfeus project\t*.sexp"
-                              :preset-file "project.sexp"))))
+                              :filter (fltk-file-filter "Orfeus project" "*.sexp")
+                              :preset-file
+                              (namestring
+                               (merge-pathnames "project.sexp"
+                                                picker-directory))))))
                (when path
+                 (remember-picked-path path)
                  (project-write project path)
                  (setf (gui-model-project-path model) (pathname path))
                  (set-status "Project saved"))))
@@ -242,8 +289,11 @@
                       (queue-event queue (list :done output))))))))
            (choose-lut ()
              (let ((path (cl-fltk:choose-file
-                          :title "Choose 3D LUT" :filter "Cube LUT\t*.{cube,CUBE}")))
+                          :title "Choose 3D LUT"
+                          :filter (fltk-file-filter "Cube LUT" "*.{cube,CUBE}")
+                          :preset-file (picker-preset))))
                (when path
+                 (remember-picked-path path)
                  (gui-model-set-setting model :lut-path path)
                  (sync-controls)
                  (schedule-edited-preview))))
@@ -304,6 +354,11 @@
                     (center (max 300 (- width left right))))
                (cl-fltk:resize-widget menu :x 0 :y 0 :width width :height 24)
                (cl-fltk:resize-widget toolbar :x 0 :y 24 :width width :height 40)
+               (when lens-label
+                 (cl-fltk:resize-widget lens-label :x 520 :y 6
+                                        :width 36 :height 28)
+                 (cl-fltk:resize-widget lens-name :x 558 :y 6
+                                        :width (max 120 (- width 568)) :height 28))
                (cl-fltk:resize-widget table :x 0 :y top :width left :height main-height)
                (cl-fltk:resize-widget canvas :x left :y top :width center :height main-height)
                (cl-fltk:resize-widget inspector :x (+ left center) :y top
@@ -425,6 +480,11 @@
                           (lambda ()
                             (setf before-p (not before-p))
                             (schedule-edited-preview))))
+        (setf lens-label (cl-fltk:make-label :parent toolbar :x 520 :y 6
+                                             :width 36 :height 28 :label "Lens")
+              lens-name (cl-fltk:make-output :parent toolbar :x 558 :y 6
+                                             :width 700 :height 28
+                                             :value "No photograph selected"))
         (setf table (cl-fltk:make-record-table
                      :parent window :x 0 :y 64 :width 240 :height 708
                      :columns '((:file "File" 230) (:settings "Settings" 90)

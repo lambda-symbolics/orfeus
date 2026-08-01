@@ -2,7 +2,8 @@
   (:use #:cl)
   (:import-from #:orfeus
                 #:make-photo-job #:make-processing-settings #:make-project
-                #:photo-extract-embedded-preview #:photo-job-input-path
+                #:photo-extract-embedded-preview #:photo-lens-description
+                #:photo-job-input-path
                 #:photo-job-output-path #:photo-job-overrides
                 #:photo-job-render-output
                 #:processing-settings-with-overrides #:project #:project-defaults

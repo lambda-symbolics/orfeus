@@ -77,6 +77,13 @@
         (orfeus/gui::delete-gui-preview-directory first))
       (orfeus/gui::delete-gui-preview-directory second))))
 
+(defun test-file-filter-syntax ()
+  (let ((filter (orfeus/gui::fltk-file-filter "RAW photographs" "*.orf")))
+    (check (char= #\Tab (char filter (length "RAW photographs")))
+           "FLTK filter does not contain a real tab separator")
+    (check (null (search "\\t" filter))
+           "FLTK filter contains a literal backslash-t")))
+
 (defun test-direct-open-workflow ()
   (check (eq :photo (orfeus/gui::gui-open-kind #P"photo.DNG"))
          "DNG was not classified as a photograph")
@@ -84,13 +91,14 @@
          "S-expression was not classified as a project")
   (check (null (orfeus/gui::gui-open-kind #P"notes.txt"))
          "Unsupported extension was accepted")
-  (let* ((project (orfeus/gui::gui-photo-project #P"/photos/one.orf"))
-         (job (first (orfeus:project-photos project))))
+  (let* ((inputs (list #P"/photos/one.orf" #P"/other/two.dng"))
+         (project (orfeus/gui::gui-photos-project inputs))
+         (jobs (orfeus:project-photos project)))
     (check (equal #P"/photos/orfeus-exports/"
                   (orfeus:project-output-directory project))
-           "Direct photo output directory is not beside the input")
-    (check (equal #P"/photos/one.orf" (orfeus:photo-job-input-path job))
-           "Direct photo project changed the input pathname")
+           "Direct photo output directory is not beside the first input")
+    (check (equal inputs (mapcar #'orfeus:photo-job-input-path jobs))
+           "Multi-photo project changed input order")
     (check (search "agfa_precisa_100.cube"
                    (orfeus:processing-settings-lut-path
                     (orfeus:project-defaults project)))
@@ -135,6 +143,7 @@
   (test-output-path-semantics)
   (test-preview-job-identity)
   (test-preview-directory)
+  (test-file-filter-syntax)
   (test-direct-open-workflow)
   (test-checkbox-normalization)
   (test-render-queue)

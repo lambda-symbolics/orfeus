@@ -1,7 +1,10 @@
 #include <FL/Fl.H>
 #include <FL/Fl_JPEG_Image.H>
+#include <FL/Fl_Native_File_Chooser.H>
 #include <FL/Fl_Widget.H>
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -41,4 +44,31 @@ extern "C" void orfeus_gui_preview_forget(const char *path) {
 
 extern "C" void orfeus_gui_preview_clear(void) {
     images.clear();
+}
+
+extern "C" char *orfeus_gui_choose_files(const char *title,
+                                          const char *filter,
+                                          const char *preset_path) {
+    Fl_Native_File_Chooser chooser(Fl_Native_File_Chooser::BROWSE_MULTI_FILE);
+    if (title && *title) chooser.title(title);
+    if (filter && *filter) chooser.filter(filter);
+    if (preset_path && *preset_path) chooser.preset_file(preset_path);
+    if (chooser.show() != 0 || chooser.count() <= 0) return nullptr;
+
+    std::string result;
+    for (int index = 0; index < chooser.count(); ++index) {
+        const char *path = chooser.filename(index);
+        if (!path || !*path) continue;
+        if (!result.empty()) result.push_back('\n');
+        result.append(path);
+    }
+    if (result.empty()) return nullptr;
+    char *copy = static_cast<char *>(std::malloc(result.size() + 1));
+    if (!copy) return nullptr;
+    std::memcpy(copy, result.c_str(), result.size() + 1);
+    return copy;
+}
+
+extern "C" void orfeus_gui_string_free(char *value) {
+    std::free(value);
 }

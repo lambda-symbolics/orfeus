@@ -59,6 +59,14 @@
         nil)
     (invalid-project-data () t)))
 
+(defun lens-description-selection-p ()
+  (and (string= "Olympus M.Zuiko 12-45mm"
+                (uiop:symbol-call '#:orfeus '#:preferred-lens-description
+                                  (format nil "Unknown~%Olympus M.Zuiko 12-45mm~%")))
+       (string= "Ultron 0.7x"
+                (uiop:symbol-call '#:orfeus '#:preferred-lens-description
+                                  (format nil "None~%Ultron 0.7x~%")))))
+
 (defun processing-overrides-p ()
   (let ((settings
           (processing-settings-with-overrides
@@ -227,6 +235,8 @@
              (project-reader-evaluation-disabled-p))
       (check "invalid project versions are rejected"
              (invalid-project-rejected-p))
+      (check "lens metadata skips unidentified values"
+             (lens-description-selection-p))
       (check "per-photo overrides produce effective settings"
              (processing-overrides-p))
       (check "photo outputs follow project path semantics"

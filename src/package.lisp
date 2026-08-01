@@ -37,6 +37,7 @@
    #:orfeus-version
    #:output-file-exists
    #:photo-extract-embedded-preview
+   #:photo-lens-description
    #:photo-job
    #:photo-job-input-path
    #:photo-job-output-path

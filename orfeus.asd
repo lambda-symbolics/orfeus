@@ -10,6 +10,7 @@
   :components ((:file "src/package")
                (:file "src/conditions")
                (:file "src/native")
+               (:file "src/metadata")
                (:file "src/project")
                (:file "src/render")
                (:file "src/batch")
