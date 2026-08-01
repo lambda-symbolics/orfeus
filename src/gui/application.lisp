@@ -98,7 +98,8 @@
                      (t (uiop:getcwd)))))
            (lens-cache (make-hash-table :test #'eq))
            window menu toolbar table before-canvas after-canvas before-caption after-caption
-           inspector status progress before-preview-file after-preview-file
+           inspector tabs basic-page optics-page effects-page
+           status progress before-preview-file after-preview-file
            lens-name controls inspector-items lut-name lut-menu wb-choice target-choice
            debounce-id poll-id comparison-p
            (preview-generation 0))
@@ -236,15 +237,19 @@
                    (enqueue-gui-task
                     target-queue role
                     (lambda ()
-                      (when publish-p
-                        (queue-event queue
-                                     (list :status generation
-                                           (format nil "Developing ~A..."
-                                                   (file-namestring input)))))
-                      (render-preview input output settings :if-exists :supersede)
-                      (when publish-p
-                        (queue-event queue
-                                     (list :preview generation index job role output))))))))
+                      (when (or (not publish-p)
+                                (= generation preview-generation))
+                        (when publish-p
+                          (queue-event queue
+                                       (list :status generation
+                                             (format nil "Developing ~A..."
+                                                     (file-namestring input)))))
+                        (render-preview input output settings :if-exists :supersede)
+                        (when (and publish-p
+                                   (= generation preview-generation))
+                          (queue-event queue
+                                       (list :preview generation index job role
+                                             output)))))))))
            (enqueue-background-previews (selected-before-p generation)
              (discard-gui-tasks background-queue)
              (let ((selected (selected-job)))
@@ -282,6 +287,11 @@
              (enqueue-preview t))
            (schedule-edited-preview ()
              (incf preview-generation)
+             (when after-preview-file
+               (forget-preview-file after-preview-file)
+               (setf after-preview-file nil)
+               (cl-fltk:redraw after-canvas))
+             (set-status "Preview update pending...")
              (when debounce-id
                (ignore-errors (cl-fltk:remove-timeout debounce-id)))
              (setf debounce-id
@@ -361,38 +371,40 @@
              (set-status (if comparison-p
                              "Before and After comparison shown"
                              "Before and After comparison hidden")))
-           (register-inspector (widget x y width-mode height)
-             (push (list widget x y width-mode height) inspector-items)
+           (register-inspector (widget x y width-mode height
+                                &optional (basis :root))
+             (push (list widget x y width-mode height basis) inspector-items)
              widget)
-           (register-field (field y)
-             (register-inspector (cl-fltk:field-label field) 12 y 112 26)
-             (register-inspector (cl-fltk:field-control field) 132 y :control 26)
+           (register-field (field y &optional (basis :root))
+             (register-inspector (cl-fltk:field-label field) 8 y 96 26 basis)
+             (register-inspector (cl-fltk:field-control field) 110 y
+                                 :control 26 basis)
              field)
-           (make-number-field (key label minimum maximum step y)
+           (make-number-field (key label minimum maximum step y parent)
              (let* ((label-widget
-                      (cl-fltk:make-label :parent inspector :x 12 :y y
-                                          :width 105 :height 26 :label label))
+                      (cl-fltk:make-label :parent parent :x 8 :y y
+                                          :width 96 :height 26 :label label))
                     (callback (lambda (widget event value)
                                 (declare (ignore event value))
                                 (setting-changed key widget)))
                     (spinner (cl-fltk:make-spinner
-                              :parent inspector :x 270 :y y
+                              :parent parent :x 202 :y y
                               :width 78 :height 26 :callback callback))
                     (slider (unless (member key '(:white-balance-temperature
                                                   :grain-size))
                               (cl-fltk:make-slider
-                               :parent inspector :x 117 :y y
-                               :width 140 :height 26 :callback callback))))
+                               :parent parent :x 110 :y y
+                               :width 84 :height 26 :callback callback))))
                (dolist (widget (remove nil (list slider spinner)))
                  (cl-fltk:set-range widget minimum maximum)
                  (cl-fltk:set-step widget step)
                  (push (list key widget) controls))
-               (register-inspector label-widget 12 y 105 26)
+               (register-inspector label-widget 8 y 96 26 :page)
                (if slider
                    (progn
-                     (register-inspector slider 117 y :slider 26)
-                     (register-inspector spinner 270 y :number 26))
-                   (register-inspector spinner 117 y :control 26))
+                     (register-inspector slider 110 y :slider 26 :page)
+                     (register-inspector spinner 202 y :number 26 :page))
+                   (register-inspector spinner 110 y :control 26 :page))
                spinner))
            (layout-ui (&optional ignored)
              (declare (ignore ignored))
@@ -439,28 +451,43 @@
                                             :width center :height viewer-height)))
                (cl-fltk:resize-widget inspector :x (+ left center) :y top
                                       :width right :height main-height)
+               (cl-fltk:resize-widget tabs :x 4 :y 40
+                                      :width (- right 8)
+                                      :height (- main-height 80))
+               (dolist (page (list basic-page optics-page effects-page))
+                 (cl-fltk:resize-widget page :x 2 :y 24
+                                        :width (- right 12)
+                                        :height (- main-height 108)))
                (cl-fltk:resize-widget progress :x 0 :y (+ top main-height)
                                       :width 180 :height bottom)
                (cl-fltk:resize-widget status :x 180 :y (+ top main-height)
                                       :width (- width 180) :height bottom)
                (dolist (item inspector-items)
-                 (destructuring-bind (widget x y width-mode item-height) item
-                   (let ((item-width
-                           (case width-mode
-                             (:control (max 100 (- right 144)))
-                             (:slider (max 80 (- right 217)))
-                             (:number 78)
-                             (:fill (max 100 (- right 24)))
-                             (:half-left (max 70 (floor (- right 30) 2)))
-                             (:half-right (max 70 (floor (- right 30) 2)))
-                             (otherwise width-mode)))
-                         (item-x
-                           (case width-mode
-                             (:number (- right 90))
-                             (:half-right (+ 18 (floor (- right 30) 2)))
-                             (otherwise x))))
+                 (destructuring-bind
+                     (widget x y width-mode item-height basis) item
+                   (let* ((basis-width (if (eq basis :page)
+                                           (- right 12)
+                                           right))
+                          (item-width
+                            (case width-mode
+                              (:scope-control (max 100 (- right 98)))
+                              (:control (max 100 (- basis-width 118)))
+                              (:slider (max 80 (- basis-width 204)))
+                              (:number 78)
+                              (:fill (max 100 (- basis-width 16)))
+                              (:half-left (max 70 (floor (- right 30) 2)))
+                              (:half-right (max 70 (floor (- right 30) 2)))
+                              (otherwise width-mode)))
+                          (item-x
+                            (case width-mode
+                              (:number (- basis-width 86))
+                              (:half-right (+ 18 (floor (- right 30) 2)))
+                              (otherwise x)))
+                          (item-y (if (eq y :action-row)
+                                      (- main-height 34)
+                                      y)))
                      (cl-fltk:resize-widget
-                      widget :x item-x :y y
+                      widget :x item-x :y item-y
                       :width item-width :height item-height))))
                (cl-fltk:redraw before-canvas)
                (cl-fltk:redraw after-canvas)))
@@ -598,123 +625,133 @@
                 after-canvas (make-preview-canvas :after 603)))
         (setf inspector (cl-fltk:make-panel :parent window :x 960 :y 64
                                             :width 320 :height 708
-                                            :label "Develop"))
-        (flet ((section-label (text y)
-                 (register-inspector
-                  (cl-fltk:make-label :parent inspector :x 12 :y y
-                                      :width 296 :height 22 :label text)
-                  12 y :fill 22)))
-          (section-label "BASIC" 14)
-          (setf target-choice
-                (cl-fltk:field-control
-                 (register-field
-                  (cl-fltk:make-labeled-choice
-                   :parent inspector :x 12 :y 40 :width 296 :height 26
-                   :label "Edit" :label-width 112
-                   :items '("Photo" "Defaults")
-                   :callback (lambda (widget event value)
-                               (declare (ignore event value))
-                               (setf (gui-model-edit-target model)
-                                     (if (string-equal (cl-fltk:value widget)
-                                                       "Defaults")
-                                         :defaults :photo))
-                               (sync-controls)))
-                  40)))
-          (setf wb-choice
-                (cl-fltk:field-control
-                 (register-field
-                  (cl-fltk:make-labeled-choice
-                   :parent inspector :x 12 :y 72 :width 296 :height 26
-                   :label "White balance" :label-width 112
-                   :items '("As shot" "Custom")
-                   :callback (lambda (widget event value)
-                               (declare (ignore event value))
-                               (set-wb-mode widget)))
-                  72)))
-          (make-number-field :white-balance-temperature "Temperature (K)" 2000 15000 50 104)
-          (make-number-field :white-balance-tint "Tint" -5 5 0.05 136)
-          (make-number-field :exposure "Exposure EV" -10 10 0.1 168)
-          (make-number-field :noise-reduction "Noise reduction" 0 1 0.05 200)
-          (section-label "OPTICS" 238)
-          (let ((lens (register-inspector
-                       (cl-fltk:make-check-button
-                        :parent inspector :x 12 :y 264 :width 296 :height 26
-                        :label "Apply lens distortion correction"
-                        :callback (lambda (widget event value)
-                                    (declare (ignore event value))
-                                    (gui-model-set-setting
-                                     model :lens-correction-p
-                                     (string/= "0" (cl-fltk:value widget)))
-                                    (schedule-edited-preview)))
-                       12 264 :fill 26)))
-            (push (list :lens-correction-p lens) controls))
-          (let ((tca (register-inspector
-                      (cl-fltk:make-check-button
-                       :parent inspector :x 12 :y 294 :width 296 :height 26
-                       :label "Remove chromatic aberration"
-                       :callback (lambda (widget event value)
-                                   (declare (ignore event value))
-                                   (gui-model-set-setting
-                                    model :chromatic-aberration-correction-p
-                                    (string/= "0" (cl-fltk:value widget)))
-                                   (schedule-edited-preview)))
-                      12 294 :fill 26)))
-            (push (list :chromatic-aberration-correction-p tca) controls))
-          (section-label "CREATIVE" 332)
-          (register-inspector
-           (cl-fltk:make-label :parent inspector :x 12 :y 358
-                               :width 112 :height 26 :label "3D LUT")
-           12 358 112 26)
-          (setf lut-name
-                (register-inspector
-                 (cl-fltk:make-output :parent inspector :x 132 :y 358
-                                      :width 176 :height 26
-                                      :value "No LUT selected")
-                 132 358 :control 26))
-          (setf lut-menu
-                (register-inspector
-                 (cl-fltk:make-menu-button :parent inspector :x 12 :y 390
-                                            :width 296 :height 26
-                                            :label "Select LUT")
-                 12 390 :fill 26))
-          (dolist (path (gui-bundled-lut-paths))
-            (let ((selected-path (namestring path))
-                  (label (substitute #\Space #\_ (pathname-name path))))
-              (cl-fltk:add-menu-item
-               lut-menu (format nil "Bundled/~:(~A~)" label)
-               (lambda (&rest ignored)
-                 (declare (ignore ignored))
-                 (gui-model-set-setting model :lut-path selected-path)
-                 (sync-controls)
-                 (schedule-edited-preview)))))
-          (cl-fltk:add-menu-item lut-menu "Browse..."
-                                 (lambda (&rest ignored)
-                                   (declare (ignore ignored))
-                                   (choose-lut)))
-          (cl-fltk:add-menu-item lut-menu "None"
-                                 (lambda (&rest ignored)
-                                   (declare (ignore ignored))
-                                   (clear-lut)))
-          (make-number-field :lut-strength "LUT strength" 0 1 0.05 422)
-          (make-number-field :grain-amount "Grain amount" 0 1 0.05 454)
-          (make-number-field :grain-size "Grain size" 0.25 16 0.25 486)
-          (register-inspector
-           (cl-fltk:make-button :parent inspector :x 12 :y 530
-                                :width 140 :height 28 :label "Reset photo"
-                                :callback (lambda (&rest ignored)
-                                            (declare (ignore ignored))
-                                            (gui-model-reset-selected model)
-                                            (sync-controls)
-                                            (update-table)
-                                            (schedule-edited-preview)))
-           12 530 :half-left 28)
-          (register-inspector
-           (cl-fltk:make-button :parent inspector :x 166 :y 530
-                                :width 142 :height 28 :label "Export selected"
-                                :callback (lambda (&rest ignored)
-                                            (declare (ignore ignored))
-                                            (render-selected)))
-           166 530 :half-right 28))
+                                            :label ""))
+        (cl-fltk:set-box inspector cl-fltk:+box-no-box+)
+        (let ((scope-field
+                (cl-fltk:make-labeled-choice
+                 :parent inspector :x 8 :y 8 :width 300 :height 26
+                 :label "Apply to" :label-width 96
+                 :items '("Photo" "Defaults")
+                 :callback (lambda (widget event value)
+                             (declare (ignore event value))
+                             (setf (gui-model-edit-target model)
+                                   (if (string-equal (cl-fltk:value widget)
+                                                     "Defaults")
+                                       :defaults :photo))
+                             (sync-controls)))))
+          (register-field scope-field 8)
+          (setf target-choice (cl-fltk:field-control scope-field)))
+        (setf tabs (cl-fltk:make-tabs :parent inspector :x 4 :y 40
+                                      :width 312 :height 628)
+              basic-page (cl-fltk:make-tab-page :parent tabs :x 2 :y 24
+                                                :width 308 :height 600
+                                                :label "Basic")
+              optics-page (cl-fltk:make-tab-page :parent tabs :x 2 :y 24
+                                                 :width 308 :height 600
+                                                 :label "Optics")
+              effects-page (cl-fltk:make-tab-page :parent tabs :x 2 :y 24
+                                                  :width 308 :height 600
+                                                  :label "Effects"))
+        (setf wb-choice
+              (cl-fltk:field-control
+               (register-field
+                (cl-fltk:make-labeled-choice
+                 :parent basic-page :x 8 :y 12 :width 292 :height 26
+                 :label "White balance" :label-width 96
+                 :items '("As shot" "Custom")
+                 :callback (lambda (widget event value)
+                             (declare (ignore event value))
+                             (set-wb-mode widget)))
+                12 :page)))
+        (make-number-field :white-balance-temperature "Temperature (K)"
+                           2000 15000 50 44 basic-page)
+        (make-number-field :white-balance-tint "Tint" -20 20 0.1 76 basic-page)
+        (make-number-field :exposure "Exposure EV" -10 10 0.1 108 basic-page)
+        (make-number-field :noise-reduction "Noise reduction" 0 1 0.05 140
+                           basic-page)
+        (let ((lens (register-inspector
+                     (cl-fltk:make-check-button
+                      :parent optics-page :x 8 :y 12 :width 292 :height 26
+                      :label "Apply lens distortion correction"
+                      :callback (lambda (widget event value)
+                                  (declare (ignore event value))
+                                  (gui-model-set-setting
+                                   model :lens-correction-p
+                                   (string/= "0" (cl-fltk:value widget)))
+                                  (schedule-edited-preview)))
+                     8 12 :fill 26 :page)))
+          (push (list :lens-correction-p lens) controls))
+        (make-number-field :lens-correction-strength "Lens strength"
+                           0 2 0.05 44 optics-page)
+        (let ((tca (register-inspector
+                    (cl-fltk:make-check-button
+                     :parent optics-page :x 8 :y 76 :width 292 :height 26
+                     :label "Remove chromatic aberration"
+                     :callback (lambda (widget event value)
+                                 (declare (ignore event value))
+                                 (gui-model-set-setting
+                                  model :chromatic-aberration-correction-p
+                                  (string/= "0" (cl-fltk:value widget)))
+                                 (schedule-edited-preview)))
+                    8 76 :fill 26 :page)))
+          (push (list :chromatic-aberration-correction-p tca) controls))
+        (register-inspector
+         (cl-fltk:make-label :parent effects-page :x 8 :y 12
+                             :width 96 :height 26 :label "3D LUT")
+         8 12 96 26 :page)
+        (setf lut-name
+              (register-inspector
+               (cl-fltk:make-output :parent effects-page :x 110 :y 12
+                                    :width 190 :height 26
+                                    :value "No LUT selected")
+               110 12 :control 26 :page))
+        (setf lut-menu
+              (register-inspector
+               (cl-fltk:make-menu-button :parent effects-page :x 8 :y 44
+                                          :width 292 :height 26
+                                          :label "Select LUT")
+               8 44 :fill 26 :page))
+        (dolist (path (gui-bundled-lut-paths))
+          (let ((selected-path (namestring path))
+                (label (substitute #\Space #\_ (pathname-name path))))
+            (cl-fltk:add-menu-item
+             lut-menu (format nil "Bundled/~:(~A~)" label)
+             (lambda (&rest ignored)
+               (declare (ignore ignored))
+               (gui-model-set-setting model :lut-path selected-path)
+               (sync-controls)
+               (schedule-edited-preview)))))
+        (cl-fltk:add-menu-item lut-menu "Browse..."
+                               (lambda (&rest ignored)
+                                 (declare (ignore ignored))
+                                 (choose-lut)))
+        (cl-fltk:add-menu-item lut-menu "None"
+                               (lambda (&rest ignored)
+                                 (declare (ignore ignored))
+                                 (clear-lut)))
+        (make-number-field :lut-strength "LUT strength" 0 1 0.05 76
+                           effects-page)
+        (make-number-field :grain-amount "Grain amount" 0 1 0.05 108
+                           effects-page)
+        (make-number-field :grain-size "Grain size" 0.25 16 0.25 140
+                           effects-page)
+        (register-inspector
+         (cl-fltk:make-button :parent inspector :x 12 :y 674
+                              :width 140 :height 26 :label "Reset photo"
+                              :callback (lambda (&rest ignored)
+                                          (declare (ignore ignored))
+                                          (gui-model-reset-selected model)
+                                          (sync-controls)
+                                          (update-table)
+                                          (schedule-edited-preview)))
+         12 :action-row :half-left 26)
+        (register-inspector
+         (cl-fltk:make-button :parent inspector :x 166 :y 674
+                              :width 142 :height 26 :label "Export selected"
+                              :callback (lambda (&rest ignored)
+                                          (declare (ignore ignored))
+                                          (render-selected)))
+         166 :action-row :half-right 26)
         (setf progress (cl-fltk:make-progress :parent window :x 0 :y 772
                                               :width 180 :height 28 :value "0")
               status (cl-fltk:make-status-bar :parent window :x 180 :y 772

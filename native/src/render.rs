@@ -47,7 +47,11 @@ pub struct RenderSettingsV1 {
     pub max_width: u32,
     pub max_height: u32,
     pub jpeg_quality: u32,
+    pub lens_correction_strength: f32,
+    pub focal_reducer: f32,
+    pub lens_crop_factor: f32,
     pub lut_path: *const c_char,
+    pub lens_profile_model: *const c_char,
 }
 
 impl Default for RenderSettingsV1 {
@@ -69,7 +73,11 @@ impl Default for RenderSettingsV1 {
             max_width: 0,
             max_height: 0,
             jpeg_quality: 92,
+            lens_correction_strength: 1.0,
+            focal_reducer: 1.0,
+            lens_crop_factor: 0.0,
             lut_path: std::ptr::null(),
+            lens_profile_model: std::ptr::null(),
         }
     }
 }
@@ -103,6 +111,9 @@ impl RenderSettingsV1 {
             (self.lut_strength, "LUT strength"),
             (self.grain_amount, "grain amount"),
             (self.grain_size, "grain size"),
+            (self.lens_correction_strength, "lens correction strength"),
+            (self.focal_reducer, "focal reducer"),
+            (self.lens_crop_factor, "lens crop factor"),
         ] {
             if !value.is_finite() {
                 return Err(Error::InvalidArgument(match name {
@@ -113,20 +124,27 @@ impl RenderSettingsV1 {
                     "luma noise reduction" => "luma noise reduction must be finite",
                     "LUT strength" => "LUT strength must be finite",
                     "grain amount" => "grain amount must be finite",
-                    _ => "grain size must be finite",
+                    "grain size" => "grain size must be finite",
+                    "lens correction strength" => "lens correction strength must be finite",
+                    "focal reducer" => "focal reducer must be finite",
+                    _ => "lens crop factor must be finite",
                 }));
             }
         }
         if self.kelvin != 0.0 && !(2000.0..=50_000.0).contains(&self.kelvin) {
             return Err(Error::InvalidArgument("Kelvin must be zero or 2000..50000"));
         }
-        if !(-5.0..=5.0).contains(&self.tint)
+        if !(-20.0..=20.0).contains(&self.tint)
             || !(-10.0..=10.0).contains(&self.exposure_ev)
             || !(0.0..=1.0).contains(&self.chroma_noise_reduction)
             || !(0.0..=1.0).contains(&self.luma_noise_reduction)
             || !(0.0..=1.0).contains(&self.lut_strength)
             || !(0.0..=1.0).contains(&self.grain_amount)
             || !(0.25..=16.0).contains(&self.grain_size)
+            || !(0.0..=2.0).contains(&self.lens_correction_strength)
+            || !(0.1..=2.0).contains(&self.focal_reducer)
+            || self.lens_crop_factor < 0.0
+            || self.lens_crop_factor > 10.0
         {
             return Err(Error::InvalidArgument(
                 "render setting outside supported range",
@@ -410,33 +428,52 @@ fn apply_noise_reduction(image: &mut RgbImage, luma: f32, chroma: f32) {
         return;
     }
     let source = image.data.clone();
-    for y in 1..image.height - 1 {
-        for x in 1..image.width - 1 {
-            let center = (y * image.width + x) * 3;
-            let center_y =
-                0.2126 * source[center] + 0.7152 * source[center + 1] + 0.0722 * source[center + 2];
-            let (mut sy, mut scb, mut scr, mut sw) = (0.0, 0.0, 0.0, 0.0);
-            for oy in y - 1..=y + 1 {
-                for ox in x - 1..=x + 1 {
-                    let offset = (oy * image.width + ox) * 3;
-                    let (r, g, b) = (source[offset], source[offset + 1], source[offset + 2]);
-                    let yy = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-                    let weight = 1.0 / (1.0 + (yy - center_y).abs() * 40.0);
-                    sy += yy * weight;
-                    scb += (b - yy) * weight;
-                    scr += (r - yy) * weight;
-                    sw += weight;
+    let pixel_count = image.width * image.height;
+    let mut ycbcr = vec![[0.0_f32; 3]; pixel_count];
+    for (index, pixel) in source.as_chunks::<3>().0.iter().enumerate() {
+        let yy = 0.2126 * pixel[0] + 0.7152 * pixel[1] + 0.0722 * pixel[2];
+        ycbcr[index] = [yy, pixel[2] - yy, pixel[0] - yy];
+    }
+    let kernel = [1.0_f32, 4.0, 6.0, 4.0, 1.0];
+    for y in 0..image.height {
+        for x in 0..image.width {
+            let center_index = y * image.width + x;
+            let center = ycbcr[center_index];
+            let left = ycbcr[y * image.width + x.saturating_sub(1)][0];
+            let right = ycbcr[y * image.width + (x + 1).min(image.width - 1)][0];
+            let above = ycbcr[y.saturating_sub(1) * image.width + x][0];
+            let below = ycbcr[(y + 1).min(image.height - 1) * image.width + x][0];
+            let gradient = (right - left).abs() + (below - above).abs();
+            let edge_protection = 1.0 / (1.0 + gradient * 48.0);
+            let shadow_boost = 1.0 + (1.0 - center[0].clamp(0.0, 1.0)) * 1.25;
+            let luma_mix = (luma * 0.6 * shadow_boost * edge_protection).min(1.0);
+            let chroma_mix = (chroma * shadow_boost * edge_protection).min(1.0);
+            let mut filtered = [0.0_f32; 3];
+            let mut weight_sum = 0.0;
+            for (ky, dy) in (-2_isize..=2).enumerate() {
+                let sample_y = (y as isize + dy).clamp(0, image.height as isize - 1) as usize;
+                for (kx, dx) in (-2_isize..=2).enumerate() {
+                    let sample_x = (x as isize + dx).clamp(0, image.width as isize - 1) as usize;
+                    let weight = kernel[kx] * kernel[ky];
+                    let sample = ycbcr[sample_y * image.width + sample_x];
+                    for channel in 0..3 {
+                        filtered[channel] += sample[channel] * weight;
+                    }
+                    weight_sum += weight;
                 }
             }
-            let yy = center_y + (sy / sw - center_y) * luma;
-            let cb = (source[center + 2] - center_y)
-                + (scb / sw - (source[center + 2] - center_y)) * chroma;
-            let cr =
-                (source[center] - center_y) + (scr / sw - (source[center] - center_y)) * chroma;
-            image.data[center] = yy + cr;
-            image.data[center + 2] = yy + cb;
-            image.data[center + 1] =
-                (yy - 0.2126 * image.data[center] - 0.0722 * image.data[center + 2]) / 0.7152;
+            for value in &mut filtered {
+                *value /= weight_sum;
+            }
+            let yy = center[0] + (filtered[0] - center[0]) * luma_mix;
+            let cb = center[1] + (filtered[1] - center[1]) * chroma_mix;
+            let cr = center[2] + (filtered[2] - center[2]) * chroma_mix;
+            image.data[center_index * 3] = yy + cr;
+            image.data[center_index * 3 + 2] = yy + cb;
+            image.data[center_index * 3 + 1] = (yy
+                - 0.2126 * image.data[center_index * 3]
+                - 0.0722 * image.data[center_index * 3 + 2])
+                / 0.7152;
         }
     }
 }
@@ -524,6 +561,31 @@ fn lens_name_matches(lens: &Lens, requested: &str) -> bool {
     )
 }
 
+fn find_explicit_lens_profile<'a>(db: &'a Database, model: &str, focal: f32) -> Option<&'a Lens> {
+    db.lenses
+        .iter()
+        .filter(|lens| {
+            (lens.focal_min <= 0.0 || focal >= lens.focal_min - 0.1)
+                && (lens.focal_max <= 0.0 || focal <= lens.focal_max + 0.1)
+        })
+        .filter(|lens| {
+            let requested = normalized_name(model);
+            std::iter::once(lens.model.as_str())
+                .chain(lens.model_localized.values().map(String::as_str))
+                .any(|candidate| normalized_name(candidate) == requested)
+        })
+        .max_by_key(|lens| {
+            std::iter::once(&lens.model)
+                .chain(lens.model_localized.values())
+                .map(|name| normalized_name(name))
+                .map(|candidate| {
+                    usize::from(candidate == normalized_name(model)) * 2 + candidate.len()
+                })
+                .max()
+                .unwrap_or_default()
+        })
+}
+
 fn find_lens_profile<'a>(
     db: &'a Database,
     camera: &Camera,
@@ -548,6 +610,10 @@ fn find_lens_profile<'a>(
                 .max()
                 .unwrap_or_default()
         })
+}
+
+fn blend_lens_coordinate(identity: f32, corrected: f32, strength: f32) -> f32 {
+    identity + (corrected - identity) * strength
 }
 
 fn lens_auto_crop_scale(valid: &[bool], width: usize, height: usize) -> f32 {
@@ -597,35 +663,70 @@ fn zoom_center(image: &mut RgbImage, scale: f32) {
     }
 }
 
-fn apply_lens(
-    image: &mut RgbImage,
-    make: &str,
-    model: &str,
-    lens_name: &str,
+struct LensCorrectionOptions<'a> {
+    make: &'a str,
+    model: &'a str,
+    lens_name: &'a str,
     focal: f32,
     flags: u32,
-) -> Result<(), Error> {
-    if flags & KNOWN_FLAGS == 0 {
+    strength: f32,
+    explicit_profile: Option<&'a str>,
+    focal_reducer: f32,
+    crop_factor: f32,
+}
+
+fn apply_lens(image: &mut RgbImage, options: &LensCorrectionOptions<'_>) -> Result<(), Error> {
+    let make = options.make;
+    let model = options.model;
+    let lens_name = options.lens_name;
+    let focal = options.focal;
+    let flags = options.flags;
+    let correction_strength = options.strength;
+    let explicit_profile = options.explicit_profile;
+    let focal_reducer = options.focal_reducer;
+    let crop_factor = options.crop_factor;
+    if flags & KNOWN_FLAGS == 0 || (flags & FLAG_LENS_TCA == 0 && correction_strength == 0.0) {
         return Ok(());
     }
-    if lens_name.is_empty() || focal <= 0.0 {
+    if (explicit_profile.is_none() && lens_name.is_empty()) || focal <= 0.0 {
         return Err(Error::LensProfileUnavailable(
             "RAW metadata does not identify a usable lens/focal length".into(),
         ));
     }
     let db = lens_database()?;
-    let camera = find_camera_profile(db, make, model).ok_or_else(|| {
-        Error::LensProfileUnavailable(format!(
-            "no exact lensfun camera profile for {make} {model}"
-        ))
-    })?;
-    let lens = find_lens_profile(db, camera, lens_name, focal).ok_or_else(|| {
-        Error::LensProfileUnavailable(format!("no conservative lensfun match for {lens_name}"))
-    })?;
+    let profile_focal = focal / focal_reducer;
+    let camera = find_camera_profile(db, make, model);
+    let (lens, base_crop_factor, display_name) = if let Some(profile) = explicit_profile {
+        let lens = find_explicit_lens_profile(db, profile, profile_focal).ok_or_else(|| {
+            Error::LensProfileUnavailable(format!(
+                "no exact lensfun profile for adapted-lens mapping {profile}"
+            ))
+        })?;
+        let base_crop = if crop_factor > 0.0 {
+            crop_factor
+        } else {
+            camera.map(|matched| matched.crop_factor).ok_or_else(|| {
+                Error::LensProfileUnavailable(format!(
+                    "adapted-lens mapping for {profile} requires a crop factor"
+                ))
+            })?
+        };
+        (lens, base_crop, profile)
+    } else {
+        let camera = camera.ok_or_else(|| {
+            Error::LensProfileUnavailable(format!(
+                "no exact lensfun camera profile for {make} {model}"
+            ))
+        })?;
+        let lens = find_lens_profile(db, camera, lens_name, focal).ok_or_else(|| {
+            Error::LensProfileUnavailable(format!("no conservative lensfun match for {lens_name}"))
+        })?;
+        (lens, camera.crop_factor, lens_name)
+    };
     let mut modifier = Modifier::new(
         lens,
-        focal,
-        camera.crop_factor,
+        profile_focal,
+        base_crop_factor * focal_reducer,
         image.width as u32,
         image.height as u32,
         // Lensfun's coordinate API maps corrected output pixels back into the
@@ -633,12 +734,13 @@ fn apply_lens(
         // lens distortion and visibly overcorrects real RAW photographs.
         false,
     );
-    let distortion =
-        flags & FLAG_LENS_DISTORTION != 0 && modifier.enable_distortion_correction(lens);
+    let distortion = flags & FLAG_LENS_DISTORTION != 0
+        && correction_strength > 0.0
+        && modifier.enable_distortion_correction(lens);
     let tca = flags & FLAG_LENS_TCA != 0 && modifier.enable_tca_correction(lens);
     if !distortion && !tca {
         return Err(Error::LensProfileUnavailable(format!(
-            "lensfun profile for {lens_name} lacks requested calibration"
+            "lensfun profile for {display_name} lacks requested calibration"
         )));
     }
     let source = image.clone();
@@ -654,7 +756,12 @@ fn apply_lens(
         }
         for x in 0..image.width {
             let (gx, gy) = if distortion {
-                (geometry[x * 2], geometry[x * 2 + 1])
+                let identity_x = x as f32;
+                let identity_y = y as f32;
+                (
+                    blend_lens_coordinate(identity_x, geometry[x * 2], correction_strength),
+                    blend_lens_coordinate(identity_y, geometry[x * 2 + 1], correction_strength),
+                )
             } else {
                 (x as f32, y as f32)
             };
@@ -997,13 +1104,28 @@ pub fn render(input: &Path, output: &Path, settings: &RenderSettingsV1) -> Resul
         .focal_length
         .as_ref()
         .map_or(0.0, |value| value.as_f32());
+    let explicit_profile = if settings.lens_profile_model.is_null() {
+        None
+    } else {
+        Some(
+            unsafe { CStr::from_ptr(settings.lens_profile_model) }
+                .to_str()
+                .map_err(|_| Error::InvalidArgument("lens profile model is not UTF-8"))?,
+        )
+    };
     apply_lens(
         &mut image,
-        &metadata.make,
-        &metadata.model,
-        lens_name,
-        focal,
-        settings.flags,
+        &LensCorrectionOptions {
+            make: &metadata.make,
+            model: &metadata.model,
+            lens_name,
+            focal,
+            flags: settings.flags,
+            strength: settings.lens_correction_strength,
+            explicit_profile,
+            focal_reducer: settings.focal_reducer,
+            crop_factor: settings.lens_crop_factor,
+        },
     )?;
     image = orient(image, orientation);
     apply_noise_reduction(
@@ -1075,6 +1197,55 @@ mod tests {
     }
 
     #[test]
+    fn tint_extremes_move_neutral_pixels_in_opposite_directions() {
+        let mut magenta = RgbImage {
+            width: 1,
+            height: 1,
+            data: vec![0.5, 0.5, 0.5],
+        };
+        let mut green = magenta.clone();
+        apply_white_adaptation(&mut magenta, 0.0, 20.0);
+        apply_white_adaptation(&mut green, 0.0, -20.0);
+        assert!(magenta.data[0] + magenta.data[2] > magenta.data[1] * 2.0);
+        assert!(green.data[1] * 2.0 > green.data[0] + green.data[2]);
+        assert!((magenta.data[1] - green.data[1]).abs() > 0.1);
+    }
+
+    #[test]
+    fn edge_aware_noise_reduction_suppresses_chroma_without_crossing_edges() {
+        let mut image = RgbImage {
+            width: 7,
+            height: 5,
+            data: Vec::new(),
+        };
+        for y in 0..image.height {
+            for x in 0..image.width {
+                let base = if x < 3 { 0.1 } else { 0.8 };
+                let noise = if (x + y) % 2 == 0 { 0.08 } else { -0.08 };
+                image
+                    .data
+                    .extend_from_slice(&[base + noise, base, base - noise]);
+            }
+        }
+        let before = image.clone();
+        apply_noise_reduction(&mut image, 0.5, 1.0);
+        let dark_edge = image.data[(2 * image.width + 2) * 3];
+        let bright_edge = image.data[(2 * image.width + 3) * 3];
+        assert!(bright_edge - dark_edge > 0.5, "edge was smeared");
+        let noisy = (before.data[0] - before.data[2]).abs();
+        let reduced = (image.data[0] - image.data[2]).abs();
+        assert!(reduced < noisy * 0.8, "chroma noise was not reduced");
+    }
+
+    #[test]
+    fn correction_strength_blends_identity_and_lensfun_coordinates() {
+        assert_eq!(10.0, blend_lens_coordinate(10.0, 14.0, 0.0));
+        assert_eq!(12.0, blend_lens_coordinate(10.0, 14.0, 0.5));
+        assert_eq!(14.0, blend_lens_coordinate(10.0, 14.0, 1.0));
+        assert_eq!(18.0, blend_lens_coordinate(10.0, 14.0, 2.0));
+    }
+
+    #[test]
     fn lens_auto_crop_removes_invalid_borders() {
         let mut valid = vec![true; 100 * 80];
         for y in 0..80 {
@@ -1120,6 +1291,18 @@ mod tests {
         }
         let camera = find_camera_profile(&db, "OLYMPUS CORPORATION", "PEN-F").unwrap();
         assert!(find_lens_profile(&db, camera, "Ultron 0.7x", 28.4).is_none());
+        let ultron = find_explicit_lens_profile(
+            &db,
+            "Voigtlander Ultron 40mm f/2 SLII Aspherical",
+            28.4 / 0.71,
+        )
+        .expect("explicit adapted-lens profile missing");
+        assert!(ultron.mounts.iter().any(|mount| mount.contains("Nikon F")));
+        assert!(
+            find_explicit_lens_profile(&db, "Carl Zeiss Makro-Planar T* 2/50 ZF.2", 50.0,)
+                .is_none(),
+            "an absent Makro-Planar 50/2 must not fall through to another Planar"
+        );
     }
 
     #[test]

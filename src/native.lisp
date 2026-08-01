@@ -35,7 +35,11 @@
   (max-width :uint32)
   (max-height :uint32)
   (jpeg-quality :uint32)
-  (lut-path :pointer))
+  (lens-correction-strength :float)
+  (focal-reducer :float)
+  (lens-crop-factor :float)
+  (lut-path :pointer)
+  (lens-profile-model :pointer))
 
 (defcfun ("orfeus_raw_render_capabilities_v1"
           %raw-render-capabilities-v1) :uint32)
@@ -95,7 +99,7 @@
 (defun native-error-message (buffer)
   (foreign-string-to-lisp buffer :encoding :utf-8))
 
-(defparameter *required-render-capabilities* #b111
+(defparameter *required-render-capabilities* #b10111
   "Render features required by the Common Lisp core.")
 
 (defun native-render-require-compatible ()
@@ -116,14 +120,15 @@
 
 (defun native-raw-render (input-pathname output-pathname
                           &key exposure kelvin tint noise-reduction
-                            lens-correction-p
+                            lens-correction-p lens-correction-strength
                             chromatic-aberration-correction-p
+                            lens-profile-model focal-reducer lens-crop-factor
                             lut-path lut-strength grain-amount grain-size
                             (grain-seed 0) (max-width 0) (max-height 0)
                             (jpeg-quality 92) output-format)
   (native-library-load)
   (native-render-require-compatible)
-  (labels ((invoke (lut-pointer)
+  (labels ((invoke (lut-pointer lens-pointer)
              (with-foreign-object (settings '(:struct render-settings-v1))
                (flet ((setting (name value)
                         (setf (foreign-slot-value
@@ -153,7 +158,13 @@
                  (setting 'max-width max-width)
                  (setting 'max-height max-height)
                  (setting 'jpeg-quality jpeg-quality)
-                 (setting 'lut-path lut-pointer))
+                 (setting 'lens-correction-strength
+                          (float lens-correction-strength 0.0))
+                 (setting 'focal-reducer (float (or focal-reducer 1.0) 0.0))
+                 (setting 'lens-crop-factor
+                          (float (or lens-crop-factor 0.0) 0.0))
+                 (setting 'lut-path lut-pointer)
+                 (setting 'lens-profile-model lens-pointer))
                (with-foreign-pointer (error-buffer *native-error-buffer-size*)
                  (let ((status
                          #+sbcl
@@ -176,12 +187,18 @@
                             :input-pathname input-pathname
                             :output-pathname output-pathname
                             :status status
-                            :message (native-error-message error-buffer))))))))
+                            :message (native-error-message error-buffer)))))))
+           (call-with-lens-pointer (lut-pointer)
+             (if lens-profile-model
+                 (with-foreign-string (lens-pointer lens-profile-model
+                                                    :encoding :utf-8)
+                   (invoke lut-pointer lens-pointer))
+                 (invoke lut-pointer (null-pointer)))))
     (if lut-path
         (with-foreign-string (lut-pointer (namestring lut-path)
                                           :encoding :utf-8)
-          (invoke lut-pointer))
-        (invoke (null-pointer))))
+          (call-with-lens-pointer lut-pointer))
+        (call-with-lens-pointer (null-pointer))))
   output-pathname)
 
 (defun dng-original-filename (pathname)

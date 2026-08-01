@@ -9,7 +9,8 @@
 (defun project-test-value ()
   (make-project
    :output-directory #P"exports/"
-   :defaults (make-processing-settings :exposure 0.75 :grain-amount 0.12)
+   :defaults (make-processing-settings :exposure 0.75 :grain-amount 0.12
+                                       :lens-correction-strength 0.65)
    :photos (list (make-photo-job
                   :input-path #P"input/example.orf"
                   :overrides '(:exposure -0.25 :lut-strength 0.8)))))
@@ -18,6 +19,8 @@
   (let* ((original (project-test-value))
          (decoded (sexp->project (project->sexp original))))
     (and (= 0.75 (processing-settings-exposure
+                  (project-defaults decoded)))
+         (= 0.65 (processing-settings-lens-correction-strength
                   (project-defaults decoded)))
          (= 1 (length (project-photos decoded)))
          (equal '(:exposure -0.25 :lut-strength 0.8)
@@ -66,6 +69,26 @@
        (string= "Ultron 0.7x"
                 (uiop:symbol-call '#:orfeus '#:preferred-lens-description
                                   (format nil "None~%Ultron 0.7x~%")))))
+
+(defun adapted-lens-aliases-p ()
+  (multiple-value-bind (model reducer crop-factor)
+      (resolve-lens-profile-alias "Ultron 0.7x")
+    (and (string= model "Voigtlander Ultron 40mm f/2 SLII Aspherical")
+         (= reducer 0.71)
+         (= crop-factor 2.0))))
+
+(defun lens-alias-reader-evaluation-disabled-p ()
+  (let ((pathname (test-temporary-pathname "sexp")))
+    (unwind-protect
+         (progn
+           (with-open-file (stream pathname :direction :output
+                                           :if-exists :supersede)
+             (write-string "#.(error \"reader evaluation escaped\")" stream))
+           (handler-case
+               (progn (lens-profile-aliases-read pathname) nil)
+             (reader-error () t)))
+      (when (probe-file pathname)
+        (delete-file pathname)))))
 
 (defun processing-overrides-p ()
   (let ((settings
@@ -237,6 +260,10 @@
              (invalid-project-rejected-p))
       (check "lens metadata skips unidentified values"
              (lens-description-selection-p))
+      (check "adapted lens nicknames resolve portable Lensfun mappings"
+             (adapted-lens-aliases-p))
+      (check "lens alias reads disable reader evaluation"
+             (lens-alias-reader-evaluation-disabled-p))
       (check "per-photo overrides produce effective settings"
              (processing-overrides-p))
       (check "photo outputs follow project path semantics"

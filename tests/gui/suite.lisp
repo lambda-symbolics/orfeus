@@ -17,6 +17,10 @@
     (setf (orfeus/gui:gui-model-edit-target model) :defaults)
     (orfeus/gui:gui-model-set-setting model :noise-reduction 0.7)
     (check (= 0.7 (orfeus:processing-settings-noise-reduction (orfeus:project-defaults project))) "Default edit missing")
+    (orfeus/gui:gui-model-set-setting model :lens-correction-strength 0.6)
+    (check (= 0.6 (orfeus:processing-settings-lens-correction-strength
+                   (orfeus:project-defaults project)))
+           "Lens correction strength edit missing")
     (orfeus/gui:gui-model-reset-selected model)
     (check (null (orfeus:photo-job-overrides job)) "Reset did not clear overrides")))
 

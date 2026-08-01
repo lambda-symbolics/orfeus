@@ -3,6 +3,8 @@
   (:import-from #:orfeus
                 #:cli-run
                 #:invalid-project-data
+                #:lens-profile-aliases-read
+                #:resolve-lens-profile-alias
                 #:make-photo-job
                 #:make-processing-settings
                 #:make-project
@@ -14,6 +16,7 @@
                 #:photo-job-render-output
                 #:processing-settings-exposure
                 #:processing-settings-grain-amount
+                #:processing-settings-lens-correction-strength
                 #:processing-settings-with-overrides
                 #:project->sexp
                 #:project-defaults

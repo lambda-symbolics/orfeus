@@ -49,8 +49,24 @@ $EDITOR project.sexp
 #+end_src
 
 Projects contain shared defaults and per-photo overrides for exposure, white
-balance, noise reduction, lens/TCA correction, CUBE LUTs, and film grain. They
-are read with =*read-eval*= disabled.
+balance, edge-aware noise reduction, lens/TCA correction and correction
+strength, CUBE LUTs, and film grain. They are read with =*read-eval*= disabled.
+
+Adapted manual lenses can be associated with exact Lensfun profiles in
+=$XDG_CONFIG_HOME/orfeus/lenses.sexp= (or the path in
+=ORFEUS_LENS_ALIASES=). The file is a safely read association list; user entries
+override built-ins:
+
+#+begin_src lisp
+(("Ultron 0.7x"
+  :lensfun-model "Voigtlander Ultron 40mm f/2 SLII Aspherical"
+  :focal-reducer 0.71
+  :crop-factor 2.0))
+#+end_src
+
+The focal-reducer ratio converts Olympus' effective EXIF focal length back to
+the Lensfun profile focal length. Crop factor describes the unreduced camera
+sensor crop. Explicit mappings bypass normal electronic mount matching.
 
 Launch the FLTK frontend directly with an optional photograph or project:
 
@@ -62,9 +78,11 @@ Launch the FLTK frontend directly with an optional photograph or project:
 
 The launcher enters the Nix development environment and builds missing native
 bridges when necessary. The GUI can also open photographs and projects from its
-File menu. It shows the embedded camera JPEG first, develops the RAW preview in
-the background, and coalesces superseded edits. White-balance mode, LUT state,
-and preview source remain visible in the status bar.
+File menu. It develops settings-keyed RAW previews, pre-renders neighboring
+photographs in the background, and rejects superseded generations. The inspector
+uses native FLTK tabs for Basic, Optics, and Effects settings, with scope and
+actions kept visible. White-balance mode, LUT state, and preview source remain
+visible in the status bar.
 
 The included test LUT is =data/luts/agfa_precisa_100.cube=. Its provenance and
 license notice are recorded in =THIRD-PARTY.md=.

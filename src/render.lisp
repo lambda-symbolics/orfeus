@@ -192,9 +192,12 @@ The output is published atomically and INPUT-PATHNAME is never modified."
 (defun render-native-photo (input-pathname output-pathname settings
                             &key max-width max-height jpeg-quality grain-seed
                               (report-input-pathname input-pathname))
-  (labels ((invoke (effective-settings)
-             (native-raw-render
-              input-pathname output-pathname
+  (multiple-value-bind (lens-profile focal-reducer lens-crop-factor)
+      (resolve-lens-profile-alias
+       (photo-lens-description report-input-pathname))
+    (labels ((invoke (effective-settings)
+               (native-raw-render
+                input-pathname output-pathname
               :output-format (render-output-format output-pathname)
               :exposure (processing-settings-exposure effective-settings)
               :kelvin
@@ -202,9 +205,14 @@ The output is published atomically and INPUT-PATHNAME is never modified."
               :tint (processing-settings-white-balance-tint effective-settings)
               :noise-reduction
               (processing-settings-noise-reduction effective-settings)
-              :lens-correction-p
-              (processing-settings-lens-correction-p effective-settings)
-              :chromatic-aberration-correction-p
+                :lens-correction-p
+                (processing-settings-lens-correction-p effective-settings)
+                :lens-correction-strength
+                (processing-settings-lens-correction-strength effective-settings)
+                :lens-profile-model lens-profile
+                :focal-reducer focal-reducer
+                :lens-crop-factor lens-crop-factor
+                :chromatic-aberration-correction-p
               (processing-settings-chromatic-aberration-correction-p
                effective-settings)
               :lut-path (processing-settings-lut-path effective-settings)
@@ -232,7 +240,7 @@ The output is published atomically and INPUT-PATHNAME is never modified."
                        fallback)
                       nil)
                 (invoke fallback)))
-            (error condition))))))
+            (error condition)))))))
 
 (defun render-photo (input-pathname output-pathname settings
                      &key (if-exists :error)

@@ -82,6 +82,8 @@
     (:white-balance-tint #'orfeus:processing-settings-white-balance-tint)
     (:noise-reduction #'orfeus:processing-settings-noise-reduction)
     (:lens-correction-p #'orfeus:processing-settings-lens-correction-p)
+    (:lens-correction-strength
+     #'orfeus:processing-settings-lens-correction-strength)
     (:chromatic-aberration-correction-p #'orfeus:processing-settings-chromatic-aberration-correction-p)
     (:lut-path #'orfeus:processing-settings-lut-path)
     (:lut-strength #'orfeus:processing-settings-lut-strength)
@@ -106,6 +108,8 @@
     (:white-balance-tint (setf (orfeus:processing-settings-white-balance-tint settings) value))
     (:noise-reduction (setf (orfeus:processing-settings-noise-reduction settings) value))
     (:lens-correction-p (setf (orfeus:processing-settings-lens-correction-p settings) value))
+    (:lens-correction-strength
+     (setf (orfeus:processing-settings-lens-correction-strength settings) value))
     (:chromatic-aberration-correction-p (setf (orfeus:processing-settings-chromatic-aberration-correction-p settings) value))
     (:lut-path (setf (orfeus:processing-settings-lut-path settings) value))
     (:lut-strength (setf (orfeus:processing-settings-lut-strength settings) value))

@@ -25,6 +25,9 @@
    #:dng-original-error
    #:dng-original-filename
    #:invalid-project-data
+   #:lens-profile-aliases-pathname
+   #:lens-profile-aliases-read
+   #:resolve-lens-profile-alias
    #:main
    #:make-photo-job
    #:make-processing-settings
@@ -48,6 +51,7 @@
    #:processing-settings-grain-amount
    #:processing-settings-grain-size
    #:processing-settings-lens-correction-p
+   #:processing-settings-lens-correction-strength
    #:processing-settings-lut-path
    #:processing-settings-lut-strength
    #:processing-settings-noise-reduction

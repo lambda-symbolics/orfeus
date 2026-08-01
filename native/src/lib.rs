@@ -480,7 +480,7 @@ pub unsafe extern "C" fn orfeus_dng_extract_original(
 /// claim metadata preservation when that bit is absent.
 #[unsafe(no_mangle)]
 pub extern "C" fn orfeus_raw_render_capabilities_v1() -> u32 {
-    1 | 2 | 4 // physical orientation, 16-bit TIFF, embedded sRGB ICC
+    1 | 2 | 4 | 16 // orientation, 16-bit TIFF, sRGB ICC, lens tuning/overrides
 }
 
 /// Decode, process, and export one Olympus ORF using version 1 render settings.
@@ -590,7 +590,7 @@ mod tests {
     #[test]
     fn reports_current_abi_version() {
         assert_eq!(orfeus_bridge_abi_version(), 1);
-        assert_eq!(orfeus_raw_render_capabilities_v1(), 1 | 2 | 4);
+        assert_eq!(orfeus_raw_render_capabilities_v1(), 1 | 2 | 4 | 16);
     }
 
     #[test]

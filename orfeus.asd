@@ -12,6 +12,7 @@
                (:file "src/native")
                (:file "src/metadata")
                (:file "src/project")
+               (:file "src/lens-aliases")
                (:file "src/render")
                (:file "src/batch")
                (:file "src/version"))

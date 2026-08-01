@@ -2,7 +2,7 @@
 
 (defparameter *processing-setting-keys*
   '(:exposure :white-balance-temperature :white-balance-tint
-    :noise-reduction :lens-correction-p
+    :noise-reduction :lens-correction-p :lens-correction-strength
     :chromatic-aberration-correction-p :lut-path :lut-strength
     :grain-amount :grain-size)
   "Keys accepted in processing setting S-expressions.")
@@ -14,6 +14,7 @@
   (white-balance-tint 0.0)
   (noise-reduction 0.35)
   (lens-correction-p t)
+  (lens-correction-strength 1.0)
   (chromatic-aberration-correction-p t)
   (lut-path nil)
   (lut-strength 1.0)
@@ -47,6 +48,8 @@
     ((:exposure :white-balance-tint :noise-reduction :lut-strength
       :grain-amount :grain-size)
      (realp value))
+    (:lens-correction-strength
+     (and (realp value) (<= 0 value 2)))
     (:white-balance-temperature
      (or (null value) (and (realp value) (plusp value))))
     ((:lens-correction-p :chromatic-aberration-correction-p)
@@ -71,6 +74,8 @@
         :white-balance-tint (processing-settings-white-balance-tint settings)
         :noise-reduction (processing-settings-noise-reduction settings)
         :lens-correction-p (processing-settings-lens-correction-p settings)
+        :lens-correction-strength
+        (processing-settings-lens-correction-strength settings)
         :chromatic-aberration-correction-p
         (processing-settings-chromatic-aberration-correction-p settings)
         :lut-path (processing-settings-lut-path settings)
@@ -121,6 +126,9 @@
                 (setf (processing-settings-noise-reduction result) value))
                (:lens-correction-p
                 (setf (processing-settings-lens-correction-p result) value))
+               (:lens-correction-strength
+                (setf (processing-settings-lens-correction-strength result)
+                      value))
                (:chromatic-aberration-correction-p
                 (setf (processing-settings-chromatic-aberration-correction-p
                        result)

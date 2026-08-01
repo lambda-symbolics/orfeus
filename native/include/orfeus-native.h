@@ -38,6 +38,7 @@ enum orfeus_render_capabilities_v1 {
     ORFEUS_RENDER_APPLIES_ORIENTATION = 1,
     ORFEUS_RENDER_TIFF_16_BIT = 2,
     ORFEUS_RENDER_EMBEDS_SRGB_ICC = 4,
+    ORFEUS_RENDER_LENS_TUNING_AND_OVERRIDES = 16,
     /* Deliberately absent: source EXIF/XMP metadata preservation. */
     ORFEUS_RENDER_PRESERVES_SOURCE_METADATA = 8
 };
@@ -61,9 +62,14 @@ struct orfeus_render_settings_v1 {
     uint32_t max_width;
     uint32_t max_height;
     uint32_t jpeg_quality;
-    /* When lut_strength is nonzero, this must remain a readable NUL-terminated
-       UTF-8 path for the complete orfeus_raw_render_v1 call. */
+    float lens_correction_strength;
+    float focal_reducer;
+    float lens_crop_factor;
+    /* String pointers must remain readable NUL-terminated UTF-8 for the complete
+       orfeus_raw_render_v1 call. lens_profile_model may be NULL for automatic
+       camera/mount matching. */
     const char *lut_path;
+    const char *lens_profile_model;
 };
 
 /* Applies orientation and embeds sRGB ICC. TIFF output is true 16-bit RGB.
