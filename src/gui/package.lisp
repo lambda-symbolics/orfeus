@@ -5,7 +5,8 @@
                 #:export-settings-max-width #:export-settings-preserve-metadata-p
                 #:make-photo-job #:make-processing-preset
                 #:make-processing-settings #:make-project
-                #:photo-capture-description #:photo-lens-description
+                #:photo-capture-description #:photo-extract-embedded-preview
+                #:photo-lens-description
                 #:photo-job-input-path #:photo-job-output-path #:photo-job-overrides
                 #:photo-job-render-output #:processing-preset-name
                 #:processing-preset-settings #:processing-settings-with-overrides

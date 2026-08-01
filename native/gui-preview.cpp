@@ -3,6 +3,7 @@
 #include <FL/Fl_JPEG_Image.H>
 #include <FL/Fl_Native_File_Chooser.H>
 #include <FL/Fl_Widget.H>
+#include <FL/fl_draw.H>
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
@@ -21,6 +22,9 @@ struct PreviewImage {
     std::unique_ptr<Fl_Image> scaled;
     int scaled_width = 0;
     int scaled_height = 0;
+    std::unique_ptr<Fl_Image> thumbnail;
+    int thumbnail_width = 0;
+    int thumbnail_height = 0;
 };
 
 std::unordered_map<std::string, PreviewImage> images;
@@ -80,6 +84,42 @@ extern "C" int orfeus_gui_preview_draw(long long widget_id,
     const int y = widget->y() + widget->h() / 2 -
                   static_cast<int>(std::lround(clamped_y * height));
     image->scaled->draw(x, y);
+    return 1;
+}
+
+extern "C" int orfeus_gui_preview_draw_rect(long long widget_id,
+                                               const char *path,
+                                               int x,
+                                               int y,
+                                               int width,
+                                               int height) {
+    Fl_Widget *widget = clfl_bridge::find_widget(widget_id);
+    PreviewImage *image = find_image(path);
+    if (!widget || !image || width <= 0 || height <= 0) return 0;
+
+    Fl_JPEG_Image &source = *image->source;
+    const double scale = std::min(static_cast<double>(width) / source.w(),
+                                  static_cast<double>(height) / source.h());
+    const int scaled_width = scaled_dimension(source.w(), scale);
+    const int scaled_height = scaled_dimension(source.h(), scale);
+    if (!image->thumbnail || image->thumbnail_width != scaled_width ||
+        image->thumbnail_height != scaled_height) {
+        image->thumbnail.reset(source.copy(scaled_width, scaled_height));
+        if (!image->thumbnail) return 0;
+        image->thumbnail_width = scaled_width;
+        image->thumbnail_height = scaled_height;
+    }
+
+    const int draw_x = x + (width - scaled_width) / 2;
+    const int draw_y = y + (height - scaled_height) / 2;
+    const int clip_x = std::max(x, widget->x());
+    const int clip_y = std::max(y, widget->y());
+    const int clip_right = std::min(x + width, widget->x() + widget->w());
+    const int clip_bottom = std::min(y + height, widget->y() + widget->h());
+    if (clip_right <= clip_x || clip_bottom <= clip_y) return 0;
+    fl_push_clip(clip_x, clip_y, clip_right - clip_x, clip_bottom - clip_y);
+    image->thumbnail->draw(draw_x, draw_y);
+    fl_pop_clip();
     return 1;
 }
 

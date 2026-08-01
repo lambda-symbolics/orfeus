@@ -24,6 +24,9 @@
 (cffi:defcfun ("orfeus_gui_preview_draw" %gui-preview-draw) :int
   (widget-id :long-long) (path :string)
   (zoom :double) (center-x :double) (center-y :double))
+(cffi:defcfun ("orfeus_gui_preview_draw_rect" %gui-preview-draw-rect) :int
+  (widget-id :long-long) (path :string)
+  (x :int) (y :int) (width :int) (height :int))
 (cffi:defcfun ("orfeus_gui_preview_size" %gui-preview-size) :int
   (path :string) (width :pointer) (height :pointer))
 (cffi:defcfun ("orfeus_gui_preview_forget" %gui-preview-forget) :void
@@ -71,3 +74,9 @@
   (load-gui-preview-library)
   (plusp (%gui-preview-draw (cl-fltk:widget-id canvas) (namestring pathname)
                             zoom center-x center-y)))
+
+(defun draw-thumbnail-file (canvas pathname x y width height)
+  "Draw PATHNAME fitted inside the absolute rectangle in CANVAS."
+  (load-gui-preview-library)
+  (plusp (%gui-preview-draw-rect (cl-fltk:widget-id canvas) (namestring pathname)
+                                 x y width height)))
