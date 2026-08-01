@@ -49,6 +49,10 @@ extern "C" void orfeus_gui_preview_clear(void) {
 extern "C" char *orfeus_gui_choose_files(const char *title,
                                           const char *filter,
                                           const char *preset_path) {
+    // Avoid FLTK 1.4's optional GTK chooser driver, which can raise SIGFPE
+    // while its nested GTK loop remains open. The built-in FLTK driver keeps
+    // multi-selection and filter semantics without entering GTK.
+    Fl::option(Fl::OPTION_FNFC_USES_GTK, false);
     Fl_Native_File_Chooser chooser(Fl_Native_File_Chooser::BROWSE_MULTI_FILE);
     if (title && *title) chooser.title(title);
     if (filter && *filter) chooser.filter(filter);
