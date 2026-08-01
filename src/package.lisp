@@ -2,8 +2,14 @@
   (:use #:cl)
   (:import-from #:cffi
                 #:defcfun
-                #:load-foreign-library)
+                #:foreign-string-to-lisp
+                #:load-foreign-library
+                #:with-foreign-pointer
+                #:with-foreign-string)
   (:export
+   #:dng-extract-original
+   #:dng-original-error
+   #:dng-original-filename
    #:invalid-project-data
    #:main
    #:make-photo-job
