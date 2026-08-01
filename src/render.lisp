@@ -69,26 +69,39 @@
                                      condition))))))))
 
 (defun render-copy-metadata (input-pathname output-pathname)
-  (multiple-value-bind (standard-output error-output status)
-      (uiop:run-program
-       (append (list "exiftool"
-                     "-overwrite_original"
-                     "-TagsFromFile" (namestring input-pathname)
-                     "-all:all")
-               *metadata-copy-exclusions*
-               (list "-Orientation#=1"
-                     "-ColorSpace#=1"
-                     (namestring output-pathname)))
-       :output :string
-       :error-output :string
-       :ignore-error-status t)
-    (declare (ignore standard-output))
-    (unless (zerop status)
-      (error 'raw-render-error
-             :input-pathname input-pathname
-             :output-pathname output-pathname
-             :status status
-             :message (format nil "metadata copy failed: ~A" error-output)))))
+  (labels ((run-exiftool (arguments operation)
+             (multiple-value-bind (standard-output error-output status)
+                 (uiop:run-program arguments
+                                   :output :string
+                                   :error-output :string
+                                   :ignore-error-status t)
+               (declare (ignore standard-output))
+               (unless (zerop status)
+                 (error 'raw-render-error
+                        :input-pathname input-pathname
+                        :output-pathname output-pathname
+                        :status status
+                        :message (format nil "~A failed: ~A"
+                                         operation error-output))))))
+    (run-exiftool
+     (append (list "exiftool"
+                   "-overwrite_original"
+                   "-TagsFromFile" (namestring input-pathname)
+                   "-all:all")
+             *metadata-copy-exclusions*
+             (list "-Orientation#=1"
+                   "-ColorSpace#=1"
+                   (namestring output-pathname)))
+     "metadata copy")
+    ;; ExifTool copies Olympus maker notes as one block, so normalize their
+    ;; output-space tags in a second pass after the block exists in the export.
+    (run-exiftool
+     (list "exiftool"
+           "-overwrite_original"
+           "-Olympus:ColorSpace=sRGB"
+           "-Olympus:RawDevColorSpace=sRGB"
+           (namestring output-pathname))
+     "metadata color-space normalization")))
 
 (defun render-native-photo (input-pathname output-pathname settings
                             &key max-width max-height jpeg-quality grain-seed)
