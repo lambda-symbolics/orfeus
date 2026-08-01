@@ -17,6 +17,26 @@
                (:file "src/version"))
   :in-order-to ((test-op (test-op "orfeus/tests"))))
 
+(asdf:defsystem #:orfeus/gui
+  :description "FLTK frontend for Orfeus."
+  :depends-on (#:orfeus #:cl-fltk)
+  :components ((:module "src/gui"
+                :serial t
+                :components ((:file "package")
+                             (:file "model")
+                             (:file "preview")
+                             (:file "application")))))
+
+(asdf:defsystem #:orfeus/gui-tests
+  :description "Noninteractive model tests for the Orfeus GUI."
+  :depends-on (#:orfeus/gui)
+  :components ((:module "tests/gui"
+                :components ((:file "suite"))))
+  :perform (test-op (operation component)
+             (declare (ignore operation component))
+             (unless (uiop:symbol-call '#:orfeus/gui-tests '#:run-tests)
+               (error "Orfeus GUI tests failed."))))
+
 (asdf:defsystem #:orfeus/cli
   :description "Command-line frontend for Orfeus."
   :depends-on (#:orfeus)

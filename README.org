@@ -17,6 +17,7 @@ available when building the GUI.
 
 #+begin_src sh
 cargo build --release --manifest-path native/Cargo.toml
+make gui-native
 sbcl --no-userinit --non-interactive \
   --eval '(require :asdf)' \
   --eval '(asdf:load-asd (truename "orfeus.asd"))' \
@@ -50,6 +51,20 @@ $EDITOR project.sexp
 Projects contain shared defaults and per-photo overrides for exposure, white
 balance, noise reduction, lens/TCA correction, CUBE LUTs, and film grain. They
 are read with =*read-eval*= disabled.
+
+Load the FLTK frontend after building the sibling bridge and the Orfeus preview
+adapter:
+
+#+begin_src sh
+make -C ../fltk-sun cl-fltk-bridge
+make gui-native
+sbcl --eval '(asdf:load-system "orfeus/gui")' \
+     --eval '(orfeus/gui:run-gui #P"project.sexp")'
+#+end_src
+
+The GUI renders previews on worker threads and publishes completed JPEGs to the
+FLTK canvas through timer polling. Keyboard basics are =B= (before/after), =R=
+(preview), =E= (export selected), and arrow keys (selection).
 
 The included test LUT is =data/luts/agfa_precisa_100.cube=. Its provenance and
 license notice are recorded in =THIRD-PARTY.md=.
