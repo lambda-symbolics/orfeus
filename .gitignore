@@ -1,0 +1,12 @@
+/orfeus
+/native/target/
+*.fasl
+*.lx64fsl
+*.dx64fsl
+*.dylib
+*.so
+*.o
+/result
+/result-*
+.direnv/
+.envrc.local
