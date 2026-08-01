@@ -46,12 +46,18 @@
     (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore)))
 
 (defun preview-settings-key (settings)
-  (logand #xffffffff
-          (sxhash (orfeus::processing-settings->sexp settings))))
+  "Return a content hash covering every processing setting for preview caching."
+  (let* ((*print-readably* t)
+         (text (prin1-to-string
+                (orfeus::processing-settings->sexp settings)))
+         (digest (ironclad:digest-sequence
+                  :sha256
+                  (sb-ext:string-to-octets text :external-format :utf-8))))
+    (subseq (ironclad:byte-array-to-hex-string digest) 0 16)))
 
 (defun preview-pathname (preview-directory index job role settings)
   (merge-pathnames
-   (make-pathname :name (format nil "~(~A~)-~D-~8,'0X-~A"
+   (make-pathname :name (format nil "~(~A~)-~D-~A-~A"
                                 role index (preview-settings-key settings)
                                 (pathname-name (photo-job-input-path job)))
                   :type "jpg")

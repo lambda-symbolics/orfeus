@@ -153,9 +153,6 @@ impl RenderSettingsV1 {
         if !(1..=100).contains(&self.jpeg_quality) {
             return Err(Error::InvalidArgument("JPEG quality must be 1..100"));
         }
-        if self.lut_strength > 0.0 && self.lut_path.is_null() {
-            return Err(Error::InvalidArgument("LUT strength requires a LUT path"));
-        }
         Ok(())
     }
 }
@@ -1135,7 +1132,7 @@ pub fn render(input: &Path, output: &Path, settings: &RenderSettingsV1) -> Resul
     );
     apply_default_display_tone(&mut image.data);
     srgb_transfer(&mut image);
-    if settings.lut_strength > 0.0 {
+    if settings.lut_strength > 0.0 && !settings.lut_path.is_null() {
         let path = unsafe { CStr::from_ptr(settings.lut_path) }
             .to_str()
             .map_err(|_| Error::InvalidArgument("LUT path is not UTF-8"))?;
@@ -1324,6 +1321,16 @@ mod tests {
             coordinate[0] > 0.0 && coordinate[1] > 0.0,
             "corrected output must sample inward from a barrel-distorted source: {coordinate:?}"
         );
+    }
+
+    #[test]
+    fn permits_nonzero_lut_strength_without_an_active_lut() {
+        let settings = RenderSettingsV1 {
+            lut_strength: 1.0,
+            lut_path: std::ptr::null(),
+            ..RenderSettingsV1::default()
+        };
+        assert!(settings.validate().is_ok());
     }
 
     #[test]

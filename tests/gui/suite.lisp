@@ -218,6 +218,10 @@
          (first (orfeus:make-processing-settings :exposure 0.0))
          (same (orfeus:make-processing-settings :exposure 0.0))
          (changed (orfeus:make-processing-settings :exposure 1.0))
+         (agfa (orfeus:make-processing-settings
+                :lut-path "agfa_precisa_100.cube" :lut-strength 1.0))
+         (portra (orfeus:make-processing-settings
+                  :lut-path "Presetpro - Portra 160.cube" :lut-strength 1.0))
          (directory #P"/tmp/"))
     (check (equal (orfeus/gui::preview-pathname directory 0 job :after first)
                   (orfeus/gui::preview-pathname directory 0 job :after same))
@@ -225,6 +229,12 @@
     (check (not (equal (orfeus/gui::preview-pathname directory 0 job :after first)
                        (orfeus/gui::preview-pathname directory 0 job :after changed)))
            "Edited preview settings reused a stale cache path")
+    (check (not (equal (orfeus/gui::preview-pathname directory 0 job :after first)
+                       (orfeus/gui::preview-pathname directory 0 job :after agfa)))
+           "Adding a LUT reused the no-LUT preview cache path")
+    (check (not (equal (orfeus/gui::preview-pathname directory 0 job :after agfa)
+                       (orfeus/gui::preview-pathname directory 0 job :after portra)))
+           "Distinct LUT paths reused one preview cache path")
     (check (not (equal (orfeus/gui::preview-pathname directory 0 job :before first)
                        (orfeus/gui::preview-pathname directory 0 job :after first)))
            "Before and After previews shared one cache path")))
