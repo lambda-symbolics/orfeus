@@ -878,6 +878,7 @@ dependencies = [
  "lensfun",
  "md-5",
  "rawler",
+ "rayon",
 ]
 
 [[package]]

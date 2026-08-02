@@ -4,7 +4,7 @@ use std::io::{BufRead, BufReader, BufWriter, Seek, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use image::codecs::jpeg::JpegEncoder;
 use image::codecs::tiff::TiffEncoder;
@@ -13,6 +13,7 @@ use lensfun::{Camera, Database, Lens, Modifier};
 use rawler::decoders::{RawDecodeParams, RawLoader};
 use rawler::imgop::develop::{ProcessingStep, RawDevelop};
 use rawler::rawsource::RawSource;
+use rayon::prelude::*;
 
 use super::Error;
 use super::color::intermediate_to_linear_srgb;
@@ -427,52 +428,61 @@ fn apply_noise_reduction(image: &mut RgbImage, luma: f32, chroma: f32) {
     let source = image.data.clone();
     let pixel_count = image.width * image.height;
     let mut ycbcr = vec![[0.0_f32; 3]; pixel_count];
-    for (index, pixel) in source.as_chunks::<3>().0.iter().enumerate() {
-        let yy = 0.2126 * pixel[0] + 0.7152 * pixel[1] + 0.0722 * pixel[2];
-        ycbcr[index] = [yy, pixel[2] - yy, pixel[0] - yy];
-    }
+    ycbcr
+        .par_iter_mut()
+        .zip(source.par_chunks_exact(3))
+        .with_min_len(image.width * 16)
+        .for_each(|(output, pixel)| {
+            let yy = 0.2126 * pixel[0] + 0.7152 * pixel[1] + 0.0722 * pixel[2];
+            *output = [yy, pixel[2] - yy, pixel[0] - yy];
+        });
     let kernel = [1.0_f32, 4.0, 6.0, 4.0, 1.0];
-    for y in 0..image.height {
-        for x in 0..image.width {
-            let center_index = y * image.width + x;
-            let center = ycbcr[center_index];
-            let left = ycbcr[y * image.width + x.saturating_sub(1)][0];
-            let right = ycbcr[y * image.width + (x + 1).min(image.width - 1)][0];
-            let above = ycbcr[y.saturating_sub(1) * image.width + x][0];
-            let below = ycbcr[(y + 1).min(image.height - 1) * image.width + x][0];
-            let gradient = (right - left).abs() + (below - above).abs();
-            let edge_protection = 1.0 / (1.0 + gradient * 48.0);
-            let shadow_boost = 1.0 + (1.0 - center[0].clamp(0.0, 1.0)) * 1.25;
-            let luma_mix = (luma * 0.6 * shadow_boost * edge_protection).min(1.0);
-            let chroma_mix = (chroma * shadow_boost * edge_protection).min(1.0);
-            let mut filtered = [0.0_f32; 3];
-            let mut weight_sum = 0.0;
-            for (ky, dy) in (-2_isize..=2).enumerate() {
-                let sample_y = (y as isize + dy).clamp(0, image.height as isize - 1) as usize;
-                for (kx, dx) in (-2_isize..=2).enumerate() {
-                    let sample_x = (x as isize + dx).clamp(0, image.width as isize - 1) as usize;
-                    let weight = kernel[kx] * kernel[ky];
-                    let sample = ycbcr[sample_y * image.width + sample_x];
-                    for channel in 0..3 {
-                        filtered[channel] += sample[channel] * weight;
+    let width = image.width;
+    let height = image.height;
+    image
+        .data
+        .par_chunks_mut(width * 3)
+        .with_min_len(16)
+        .enumerate()
+        .for_each(|(y, output_row)| {
+            for x in 0..width {
+                let center_index = y * width + x;
+                let center = ycbcr[center_index];
+                let left = ycbcr[y * width + x.saturating_sub(1)][0];
+                let right = ycbcr[y * width + (x + 1).min(width - 1)][0];
+                let above = ycbcr[y.saturating_sub(1) * width + x][0];
+                let below = ycbcr[(y + 1).min(height - 1) * width + x][0];
+                let gradient = (right - left).abs() + (below - above).abs();
+                let edge_protection = 1.0 / (1.0 + gradient * 48.0);
+                let shadow_boost = 1.0 + (1.0 - center[0].clamp(0.0, 1.0)) * 1.25;
+                let luma_mix = (luma * 0.6 * shadow_boost * edge_protection).min(1.0);
+                let chroma_mix = (chroma * shadow_boost * edge_protection).min(1.0);
+                let mut filtered = [0.0_f32; 3];
+                let mut weight_sum = 0.0;
+                for (ky, dy) in (-2_isize..=2).enumerate() {
+                    let sample_y = (y as isize + dy).clamp(0, height as isize - 1) as usize;
+                    for (kx, dx) in (-2_isize..=2).enumerate() {
+                        let sample_x = (x as isize + dx).clamp(0, width as isize - 1) as usize;
+                        let weight = kernel[kx] * kernel[ky];
+                        let sample = ycbcr[sample_y * width + sample_x];
+                        for channel in 0..3 {
+                            filtered[channel] += sample[channel] * weight;
+                        }
+                        weight_sum += weight;
                     }
-                    weight_sum += weight;
                 }
+                for value in &mut filtered {
+                    *value /= weight_sum;
+                }
+                let yy = center[0] + (filtered[0] - center[0]) * luma_mix;
+                let cb = center[1] + (filtered[1] - center[1]) * chroma_mix;
+                let cr = center[2] + (filtered[2] - center[2]) * chroma_mix;
+                let output = &mut output_row[x * 3..x * 3 + 3];
+                output[0] = yy + cr;
+                output[2] = yy + cb;
+                output[1] = (yy - 0.2126 * output[0] - 0.0722 * output[2]) / 0.7152;
             }
-            for value in &mut filtered {
-                *value /= weight_sum;
-            }
-            let yy = center[0] + (filtered[0] - center[0]) * luma_mix;
-            let cb = center[1] + (filtered[1] - center[1]) * chroma_mix;
-            let cr = center[2] + (filtered[2] - center[2]) * chroma_mix;
-            image.data[center_index * 3] = yy + cr;
-            image.data[center_index * 3 + 2] = yy + cb;
-            image.data[center_index * 3 + 1] = (yy
-                - 0.2126 * image.data[center_index * 3]
-                - 0.0722 * image.data[center_index * 3 + 2])
-                / 0.7152;
-        }
-    }
+        });
 }
 
 fn bilinear(image: &RgbImage, x: f32, y: f32, channel: usize) -> f32 {
@@ -740,46 +750,86 @@ fn apply_lens(image: &mut RgbImage, options: &LensCorrectionOptions<'_>) -> Resu
             "lensfun profile for {display_name} lacks requested calibration"
         )));
     }
+    const STRIPE_ROWS: usize = 32;
     let source = image.clone();
-    let mut geometry = vec![0.0; image.width * 2];
-    let mut subpixel = vec![0.0; image.width * 6];
-    let mut valid = vec![true; image.width * image.height];
-    for y in 0..image.height {
-        if distortion {
-            modifier.apply_geometry_distortion(0.0, y as f32, image.width, 1, &mut geometry);
-        }
-        if tca {
-            modifier.apply_subpixel_distortion(0.0, y as f32, image.width, 1, &mut subpixel);
-        }
-        for x in 0..image.width {
-            let (gx, gy) = if distortion {
-                let identity_x = x as f32;
-                let identity_y = y as f32;
-                (
-                    blend_lens_coordinate(identity_x, geometry[x * 2], correction_strength),
-                    blend_lens_coordinate(identity_y, geometry[x * 2 + 1], correction_strength),
-                )
-            } else {
-                (x as f32, y as f32)
-            };
-            for channel in 0..3 {
-                let (sx, sy) = if tca {
-                    (
-                        subpixel[x * 6 + channel * 2] + gx - x as f32,
-                        subpixel[x * 6 + channel * 2 + 1] + gy - y as f32,
-                    )
-                } else {
-                    (gx, gy)
-                };
-                let coordinate_valid = sx >= 0.0
-                    && sy >= 0.0
-                    && sx <= (image.width - 1) as f32
-                    && sy <= (image.height - 1) as f32;
-                valid[y * image.width + x] &= coordinate_valid;
-                image.data[(y * image.width + x) * 3 + channel] =
-                    bilinear(&source, sx, sy, channel);
+    let width = image.width;
+    let height = image.height;
+    let row_stride = width * 3;
+    let mut geometry = vec![0.0; width * STRIPE_ROWS * 2];
+    let mut subpixel = vec![0.0; width * STRIPE_ROWS * 6];
+    let mut valid = vec![true; width * height];
+    for stripe_y in (0..height).step_by(STRIPE_ROWS) {
+        let stripe_rows = STRIPE_ROWS.min(height - stripe_y);
+        for row in 0..stripe_rows {
+            let y = stripe_y + row;
+            if distortion {
+                modifier.apply_geometry_distortion(
+                    0.0,
+                    y as f32,
+                    width,
+                    1,
+                    &mut geometry[row * width * 2..(row + 1) * width * 2],
+                );
+            }
+            if tca {
+                modifier.apply_subpixel_distortion(
+                    0.0,
+                    y as f32,
+                    width,
+                    1,
+                    &mut subpixel[row * width * 6..(row + 1) * width * 6],
+                );
             }
         }
+        let data_start = stripe_y * row_stride;
+        let data_end = (stripe_y + stripe_rows) * row_stride;
+        let valid_start = stripe_y * width;
+        let valid_end = (stripe_y + stripe_rows) * width;
+        image.data[data_start..data_end]
+            .par_chunks_mut(row_stride)
+            .zip(valid[valid_start..valid_end].par_chunks_mut(width))
+            .enumerate()
+            .for_each(|(row, (output_row, valid_row))| {
+                let y = stripe_y + row;
+                for x in 0..width {
+                    let (gx, gy) = if distortion {
+                        let identity_x = x as f32;
+                        let identity_y = y as f32;
+                        let map_index = (row * width + x) * 2;
+                        (
+                            blend_lens_coordinate(
+                                identity_x,
+                                geometry[map_index],
+                                correction_strength,
+                            ),
+                            blend_lens_coordinate(
+                                identity_y,
+                                geometry[map_index + 1],
+                                correction_strength,
+                            ),
+                        )
+                    } else {
+                        (x as f32, y as f32)
+                    };
+                    for channel in 0..3 {
+                        let (sx, sy) = if tca {
+                            let map_index = (row * width + x) * 6 + channel * 2;
+                            (
+                                subpixel[map_index] + gx - x as f32,
+                                subpixel[map_index + 1] + gy - y as f32,
+                            )
+                        } else {
+                            (gx, gy)
+                        };
+                        let coordinate_valid = sx >= 0.0
+                            && sy >= 0.0
+                            && sx <= (width - 1) as f32
+                            && sy <= (height - 1) as f32;
+                        valid_row[x] &= coordinate_valid;
+                        output_row[x * 3 + channel] = bilinear(&source, sx, sy, channel);
+                    }
+                }
+            });
     }
     zoom_center(
         image,
@@ -1045,6 +1095,22 @@ fn atomic_encode(
 }
 
 pub fn render(input: &Path, output: &Path, settings: &RenderSettingsV1) -> Result<(), Error> {
+    let profiling = std::env::var_os("ORFEUS_PROFILE").is_some();
+    let render_started = Instant::now();
+    let mut stage_started = render_started;
+    macro_rules! profile_stage {
+        ($name:literal) => {
+            if profiling {
+                let now = Instant::now();
+                eprintln!(
+                    "orfeus-profile stage={} milliseconds={:.3}",
+                    $name,
+                    now.duration_since(stage_started).as_secs_f64() * 1000.0
+                );
+                stage_started = now;
+            }
+        };
+    }
     settings.validate()?;
     if same_file(input, output)? {
         return Err(Error::InvalidArgument(
@@ -1063,6 +1129,7 @@ pub fn render(input: &Path, output: &Path, settings: &RenderSettingsV1) -> Resul
     let raw = decoder
         .raw_image(&source, &params, false)
         .map_err(|e| Error::Render(format!("RAW decode: {e}")))?;
+    profile_stage!("decode");
     // Rawler performs scaling, demosaic, and cropping. Orfeus owns white
     // balance and the camera-to-sRGB transform so scene-linear highlights remain
     // unclipped through white adaptation and exposure.
@@ -1075,6 +1142,7 @@ pub fn render(input: &Path, output: &Path, settings: &RenderSettingsV1) -> Resul
     let developed = RawDevelop { steps }
         .develop_intermediate(&raw)
         .map_err(|e| Error::Render(format!("RAW development: {e}")))?;
+    profile_stage!("develop");
     // Start from the camera's neutral rendering for both as-shot and custom
     // temperature. Custom Kelvin is a relative chromatic adaptation around D65;
     // dropping the sensor WB coefficients leaves Bayer green dominant.
@@ -1088,10 +1156,12 @@ pub fn render(input: &Path, output: &Path, settings: &RenderSettingsV1) -> Resul
     };
     apply_white_adaptation(&mut image, settings.kelvin, settings.tint);
     apply_exposure(&mut image, settings.exposure_ev);
+    profile_stage!("color");
     let orientation = metadata.exif.orientation.unwrap_or(1);
     let (native_max_width, native_max_height) =
         native_downscale_bounds(orientation, settings.max_width, settings.max_height);
     image = downscale(image, native_max_width, native_max_height);
+    profile_stage!("downscale");
     let lens_name = metadata
         .lens
         .as_ref()
@@ -1124,14 +1194,18 @@ pub fn render(input: &Path, output: &Path, settings: &RenderSettingsV1) -> Resul
             crop_factor: settings.lens_crop_factor,
         },
     )?;
+    profile_stage!("lens");
     image = orient(image, orientation);
+    profile_stage!("orient");
     apply_noise_reduction(
         &mut image,
         settings.luma_noise_reduction,
         settings.chroma_noise_reduction,
     );
+    profile_stage!("noise-reduction");
     apply_default_display_tone(&mut image.data);
     srgb_transfer(&mut image);
+    profile_stage!("tone-transfer");
     if settings.lut_strength > 0.0 && !settings.lut_path.is_null() {
         let path = unsafe { CStr::from_ptr(settings.lut_path) }
             .to_str()
@@ -1148,13 +1222,23 @@ pub fn render(input: &Path, output: &Path, settings: &RenderSettingsV1) -> Resul
         settings.grain_size,
         settings.grain_seed,
     );
+    profile_stage!("lut-grain");
     atomic_encode(
         input,
         output,
         &image,
         settings.output_format,
         settings.jpeg_quality,
-    )
+    )?;
+    profile_stage!("encode");
+    let _ = stage_started;
+    if profiling {
+        eprintln!(
+            "orfeus-profile stage=total milliseconds={:.3}",
+            render_started.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]

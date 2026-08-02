@@ -1,5 +1,7 @@
 //! Default scene-linear to display-linear tone mapping.
 
+use rayon::prelude::*;
+
 const CURVE_INPUT_GAIN: f32 = 1.6;
 const CURVE_NUMERATOR: f32 = 8.75;
 const CURVE_DENOMINATOR: f32 = 1.46;
@@ -14,22 +16,25 @@ const SRGB_LUMINANCE: [f32; 3] = [0.212_672_9, 0.715_152_2, 0.072_175];
 /// scalar curve lifts deep shadows and midtones to a practical display baseline.
 /// Explicit user exposure compensation remains a separate earlier step.
 pub(crate) fn apply_default_display_tone(linear_rgb: &mut [f32]) {
-    let (pixels, remainder) = linear_rgb.as_chunks_mut::<3>();
-    assert!(remainder.is_empty(), "RGB data must contain triplets");
-    for pixel in pixels {
+    assert_eq!(linear_rgb.len() % 3, 0, "RGB data must contain triplets");
+    linear_rgb.par_chunks_exact_mut(3).for_each(|pixel| {
         let luminance = pixel
             .iter()
             .zip(SRGB_LUMINANCE)
             .map(|(channel, coefficient)| channel * coefficient)
             .sum::<f32>();
         if !luminance.is_finite() || luminance <= 0.0 {
-            *pixel = [0.0; 3];
-            continue;
+            pixel.copy_from_slice(&[0.0; 3]);
+            return;
         }
 
         let target = default_display_tone(luminance);
         let luminance_gain = target / luminance;
-        let toned = pixel.map(|channel| channel * luminance_gain);
+        let toned = [
+            pixel[0] * luminance_gain,
+            pixel[1] * luminance_gain,
+            pixel[2] * luminance_gain,
+        ];
         let mut saturation = 1.0_f32;
         for channel in toned {
             let chroma = channel - target;
@@ -43,7 +48,7 @@ pub(crate) fn apply_default_display_tone(linear_rgb: &mut [f32]) {
         for (channel, toned_channel) in pixel.iter_mut().zip(toned) {
             *channel = target + saturation * (toned_channel - target);
         }
-    }
+    });
 }
 
 fn default_display_tone(value: f32) -> f32 {
