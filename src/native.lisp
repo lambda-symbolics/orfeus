@@ -157,8 +157,10 @@
                  (setting 'exposure-ev (float exposure 0.0))
                  (setting 'chroma-noise-reduction
                           (float noise-reduction 0.0))
+                 ;; Demosaiced chroma needs much stronger filtering than luma;
+                 ;; retain fine luminance texture instead of making it waxy.
                  (setting 'luma-noise-reduction
-                          (float noise-reduction 0.0))
+                          (float (* 0.2 noise-reduction) 0.0))
                  (setting 'tone-blacks (float tone-blacks 0.0))
                  (setting 'tone-shadows (float tone-shadows 0.0))
                  (setting 'tone-dark-mids (float tone-dark-mids 0.0))

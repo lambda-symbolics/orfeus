@@ -481,89 +481,161 @@ fn apply_tonal_equalizer(image: &mut RgbImage, adjustments: [f32; 7]) {
     });
 }
 
+fn edge_guided_blur(
+    source: &[f32],
+    guide: &[f32],
+    width: usize,
+    height: usize,
+    step: usize,
+) -> Vec<f32> {
+    let kernel = [1.0_f32, 4.0, 6.0, 4.0, 1.0];
+    let mut horizontal = vec![0.0_f32; source.len()];
+    horizontal
+        .par_chunks_mut(width)
+        .enumerate()
+        .for_each(|(y, output)| {
+            for (x, value) in output.iter_mut().enumerate() {
+                let center = guide[y * width + x];
+                let sigma = 0.012 + 0.055 * center.max(0.0).sqrt();
+                let inverse_sigma_squared = 1.0 / (sigma * sigma);
+                let mut sum = 0.0;
+                let mut weight_sum = 0.0;
+                for (kernel_index, offset) in (-2_isize..=2).enumerate() {
+                    let sample_x =
+                        (x as isize + offset * step as isize).clamp(0, width as isize - 1) as usize;
+                    let index = y * width + sample_x;
+                    let distance = guide[index] - center;
+                    let range_weight = 1.0 / (1.0 + distance * distance * inverse_sigma_squared);
+                    let weight = kernel[kernel_index] * range_weight;
+                    sum += source[index] * weight;
+                    weight_sum += weight;
+                }
+                *value = sum / weight_sum;
+            }
+        });
+    let mut output = vec![0.0_f32; source.len()];
+    output
+        .par_chunks_mut(width)
+        .enumerate()
+        .for_each(|(y, output_row)| {
+            for (x, value) in output_row.iter_mut().enumerate() {
+                let center = guide[y * width + x];
+                let sigma = 0.012 + 0.055 * center.max(0.0).sqrt();
+                let inverse_sigma_squared = 1.0 / (sigma * sigma);
+                let mut sum = 0.0;
+                let mut weight_sum = 0.0;
+                for (kernel_index, offset) in (-2_isize..=2).enumerate() {
+                    let sample_y = (y as isize + offset * step as isize)
+                        .clamp(0, height as isize - 1) as usize;
+                    let index = sample_y * width + x;
+                    let distance = guide[index] - center;
+                    let range_weight = 1.0 / (1.0 + distance * distance * inverse_sigma_squared);
+                    let weight = kernel[kernel_index] * range_weight;
+                    sum += horizontal[index] * weight;
+                    weight_sum += weight;
+                }
+                *value = sum / weight_sum;
+            }
+        });
+    output
+}
+
+fn median_filter_3x3(source: &[f32], width: usize, height: usize) -> Vec<f32> {
+    let mut output = vec![0.0_f32; source.len()];
+    output
+        .par_chunks_mut(width)
+        .enumerate()
+        .for_each(|(y, output_row)| {
+            for (x, value) in output_row.iter_mut().enumerate() {
+                let mut samples = [0.0_f32; 9];
+                let mut index = 0;
+                for dy in -1_isize..=1 {
+                    let sample_y = (y as isize + dy).clamp(0, height as isize - 1) as usize;
+                    for dx in -1_isize..=1 {
+                        let sample_x = (x as isize + dx).clamp(0, width as isize - 1) as usize;
+                        samples[index] = source[sample_y * width + sample_x];
+                        index += 1;
+                    }
+                }
+                samples.sort_unstable_by(f32::total_cmp);
+                *value = samples[4];
+            }
+        });
+    output
+}
+
+fn blend_toward(source: &mut [f32], filtered: &[f32], amount: f32) {
+    source
+        .par_iter_mut()
+        .zip(filtered.par_iter())
+        .for_each(|(value, filtered)| *value += (*filtered - *value) * amount);
+}
+
+fn soft_threshold(value: f32, threshold: f32) -> f32 {
+    value.signum() * (value.abs() - threshold).max(0.0)
+}
+
 fn apply_noise_reduction(image: &mut RgbImage, luma: f32, chroma: f32) {
     if (luma == 0.0 && chroma == 0.0) || image.width < 3 || image.height < 3 {
         return;
     }
     let pixel_count = image.width * image.height;
-    let mut ycbcr = vec![[0.0_f32; 3]; pixel_count];
-    ycbcr
-        .par_iter_mut()
+    let mut yy = vec![0.0_f32; pixel_count];
+    let mut cb = vec![0.0_f32; pixel_count];
+    let mut cr = vec![0.0_f32; pixel_count];
+    yy.par_iter_mut()
+        .zip(cb.par_iter_mut())
+        .zip(cr.par_iter_mut())
         .zip(image.data.par_chunks_exact(3))
-        .with_min_len(image.width * 16)
-        .for_each(|(output, pixel)| {
-            let yy = 0.2126 * pixel[0] + 0.7152 * pixel[1] + 0.0722 * pixel[2];
-            *output = [yy, pixel[2] - yy, pixel[0] - yy];
+        .for_each(|(((yy, cb), cr), pixel)| {
+            *yy = 0.2126 * pixel[0] + 0.7152 * pixel[1] + 0.0722 * pixel[2];
+            *cb = pixel[2] - *yy;
+            *cr = pixel[0] - *yy;
         });
-    let luma_mix = luma.clamp(0.0, 1.0) * (2.0 - luma.clamp(0.0, 1.0));
+
+    let luma_strength = luma.clamp(0.0, 1.0);
+    if luma_strength > 0.0 {
+        let scale_one = edge_guided_blur(&yy, &yy, image.width, image.height, 1);
+        let scale_two = edge_guided_blur(&scale_one, &yy, image.width, image.height, 2);
+        yy.par_iter_mut()
+            .zip(scale_one.par_iter())
+            .zip(scale_two.par_iter())
+            .for_each(|((value, scale_one), scale_two)| {
+                let threshold = luma_strength * (0.012 + 0.035 * value.max(0.0).sqrt());
+                let fine = soft_threshold(*value - *scale_one, threshold);
+                let coarse = soft_threshold(*scale_one - *scale_two, threshold * 0.45);
+                *value = *scale_two + coarse + fine;
+            });
+    }
+
     let chroma_strength = chroma.clamp(0.0, 1.0);
-    let chroma_mix = chroma_strength * (1.65 - 0.65 * chroma_strength);
-    let kernel = [1.0_f32, 4.0, 6.0, 4.0, 1.0];
-    let width = image.width;
-    let height = image.height;
+    if chroma_strength > 0.0 {
+        for channel in [&mut cb, &mut cr] {
+            let median = median_filter_3x3(channel, image.width, image.height);
+            blend_toward(channel, &median, (chroma_strength * 1.5).min(1.0));
+            for (step, amount) in [
+                (1, (chroma_strength * 1.8).min(1.0)),
+                (2, (chroma_strength * 1.25).min(1.0)),
+                (4, ((chroma_strength - 0.2) * 1.25).clamp(0.0, 1.0)),
+            ] {
+                if amount > 0.0 {
+                    let filtered = edge_guided_blur(channel, &yy, image.width, image.height, step);
+                    blend_toward(channel, &filtered, amount);
+                }
+            }
+        }
+    }
+
     image
         .data
-        .par_chunks_mut(width * 3)
-        .with_min_len(16)
-        .enumerate()
-        .for_each(|(y, output_row)| {
-            for x in 0..width {
-                let center = ycbcr[y * width + x];
-                let shadow = 1.0 - center[0].clamp(0.0, 1.0);
-                let sigma_y = (0.025 + 0.25 * luma_mix) * (1.0 + 0.65 * shadow);
-                let sigma_c = 0.035 + 0.30 * chroma_mix;
-                let inverse_sigma_y_squared = 1.0 / (sigma_y * sigma_y);
-                let inverse_sigma_c_squared = 1.0 / (sigma_c * sigma_c);
-                let mut filtered_y = 0.0_f32;
-                let mut filtered_cb = 0.0_f32;
-                let mut filtered_cr = 0.0_f32;
-                let mut luma_weight_sum = 0.0_f32;
-                let mut chroma_weight_sum = 0.0_f32;
-                for (ky, dy) in (-2_isize..=2).enumerate() {
-                    let sample_y = (y as isize + dy).clamp(0, height as isize - 1) as usize;
-                    for (kx, dx) in (-2_isize..=2).enumerate() {
-                        let sample_x = (x as isize + dx).clamp(0, width as isize - 1) as usize;
-                        let spatial_weight = kernel[kx] * kernel[ky];
-                        let sample = ycbcr[sample_y * width + sample_x];
-                        let luma_distance = sample[0] - center[0];
-                        let luma_t = luma_distance * luma_distance * inverse_sigma_y_squared;
-                        let luma_range = if luma_t < 1.0 {
-                            let remaining = 1.0 - luma_t;
-                            remaining * remaining
-                        } else {
-                            0.0
-                        };
-                        let luma_weight = spatial_weight * luma_range;
-                        filtered_y += sample[0] * luma_weight;
-                        luma_weight_sum += luma_weight;
-
-                        let cb_distance = sample[1] - center[1];
-                        let cr_distance = sample[2] - center[2];
-                        let chroma_t = (cb_distance * cb_distance + cr_distance * cr_distance)
-                            * inverse_sigma_c_squared;
-                        let chroma_range = if chroma_t < 1.0 {
-                            let remaining = 1.0 - chroma_t;
-                            remaining * remaining
-                        } else {
-                            0.0
-                        };
-                        let chroma_weight = luma_weight * chroma_range;
-                        filtered_cb += sample[1] * chroma_weight;
-                        filtered_cr += sample[2] * chroma_weight;
-                        chroma_weight_sum += chroma_weight;
-                    }
-                }
-                let filtered_y = filtered_y / luma_weight_sum;
-                let filtered_cb = filtered_cb / chroma_weight_sum;
-                let filtered_cr = filtered_cr / chroma_weight_sum;
-                let yy = center[0] + (filtered_y - center[0]) * luma_mix;
-                let cb = center[1] + (filtered_cb - center[1]) * chroma_mix;
-                let cr = center[2] + (filtered_cr - center[2]) * chroma_mix;
-                let output = &mut output_row[x * 3..x * 3 + 3];
-                output[0] = yy + cr;
-                output[2] = yy + cb;
-                output[1] = (yy - 0.2126 * output[0] - 0.0722 * output[2]) / 0.7152;
-            }
+        .par_chunks_exact_mut(3)
+        .zip(yy.par_iter())
+        .zip(cb.par_iter())
+        .zip(cr.par_iter())
+        .for_each(|(((pixel, yy), cb), cr)| {
+            pixel[0] = *yy + *cr;
+            pixel[2] = *yy + *cb;
+            pixel[1] = (*yy - 0.2126 * pixel[0] - 0.0722 * pixel[2]) / 0.7152;
         });
 }
 
@@ -1462,6 +1534,52 @@ mod tests {
         assert!(
             maximum_rms < moderate_rms * 0.8,
             "maximum NR RMS {maximum_rms} did not improve moderate {moderate_rms}"
+        );
+    }
+
+    fn flat_patch_chroma_rms(image: &RgbImage) -> f32 {
+        let squared = image
+            .data
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .map(|pixel| {
+                let yy = 0.2126 * pixel[0] + 0.7152 * pixel[1] + 0.0722 * pixel[2];
+                (pixel[2] - yy).powi(2) + (pixel[0] - yy).powi(2)
+            })
+            .sum::<f32>();
+        (squared / (image.width * image.height) as f32).sqrt()
+    }
+
+    #[test]
+    fn multiscale_chroma_reduction_removes_colored_blotches() {
+        let mut image = RgbImage {
+            width: 35,
+            height: 29,
+            data: Vec::new(),
+        };
+        for y in 0..image.height {
+            for x in 0..image.width {
+                let blotch = if ((x / 5) + (y / 5)) % 2 == 0 {
+                    0.09
+                } else {
+                    -0.09
+                };
+                image
+                    .data
+                    .extend_from_slice(&[0.3 + blotch, 0.3, 0.3 - blotch]);
+            }
+        }
+        let before = flat_patch_chroma_rms(&image);
+        apply_noise_reduction(&mut image, 0.0, 0.6);
+        let after = flat_patch_chroma_rms(&image);
+        assert!(
+            after < before * 0.35,
+            "chroma RMS {after} remained near {before}"
+        );
+        assert!(
+            flat_patch_luma_rms(&image, 0.3) < 0.015,
+            "chroma filtering changed flat-patch luminance"
         );
     }
 
