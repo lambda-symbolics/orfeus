@@ -53,6 +53,12 @@ balance, edge-aware and neural (FFDNet) noise reduction, lens/TCA correction
 and correction strength, CUBE LUTs, and film grain. They are read with
 =*read-eval*= disabled.
 
+The processing pipeline is presented as a chain of stages (white balance,
+exposure, noise reduction, tone, optics, film). Each photo can bypass stages
+non-destructively (=:disabled-stages=), whole or partial grades copy between
+photos, and the GUI grabs auto-named stills into a thumbnail gallery whose
+grades apply to any selection — batch grading in the DaVinci Resolve style.
+
 Adapted manual lenses can be associated with exact Lensfun profiles in
 =$XDG_CONFIG_HOME/orfeus/lenses.sexp= (or the path in
 =ORFEUS_LENS_ALIASES=). The file is a safely read association list; user entries
