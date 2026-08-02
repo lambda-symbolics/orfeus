@@ -151,10 +151,13 @@
          (project (gui-model-project model)))
     (unless (plusp (length trimmed))
       (error "Preset name cannot be empty."))
-    (let* ((preset (make-processing-preset
+    (let* ((source (let ((job (gui-model-selected-job model)))
+                     (and job (photo-job-input-path job))))
+           (preset (make-processing-preset
                     :name trimmed
                     :settings (orfeus::copy-processing-settings
-                               (gui-model-selected-settings model))))
+                               (gui-model-selected-settings model))
+                    :source-photo source))
            (existing (project-presets project))
            (position (position trimmed existing :test #'string-equal
                                                 :key #'processing-preset-name)))
@@ -259,13 +262,103 @@
               (plist-put (photo-job-overrides job) key value))))
   value)
 
+(defun gui-model-acting-jobs (model)
+  "Return the selected photo jobs, falling back to the current photograph."
+  (or (gui-model-selected-jobs model)
+      (let ((job (gui-model-selected-job model)))
+        (and job (list job)))))
+
 (defun gui-model-reset-selected (model)
-  "Clear overrides from all selected photos."
-  (dolist (job (or (gui-model-selected-jobs model)
-                   (let ((job (gui-model-selected-job model)))
-                     (and job (list job)))))
-    (setf (photo-job-overrides job) '()))
+  "Clear overrides and stage bypasses from all selected photos."
+  (dolist (job (gui-model-acting-jobs model))
+    (setf (photo-job-overrides job) '()
+          (orfeus:photo-job-disabled-stages job) '()))
   model)
+
+(defun gui-model-render-settings (model)
+  "Return the selected photo's settings as rendered, honoring stage bypass."
+  (let ((project (gui-model-project model))
+        (job (gui-model-selected-job model)))
+    (if job
+        (orfeus:photo-render-settings project job)
+        (project-defaults project))))
+
+(defun gui-model-stage-bypassed-p (model stage)
+  "Return true when STAGE is bypassed on the selected photograph."
+  (let ((job (gui-model-selected-job model)))
+    (and job
+         (member stage (orfeus:photo-job-disabled-stages job))
+         t)))
+
+(defun gui-model-toggle-stage (model stage)
+  "Toggle STAGE bypass across the selection; primary photo decides direction.
+Returns :BYPASSED, :ENABLED, or :NONE without a photograph."
+  (let ((jobs (gui-model-acting-jobs model)))
+    (if (null jobs)
+        :none
+        (let ((enable (and (member stage (orfeus:photo-job-disabled-stages
+                                          (first jobs)))
+                           t)))
+          (dolist (job jobs)
+            (setf (orfeus:photo-job-disabled-stages job)
+                  (if enable
+                      (remove stage (orfeus:photo-job-disabled-stages job))
+                      (adjoin stage (orfeus:photo-job-disabled-stages job)))))
+          (if enable :enabled :bypassed)))))
+
+(defun stage-setting-inert-p (key grade)
+  "True when KEY cannot affect rendering given the other GRADE values."
+  (case key
+    (:lut-strength (null (getf grade :lut-path)))
+    (:grain-size (let ((amount (getf grade :grain-amount)))
+                   (or (null amount) (not (plusp amount)))))
+    (:lens-correction-strength (not (getf grade :lens-correction-p)))
+    (t nil)))
+
+(defun stage-setting-equal (first-value second-value)
+  (cond ((and (null first-value) (null second-value)) t)
+        ((and (realp first-value) (realp second-value))
+         (= first-value second-value))
+        ((and (stringp first-value) (stringp second-value))
+         (string= first-value second-value))
+        (t (eql first-value second-value))))
+
+(defun gui-model-stage-adjusted-p (model stage)
+  "True when STAGE departs from identity in the selected effective settings."
+  (let ((grade (orfeus:settings-grade-plist
+                (gui-model-selected-settings model) (list stage))))
+    (loop for (key value) on grade by #'cddr
+          thereis (and (not (stage-setting-inert-p key grade))
+                       (not (stage-setting-equal
+                             value
+                             (getf orfeus::*stage-identity-plist* key)))))))
+
+(defun gui-model-grab-still (model)
+  "Capture the rendered look as an auto-named still preset, or NIL."
+  (let ((job (gui-model-selected-job model)))
+    (when job
+      (let* ((project (gui-model-project model))
+             (preset (orfeus:make-processing-preset
+                      :name (orfeus:next-still-preset-name project job)
+                      :settings (orfeus:photo-render-settings project job)
+                      :source-photo (photo-job-input-path job))))
+        (setf (project-presets project)
+              (append (project-presets project) (list preset)))
+        preset))))
+
+(defun gui-model-copy-grade (model)
+  "Return the selected photo's grade plist and bypass list, or NIL."
+  (let ((job (gui-model-selected-job model)))
+    (when job
+      (values (orfeus:settings-grade-plist (gui-model-selected-settings model))
+              (copy-list (orfeus:photo-job-disabled-stages job))))))
+
+(defun gui-model-paste-grade (model grade disabled-stages)
+  "Apply GRADE and DISABLED-STAGES to every selected photo; return the count."
+  (let ((jobs (gui-model-acting-jobs model)))
+    (dolist (job jobs)
+      (orfeus:photo-job-apply-grade job grade disabled-stages))
+    (length jobs)))
 
 (defun gui-photo-output-path (model job)
   "Return JOB's render output using the shared core project semantics."

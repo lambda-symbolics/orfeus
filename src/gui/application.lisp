@@ -37,6 +37,24 @@
 (defconstant +key-f5+ #xffc2
   "FLTK key code for the F5 function key.")
 
+(defparameter *stage-node-labels*
+  '((:white-balance . "WB")
+    (:exposure . "Expo")
+    (:noise-reduction . "NR")
+    (:tone . "Tone")
+    (:optics . "Optics")
+    (:film . "Film"))
+  "Short node captions for the pipeline strip, in processing order.")
+
+(defparameter *node-strip-height* 46
+  "Height of the pipeline node strip under the preview.")
+
+(defparameter *gallery-cell-width* 96
+  "Width of one still cell in the gallery grid.")
+
+(defparameter *gallery-cell-height* 92
+  "Height of one still cell in the gallery grid.")
+
 (defun thumbnail-row-at (event-y scroll row-height)
   "Return the zero-based thumbnail row at local EVENT-Y."
   (floor (+ event-y scroll) row-height))
@@ -174,11 +192,17 @@
            window menu toolbar toolbar-bottom-rule main-tile left-pane center-pane
            thumbnail-canvas thumbnail-scrollbar
            before-canvas after-canvas before-caption after-caption
+           node-strip still-button copy-grade-button paste-grade-button
+           grade-clipboard
            inspector tabs basic-page optics-page effects-page export-page presets-page
            status progress before-preview-file after-preview-file
            lens-name controls inspector-items tone-items lut-choice wb-choice target-choice
            export-quality export-max-width export-max-height export-metadata
-           preset-browser preset-name-input preset-apply-button
+           gallery-canvas preset-name-input preset-apply-button
+           (gallery-scroll 0)
+           (gallery-selected nil)
+           (gallery-thumbs (make-hash-table :test #'equal))
+           (gallery-click (cons 0 -1))
            debounce-id poll-id comparison-p layout-initialized-p
            (thumbnail-scroll 0)
            (thumbnail-anchor 0)
@@ -366,6 +390,7 @@
                    (setf (gui-model-selected-index model) row))
                  (clear-previews)
                  (sync-controls)
+                 (when node-strip (cl-fltk:redraw node-strip))
                  (when selection (schedule-initial-preview))
                  (redraw-thumbnails))))
            (handle-thumbnail-mouse (canvas event value)
@@ -459,12 +484,274 @@
            (selected-photo-count ()
              (length (or (gui-model-selected-indices model)
                          (and (selected-job) '(0)))))
-           (refresh-preset-browser ()
-             (when preset-browser
-               (cl-fltk:clear preset-browser)
+           (node-strip-metrics ()
+             (let* ((width (cl-fltk:widget-width node-strip))
+                    (count (length *stage-node-labels*))
+                    (wire 14)
+                    (node-width (max 44 (min 96 (floor (- width 16
+                                                          (* (1- count) wire))
+                                                       count)))))
+               (values node-width wire)))
+           (node-index-at (x)
+             (multiple-value-bind (node-width wire) (node-strip-metrics)
+               (let* ((pitch (+ node-width wire))
+                      (index (floor (- x 8) pitch))
+                      (offset (- x 8 (* index pitch))))
+                 (when (and (>= x 8)
+                            (>= index 0)
+                            (< index (length *stage-node-labels*))
+                            (< offset node-width))
+                   index))))
+           (draw-node-strip (widget)
+             (multiple-value-bind (node-width wire) (node-strip-metrics)
+               (let* ((x (cl-fltk:widget-x widget))
+                      (y (cl-fltk:widget-y widget))
+                      (width (cl-fltk:widget-width widget))
+                      (height (cl-fltk:widget-height widget))
+                      (node-height 30)
+                      (top (+ y (floor (- height node-height) 2)))
+                      (middle (+ top (floor node-height 2))))
+                 (cl-fltk:draw-color-rgb :red 192 :green 192 :blue 192)
+                 (cl-fltk:draw-filled-rect x y width height)
+                 (loop for (stage . label) in *stage-node-labels*
+                       for index from 0
+                       for node-x = (+ x 8 (* index (+ node-width wire)))
+                       do (let ((bypassed (gui-model-stage-bypassed-p model
+                                                                      stage))
+                                (adjusted (gui-model-stage-adjusted-p model
+                                                                      stage)))
+                            (when (plusp index)
+                              (cl-fltk:draw-color-rgb :red 90 :green 90
+                                                      :blue 90)
+                              (cl-fltk:draw-filled-rect (- node-x wire) middle
+                                                        wire 2))
+                            (if bypassed
+                                (cl-fltk:draw-color-rgb :red 168 :green 168
+                                                        :blue 168)
+                                (cl-fltk:draw-color-rgb :red 210 :green 210
+                                                        :blue 210))
+                            (cl-fltk:draw-filled-rect node-x top node-width
+                                                      node-height)
+                            (cl-fltk:draw-color-rgb :red 248 :green 248
+                                                    :blue 248)
+                            (cl-fltk:draw-filled-rect node-x top node-width 1)
+                            (cl-fltk:draw-filled-rect node-x top 1 node-height)
+                            (cl-fltk:draw-color-rgb :red 105 :green 105
+                                                    :blue 105)
+                            (cl-fltk:draw-filled-rect
+                             node-x (+ top node-height -1) node-width 1)
+                            (cl-fltk:draw-filled-rect
+                             (+ node-x node-width -1) top 1 node-height)
+                            (if adjusted
+                                (cl-fltk:draw-color-rgb :red 40 :green 150
+                                                        :blue 40)
+                                (cl-fltk:draw-color-rgb :red 150 :green 150
+                                                        :blue 150))
+                            (cl-fltk:draw-filled-rect (+ node-x node-width -11)
+                                                      (+ top 4) 7 7)
+                            (if bypassed
+                                (cl-fltk:draw-color-rgb :red 110 :green 110
+                                                        :blue 110)
+                                (cl-fltk:draw-color-rgb :red 0 :green 0
+                                                        :blue 0))
+                            (cl-fltk:draw-font :size 11)
+                            (cl-fltk:draw-text label (+ node-x 6)
+                                               (+ top 20))
+                            (cl-fltk:draw-font :size 12)
+                            (when bypassed
+                              (cl-fltk:draw-color-rgb :red 165 :green 40
+                                                      :blue 40)
+                              (cl-fltk:draw-line node-x (+ top node-height -1)
+                                                 (+ node-x node-width -1)
+                                                 top)))))))
+           (handle-node-strip-mouse (widget event value)
+             (declare (ignore widget event))
+             (multiple-value-bind (x y) (parse-preview-event value)
+               (declare (ignore y))
+               (when x
+                 (let ((index (node-index-at x)))
+                   (when index
+                     (destructuring-bind (stage . label)
+                         (nth index *stage-node-labels*)
+                       (let ((result (gui-model-toggle-stage model stage)))
+                         (unless (eq result :none)
+                           (cl-fltk:redraw node-strip)
+                           (schedule-edited-preview)
+                           (set-status
+                            (format nil "~A ~A for ~D photo~:P"
+                                    (if (eq result :bypassed)
+                                        "Bypassed"
+                                        "Enabled")
+                                    label
+                                    (selected-photo-count)))))))))))
+           (copy-grade ()
+             (multiple-value-bind (grade disabled)
+                 (gui-model-copy-grade model)
+               (if grade
+                   (progn
+                     (setf grade-clipboard (list grade disabled))
+                     (set-status "Grade copied"))
+                   (set-status "No photograph selected"))))
+           (paste-grade ()
+             (cond
+               ((null grade-clipboard)
+                (set-status "Copy a grade first"))
+               (t
+                (let ((count (gui-model-paste-grade
+                              model
+                              (first grade-clipboard)
+                              (second grade-clipboard))))
+                  (if (plusp count)
+                      (progn
+                        (sync-controls)
+                        (when node-strip (cl-fltk:redraw node-strip))
+                        (schedule-edited-preview)
+                        (set-status (format nil "Grade pasted to ~D photo~:P"
+                                            count)))
+                      (set-status "No photograph selected"))))))
+           (grab-still ()
+             (let ((preset (gui-model-grab-still model)))
+               (if preset
+                   (progn
+                     (refresh-gallery)
+                     (setf (cl-fltk:value preset-name-input)
+                           (processing-preset-name preset))
+                     (sync-preset-action-label)
+                     (set-status (format nil "Grabbed ~A"
+                                         (processing-preset-name preset))))
+                   (set-status "No photograph selected"))))
+           (still-thumbnail-pathname (preset)
+             (merge-pathnames
+              (make-pathname
+               :name (format nil "still-~A-~A"
+                             (preview-settings-key
+                              (processing-preset-settings preset))
+                             (or (pathname-name
+                                  (processing-preset-source-photo preset))
+                                 "none"))
+               :type "jpg")
+              preview-directory))
+           (request-still-thumbnail (preset)
+             (let ((name (processing-preset-name preset))
+                   (source (processing-preset-source-photo preset)))
+               (when (and source (null (gethash name gallery-thumbs)))
+                 (let ((output (still-thumbnail-pathname preset))
+                       (settings (processing-preset-settings preset)))
+                   (if (probe-file output)
+                       (setf (gethash name gallery-thumbs) output)
+                       (enqueue-gui-task
+                        background-queue :still
+                        (lambda ()
+                          (handler-case
+                              (progn
+                                (render-preview
+                                 source output settings
+                                 :max-width *thumbnail-preview-size*
+                                 :max-height *thumbnail-preview-size*
+                                 :jpeg-quality 82
+                                 :if-exists :supersede)
+                                (queue-event queue
+                                             (list :still-thumb name output)))
+                            (error () nil)))))))))
+           (refresh-gallery ()
+             (when gallery-canvas
                (dolist (preset (project-presets project))
-                 (cl-fltk:add-item preset-browser
-                                   (processing-preset-name preset)))))
+                 (request-still-thumbnail preset))
+               (cl-fltk:redraw gallery-canvas)))
+           (gallery-columns ()
+             (max 1 (floor (- (cl-fltk:widget-width gallery-canvas) 8)
+                           *gallery-cell-width*)))
+           (gallery-index-at (x y)
+             (let* ((columns (gallery-columns))
+                    (column (floor (- x 4) *gallery-cell-width*))
+                    (row (floor (+ (- y 4) gallery-scroll)
+                                *gallery-cell-height*))
+                    (index (+ (* row columns) (min column (1- columns)))))
+               (when (and (>= column 0) (< column columns) (>= row 0)
+                          (< index (length (project-presets project))))
+                 index)))
+           (gallery-scroll-limit ()
+             (let ((columns (gallery-columns)))
+               (max 0 (- (* (ceiling (length (project-presets project))
+                                     columns)
+                            *gallery-cell-height*)
+                         (- (cl-fltk:widget-height gallery-canvas) 8)))))
+           (draw-gallery (widget)
+             (let ((x (cl-fltk:widget-x widget))
+                   (y (cl-fltk:widget-y widget))
+                   (width (cl-fltk:widget-width widget))
+                   (height (cl-fltk:widget-height widget))
+                   (columns (gallery-columns)))
+               (cl-fltk:draw-color-rgb :red 255 :green 255 :blue 255)
+               (cl-fltk:draw-filled-rect x y width height)
+               (loop for preset in (project-presets project)
+                     for index from 0
+                     for column = (mod index columns)
+                     for row = (floor index columns)
+                     for cell-x = (+ x 4 (* column *gallery-cell-width*))
+                     for cell-y = (+ y 4 (* row *gallery-cell-height*)
+                                    (- gallery-scroll))
+                     when (and (< cell-y (+ y height))
+                               (> (+ cell-y *gallery-cell-height*) y))
+                       do (let ((name (processing-preset-name preset))
+                                (selected (eql index gallery-selected)))
+                            (when selected
+                              (cl-fltk:draw-color-rgb :red 0 :green 0 :blue 128)
+                              (cl-fltk:draw-filled-rect
+                               cell-x cell-y (- *gallery-cell-width* 6)
+                               (- *gallery-cell-height* 6)))
+                            (let ((thumb (gethash name gallery-thumbs)))
+                              (if thumb
+                                  (draw-thumbnail-file
+                                   widget thumb (+ cell-x 3) (+ cell-y 3)
+                                   (- *gallery-cell-width* 12) 62)
+                                  (progn
+                                    (cl-fltk:draw-color-rgb
+                                     :red 205 :green 205 :blue 205)
+                                    (cl-fltk:draw-filled-rect
+                                     (+ cell-x 3) (+ cell-y 3)
+                                     (- *gallery-cell-width* 12) 62))))
+                            (if selected
+                                (cl-fltk:draw-color-rgb :red 255 :green 255
+                                                        :blue 255)
+                                (cl-fltk:draw-color-rgb :red 0 :green 0
+                                                        :blue 0))
+                            (cl-fltk:draw-font :size 10)
+                            (cl-fltk:draw-text
+                             (if (> (length name) 14)
+                                 (subseq name 0 14)
+                                 name)
+                             (+ cell-x 3) (+ cell-y 80))
+                            (cl-fltk:draw-font :size 12)))))
+           (gallery-select (index)
+             (setf gallery-selected index)
+             (let ((preset (nth index (project-presets project))))
+               (when preset
+                 (setf (cl-fltk:value preset-name-input)
+                       (processing-preset-name preset))))
+             (cl-fltk:redraw gallery-canvas))
+           (handle-gallery-mouse (widget event value)
+             (declare (ignore widget))
+             (multiple-value-bind (x y button dx dy state)
+                 (parse-preview-event value)
+               (declare (ignore button dx state))
+               (when x
+                 (case event
+                   (#.cl-fltk:+event-push+
+                    (let ((index (gallery-index-at x y))
+                          (now (get-internal-real-time)))
+                      (when index
+                        (gallery-select index)
+                        (if (and (eql index (cdr gallery-click))
+                                 (< (- now (car gallery-click))
+                                    (* 0.4 internal-time-units-per-second)))
+                            (apply-current-preset)
+                            (setf gallery-click (cons now index))))))
+                   (#.cl-fltk:+event-wheel+
+                    (setf gallery-scroll
+                          (min (gallery-scroll-limit)
+                               (max 0 (+ gallery-scroll (* dy 32)))))
+                    (cl-fltk:redraw gallery-canvas))))))
            (sync-preset-action-label ()
              (when preset-apply-button
                (setf (cl-fltk:label preset-apply-button)
@@ -474,7 +761,8 @@
              (handler-case
                  (let ((preset (gui-model-save-preset
                                 model (cl-fltk:value preset-name-input))))
-                   (refresh-preset-browser)
+                   (remhash (processing-preset-name preset) gallery-thumbs)
+                   (refresh-gallery)
                    (setf (cl-fltk:value preset-name-input)
                          (processing-preset-name preset))
                    (set-status (format nil "Saved preset ~A"
@@ -524,8 +812,12 @@
                    thumbnail-scroll 0
                    thumbnail-anchor 0)
              (clrhash thumbnail-files)
+             (clrhash gallery-thumbs)
+             (setf gallery-selected nil
+                   gallery-scroll 0)
              (gui-model-replace-project model new-project path)
-             (refresh-preset-browser)
+             (refresh-gallery)
+             (when node-strip (cl-fltk:redraw node-strip))
              (sync-controls)
              (if (selected-job)
                  (schedule-initial-preview)
@@ -602,9 +894,9 @@
               :lut-path nil
               :grain-amount 0.0))
            (settings-for-job (job)
-             (processing-settings-with-overrides
-              (project-defaults project)
-              (photo-job-overrides job)))
+             ;; Rendering settings: overrides applied and bypassed stages
+             ;; neutralized, exactly as the CLI batch renders them.
+             (orfeus:photo-render-settings project job))
            (current-settings ()
              (settings-for-job (selected-job)))
            (enqueue-render (target-queue role job index settings generation publish-p
@@ -885,7 +1177,12 @@
              (let* ((center (cl-fltk:widget-width center-pane))
                     (main-height (cl-fltk:widget-height center-pane))
                     (caption-height 22)
-                    (viewer-height (max 100 (- main-height caption-height)))
+                    (strip-height *node-strip-height*)
+                    (viewer-height (max 100 (- main-height caption-height
+                                               strip-height)))
+                    (strip-y (+ caption-height viewer-height))
+                    (button-width 52)
+                    (buttons-width (+ (* 3 button-width) 16))
                     (gutter 6)
                     (pane-width (floor (- center gutter) 2)))
                (if comparison-p
@@ -911,6 +1208,23 @@
                                             :width center :height caption-height)
                      (cl-fltk:resize-widget after-canvas :x 0 :y caption-height
                                             :width center :height viewer-height)))
+               (when node-strip
+                 (cl-fltk:resize-widget node-strip :x 0 :y strip-y
+                                        :width (max 120 (- center buttons-width))
+                                        :height strip-height)
+                 (let ((button-y (+ strip-y (floor (- strip-height 24) 2))))
+                   (cl-fltk:resize-widget still-button
+                                          :x (- center (* 3 button-width) 12)
+                                          :y button-y
+                                          :width button-width :height 24)
+                   (cl-fltk:resize-widget copy-grade-button
+                                          :x (- center (* 2 button-width) 8)
+                                          :y button-y
+                                          :width button-width :height 24)
+                   (cl-fltk:resize-widget paste-grade-button
+                                          :x (- center button-width 4)
+                                          :y button-y
+                                          :width button-width :height 24)))
                (cl-fltk:redraw center-pane)))
            (layout-inspector-pane (&optional ignored)
              (declare (ignore ignored))
@@ -1031,6 +1345,9 @@
                              (null (gethash (third event) thumbnail-files)))
                     (setf (gethash (third event) thumbnail-files) (fourth event))
                     (redraw-thumbnails)))
+                 (:still-thumb
+                  (setf (gethash (second event) gallery-thumbs) (third event))
+                  (when gallery-canvas (cl-fltk:redraw gallery-canvas)))
                  (:done
                   (set-status (format nil "Exported ~A" (second event))))
                  (:error
@@ -1083,6 +1400,18 @@
                                                     (declare (ignore ignored))
                                                     (cl-fltk:quit))
                                :shortcut (logior +menu-ctrl+ (char-code #\q)))
+        (cl-fltk:add-menu-item menu "Edit/Copy Grade"
+                               (lambda (&rest ignored)
+                                 (declare (ignore ignored))
+                                 (copy-grade))
+                               :shortcut (logior +menu-ctrl+ +menu-shift+
+                                                 (char-code #\c)))
+        (cl-fltk:add-menu-item menu "Edit/Paste Grade to Selected"
+                               (lambda (&rest ignored)
+                                 (declare (ignore ignored))
+                                 (paste-grade))
+                               :shortcut (logior +menu-ctrl+ +menu-shift+
+                                                 (char-code #\v)))
         (cl-fltk:add-menu-item menu "Edit/Remove Selected Photos"
                                (lambda (&rest ignored)
                                  (declare (ignore ignored))
@@ -1110,6 +1439,11 @@
                                  (declare (ignore ignored))
                                  (schedule-initial-preview))
                                :shortcut +key-f5+)
+        (cl-fltk:add-menu-item menu "Process/Grab Still"
+                               (lambda (&rest ignored)
+                                 (declare (ignore ignored))
+                                 (grab-still))
+                               :shortcut (logior +menu-ctrl+ (char-code #\g)))
         (cl-fltk:add-menu-item menu "Process/Export Current Photo"
                                (lambda (&rest ignored)
                                  (declare (ignore ignored))
@@ -1281,6 +1615,35 @@
                           (lambda (widget callback-event value)
                             (handle-preview-mouse widget callback-event value))
                           :event event))))
+        (setf node-strip
+              (cl-fltk:make-canvas
+               :parent center-pane :x 0 :y 662 :width 540 :height 46
+               :callback (lambda (widget event value)
+                           (declare (ignore event value))
+                           (draw-node-strip widget))))
+        (cl-fltk:set-box node-strip cl-fltk:+box-flat-box+)
+        (cl-fltk:set-tooltip node-strip
+                             "Pipeline nodes: click one to bypass its stage")
+        (cl-fltk:on node-strip #'handle-node-strip-mouse
+                    :event cl-fltk:+event-push+)
+        (flet ((grade-button (label tooltip action)
+                 (let ((button (cl-fltk:make-button
+                                :parent center-pane :x 560 :y 672
+                                :width 52 :height 24 :label label
+                                :callback (lambda (&rest ignored)
+                                            (declare (ignore ignored))
+                                            (funcall action)))))
+                   (cl-fltk:set-tooltip button tooltip)
+                   button)))
+          (setf still-button
+                (grade-button "Still" "Grab a still of the current grade"
+                              #'grab-still)
+                copy-grade-button
+                (grade-button "Copy" "Copy the current photo's grade"
+                              #'copy-grade)
+                paste-grade-button
+                (grade-button "Paste" "Paste the copied grade to the selection"
+                              #'paste-grade)))
         (setf inspector (cl-fltk:make-panel :parent main-tile :x 960 :y 0
                                             :width 320 :height 708
                                             :label ""))
@@ -1318,7 +1681,7 @@
                                                   :label "Export")
                presets-page (cl-fltk:make-tab-page :parent tabs :x 2 :y 24
                                                    :width 308 :height 600
-                                                   :label "Presets"))
+                                                   :label "Gallery"))
         (section-frame export-page "Output" 16 140)
         (flet ((export-integer-field (key label y)
                  (cl-fltk:field-control
@@ -1342,18 +1705,17 @@
                               (declare (ignore event value))
                               (export-setting-changed :preserve-metadata-p widget)))
                  110 122 :control 26 :page)))
-        (section-frame presets-page "Preset Library" 16 244)
-        (setf preset-browser
+        (section-frame presets-page "Stills Gallery" 16 244)
+        (setf gallery-canvas
               (register-inspector
-               (cl-fltk:make-browser
+               (cl-fltk:make-canvas
                 :parent presets-page :x 12 :y 28 :width 292 :height 190
-                :items nil
                 :callback (lambda (widget event value)
                             (declare (ignore event value))
-                            (let ((name (cl-fltk:value widget)))
-                              (when (plusp (length name))
-                                (setf (cl-fltk:value preset-name-input) name)))))
+                            (draw-gallery widget)))
                12 28 :fill 190 :page))
+        (dolist (event (list cl-fltk:+event-push+ cl-fltk:+event-wheel+))
+          (cl-fltk:on gallery-canvas #'handle-gallery-mouse :event event))
         (let ((name-field
                 (register-field
                  (cl-fltk:make-labeled-input
@@ -1378,7 +1740,7 @@
                             (declare (ignore ignored))
                             (apply-current-preset)))
                158 270 :half-right 26 :page))
-        (refresh-preset-browser)
+        (refresh-gallery)
         (section-frame basic-page "White Balance" 16 110)
         (setf wb-choice
               (cl-fltk:field-control
