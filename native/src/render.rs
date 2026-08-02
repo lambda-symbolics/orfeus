@@ -7,7 +7,6 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use image::codecs::jpeg::JpegEncoder;
 use image::codecs::tiff::TiffEncoder;
 use image::{ColorType, ImageEncoder};
 use lensfun::{Camera, Database, Lens, Modifier};
@@ -28,6 +27,7 @@ pub const FLAG_LENS_TCA: u32 = 2;
 const KNOWN_FLAGS: u32 = FLAG_LENS_DISTORTION | FLAG_LENS_TCA;
 const MAX_LUT_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_LUT_SIZE: usize = 65;
+const LENS_MAP_ROW_STEP: usize = 16;
 const SRGB_ICC: &[u8] = include_bytes!("sRGB-v4.icc");
 
 #[repr(C)]
@@ -384,8 +384,14 @@ fn parse_triplet_iter<'a>(
 }
 
 fn apply_exposure(image: &mut RgbImage, ev: f32) {
+    if ev == 0.0 {
+        return;
+    }
     let multiplier = 2.0_f32.powf(ev);
-    image.data.iter_mut().for_each(|value| *value *= multiplier);
+    image
+        .data
+        .par_iter_mut()
+        .for_each(|value| *value *= multiplier);
 }
 
 fn kelvin_xy(kelvin: f32) -> (f32, f32) {
@@ -407,6 +413,16 @@ fn kelvin_xy(kelvin: f32) -> (f32, f32) {
 
 fn mat_vec(matrix: [[f32; 3]; 3], value: [f32; 3]) -> [f32; 3] {
     matrix.map(|row| row[0] * value[0] + row[1] * value[1] + row[2] * value[2])
+}
+
+fn mat_mul(left: [[f32; 3]; 3], right: [[f32; 3]; 3]) -> [[f32; 3]; 3] {
+    std::array::from_fn(|row| {
+        std::array::from_fn(|column| {
+            (0..3)
+                .map(|inner| left[row][inner] * right[inner][column])
+                .sum()
+        })
+    })
 }
 
 /// Chromatically adapts linear sRGB from the requested source white to D65.
@@ -447,14 +463,23 @@ fn apply_white_adaptation(image: &mut RgbImage, kelvin: f32, tint: f32) {
         [-0.969_266, 1.876_010_8, 0.041_556],
         [0.055_643_4, -0.204_025_9, 1.057_225_2],
     ];
-    for pixel in image.data.as_chunks_mut::<3>().0 {
-        let xyz = mat_vec(rgb_to_xyz, *pixel);
-        let mut lms = mat_vec(bradford, xyz);
-        for channel in 0..3 {
-            lms[channel] *= dst_lms[channel] / src_lms[channel];
-        }
-        *pixel = mat_vec(xyz_to_rgb, mat_vec(inverse, lms));
-    }
+    let scale: [[f32; 3]; 3] = std::array::from_fn(|row| {
+        std::array::from_fn(|column| {
+            if row == column {
+                dst_lms[row] / src_lms[row]
+            } else {
+                0.0
+            }
+        })
+    });
+    let adaptation = mat_mul(
+        xyz_to_rgb,
+        mat_mul(inverse, mat_mul(scale, mat_mul(bradford, rgb_to_xyz))),
+    );
+    image
+        .data
+        .par_chunks_exact_mut(3)
+        .for_each(|pixel| pixel.copy_from_slice(&mat_vec(adaptation, [pixel[0], pixel[1], pixel[2]])));
 }
 
 fn tone_adjustment_ev(luminance: f32, adjustments: &[f32; 7]) -> f32 {
@@ -481,15 +506,20 @@ fn apply_tonal_equalizer(image: &mut RgbImage, adjustments: [f32; 7]) {
     });
 }
 
-fn edge_guided_blur(
+fn edge_guided_blur_into(
     source: &[f32],
     guide: &[f32],
     width: usize,
     height: usize,
     step: usize,
-) -> Vec<f32> {
+    horizontal: &mut Vec<f32>,
+    output: &mut Vec<f32>,
+) {
     let kernel = [1.0_f32, 4.0, 6.0, 4.0, 1.0];
-    let mut horizontal = vec![0.0_f32; source.len()];
+    horizontal.clear();
+    horizontal.resize(source.len(), 0.0);
+    output.clear();
+    output.resize(source.len(), 0.0);
     horizontal
         .par_chunks_mut(width)
         .enumerate()
@@ -513,7 +543,7 @@ fn edge_guided_blur(
                 *value = sum / weight_sum;
             }
         });
-    let mut output = vec![0.0_f32; source.len()];
+    let horizontal = &*horizontal;
     output
         .par_chunks_mut(width)
         .enumerate()
@@ -537,31 +567,65 @@ fn edge_guided_blur(
                 *value = sum / weight_sum;
             }
         });
-    output
 }
 
-fn median_filter_3x3(source: &[f32], width: usize, height: usize) -> Vec<f32> {
-    let mut output = vec![0.0_f32; source.len()];
+fn median_of_9(mut samples: [f32; 9]) -> f32 {
+    // Paeth's 19-exchange median network; equivalent to sorting and taking [4].
+    macro_rules! exchange {
+        ($a:expr, $b:expr) => {
+            if samples[$b] < samples[$a] {
+                samples.swap($a, $b);
+            }
+        };
+    }
+    exchange!(1, 2);
+    exchange!(4, 5);
+    exchange!(7, 8);
+    exchange!(0, 1);
+    exchange!(3, 4);
+    exchange!(6, 7);
+    exchange!(1, 2);
+    exchange!(4, 5);
+    exchange!(7, 8);
+    exchange!(0, 3);
+    exchange!(5, 8);
+    exchange!(4, 7);
+    exchange!(3, 6);
+    exchange!(1, 4);
+    exchange!(2, 5);
+    exchange!(4, 7);
+    exchange!(4, 2);
+    exchange!(6, 4);
+    exchange!(4, 2);
+    samples[4]
+}
+
+fn median_filter_3x3_into(source: &[f32], width: usize, height: usize, output: &mut Vec<f32>) {
+    output.clear();
+    output.resize(source.len(), 0.0);
     output
         .par_chunks_mut(width)
         .enumerate()
         .for_each(|(y, output_row)| {
+            let above = &source[y.saturating_sub(1) * width..];
+            let center = &source[y * width..];
+            let below = &source[(y + 1).min(height - 1) * width..];
             for (x, value) in output_row.iter_mut().enumerate() {
-                let mut samples = [0.0_f32; 9];
-                let mut index = 0;
-                for dy in -1_isize..=1 {
-                    let sample_y = (y as isize + dy).clamp(0, height as isize - 1) as usize;
-                    for dx in -1_isize..=1 {
-                        let sample_x = (x as isize + dx).clamp(0, width as isize - 1) as usize;
-                        samples[index] = source[sample_y * width + sample_x];
-                        index += 1;
-                    }
-                }
-                samples.sort_unstable_by(f32::total_cmp);
-                *value = samples[4];
+                let left = x.saturating_sub(1);
+                let right = (x + 1).min(width - 1);
+                *value = median_of_9([
+                    above[left],
+                    above[x],
+                    above[right],
+                    center[left],
+                    center[x],
+                    center[right],
+                    below[left],
+                    below[x],
+                    below[right],
+                ]);
             }
         });
-    output
 }
 
 fn blend_toward(source: &mut [f32], filtered: &[f32], amount: f32) {
@@ -593,13 +657,32 @@ fn apply_noise_reduction(image: &mut RgbImage, luma: f32, chroma: f32) {
             *cr = pixel[0] - *yy;
         });
 
+    let mut scratch = Vec::new();
+    let mut filtered = Vec::new();
     let luma_strength = luma.clamp(0.0, 1.0);
     if luma_strength > 0.0 {
-        let scale_one = edge_guided_blur(&yy, &yy, image.width, image.height, 1);
-        let scale_two = edge_guided_blur(&scale_one, &yy, image.width, image.height, 2);
+        let mut scale_one = Vec::new();
+        edge_guided_blur_into(
+            &yy,
+            &yy,
+            image.width,
+            image.height,
+            1,
+            &mut scratch,
+            &mut scale_one,
+        );
+        edge_guided_blur_into(
+            &scale_one,
+            &yy,
+            image.width,
+            image.height,
+            2,
+            &mut scratch,
+            &mut filtered,
+        );
         yy.par_iter_mut()
             .zip(scale_one.par_iter())
-            .zip(scale_two.par_iter())
+            .zip(filtered.par_iter())
             .for_each(|((value, scale_one), scale_two)| {
                 let threshold = luma_strength * (0.012 + 0.035 * value.max(0.0).sqrt());
                 let fine = soft_threshold(*value - *scale_one, threshold);
@@ -611,15 +694,23 @@ fn apply_noise_reduction(image: &mut RgbImage, luma: f32, chroma: f32) {
     let chroma_strength = chroma.clamp(0.0, 1.0);
     if chroma_strength > 0.0 {
         for channel in [&mut cb, &mut cr] {
-            let median = median_filter_3x3(channel, image.width, image.height);
-            blend_toward(channel, &median, (chroma_strength * 1.5).min(1.0));
+            median_filter_3x3_into(channel, image.width, image.height, &mut filtered);
+            blend_toward(channel, &filtered, (chroma_strength * 1.5).min(1.0));
             for (step, amount) in [
                 (1, (chroma_strength * 1.8).min(1.0)),
                 (2, (chroma_strength * 1.25).min(1.0)),
                 (4, ((chroma_strength - 0.2) * 1.25).clamp(0.0, 1.0)),
             ] {
                 if amount > 0.0 {
-                    let filtered = edge_guided_blur(channel, &yy, image.width, image.height, step);
+                    edge_guided_blur_into(
+                        channel,
+                        &yy,
+                        image.width,
+                        image.height,
+                        step,
+                        &mut scratch,
+                        &mut filtered,
+                    );
                     blend_toward(channel, &filtered, amount);
                 }
             }
@@ -810,18 +901,22 @@ fn zoom_center(image: &mut RgbImage, scale: f32) {
         return;
     }
     let source = image.clone();
+    let width = image.width;
     let center_x = (image.width.saturating_sub(1)) as f32 * 0.5;
     let center_y = (image.height.saturating_sub(1)) as f32 * 0.5;
-    for y in 0..image.height {
-        let source_y = center_y + (y as f32 - center_y) / scale;
-        for x in 0..image.width {
-            let source_x = center_x + (x as f32 - center_x) / scale;
-            for channel in 0..3 {
-                image.data[(y * image.width + x) * 3 + channel] =
-                    bilinear(&source, source_x, source_y, channel);
+    image
+        .data
+        .par_chunks_mut(width * 3)
+        .enumerate()
+        .for_each(|(y, output_row)| {
+            let source_y = center_y + (y as f32 - center_y) / scale;
+            for (x, pixel) in output_row.as_chunks_mut::<3>().0.iter_mut().enumerate() {
+                let source_x = center_x + (x as f32 - center_x) / scale;
+                for (channel, value) in pixel.iter_mut().enumerate() {
+                    *value = bilinear(&source, source_x, source_y, channel);
+                }
             }
-        }
-    }
+        });
 }
 
 struct LensCorrectionOptions<'a> {
@@ -904,87 +999,87 @@ fn apply_lens(image: &mut RgbImage, options: &LensCorrectionOptions<'_>) -> Resu
             "lensfun profile for {display_name} lacks requested calibration"
         )));
     }
-    const STRIPE_ROWS: usize = 32;
     let source = image.clone();
     let width = image.width;
     let height = image.height;
     let row_stride = width * 3;
-    let mut geometry = vec![0.0; width * STRIPE_ROWS * 2];
-    let mut subpixel = vec![0.0; width * STRIPE_ROWS * 6];
-    let mut valid = vec![true; width * height];
-    for stripe_y in (0..height).step_by(STRIPE_ROWS) {
-        let stripe_rows = STRIPE_ROWS.min(height - stripe_y);
-        for row in 0..stripe_rows {
-            let y = stripe_y + row;
-            if distortion {
-                modifier.apply_geometry_distortion(
-                    0.0,
-                    y as f32,
-                    width,
-                    1,
-                    &mut geometry[row * width * 2..(row + 1) * width * 2],
-                );
-            }
-            if tca {
-                modifier.apply_subpixel_distortion(
-                    0.0,
-                    y as f32,
-                    width,
-                    1,
-                    &mut subpixel[row * width * 6..(row + 1) * width * 6],
-                );
-            }
+    // Lensfun's distortion and TCA models vary smoothly, so the maps are
+    // evaluated on every LENS_MAP_ROW_STEPth row and interpolated vertically.
+    // This keeps the serial modifier evaluation off the hot path; the
+    // interpolation error is far below one hundredth of a pixel.
+    let grid_rows = height.div_ceil(LENS_MAP_ROW_STEP) + 1;
+    let mut geometry_rows = vec![0.0_f32; if distortion { grid_rows * width * 2 } else { 0 }];
+    let mut subpixel_rows = vec![0.0_f32; if tca { grid_rows * width * 6 } else { 0 }];
+    for grid_row in 0..grid_rows {
+        let y = (grid_row * LENS_MAP_ROW_STEP) as f32;
+        if distortion {
+            modifier.apply_geometry_distortion(
+                0.0,
+                y,
+                width,
+                1,
+                &mut geometry_rows[grid_row * width * 2..(grid_row + 1) * width * 2],
+            );
         }
-        let data_start = stripe_y * row_stride;
-        let data_end = (stripe_y + stripe_rows) * row_stride;
-        let valid_start = stripe_y * width;
-        let valid_end = (stripe_y + stripe_rows) * width;
-        image.data[data_start..data_end]
-            .par_chunks_mut(row_stride)
-            .zip(valid[valid_start..valid_end].par_chunks_mut(width))
-            .enumerate()
-            .for_each(|(row, (output_row, valid_row))| {
-                let y = stripe_y + row;
-                for x in 0..width {
-                    let (gx, gy) = if distortion {
-                        let identity_x = x as f32;
-                        let identity_y = y as f32;
-                        let map_index = (row * width + x) * 2;
+        if tca {
+            modifier.apply_subpixel_distortion(
+                0.0,
+                y,
+                width,
+                1,
+                &mut subpixel_rows[grid_row * width * 6..(grid_row + 1) * width * 6],
+            );
+        }
+    }
+    let mut valid = vec![true; width * height];
+    image
+        .data
+        .par_chunks_mut(row_stride)
+        .zip(valid.par_chunks_mut(width))
+        .enumerate()
+        .for_each(|(y, (output_row, valid_row))| {
+            let grid_row = y / LENS_MAP_ROW_STEP;
+            let fraction = (y - grid_row * LENS_MAP_ROW_STEP) as f32 / LENS_MAP_ROW_STEP as f32;
+            let lerp_rows = |rows: &[f32], stride: usize, index: usize| -> f32 {
+                let low = rows[grid_row * width * stride + index];
+                let high = rows[(grid_row + 1) * width * stride + index];
+                low + (high - low) * fraction
+            };
+            for x in 0..width {
+                let (gx, gy) = if distortion {
+                    (
+                        blend_lens_coordinate(
+                            x as f32,
+                            lerp_rows(&geometry_rows, 2, x * 2),
+                            correction_strength,
+                        ),
+                        blend_lens_coordinate(
+                            y as f32,
+                            lerp_rows(&geometry_rows, 2, x * 2 + 1),
+                            correction_strength,
+                        ),
+                    )
+                } else {
+                    (x as f32, y as f32)
+                };
+                for channel in 0..3 {
+                    let (sx, sy) = if tca {
                         (
-                            blend_lens_coordinate(
-                                identity_x,
-                                geometry[map_index],
-                                correction_strength,
-                            ),
-                            blend_lens_coordinate(
-                                identity_y,
-                                geometry[map_index + 1],
-                                correction_strength,
-                            ),
+                            lerp_rows(&subpixel_rows, 6, x * 6 + channel * 2) + gx - x as f32,
+                            lerp_rows(&subpixel_rows, 6, x * 6 + channel * 2 + 1) + gy - y as f32,
                         )
                     } else {
-                        (x as f32, y as f32)
+                        (gx, gy)
                     };
-                    for channel in 0..3 {
-                        let (sx, sy) = if tca {
-                            let map_index = (row * width + x) * 6 + channel * 2;
-                            (
-                                subpixel[map_index] + gx - x as f32,
-                                subpixel[map_index + 1] + gy - y as f32,
-                            )
-                        } else {
-                            (gx, gy)
-                        };
-                        let coordinate_valid = sx >= 0.0
-                            && sy >= 0.0
-                            && sx <= (width - 1) as f32
-                            && sy <= (height - 1) as f32;
-                        valid_row[x] &= coordinate_valid;
-                        output_row[x * 3 + channel] = bilinear(&source, sx, sy, channel);
-                    }
+                    let coordinate_valid = sx >= 0.0
+                        && sy >= 0.0
+                        && sx <= (width - 1) as f32
+                        && sy <= (height - 1) as f32;
+                    valid_row[x] &= coordinate_valid;
+                    output_row[x * 3 + channel] = bilinear(&source, sx, sy, channel);
                 }
-            });
-    }
+            }
+        });
     zoom_center(
         image,
         lens_auto_crop_scale(&valid, image.width, image.height),
@@ -1007,23 +1102,26 @@ fn orient(image: RgbImage, orientation: u16) -> RgbImage {
         height,
         data: vec![0.0; width * height * 3],
     };
-    for y in 0..height {
-        for x in 0..width {
-            let (sx, sy) = match orientation {
-                2 => (image.width - 1 - x, y),
-                3 => (image.width - 1 - x, image.height - 1 - y),
-                4 => (x, image.height - 1 - y),
-                5 => (y, x),
-                6 => (y, image.height - 1 - x),
-                7 => (image.width - 1 - y, image.height - 1 - x),
-                8 => (image.width - 1 - y, x),
-                _ => (x, y),
-            };
-            let dst = (y * width + x) * 3;
-            let src = (sy * image.width + sx) * 3;
-            output.data[dst..dst + 3].copy_from_slice(&image.data[src..src + 3]);
-        }
-    }
+    output
+        .data
+        .par_chunks_mut(width * 3)
+        .enumerate()
+        .for_each(|(y, output_row)| {
+            for (x, pixel) in output_row.as_chunks_mut::<3>().0.iter_mut().enumerate() {
+                let (sx, sy) = match orientation {
+                    2 => (image.width - 1 - x, y),
+                    3 => (image.width - 1 - x, image.height - 1 - y),
+                    4 => (x, image.height - 1 - y),
+                    5 => (y, x),
+                    6 => (y, image.height - 1 - x),
+                    7 => (image.width - 1 - y, image.height - 1 - x),
+                    8 => (image.width - 1 - y, x),
+                    _ => (x, y),
+                };
+                let src = (sy * image.width + sx) * 3;
+                pixel.copy_from_slice(&image.data[src..src + 3]);
+            }
+        });
     output
 }
 
@@ -1055,44 +1153,98 @@ fn downscale(image: RgbImage, max_width: u32, max_height: u32) -> RgbImage {
     }
     let width = ((image.width as f32 * scale).round() as usize).max(1);
     let height = ((image.height as f32 * scale).round() as usize).max(1);
+    // Minification uses exact area averaging: each output pixel integrates the
+    // source cells it covers, which suppresses the aliasing that point-sampled
+    // bilinear reduction produced on fine detail.
+    let x_coverage = area_coverage(image.width, width);
+    let y_coverage = area_coverage(image.height, height);
+    let mut horizontal = vec![0.0_f32; width * image.height * 3];
+    horizontal
+        .par_chunks_mut(width * 3)
+        .enumerate()
+        .for_each(|(y, output_row)| {
+            let source_row = &image.data[y * image.width * 3..(y + 1) * image.width * 3];
+            for (x, pixel) in output_row.as_chunks_mut::<3>().0.iter_mut().enumerate() {
+                let (start, ref weights) = x_coverage[x];
+                let mut sum = [0.0_f32; 3];
+                for (offset, weight) in weights.iter().enumerate() {
+                    let source = (start + offset) * 3;
+                    for channel in 0..3 {
+                        sum[channel] += source_row[source + channel] * weight;
+                    }
+                }
+                *pixel = sum;
+            }
+        });
     let mut output = RgbImage {
         width,
         height,
         data: vec![0.0; width * height * 3],
     };
-    for y in 0..height {
-        for x in 0..width {
-            for channel in 0..3 {
-                output.data[(y * width + x) * 3 + channel] = bilinear(
-                    &image,
-                    (x as f32 + 0.5) / scale - 0.5,
-                    (y as f32 + 0.5) / scale - 0.5,
-                    channel,
-                );
+    output
+        .data
+        .par_chunks_mut(width * 3)
+        .enumerate()
+        .for_each(|(y, output_row)| {
+            let (start, ref weights) = y_coverage[y];
+            for (x, pixel) in output_row.as_chunks_mut::<3>().0.iter_mut().enumerate() {
+                let mut sum = [0.0_f32; 3];
+                for (offset, weight) in weights.iter().enumerate() {
+                    let source = ((start + offset) * width + x) * 3;
+                    for channel in 0..3 {
+                        sum[channel] += horizontal[source + channel] * weight;
+                    }
+                }
+                *pixel = sum;
             }
-        }
-    }
+        });
     output
 }
 
+/// Per-output-pixel source range and normalized area weights for one axis.
+fn area_coverage(source: usize, target: usize) -> Vec<(usize, Vec<f32>)> {
+    let ratio = source as f64 / target as f64;
+    (0..target)
+        .map(|index| {
+            let begin = index as f64 * ratio;
+            let end = ((index + 1) as f64 * ratio).min(source as f64);
+            let first = (begin.floor() as usize).min(source - 1);
+            let last = (end.ceil() as usize).clamp(first + 1, source);
+            let mut weights = Vec::with_capacity(last - first);
+            for cell in first..last {
+                let cell_begin = (cell as f64).max(begin);
+                let cell_end = ((cell + 1) as f64).min(end);
+                weights.push((cell_end - cell_begin).max(0.0) as f32);
+            }
+            let total: f32 = weights.iter().sum();
+            if total > 0.0 {
+                for weight in &mut weights {
+                    *weight /= total;
+                }
+            }
+            (first, weights)
+        })
+        .collect()
+}
+
 fn srgb_transfer(image: &mut RgbImage) {
-    for value in &mut image.data {
+    image.data.par_iter_mut().for_each(|value| {
         *value = if *value <= 0.003_130_8 {
             12.92 * *value
         } else {
             1.055 * value.max(0.0).powf(1.0 / 2.4) - 0.055
         };
-    }
+    });
 }
 
 fn apply_lut(image: &mut RgbImage, lut: &CubeLut, strength: f32) {
-    for pixel in image.data.as_chunks_mut::<3>().0 {
-        let transformed = lut.sample(*pixel);
+    image.data.par_chunks_exact_mut(3).for_each(|pixel| {
+        let transformed = lut.sample([pixel[0], pixel[1], pixel[2]]);
         for channel in 0..3 {
             pixel[channel] = (pixel[channel] + (transformed[channel] - pixel[channel]) * strength)
                 .clamp(0.0, 1.0);
         }
-    }
+    });
 }
 
 fn splitmix64(mut value: u64) -> u64 {
@@ -1106,26 +1258,25 @@ fn apply_grain(image: &mut RgbImage, amount: f32, size: f32, seed: u64) {
     if amount == 0.0 {
         return;
     }
-    for y in 0..image.height {
-        for x in 0..image.width {
-            let gx = (x as f32 / size).floor() as u64;
+    let width = image.width;
+    image
+        .data
+        .par_chunks_mut(width * 3)
+        .enumerate()
+        .for_each(|(y, row)| {
             let gy = (y as f32 / size).floor() as u64;
-            let bits = splitmix64(
-                seed ^ gx.wrapping_mul(0x517c_c1b7_2722_0a95)
-                    ^ gy.wrapping_mul(0x6eed_0e9d_a4d9_4a4f),
-            );
-            let noise = ((bits >> 40) as f32 / 16_777_215.0 - 0.5) * amount * 0.16;
-            let offset = (y * image.width + x) * 3;
-            let luminance = 0.2126 * image.data[offset]
-                + 0.7152 * image.data[offset + 1]
-                + 0.0722 * image.data[offset + 2];
-            let shaped = noise * (0.35 + 0.65 * (1.0 - luminance));
-            for channel in 0..3 {
-                image.data[offset + channel] =
-                    (image.data[offset + channel] + shaped).clamp(0.0, 1.0);
+            let row_seed = seed ^ gy.wrapping_mul(0x6eed_0e9d_a4d9_4a4f);
+            for (x, pixel) in row.as_chunks_mut::<3>().0.iter_mut().enumerate() {
+                let gx = (x as f32 / size).floor() as u64;
+                let bits = splitmix64(row_seed ^ gx.wrapping_mul(0x517c_c1b7_2722_0a95));
+                let noise = ((bits >> 40) as f32 / 16_777_215.0 - 0.5) * amount * 0.16;
+                let luminance = 0.2126 * pixel[0] + 0.7152 * pixel[1] + 0.0722 * pixel[2];
+                let shaped = noise * (0.35 + 0.65 * (1.0 - luminance));
+                for value in pixel.iter_mut() {
+                    *value = (*value + shaped).clamp(0.0, 1.0);
+                }
             }
-        }
-    }
+        });
 }
 
 fn encode_to<W: Write + Seek>(
@@ -1138,27 +1289,45 @@ fn encode_to<W: Write + Seek>(
         OUTPUT_JPEG => {
             let bytes: Vec<u8> = image
                 .data
-                .iter()
+                .par_iter()
                 .map(|v| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8)
                 .collect();
-            let mut encoder = JpegEncoder::new_with_quality(writer, quality as u8);
+            let width = u16::try_from(image.width)
+                .map_err(|_| Error::Render("JPEG output is wider than 65535 pixels".into()))?;
+            let height = u16::try_from(image.height)
+                .map_err(|_| Error::Render("JPEG output is taller than 65535 pixels".into()))?;
+            let mut encoded = Vec::with_capacity(bytes.len() / 4);
+            let mut encoder = jpeg_encoder::Encoder::new(&mut encoded, quality as u8);
+            encoder.set_sampling_factor(jpeg_encoder::SamplingFactor::F_2_2);
+            for (chunk_index, chunk) in SRGB_ICC.chunks(65_519).enumerate() {
+                let chunk_count = SRGB_ICC.len().div_ceil(65_519);
+                let mut segment = Vec::with_capacity(chunk.len() + 14);
+                segment.extend_from_slice(b"ICC_PROFILE\0");
+                segment.push(chunk_index as u8 + 1);
+                segment.push(chunk_count as u8);
+                segment.extend_from_slice(chunk);
+                encoder
+                    .add_app_segment(2, segment)
+                    .map_err(|e| Error::Render(format!("JPEG ICC profile: {e}")))?;
+            }
             encoder
-                .set_icc_profile(SRGB_ICC.to_vec())
-                .map_err(|e| Error::Render(format!("JPEG ICC profile: {e}")))?;
-            encoder.write_image(
-                &bytes,
-                image.width as u32,
-                image.height as u32,
-                ColorType::Rgb8.into(),
-            )
+                .encode(&bytes, width, height, jpeg_encoder::ColorType::Rgb)
+                .map_err(|e| Error::Render(format!("JPEG encoding failed: {e}")))?;
+            let mut writer = writer;
+            return writer
+                .write_all(&encoded)
+                .map_err(|e| Error::Render(format!("image encoding failed: {e}")));
         }
         OUTPUT_TIFF => {
-            let mut bytes = Vec::with_capacity(image.data.len() * 2);
-            for value in &image.data {
-                bytes.extend_from_slice(
-                    &((value.clamp(0.0, 1.0) * 65535.0 + 0.5) as u16).to_ne_bytes(),
-                );
-            }
+            let mut bytes = vec![0_u8; image.data.len() * 2];
+            bytes
+                .par_chunks_exact_mut(2)
+                .zip(image.data.par_iter())
+                .for_each(|(chunk, value)| {
+                    chunk.copy_from_slice(
+                        &((value.clamp(0.0, 1.0) * 65535.0 + 0.5) as u16).to_ne_bytes(),
+                    );
+                });
             let mut encoder = TiffEncoder::new(writer);
             encoder
                 .set_icc_profile(SRGB_ICC.to_vec())
@@ -1727,6 +1896,77 @@ mod tests {
                 .is_none(),
             "an absent Makro-Planar 50/2 must not fall through to another Planar"
         );
+    }
+
+    #[test]
+    fn vertically_interpolated_lens_maps_match_direct_evaluation() {
+        let db = Database::load_bundled().unwrap();
+        let camera = find_camera_profile(&db, "OM Digital Solutions", "OM-1").unwrap();
+        let lens = find_lens_profile(
+            &db,
+            camera,
+            "Olympus M.Zuiko Digital ED 12-45mm F4.0 Pro",
+            12.0,
+        )
+        .unwrap();
+        let width = 320_usize;
+        let mut modifier = Modifier::new(lens, 12.0, camera.crop_factor, width as u32, 240, false);
+        assert!(modifier.enable_distortion_correction(lens));
+        let probe_y = 100_usize;
+        let low_y = probe_y - probe_y % LENS_MAP_ROW_STEP;
+        let mut direct = vec![0.0_f32; width * 2];
+        let mut low = vec![0.0_f32; width * 2];
+        let mut high = vec![0.0_f32; width * 2];
+        assert!(modifier.apply_geometry_distortion(0.0, probe_y as f32, width, 1, &mut direct));
+        assert!(modifier.apply_geometry_distortion(0.0, low_y as f32, width, 1, &mut low));
+        assert!(modifier.apply_geometry_distortion(
+            0.0,
+            (low_y + LENS_MAP_ROW_STEP) as f32,
+            width,
+            1,
+            &mut high
+        ));
+        let fraction = (probe_y - low_y) as f32 / LENS_MAP_ROW_STEP as f32;
+        for index in 0..width * 2 {
+            let interpolated = low[index] + (high[index] - low[index]) * fraction;
+            assert!(
+                (interpolated - direct[index]).abs() < 0.05,
+                "lens map interpolation drifted {} pixels at {index}",
+                (interpolated - direct[index]).abs()
+            );
+        }
+    }
+
+    #[test]
+    fn area_downscale_averages_uniform_blocks_and_bounds_dimensions() {
+        let mut image = RgbImage {
+            width: 8,
+            height: 4,
+            data: Vec::new(),
+        };
+        for y in 0..4 {
+            for x in 0..8 {
+                let value = if x < 4 { 1.0 } else { 0.0 };
+                let _ = y;
+                image.data.extend_from_slice(&[value, value, value]);
+            }
+        }
+        let result = downscale(image, 4, 2);
+        assert_eq!((result.width, result.height), (4, 2));
+        assert!((result.data[0] - 1.0).abs() < 1.0e-6);
+        assert!((result.data[(2 * 4 - 1) * 3] - 0.0).abs() < 1.0e-6);
+        let middle = result.data[1 * 3];
+        assert!((middle - 1.0).abs() < 1.0e-6, "left half must stay white");
+    }
+
+    #[test]
+    fn median_network_matches_sorted_median() {
+        let samples = [0.3_f32, -1.0, 0.5, 0.2, 0.9, -0.5, 0.0, 0.7, 0.1];
+        let mut sorted = samples;
+        sorted.sort_unstable_by(f32::total_cmp);
+        assert_eq!(median_of_9(samples), sorted[4]);
+        let ramp = [9.0_f32, 8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0];
+        assert_eq!(median_of_9(ramp), 5.0);
     }
 
     #[test]

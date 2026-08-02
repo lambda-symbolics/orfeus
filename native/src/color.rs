@@ -146,17 +146,25 @@ fn transform_pixels<const N: usize>(
     white_balance: &[f32; N],
     matrix: &[[f32; N]; 3],
 ) -> Vec<f32> {
-    let mut output = Vec::with_capacity(pixels.len() * 3);
-    for pixel in pixels {
-        for row in matrix {
-            output.push(
-                row.iter()
-                    .zip(pixel.iter().zip(white_balance))
-                    .map(|(coefficient, (channel, balance))| coefficient * channel * balance)
-                    .sum(),
-            );
-        }
-    }
+    use rayon::prelude::*;
+    // Fold the white-balance gains into the matrix so the per-pixel work is a
+    // single small matrix product.
+    let balanced: [[f32; N]; 3] = std::array::from_fn(|row| {
+        std::array::from_fn(|column| matrix[row][column] * white_balance[column])
+    });
+    let mut output = vec![0.0_f32; pixels.len() * 3];
+    output
+        .par_chunks_exact_mut(3)
+        .zip(pixels.par_iter())
+        .for_each(|(destination, pixel)| {
+            for (value, row) in destination.iter_mut().zip(&balanced) {
+                *value = row
+                    .iter()
+                    .zip(pixel)
+                    .map(|(coefficient, channel)| coefficient * channel)
+                    .sum();
+            }
+        });
     output
 }
 
