@@ -116,11 +116,13 @@
 (defun preview-status-text (model)
   (let ((temperature (gui-model-setting model :white-balance-temperature))
         (noise-reduction (gui-model-setting model :noise-reduction))
+        (neural (gui-model-setting model :neural-noise-reduction))
         (lut (gui-model-setting model :lut-path))
         (strength (gui-model-setting model :lut-strength)))
-    (format nil "RAW preview  |  WB: ~A  |  NR: ~D%  |  LUT: ~A"
+    (format nil "RAW preview  |  WB: ~A  |  NR: ~D%~@[  |  Neural: ~D%~]  |  LUT: ~A"
             (if temperature "Custom" "As shot")
             (round (* 100 noise-reduction))
+            (when (plusp neural) (round (* 100 neural)))
             (if (and lut (plusp strength))
                 (format nil "~A (~D%)" (file-namestring lut)
                         (round (* 100 strength)))
@@ -821,13 +823,13 @@
                                 (declare (ignore event value))
                                 (setting-changed key widget)))
                     (label (cl-fltk:make-label
-                            :parent basic-page :x 0 :y 172 :width 32 :height 24
+                            :parent basic-page :x 0 :y 204 :width 32 :height 24
                             :label short-label))
                     (slider (cl-fltk:make-vertical-slider
-                             :parent basic-page :x 0 :y 198 :width 20 :height 132
+                             :parent basic-page :x 0 :y 230 :width 20 :height 132
                              :callback callback))
                     (input (cl-fltk:make-value-input
-                            :parent basic-page :x 0 :y 334 :width 32 :height 24
+                            :parent basic-page :x 0 :y 366 :width 32 :height 24
                             :callback callback)))
                (dolist (widget (list slider input))
                  (cl-fltk:set-range widget -2 2)
@@ -929,7 +931,7 @@
                                       (:label column-x)
                                       (:slider (+ column-x (floor (- column-width 20) 2)))
                                       (:input (+ column-x 2))))
-                            (item-y (ecase role (:label 172) (:slider 198) (:input 334)))
+                            (item-y (ecase role (:label 204) (:slider 230) (:input 366)))
                             (item-height (ecase role (:label 24) (:slider 132) (:input 24))))
                        (cl-fltk:resize-widget widget :x item-x :y item-y
                                               :width item-width :height item-height)))))
@@ -1319,6 +1321,8 @@
         (make-number-field :white-balance-tint "Tint" -20 20 0.1 76 basic-page)
         (make-number-field :exposure "Exposure EV" -10 10 0.1 108 basic-page)
         (make-number-field :noise-reduction "Noise reduction" 0 1 0.05 140
+                           basic-page)
+        (make-number-field :neural-noise-reduction "Neural denoise" 0 1 0.05 172
                            basic-page)
         (make-tone-band :tone-blacks "Blk" "Blacks" 0)
         (make-tone-band :tone-shadows "Shd" "Shadows" 1)

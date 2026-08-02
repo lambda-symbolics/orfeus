@@ -185,6 +185,7 @@
     (:white-balance-temperature #'orfeus:processing-settings-white-balance-temperature)
     (:white-balance-tint #'orfeus:processing-settings-white-balance-tint)
     (:noise-reduction #'orfeus:processing-settings-noise-reduction)
+    (:neural-noise-reduction #'orfeus:processing-settings-neural-noise-reduction)
     (:tone-blacks #'orfeus:processing-settings-tone-blacks)
     (:tone-shadows #'orfeus:processing-settings-tone-shadows)
     (:tone-dark-mids #'orfeus:processing-settings-tone-dark-mids)
@@ -218,6 +219,8 @@
     (:white-balance-temperature (setf (orfeus:processing-settings-white-balance-temperature settings) value))
     (:white-balance-tint (setf (orfeus:processing-settings-white-balance-tint settings) value))
     (:noise-reduction (setf (orfeus:processing-settings-noise-reduction settings) value))
+    (:neural-noise-reduction
+     (setf (orfeus:processing-settings-neural-noise-reduction settings) value))
     (:tone-blacks (setf (orfeus:processing-settings-tone-blacks settings) value))
     (:tone-shadows (setf (orfeus:processing-settings-tone-shadows settings) value))
     (:tone-dark-mids (setf (orfeus:processing-settings-tone-dark-mids settings) value))
