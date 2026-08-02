@@ -144,8 +144,8 @@ struct TileScratch {
 }
 
 impl TileScratch {
-    fn new() -> Self {
-        let patch = TILE + 2 * HALO;
+    fn new(tile_size: usize) -> Self {
+        let patch = tile_size + 2 * HALO;
         Self {
             ping: vec![0.0; FEATURES.max(INPUT_CHANNELS) * patch * patch],
             pong: vec![0.0; FEATURES * (patch - 2) * (patch - 2)],
@@ -404,7 +404,168 @@ fn gather_patch(
                 .copy_from_slice(&planes[source..source + clipped_end - clipped_start]);
         }
     }
-    patch[OUTPUT_CHANNELS * patch_plane..INPUT_CHANNELS * patch_plane].fill(sigma);
+    let sigma_plane = OUTPUT_CHANNELS * patch_plane;
+    for row in 0..patch_size {
+        let source_y = tile_y as isize + row as isize - HALO as isize;
+        if source_y < 0 || source_y >= half_height as isize {
+            continue;
+        }
+        let source_x_start = tile_x as isize - HALO as isize;
+        let clipped_start = source_x_start.max(0) as usize;
+        let clipped_end =
+            ((source_x_start + patch_size as isize).min(half_width as isize)).max(0) as usize;
+        if clipped_end <= clipped_start {
+            continue;
+        }
+        let target_offset = (clipped_start as isize - source_x_start) as usize;
+        let target = sigma_plane + row * patch_size + target_offset;
+        patch[target..target + clipped_end - clipped_start].fill(sigma);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn zero_outside_global_image(
+    data: &mut [f32],
+    channels: usize,
+    size: usize,
+    origin_x: usize,
+    origin_y: usize,
+    remaining_halo: usize,
+    image_width: usize,
+    image_height: usize,
+) {
+    // After each valid convolution, the active patch has shed one halo pixel.
+    // Activations outside the real feature-map extent must return to zero before
+    // the next layer, exactly matching Conv2d padding=1 at every global border.
+    let global_left = origin_x as isize - remaining_halo as isize;
+    let global_top = origin_y as isize - remaining_halo as isize;
+    let clamp = |value: isize| value.clamp(0, size as isize) as usize;
+    let valid_x_start = clamp(-global_left);
+    let valid_x_end = clamp(image_width as isize - global_left);
+    let valid_y_start = clamp(-global_top);
+    let valid_y_end = clamp(image_height as isize - global_top);
+    let plane = size * size;
+
+    for channel in 0..channels {
+        let channel_data = &mut data[channel * plane..(channel + 1) * plane];
+        channel_data[..valid_y_start * size].fill(0.0);
+        channel_data[valid_y_end * size..].fill(0.0);
+        for row in valid_y_start..valid_y_end {
+            let row_data = &mut channel_data[row * size..(row + 1) * size];
+            row_data[..valid_x_start].fill(0.0);
+            row_data[valid_x_end..].fill(0.0);
+        }
+    }
+}
+
+fn infer_tiled_with_tile_size(
+    net: &FfdNet,
+    planes: &[f32],
+    half_width: usize,
+    half_height: usize,
+    sigma: f32,
+    tile_size: usize,
+) -> Vec<f32> {
+    let half_plane = half_width * half_height;
+    let mut denoised = vec![0.0_f32; OUTPUT_CHANNELS * half_plane];
+    let patch_size = tile_size + 2 * HALO;
+    let tiles: Vec<(usize, usize)> = (0..half_height.div_ceil(tile_size))
+        .flat_map(|tile_y| (0..half_width.div_ceil(tile_size)).map(move |tile_x| (tile_x, tile_y)))
+        .collect();
+    for tile_batch in tiles.chunks(MAX_PARALLEL_TILES) {
+        let tile_results: Vec<((usize, usize), Vec<f32>)> = tile_batch
+            .par_iter()
+            .map_init(
+                || TileScratch::new(tile_size),
+                |scratch, &(tile_x, tile_y)| {
+                    let origin_x = tile_x * tile_size;
+                    let origin_y = tile_y * tile_size;
+                    gather_patch(
+                        planes,
+                        half_width,
+                        half_height,
+                        origin_x,
+                        origin_y,
+                        sigma,
+                        &mut scratch.ping,
+                        patch_size,
+                    );
+                    let mut size = patch_size;
+                    let mut source_is_ping = true;
+                    for (index, layer) in net.layers.iter().enumerate() {
+                        let relu = index + 1 < net.layers.len();
+                        let (input, output) = if source_is_ping {
+                            (&scratch.ping, &mut scratch.pong)
+                        } else {
+                            (&scratch.pong, &mut scratch.ping)
+                        };
+                        convolve_valid(
+                            layer,
+                            input,
+                            size,
+                            output,
+                            &mut scratch.row_accumulators,
+                            relu,
+                        );
+                        size -= 2;
+                        zero_outside_global_image(
+                            output,
+                            layer.output_channels,
+                            size,
+                            origin_x,
+                            origin_y,
+                            HALO - index - 1,
+                            half_width,
+                            half_height,
+                        );
+                        source_is_ping = !source_is_ping;
+                    }
+                    let result = if source_is_ping {
+                        &scratch.ping
+                    } else {
+                        &scratch.pong
+                    };
+                    let tile_width = tile_size.min(half_width.saturating_sub(origin_x));
+                    let tile_height = tile_size.min(half_height.saturating_sub(origin_y));
+                    let mut tile_output = vec![0.0_f32; OUTPUT_CHANNELS * tile_width * tile_height];
+                    for channel in 0..OUTPUT_CHANNELS {
+                        for row in 0..tile_height {
+                            let source = channel * size * size + row * size;
+                            let target = channel * tile_width * tile_height + row * tile_width;
+                            tile_output[target..target + tile_width]
+                                .copy_from_slice(&result[source..source + tile_width]);
+                        }
+                    }
+                    ((tile_x, tile_y), tile_output)
+                },
+            )
+            .collect();
+        for ((tile_x, tile_y), tile_output) in tile_results {
+            let origin_x = tile_x * tile_size;
+            let origin_y = tile_y * tile_size;
+            let tile_width = tile_size.min(half_width.saturating_sub(origin_x));
+            let tile_height = tile_size.min(half_height.saturating_sub(origin_y));
+            for channel in 0..OUTPUT_CHANNELS {
+                for row in 0..tile_height {
+                    let source = channel * tile_width * tile_height + row * tile_width;
+                    let target = channel * half_plane + (origin_y + row) * half_width + origin_x;
+                    denoised[target..target + tile_width]
+                        .copy_from_slice(&tile_output[source..source + tile_width]);
+                }
+            }
+        }
+    }
+    denoised
+}
+
+fn infer_tiled(
+    net: &FfdNet,
+    planes: &[f32],
+    half_width: usize,
+    half_height: usize,
+    sigma: f32,
+) -> Vec<f32> {
+    infer_tiled_with_tile_size(net, planes, half_width, half_height, sigma, TILE)
 }
 
 /// Applies FFDNet color denoising in place.
@@ -448,81 +609,7 @@ pub(crate) fn apply_neural_noise_reduction(
             }
         });
 
-    let mut denoised = vec![0.0_f32; OUTPUT_CHANNELS * half_plane];
-    let patch_size = TILE + 2 * HALO;
-    let tiles: Vec<(usize, usize)> = (0..half_height.div_ceil(TILE))
-        .flat_map(|tile_y| (0..half_width.div_ceil(TILE)).map(move |tile_x| (tile_x, tile_y)))
-        .collect();
-    for tile_batch in tiles.chunks(MAX_PARALLEL_TILES) {
-        let tile_results: Vec<((usize, usize), Vec<f32>)> = tile_batch
-            .par_iter()
-            .map_init(TileScratch::new, |scratch, &(tile_x, tile_y)| {
-                let origin_x = tile_x * TILE;
-                let origin_y = tile_y * TILE;
-                gather_patch(
-                    &planes,
-                    half_width,
-                    half_height,
-                    origin_x,
-                    origin_y,
-                    sigma,
-                    &mut scratch.ping,
-                    patch_size,
-                );
-                let mut size = patch_size;
-                let mut source_is_ping = true;
-                for (index, layer) in net.layers.iter().enumerate() {
-                    let relu = index + 1 < net.layers.len();
-                    let (input, output) = if source_is_ping {
-                        (&scratch.ping, &mut scratch.pong)
-                    } else {
-                        (&scratch.pong, &mut scratch.ping)
-                    };
-                    convolve_valid(
-                        layer,
-                        input,
-                        size,
-                        output,
-                        &mut scratch.row_accumulators,
-                        relu,
-                    );
-                    size -= 2;
-                    source_is_ping = !source_is_ping;
-                }
-                let result = if source_is_ping {
-                    &scratch.ping
-                } else {
-                    &scratch.pong
-                };
-                let tile_width = TILE.min(half_width.saturating_sub(origin_x));
-                let tile_height = TILE.min(half_height.saturating_sub(origin_y));
-                let mut tile_output = vec![0.0_f32; OUTPUT_CHANNELS * tile_width * tile_height];
-                for channel in 0..OUTPUT_CHANNELS {
-                    for row in 0..tile_height {
-                        let source = channel * size * size + row * size;
-                        let target = channel * tile_width * tile_height + row * tile_width;
-                        tile_output[target..target + tile_width]
-                            .copy_from_slice(&result[source..source + tile_width]);
-                    }
-                }
-                ((tile_x, tile_y), tile_output)
-            })
-            .collect();
-        for ((tile_x, tile_y), tile_output) in tile_results {
-            let origin_x = tile_x * TILE;
-            let origin_y = tile_y * TILE;
-            let tile_width = TILE.min(half_width.saturating_sub(origin_x));
-            let tile_height = TILE.min(half_height.saturating_sub(origin_y));
-            for channel in 0..OUTPUT_CHANNELS {
-                for row in 0..tile_height {
-                    let source = channel * tile_width * tile_height + row * tile_width;
-                    let target = channel * half_plane + (origin_y + row) * half_width + origin_x;
-                    denoised[target..target + tile_width]
-                        .copy_from_slice(&tile_output[source..source + tile_width]);
-                }
-            }
-        }
-    }
+    let denoised = infer_tiled(net, &planes, half_width, half_height, sigma);
 
     // Pixel-shuffle back to full resolution; energy outside [0, 1] survives.
     data.par_chunks_mut(width * 3)
@@ -548,6 +635,101 @@ pub(crate) fn apply_neural_noise_reduction(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gathered_sigma_is_zero_outside_the_real_image() {
+        let half_width = 3;
+        let half_height = 2;
+        let patch_size = TILE + 2 * HALO;
+        let mut patch = vec![1.0; INPUT_CHANNELS * patch_size * patch_size];
+        let planes = vec![0.0; OUTPUT_CHANNELS * half_width * half_height];
+        gather_patch(
+            &planes,
+            half_width,
+            half_height,
+            0,
+            0,
+            0.25,
+            &mut patch,
+            patch_size,
+        );
+        let sigma = &patch[OUTPUT_CHANNELS * patch_size * patch_size..];
+        assert_eq!(sigma[(HALO - 1) * patch_size + HALO], 0.0);
+        assert_eq!(sigma[HALO * patch_size + HALO - 1], 0.0);
+        assert_eq!(sigma[HALO * patch_size + HALO], 0.25);
+        assert_eq!(sigma[(HALO + half_height) * patch_size + HALO], 0.0);
+    }
+
+    #[test]
+    fn intermediate_padding_is_zeroed_at_every_global_border() {
+        let size = 5;
+        let mut data = vec![1.0; 2 * size * size];
+        zero_outside_global_image(&mut data, 2, size, 0, 0, 2, 3, 3);
+        for channel in 0..2 {
+            for y in 0..size {
+                for x in 0..size {
+                    let expected = if x >= 2 && y >= 2 { 1.0 } else { 0.0 };
+                    assert_eq!(data[channel * size * size + y * size + x], expected);
+                }
+            }
+        }
+    }
+
+    fn infer_same_padded_reference(
+        net: &FfdNet,
+        planes: &[f32],
+        size: usize,
+        sigma: f32,
+    ) -> Vec<f32> {
+        let plane = size * size;
+        let mut current = vec![0.0; INPUT_CHANNELS * plane];
+        current[..OUTPUT_CHANNELS * plane].copy_from_slice(planes);
+        current[OUTPUT_CHANNELS * plane..].fill(sigma);
+        for (index, layer) in net.layers.iter().enumerate() {
+            let padded_size = size + 2;
+            let padded_plane = padded_size * padded_size;
+            let mut padded = vec![0.0; layer.input_channels * padded_plane];
+            for channel in 0..layer.input_channels {
+                for row in 0..size {
+                    let source = channel * plane + row * size;
+                    let target = channel * padded_plane + (row + 1) * padded_size + 1;
+                    padded[target..target + size].copy_from_slice(&current[source..source + size]);
+                }
+            }
+            let mut output = vec![0.0; layer.output_channels * plane];
+            let mut row_accumulators = vec![0.0; size * 3];
+            convolve_valid(
+                layer,
+                &padded,
+                padded_size,
+                &mut output,
+                &mut row_accumulators,
+                index + 1 < net.layers.len(),
+            );
+            current = output;
+        }
+        current
+    }
+
+    #[test]
+    fn tiled_inference_matches_per_layer_zero_padding_at_borders_and_seams() {
+        let size = 7;
+        let tile_size = 3;
+        let plane = size * size;
+        let planes: Vec<f32> = (0..OUTPUT_CHANNELS * plane)
+            .map(|index| (index % 17) as f32 / 19.0)
+            .collect();
+        let sigma = 0.07;
+        let net = network().unwrap();
+        let tiled = infer_tiled_with_tile_size(net, &planes, size, size, sigma, tile_size);
+        let reference = infer_same_padded_reference(net, &planes, size, sigma);
+        let max_error = tiled
+            .iter()
+            .zip(&reference)
+            .map(|(actual, expected)| (actual - expected).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(max_error < 3.0e-6, "maximum border error was {max_error}");
+    }
 
     #[test]
     fn embedded_weights_parse_with_expected_shapes() {

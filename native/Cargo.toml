@@ -17,6 +17,7 @@ lensfun = "=0.7.0"
 md-5 = "=0.10.6"
 rawler = "=0.7.2"
 rayon = "=1.12.0"
+sha2 = "=0.10.9"
 
 [profile.release]
 lto = "thin"

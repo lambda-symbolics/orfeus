@@ -452,6 +452,158 @@
         (when (probe-file pathname)
           (delete-file pathname))))))
 
+(defun write-test-bytes (pathname bytes)
+  (with-open-file (stream pathname :direction :output
+                                   :if-exists :supersede
+                                   :if-does-not-exist :create
+                                   :element-type '(unsigned-byte 8))
+    (write-sequence bytes stream)))
+
+(defun copy-test-bytes (input output)
+  (with-open-file (source input :direction :input
+                                :element-type '(unsigned-byte 8))
+    (with-open-file (target output :direction :output
+                                   :if-exists :error
+                                   :if-does-not-exist :create
+                                   :element-type '(unsigned-byte 8))
+      (let ((buffer (make-array 4096 :element-type '(unsigned-byte 8))))
+        (loop for count = (read-sequence buffer source)
+              while (plusp count)
+              do (write-sequence buffer target :end count))))))
+
+(defun dng-render-source-cache-reuses-content-p ()
+  (let ((input (test-temporary-pathname "dng"))
+        (extract-count 0)
+        first-path second-path changed-path cache-directory result)
+    (unwind-protect
+         (setf result
+               (progn
+           (orfeus::clear-render-source-cache)
+           (write-test-bytes input #(1 2 3 4 5 6 7 8))
+           (let ((orfeus::*render-source-name-reader*
+                   (lambda (ignored)
+                     (declare (ignore ignored))
+                     "embedded.orf"))
+                 (orfeus::*render-source-extractor*
+                   (lambda (source output)
+                     (incf extract-count)
+                     (copy-test-bytes source output))))
+             (orfeus::call-with-render-source
+              input (lambda (source)
+                      (setf first-path source)
+                      (and (probe-file source) t)))
+             (orfeus::call-with-render-source
+              input (lambda (source)
+                      (setf second-path source)
+                      (and (probe-file source) t)))
+             (write-test-bytes input #(8 7 6 5 4 3 2 1))
+             (orfeus::call-with-render-source
+              input (lambda (source)
+                      (setf changed-path source)
+                      (and (probe-file source) t)))
+             (setf cache-directory orfeus::*render-source-cache-directory*)
+             (and (= extract-count 2)
+                  (equal first-path second-path)
+                  (not (equal first-path changed-path))
+                  (probe-file first-path)
+                  (probe-file changed-path)))))
+      (orfeus::clear-render-source-cache)
+      (when (probe-file input)
+        (delete-file input)))
+    (and result
+         cache-directory
+         (not (probe-file cache-directory)))))
+
+(defun dng-render-source-cache-coalesces-concurrent-p ()
+  (let ((input (test-temporary-pathname "dng"))
+        (extract-count 0)
+        (paths (make-array 4 :initial-element nil))
+        (old-name-reader orfeus::*render-source-name-reader*)
+        (old-extractor orfeus::*render-source-extractor*)
+        threads result)
+    (unwind-protect
+         (progn
+           (orfeus::clear-render-source-cache)
+           (write-test-bytes input #(10 20 30 40 50 60))
+           (setf orfeus::*render-source-name-reader*
+                 (lambda (ignored)
+                   (declare (ignore ignored))
+                   "embedded.orf")
+                 orfeus::*render-source-extractor*
+                 (lambda (source output)
+                   (incf extract-count)
+                   (sleep 0.1)
+                   (copy-test-bytes source output)))
+           (setf threads
+                 (loop for index below (length paths)
+                       collect
+                       (let ((slot index))
+                         (sb-thread:make-thread
+                          (lambda ()
+                            (orfeus::call-with-render-source
+                             input
+                             (lambda (source)
+                               (setf (aref paths slot) source))))))))
+           (dolist (thread threads)
+             (sb-thread:join-thread thread))
+           (setf result
+                 (and (= extract-count 1)
+                      (every (lambda (path) (equal path (aref paths 0)))
+                             paths))))
+      (setf orfeus::*render-source-name-reader* old-name-reader
+            orfeus::*render-source-extractor* old-extractor)
+      (orfeus::clear-render-source-cache)
+      (when (probe-file input)
+        (delete-file input)))
+    result))
+
+(defun distinct-dng-render-sources-extract-concurrently-p ()
+  (let ((inputs (list (test-temporary-pathname "dng")
+                      (test-temporary-pathname "dng")))
+        (activity-lock (sb-thread:make-mutex :name "DNG test activity"))
+        (active 0)
+        (maximum-active 0)
+        (old-name-reader orfeus::*render-source-name-reader*)
+        (old-extractor orfeus::*render-source-extractor*)
+        threads result)
+    (unwind-protect
+         (progn
+           (orfeus::clear-render-source-cache)
+           (write-test-bytes (first inputs) #(1 3 5 7))
+           (write-test-bytes (second inputs) #(2 4 6 8))
+           (setf orfeus::*render-source-name-reader*
+                 (lambda (ignored)
+                   (declare (ignore ignored))
+                   "embedded.orf")
+                 orfeus::*render-source-extractor*
+                 (lambda (source output)
+                   (sb-thread:with-mutex (activity-lock)
+                     (incf active)
+                     (setf maximum-active (max maximum-active active)))
+                   (unwind-protect
+                        (progn
+                          (sleep 0.15)
+                          (copy-test-bytes source output))
+                     (sb-thread:with-mutex (activity-lock)
+                       (decf active)))))
+           (setf threads
+                 (mapcar
+                  (lambda (input)
+                    (sb-thread:make-thread
+                     (lambda ()
+                       (orfeus::call-with-render-source input #'probe-file))))
+                  inputs))
+           (dolist (thread threads)
+             (sb-thread:join-thread thread))
+           (setf result (= maximum-active 2)))
+      (setf orfeus::*render-source-name-reader* old-name-reader
+            orfeus::*render-source-extractor* old-extractor)
+      (orfeus::clear-render-source-cache)
+      (dolist (input inputs)
+        (when (probe-file input)
+          (delete-file input))))
+    result))
+
 (defun bundled-film-luts-match-pinned-digests-p ()
   (let* ((directory (asdf:system-relative-pathname "orfeus" #P"data/luts/"))
          (expected
@@ -550,6 +702,12 @@
              (embedded-preview-rejects-missing-image-p))
       (check "a racing writer is not clobbered at publish time"
              (publish-race-does-not-clobber-p))
+      (check "DNG render sources reuse content and invalidate by digest"
+             (dng-render-source-cache-reuses-content-p))
+      (check "concurrent DNG render requests share one extraction"
+             (dng-render-source-cache-coalesces-concurrent-p))
+      (check "distinct DNG render sources extract concurrently"
+             (distinct-dng-render-sources-extract-concurrently-p))
       (check "bundled film LUTs match pinned digests"
              (bundled-film-luts-match-pinned-digests-p))
       (check "CLI reports its version" (cli-version-p))

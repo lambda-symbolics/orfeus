@@ -1,10 +1,11 @@
+use std::collections::HashSet;
 use std::ffi::{CStr, c_char};
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, BufWriter, Seek, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Seek, Write};
 use std::os::unix::fs::MetadataExt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use image::codecs::tiff::TiffEncoder;
@@ -14,6 +15,7 @@ use rawler::decoders::{RawDecodeParams, RawLoader};
 use rawler::imgop::develop::{ProcessingStep, RawDevelop};
 use rawler::rawsource::RawSource;
 use rayon::prelude::*;
+use sha2::{Digest, Sha256};
 
 use super::Error;
 use super::color::intermediate_to_linear_srgb;
@@ -1447,12 +1449,18 @@ struct DecodedRaw {
     focal: f32,
 }
 
-type DecodeCacheKey = (PathBuf, SystemTime, u64);
+type DecodeCacheKey = [u8; 32];
 type DecodeCacheEntries = Vec<(DecodeCacheKey, Arc<DecodedRaw>)>;
 
-fn decode_cache() -> &'static Mutex<DecodeCacheEntries> {
-    static CACHE: OnceLock<Mutex<DecodeCacheEntries>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(Vec::new()))
+#[derive(Default)]
+struct DecodeCacheState {
+    entries: DecodeCacheEntries,
+    loading: HashSet<DecodeCacheKey>,
+}
+
+fn decode_cache() -> &'static (Mutex<DecodeCacheState>, Condvar) {
+    static CACHE: OnceLock<(Mutex<DecodeCacheState>, Condvar)> = OnceLock::new();
+    CACHE.get_or_init(|| (Mutex::new(DecodeCacheState::default()), Condvar::new()))
 }
 
 fn neural_render_lock() -> &'static Mutex<()> {
@@ -1461,8 +1469,17 @@ fn neural_render_lock() -> &'static Mutex<()> {
 }
 
 fn decode_cache_key(input: &Path) -> Result<DecodeCacheKey, Error> {
-    let metadata = fs::metadata(input)?;
-    Ok((input.to_path_buf(), metadata.modified()?, metadata.len()))
+    let mut file = File::open(input)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    Ok(hasher.finalize().into())
 }
 
 fn decode_linear_srgb(input: &Path, profiling: bool) -> Result<DecodedRaw, Error> {
@@ -1533,39 +1550,86 @@ fn decode_linear_srgb(input: &Path, profiling: bool) -> Result<DecodedRaw, Error
     })
 }
 
+fn decoded_for_render_with<F>(
+    input: &Path,
+    cache_mode: u32,
+    profiling: bool,
+    decode: F,
+) -> Result<Arc<DecodedRaw>, Error>
+where
+    F: FnOnce() -> Result<DecodedRaw, Error>,
+{
+    if cache_mode != CACHE_USE {
+        return Ok(Arc::new(decode()?));
+    }
+    let key = decode_cache_key(input)?;
+    let (cache_lock, cache_changed) = decode_cache();
+    loop {
+        let mut cache = cache_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(position) = cache.entries.iter().position(|(entry, _)| *entry == key) {
+            let entry = cache.entries.remove(position);
+            let decoded = entry.1.clone();
+            cache.entries.push(entry);
+            if profiling {
+                eprintln!("orfeus-profile stage=decode-cache hit=true");
+            }
+            return Ok(decoded);
+        }
+        if cache.loading.insert(key) {
+            break;
+        }
+        drop(
+            cache_changed
+                .wait(cache)
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+    }
+
+    let decode_result = catch_unwind(AssertUnwindSafe(decode));
+    let result = match decode_result {
+        Ok(result) => result.and_then(|decoded| {
+            if decode_cache_key(input)? != key {
+                return Err(Error::Render(
+                    "RAW source changed while it was being decoded".into(),
+                ));
+            }
+            Ok(Arc::new(decoded))
+        }),
+        Err(payload) => {
+            let mut cache = cache_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            cache.loading.remove(&key);
+            cache_changed.notify_all();
+            drop(cache);
+            std::panic::resume_unwind(payload);
+        }
+    };
+    let mut cache = cache_lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cache.loading.remove(&key);
+    if let Ok(decoded) = &result {
+        cache.entries.retain(|(entry, _)| *entry != key);
+        if cache.entries.len() >= DECODE_CACHE_CAPACITY {
+            cache.entries.remove(0);
+        }
+        cache.entries.push((key, decoded.clone()));
+    }
+    cache_changed.notify_all();
+    result
+}
+
 fn decoded_for_render(
     input: &Path,
     cache_mode: u32,
     profiling: bool,
 ) -> Result<Arc<DecodedRaw>, Error> {
-    if cache_mode != CACHE_USE {
-        return Ok(Arc::new(decode_linear_srgb(input, profiling)?));
-    }
-    let key = decode_cache_key(input)?;
-    if let Some(cached) = {
-        let mut cache = decode_cache().lock().expect("decode cache poisoned");
-        if let Some(position) = cache.iter().position(|(entry, _)| *entry == key) {
-            let entry = cache.remove(position);
-            let decoded = entry.1.clone();
-            cache.push(entry);
-            Some(decoded)
-        } else {
-            None
-        }
-    } {
-        if profiling {
-            eprintln!("orfeus-profile stage=decode-cache hit=true");
-        }
-        return Ok(cached);
-    }
-    let decoded = Arc::new(decode_linear_srgb(input, profiling)?);
-    let mut cache = decode_cache().lock().expect("decode cache poisoned");
-    cache.retain(|(entry, _)| *entry != key);
-    if cache.len() >= DECODE_CACHE_CAPACITY {
-        cache.remove(0);
-    }
-    cache.push((key, decoded.clone()));
-    Ok(decoded)
+    decoded_for_render_with(input, cache_mode, profiling, || {
+        decode_linear_srgb(input, profiling)
+    })
 }
 
 pub fn render(
@@ -1765,6 +1829,9 @@ mod tests {
     use image::{ImageDecoder, ImageReader};
     use std::io::Cursor;
     use std::os::unix::fs::symlink;
+    use std::sync::Barrier;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::thread;
 
     fn identity_cube() -> CubeLut {
         CubeLut::parse(Cursor::new(
@@ -1781,6 +1848,93 @@ mod tests {
     }
     fn temp(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("orfeus-test-{}-{name}", std::process::id()))
+    }
+
+    fn test_decoded_raw() -> DecodedRaw {
+        DecodedRaw {
+            width: 1,
+            height: 1,
+            data: vec![0.5; 3],
+            orientation: 1,
+            make: String::new(),
+            model: String::new(),
+            lens_name: String::new(),
+            focal: 0.0,
+        }
+    }
+
+    #[test]
+    fn decode_cache_keys_complete_content_not_metadata_or_path() {
+        let first = temp("cache-key-first.raw");
+        let second = temp("cache-key-second.raw");
+        fs::write(&first, [1, 2, 3, 4]).unwrap();
+        fs::write(&second, [1, 2, 3, 4]).unwrap();
+        let original = decode_cache_key(&first).unwrap();
+        assert_eq!(original, decode_cache_key(&second).unwrap());
+        fs::write(&first, [4, 3, 2, 1]).unwrap();
+        assert_ne!(original, decode_cache_key(&first).unwrap());
+        fs::remove_file(first).unwrap();
+        fs::remove_file(second).unwrap();
+    }
+
+    #[test]
+    fn concurrent_decode_cache_misses_share_one_loader() {
+        let input = temp("cache-concurrent.raw");
+        fs::write(&input, b"unique concurrent cache source").unwrap();
+        let workers = 4;
+        let barrier = Arc::new(Barrier::new(workers));
+        let loads = Arc::new(AtomicUsize::new(0));
+        let threads: Vec<_> = (0..workers)
+            .map(|_| {
+                let input = input.clone();
+                let barrier = barrier.clone();
+                let loads = loads.clone();
+                thread::spawn(move || {
+                    barrier.wait();
+                    decoded_for_render_with(&input, CACHE_USE, false, || {
+                        loads.fetch_add(1, Ordering::SeqCst);
+                        thread::sleep(std::time::Duration::from_millis(50));
+                        Ok(test_decoded_raw())
+                    })
+                    .unwrap()
+                })
+            })
+            .collect();
+        let decoded: Vec<_> = threads
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect();
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
+        assert!(
+            decoded[1..]
+                .iter()
+                .all(|entry| Arc::ptr_eq(&decoded[0], entry))
+        );
+        fs::remove_file(input).unwrap();
+    }
+
+    #[test]
+    fn failed_or_changed_loads_release_decode_cache_reservations() {
+        let input = temp("cache-retry.raw");
+        fs::write(&input, b"first cache source").unwrap();
+        let panicked = catch_unwind(AssertUnwindSafe(|| {
+            let _ = decoded_for_render_with(&input, CACHE_USE, false, || {
+                panic!("synthetic decoder panic")
+            });
+        }));
+        assert!(panicked.is_err());
+        let failed = decoded_for_render_with(&input, CACHE_USE, false, || {
+            Err(Error::Render("synthetic decode failure".into()))
+        });
+        assert!(failed.is_err());
+        let changed = decoded_for_render_with(&input, CACHE_USE, false, || {
+            fs::write(&input, b"other cache source").unwrap();
+            Ok(test_decoded_raw())
+        });
+        assert!(matches!(changed, Err(Error::Render(message)) if message.contains("changed")));
+        let retried = decoded_for_render_with(&input, CACHE_USE, false, || Ok(test_decoded_raw()));
+        assert!(retried.is_ok());
+        fs::remove_file(input).unwrap();
     }
 
     #[test]

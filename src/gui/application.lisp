@@ -1888,6 +1888,7 @@
           (when debounce-id (ignore-errors (cl-fltk:remove-timeout debounce-id)))
           (stop-gui-queue queue)
           (stop-gui-queue background-queue)
+          (orfeus::clear-render-source-cache)
           (clear-preview-cache)
           (ignore-errors (delete-gui-preview-directory preview-directory))
           (when window (ignore-errors (cl-fltk:destroy window))))))))

@@ -37,35 +37,173 @@
 (defun dng-input-pathname-p (pathname)
   (string-equal (or (pathname-type pathname) "") "dng"))
 
-(defun render-source-temporary-pathname (input-pathname)
-  (let* ((original-name (dng-original-filename input-pathname))
-         (type (or (pathname-type (pathname original-name)) "orf")))
-    (loop repeat 100
-          for candidate =
-             (merge-pathnames
-              (make-pathname :name (format nil "orfeus-source-~D-~D"
-                                            (get-universal-time)
-                                            (random most-positive-fixnum))
-                             :type type)
-              (uiop:temporary-directory))
-          unless (probe-file candidate)
-            return candidate
-          finally
-             (error 'raw-render-error
-                    :input-pathname input-pathname
-                    :output-pathname input-pathname
-                    :status 2
-                    :message "could not allocate a temporary embedded original"))))
+(defparameter *render-source-cache-capacity* 4
+  "Maximum number of unleased DNG originals retained for process-local reuse.")
+
+(defparameter *render-source-extractor* #'dng-extract-original
+  "Function used to extract an embedded original into the DNG source cache.")
+
+(defparameter *render-source-name-reader* #'dng-original-filename
+  "Function used to read the embedded original filename for its extension.")
+
+(defstruct render-source-cache-entry
+  pathname
+  (state :loading :type (member :loading :ready))
+  (leases 0 :type fixnum)
+  (last-used 0 :type integer))
+
+(defvar *render-source-cache-lock*
+  (sb-thread:make-mutex :name "Orfeus DNG source cache"))
+(defvar *render-source-cache-waitqueue*
+  (sb-thread:make-waitqueue :name "Orfeus DNG source cache"))
+(defvar *render-source-cache-directory* nil)
+(defvar *render-source-cache-entries* (make-hash-table :test #'equal))
+(defvar *render-source-cache-clock* 0)
+
+(defun file-sha256-string (pathname)
+  (ironclad:byte-array-to-hex-string
+   (ironclad:digest-file :sha256 pathname)))
+
+(defun render-source-cache-directory ()
+  (or *render-source-cache-directory*
+      (setf *render-source-cache-directory*
+            (uiop:ensure-directory-pathname
+             (sb-posix:mkdtemp
+              (namestring
+               (merge-pathnames "orfeus-source-cache-XXXXXX"
+                                (uiop:temporary-directory))))))))
+
+(defun render-source-extension (input-pathname)
+  (let* ((original-name (funcall *render-source-name-reader* input-pathname))
+         (type (string-downcase
+                (or (pathname-type (pathname original-name)) "raw"))))
+    (if (and (<= (length type) 16)
+             (plusp (length type))
+             (every #'alphanumericp type))
+        type
+        "raw")))
+
+(defun render-source-cache-pathname (key extension)
+  (merge-pathnames
+   (make-pathname :name (format nil "raw-~A" key) :type extension)
+   (render-source-cache-directory)))
+
+(defun render-source-cache-evict ()
+  (loop while (> (hash-table-count *render-source-cache-entries*)
+                 *render-source-cache-capacity*)
+        for candidate-key =
+           (let ((oldest-key nil)
+                 (oldest-time nil))
+             (maphash
+              (lambda (key entry)
+                (when (and (eq :ready (render-source-cache-entry-state entry))
+                           (zerop (render-source-cache-entry-leases entry))
+                           (or (null oldest-time)
+                               (< (render-source-cache-entry-last-used entry)
+                                  oldest-time)))
+                  (setf oldest-key key
+                        oldest-time (render-source-cache-entry-last-used entry))))
+              *render-source-cache-entries*)
+             oldest-key)
+        while candidate-key
+        do (let ((entry (gethash candidate-key *render-source-cache-entries*)))
+             (remhash candidate-key *render-source-cache-entries*)
+             (when (probe-file (render-source-cache-entry-pathname entry))
+               (delete-file (render-source-cache-entry-pathname entry)))))
+  nil)
+
+(defun acquire-render-source (input-pathname)
+  (let ((key (file-sha256-string input-pathname))
+        (extension (render-source-extension input-pathname)))
+    (loop
+      (let (entry builder-p)
+        (sb-thread:with-mutex (*render-source-cache-lock*)
+          (setf entry (gethash key *render-source-cache-entries*))
+          (cond
+            ((and entry (eq :ready (render-source-cache-entry-state entry)))
+             (incf *render-source-cache-clock*)
+             (incf (render-source-cache-entry-leases entry))
+             (setf (render-source-cache-entry-last-used entry)
+                   *render-source-cache-clock*)
+             (render-source-cache-evict)
+             (return-from acquire-render-source
+               (values key (render-source-cache-entry-pathname entry))))
+            (entry
+             (sb-thread:condition-wait *render-source-cache-waitqueue*
+                                       *render-source-cache-lock*))
+            (t
+             (setf entry
+                   (make-render-source-cache-entry
+                    :pathname (render-source-cache-pathname key extension))
+                   (gethash key *render-source-cache-entries*) entry
+                   builder-p t))))
+        (when builder-p
+          (handler-case
+              (progn
+                (funcall *render-source-extractor*
+                         input-pathname
+                         (render-source-cache-entry-pathname entry))
+                (unless (string= key (file-sha256-string input-pathname))
+                  (error 'raw-render-error
+                         :input-pathname input-pathname
+                         :output-pathname
+                         (render-source-cache-entry-pathname entry)
+                         :status 2
+                         :message "DNG source changed during original extraction"))
+                (sb-thread:with-mutex (*render-source-cache-lock*)
+                  (setf (render-source-cache-entry-state entry) :ready
+                        (render-source-cache-entry-leases entry) 1)
+                  (incf *render-source-cache-clock*)
+                  (setf (render-source-cache-entry-last-used entry)
+                        *render-source-cache-clock*)
+                  (render-source-cache-evict)
+                  (sb-thread:condition-broadcast
+                   *render-source-cache-waitqueue*))
+                (return-from acquire-render-source
+                  (values key (render-source-cache-entry-pathname entry))))
+            (error (condition)
+              (when (probe-file (render-source-cache-entry-pathname entry))
+                (ignore-errors
+                  (delete-file (render-source-cache-entry-pathname entry))))
+              (sb-thread:with-mutex (*render-source-cache-lock*)
+                (when (eq entry (gethash key *render-source-cache-entries*))
+                  (remhash key *render-source-cache-entries*))
+                (sb-thread:condition-broadcast
+                 *render-source-cache-waitqueue*))
+              (error condition))))))))
+
+(defun release-render-source (key)
+  (sb-thread:with-mutex (*render-source-cache-lock*)
+    (let ((entry (gethash key *render-source-cache-entries*)))
+      (when entry
+        (decf (render-source-cache-entry-leases entry))
+        (incf *render-source-cache-clock*)
+        (setf (render-source-cache-entry-last-used entry)
+              *render-source-cache-clock*)
+        (render-source-cache-evict)))))
+
+(defun clear-render-source-cache ()
+  "Delete process-local extracted DNG originals after all render workers stop."
+  (sb-thread:with-mutex (*render-source-cache-lock*)
+    (when (loop for entry being the hash-values of *render-source-cache-entries*
+                thereis (or (eq :loading (render-source-cache-entry-state entry))
+                            (plusp (render-source-cache-entry-leases entry))))
+      (error "Cannot clear the DNG source cache while a render is using it."))
+    (clrhash *render-source-cache-entries*)
+    (when *render-source-cache-directory*
+      (uiop:delete-directory-tree *render-source-cache-directory*
+                                  :validate t
+                                  :if-does-not-exist :ignore)
+      (setf *render-source-cache-directory* nil)))
+  nil)
 
 (defun call-with-render-source (input-pathname function)
   (if (dng-input-pathname-p input-pathname)
-      (let ((temporary (render-source-temporary-pathname input-pathname)))
+      (multiple-value-bind (key pathname)
+          (acquire-render-source input-pathname)
         (unwind-protect
-             (progn
-               (dng-extract-original input-pathname temporary)
-               (funcall function temporary))
-          (when (probe-file temporary)
-            (delete-file temporary))))
+             (funcall function pathname)
+          (release-render-source key)))
       (funcall function input-pathname)))
 
 (defun photo-extract-embedded-preview (input-pathname output-pathname
