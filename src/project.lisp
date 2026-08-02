@@ -69,10 +69,12 @@ them as a copyable node chain.")
   "A named, portable snapshot of processing settings.
 
 A preset grabbed from a specific photograph remembers that photograph in
-SOURCE-PHOTO so galleries can render a representative still thumbnail."
+SOURCE-PHOTO so galleries can render a representative still thumbnail.
+DISABLED-STAGES preserves pipeline bypass state without discarding its settings."
   (name "" :type string)
   (settings (make-processing-settings) :type processing-settings)
-  (source-photo nil))
+  (source-photo nil)
+  (disabled-stages '()))
 
 (defstruct export-settings
   "Frontend-independent options for encoded photo exports."
@@ -175,24 +177,32 @@ settings are remembered but render as identity, like a disabled node."
                     (processing-preset-settings preset)))
    (let ((source (processing-preset-source-photo preset)))
      (when source
-       (list :source-photo (namestring source))))))
+       (list :source-photo (namestring source))))
+   (when (processing-preset-disabled-stages preset)
+     (list :disabled-stages
+           (copy-list (processing-preset-disabled-stages preset))))))
 
 (defun sexp->processing-preset (sexp)
   (unless (and (listp sexp)
-               (plist-known-keys-p sexp '(:name :settings :source-photo)))
+               (plist-known-keys-p sexp
+                                   '(:name :settings :source-photo
+                                     :disabled-stages)))
     (project-invalid sexp "expected a preset property list"))
   (let ((name (getf sexp :name))
         (settings (getf sexp :settings))
-        (source-photo (getf sexp :source-photo)))
+        (source-photo (getf sexp :source-photo))
+        (disabled-stages (getf sexp :disabled-stages '())))
     (unless (and (stringp name)
                  (plusp (length (string-trim '(#\Space #\Tab) name))))
       (project-invalid sexp "preset :name must be a nonempty string"))
     (unless (or (null source-photo) (stringp source-photo))
       (project-invalid sexp "preset :source-photo must be NIL or a pathname string"))
+    (disabled-stages-validate disabled-stages)
     (make-processing-preset :name name
                             :settings (sexp->processing-settings settings)
                             :source-photo (when source-photo
-                                            (pathname source-photo)))))
+                                            (pathname source-photo))
+                            :disabled-stages disabled-stages)))
 
 (defun sexp->processing-presets (sexp)
   (unless (listp sexp)
@@ -383,7 +393,7 @@ so pasting a grade also carries which nodes were switched off."
 
 (defun project->sexp (project)
   "Convert PROJECT to its portable, versioned S-expression representation."
-  (list :orfeus-project 1
+  (list :orfeus-project 2
         :output-directory (namestring (project-output-directory project))
         :defaults (processing-settings->sexp (project-defaults project))
         :export-settings (export-settings->sexp (project-export-settings project))
@@ -394,11 +404,11 @@ so pasting a grade also carries which nodes were switched off."
   "Validate and convert a project S-expression into a PROJECT."
   (unless (and (listp sexp)
                (eq (first sexp) :orfeus-project)
-               (eql (second sexp) 1)
+               (member (second sexp) '(1 2))
                (plist-known-keys-p
                 (cddr sexp)
                 '(:output-directory :defaults :export-settings :presets :photos)))
-    (project-invalid sexp "expected (:ORFEUS-PROJECT 1 ...)"))
+    (project-invalid sexp "expected (:ORFEUS-PROJECT 1|2 ...)"))
   (let ((output-directory (getf (cddr sexp) :output-directory))
         (defaults (getf (cddr sexp) :defaults))
         (export-settings (getf (cddr sexp) :export-settings))

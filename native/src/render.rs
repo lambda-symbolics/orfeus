@@ -486,10 +486,9 @@ fn apply_white_adaptation(image: &mut RgbImage, kelvin: f32, tint: f32) {
         xyz_to_rgb,
         mat_mul(inverse, mat_mul(scale, mat_mul(bradford, rgb_to_xyz))),
     );
-    image
-        .data
-        .par_chunks_exact_mut(3)
-        .for_each(|pixel| pixel.copy_from_slice(&mat_vec(adaptation, [pixel[0], pixel[1], pixel[2]])));
+    image.data.par_chunks_exact_mut(3).for_each(|pixel| {
+        pixel.copy_from_slice(&mat_vec(adaptation, [pixel[0], pixel[1], pixel[2]]))
+    });
 }
 
 fn tone_adjustment_ev(luminance: f32, adjustments: &[f32; 7]) -> f32 {
@@ -1143,13 +1142,6 @@ fn native_downscale_bounds(orientation: u16, max_width: u32, max_height: u32) ->
     }
 }
 
-fn downscale(image: RgbImage, max_width: u32, max_height: u32) -> RgbImage {
-    match downscale_from(&image.data, image.width, image.height, max_width, max_height) {
-        Some(scaled) => scaled,
-        None => image,
-    }
-}
-
 /// Area-averages SOURCE into the bounded size, or returns None when the
 /// bounds do not require shrinking. Reading borrowed pixels lets bounded
 /// renders start straight from the shared decode cache without copying it.
@@ -1456,19 +1448,21 @@ struct DecodedRaw {
 }
 
 type DecodeCacheKey = (PathBuf, SystemTime, u64);
+type DecodeCacheEntries = Vec<(DecodeCacheKey, Arc<DecodedRaw>)>;
 
-fn decode_cache() -> &'static Mutex<Vec<(DecodeCacheKey, Arc<DecodedRaw>)>> {
-    static CACHE: OnceLock<Mutex<Vec<(DecodeCacheKey, Arc<DecodedRaw>)>>> = OnceLock::new();
+fn decode_cache() -> &'static Mutex<DecodeCacheEntries> {
+    static CACHE: OnceLock<Mutex<DecodeCacheEntries>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn neural_render_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
 }
 
 fn decode_cache_key(input: &Path) -> Result<DecodeCacheKey, Error> {
     let metadata = fs::metadata(input)?;
-    Ok((
-        input.to_path_buf(),
-        metadata.modified()?,
-        metadata.len(),
-    ))
+    Ok((input.to_path_buf(), metadata.modified()?, metadata.len()))
 }
 
 fn decode_linear_srgb(input: &Path, profiling: bool) -> Result<DecodedRaw, Error> {
@@ -1519,6 +1513,7 @@ fn decode_linear_srgb(input: &Path, profiling: bool) -> Result<DecodedRaw, Error
     let linear_srgb = intermediate_to_linear_srgb(developed, &raw.color_matrix, white_balance)
         .map_err(Error::Color)?;
     profile_stage!("camera-to-srgb");
+    let _ = stage_started;
     Ok(DecodedRaw {
         width: linear_srgb.width,
         height: linear_srgb.height,
@@ -1590,6 +1585,18 @@ pub fn render(
             "input and output refer to the same file",
         ));
     }
+    // FFDNet retains large full-image and per-worker feature buffers. Serialize
+    // neural renders before decoding so concurrent GUI preview workers cannot
+    // each hold a complete RAW image while waiting for inference memory.
+    let _neural_render_guard = if settings.neural_noise_reduction > 0.0 {
+        Some(
+            neural_render_lock()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        )
+    } else {
+        None
+    };
     let decoded = decoded_for_render(input, cache_mode, profiling)?;
     let mut stage_started = Instant::now();
     macro_rules! profile_stage {
@@ -2093,11 +2100,11 @@ mod tests {
                 image.data.extend_from_slice(&[value, value, value]);
             }
         }
-        let result = downscale(image, 4, 2);
+        let result = downscale_from(&image.data, image.width, image.height, 4, 2).unwrap();
         assert_eq!((result.width, result.height), (4, 2));
         assert!((result.data[0] - 1.0).abs() < 1.0e-6);
         assert!((result.data[(2 * 4 - 1) * 3] - 0.0).abs() < 1.0e-6);
-        let middle = result.data[1 * 3];
+        let middle = result.data[3];
         assert!((middle - 1.0).abs() < 1.0e-6, "left half must stay white");
     }
 

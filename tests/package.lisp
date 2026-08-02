@@ -28,6 +28,7 @@
                 #:photo-job-apply-grade
                 #:photo-job-disabled-stages
                 #:photo-render-settings
+                #:processing-preset-disabled-stages
                 #:processing-preset-source-photo
                 #:processing-settings-exposure
                 #:processing-settings-grain-amount

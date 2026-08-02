@@ -119,6 +119,11 @@
   "Render features required by the Common Lisp core.")
 
 (defun native-render-require-compatible ()
+  (let ((version (native-bridge-version)))
+    (unless (>= version 2)
+      (error 'native-library-incompatible
+             :message (format nil "bridge ABI ~D does not provide raw render v2"
+                              version))))
   (let ((capabilities
           (handler-case
               (%raw-render-capabilities-v1)

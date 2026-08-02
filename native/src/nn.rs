@@ -24,6 +24,8 @@ const KERNEL: usize = 3;
 /// Half-resolution output tile edge; one halo pixel per convolution layer.
 const TILE: usize = 192;
 const HALO: usize = LAYER_COUNT;
+/// Bound simultaneous tile scratch buffers regardless of the global Rayon pool.
+const MAX_PARALLEL_TILES: usize = 4;
 /// Slider position 1.0 asks the network for this training-domain sigma.
 /// Sigma 30/255 already erases the worst high-ISO Micro Four Thirds noise;
 /// larger values only smear detail on real photographs.
@@ -186,6 +188,7 @@ macro_rules! accumulate_triple_body {
 /// only after runtime feature detection.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma")]
+#[allow(clippy::too_many_arguments)]
 fn accumulate_triple_fma(
     layer: &ConvLayer,
     input: &[f32],
@@ -196,9 +199,7 @@ fn accumulate_triple_fma(
     acc1: &mut [f32],
     acc2: &mut [f32],
 ) {
-    use std::arch::x86_64::{
-        _mm256_fmadd_ps, _mm256_loadu_ps, _mm256_set1_ps, _mm256_storeu_ps,
-    };
+    use std::arch::x86_64::{_mm256_fmadd_ps, _mm256_loadu_ps, _mm256_set1_ps, _mm256_storeu_ps};
     let count = acc0.len();
     let plane = size * size;
     assert!(acc1.len() == count && acc2.len() == count && count + 2 <= size);
@@ -324,25 +325,37 @@ fn convolve_valid(
             if use_fma {
                 // SAFETY: fma_available checked AVX2 and FMA support.
                 unsafe {
-                    accumulate_triple_fma(
-                        layer, input, size, out_y, weight_rows, acc0, acc1, acc2,
-                    )
+                    accumulate_triple_fma(layer, input, size, out_y, weight_rows, acc0, acc1, acc2)
                 };
             } else {
                 accumulate_triple_portable(
-                    layer, input, size, out_y, weight_rows, acc0, acc1, acc2,
+                    layer,
+                    input,
+                    size,
+                    out_y,
+                    weight_rows,
+                    acc0,
+                    acc1,
+                    acc2,
                 );
             }
             #[cfg(not(target_arch = "x86_64"))]
             {
                 let _ = use_fma;
                 accumulate_triple_portable(
-                    layer, input, size, out_y, weight_rows, acc0, acc1, acc2,
+                    layer,
+                    input,
+                    size,
+                    out_y,
+                    weight_rows,
+                    acc0,
+                    acc1,
+                    acc2,
                 );
             }
             for (offset, accumulator) in [&*acc0, &*acc1, &*acc2].into_iter().enumerate() {
-                let target = &mut output
-                    [(channel + offset) * output_plane + out_y * output_size..][..output_size];
+                let target = &mut output[(channel + offset) * output_plane + out_y * output_size..]
+                    [..output_size];
                 if relu {
                     for (destination, value) in target.iter_mut().zip(accumulator) {
                         *destination = value.max(0.0);
@@ -440,71 +453,73 @@ pub(crate) fn apply_neural_noise_reduction(
     let tiles: Vec<(usize, usize)> = (0..half_height.div_ceil(TILE))
         .flat_map(|tile_y| (0..half_width.div_ceil(TILE)).map(move |tile_x| (tile_x, tile_y)))
         .collect();
-    let tile_results: Vec<((usize, usize), Vec<f32>)> = tiles
-        .par_iter()
-        .map_init(TileScratch::new, |scratch, &(tile_x, tile_y)| {
+    for tile_batch in tiles.chunks(MAX_PARALLEL_TILES) {
+        let tile_results: Vec<((usize, usize), Vec<f32>)> = tile_batch
+            .par_iter()
+            .map_init(TileScratch::new, |scratch, &(tile_x, tile_y)| {
+                let origin_x = tile_x * TILE;
+                let origin_y = tile_y * TILE;
+                gather_patch(
+                    &planes,
+                    half_width,
+                    half_height,
+                    origin_x,
+                    origin_y,
+                    sigma,
+                    &mut scratch.ping,
+                    patch_size,
+                );
+                let mut size = patch_size;
+                let mut source_is_ping = true;
+                for (index, layer) in net.layers.iter().enumerate() {
+                    let relu = index + 1 < net.layers.len();
+                    let (input, output) = if source_is_ping {
+                        (&scratch.ping, &mut scratch.pong)
+                    } else {
+                        (&scratch.pong, &mut scratch.ping)
+                    };
+                    convolve_valid(
+                        layer,
+                        input,
+                        size,
+                        output,
+                        &mut scratch.row_accumulators,
+                        relu,
+                    );
+                    size -= 2;
+                    source_is_ping = !source_is_ping;
+                }
+                let result = if source_is_ping {
+                    &scratch.ping
+                } else {
+                    &scratch.pong
+                };
+                let tile_width = TILE.min(half_width.saturating_sub(origin_x));
+                let tile_height = TILE.min(half_height.saturating_sub(origin_y));
+                let mut tile_output = vec![0.0_f32; OUTPUT_CHANNELS * tile_width * tile_height];
+                for channel in 0..OUTPUT_CHANNELS {
+                    for row in 0..tile_height {
+                        let source = channel * size * size + row * size;
+                        let target = channel * tile_width * tile_height + row * tile_width;
+                        tile_output[target..target + tile_width]
+                            .copy_from_slice(&result[source..source + tile_width]);
+                    }
+                }
+                ((tile_x, tile_y), tile_output)
+            })
+            .collect();
+        for ((tile_x, tile_y), tile_output) in tile_results {
             let origin_x = tile_x * TILE;
             let origin_y = tile_y * TILE;
-            gather_patch(
-                &planes,
-                half_width,
-                half_height,
-                origin_x,
-                origin_y,
-                sigma,
-                &mut scratch.ping,
-                patch_size,
-            );
-            let mut size = patch_size;
-            let mut source_is_ping = true;
-            for (index, layer) in net.layers.iter().enumerate() {
-                let relu = index + 1 < net.layers.len();
-                let (input, output) = if source_is_ping {
-                    (&scratch.ping, &mut scratch.pong)
-                } else {
-                    (&scratch.pong, &mut scratch.ping)
-                };
-                convolve_valid(
-                    layer,
-                    input,
-                    size,
-                    output,
-                    &mut scratch.row_accumulators,
-                    relu,
-                );
-                size -= 2;
-                source_is_ping = !source_is_ping;
-            }
-            let result = if source_is_ping {
-                &scratch.ping
-            } else {
-                &scratch.pong
-            };
             let tile_width = TILE.min(half_width.saturating_sub(origin_x));
             let tile_height = TILE.min(half_height.saturating_sub(origin_y));
-            let mut tile_output = vec![0.0_f32; OUTPUT_CHANNELS * tile_width * tile_height];
             for channel in 0..OUTPUT_CHANNELS {
                 for row in 0..tile_height {
-                    let source = channel * size * size + row * size;
-                    let target = channel * tile_width * tile_height + row * tile_width;
-                    tile_output[target..target + tile_width]
-                        .copy_from_slice(&result[source..source + tile_width]);
+                    let source = channel * tile_width * tile_height + row * tile_width;
+                    let target = channel * half_plane + (origin_y + row) * half_width + origin_x;
+                    denoised[target..target + tile_width]
+                        .copy_from_slice(&tile_output[source..source + tile_width]);
                 }
-            }
-            ((tile_x, tile_y), tile_output)
-        })
-        .collect();
-    for ((tile_x, tile_y), tile_output) in tile_results {
-        let origin_x = tile_x * TILE;
-        let origin_y = tile_y * TILE;
-        let tile_width = TILE.min(half_width.saturating_sub(origin_x));
-        let tile_height = TILE.min(half_height.saturating_sub(origin_y));
-        for channel in 0..OUTPUT_CHANNELS {
-            for row in 0..tile_height {
-                let source = channel * tile_width * tile_height + row * tile_width;
-                let target = channel * half_plane + (origin_y + row) * half_width + origin_x;
-                denoised[target..target + tile_width]
-                    .copy_from_slice(&tile_output[source..source + tile_width]);
             }
         }
     }
@@ -541,8 +556,7 @@ mod tests {
         assert_eq!(net.layers[0].input_channels, INPUT_CHANNELS);
         assert_eq!(net.layers[11].output_channels, OUTPUT_CHANNELS);
         assert!(net.layers.iter().all(|layer| {
-            layer.weights.len()
-                == layer.output_channels * layer.input_channels * KERNEL * KERNEL
+            layer.weights.len() == layer.output_channels * layer.input_channels * KERNEL * KERNEL
                 && layer.bias.len() == layer.output_channels
         }));
     }

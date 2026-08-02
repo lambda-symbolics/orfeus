@@ -157,7 +157,12 @@
                     :name trimmed
                     :settings (orfeus::copy-processing-settings
                                (gui-model-selected-settings model))
-                    :source-photo source))
+                    :source-photo source
+                    :disabled-stages
+                    (let ((job (gui-model-selected-job model)))
+                      (if job
+                          (copy-list (photo-job-disabled-stages job))
+                          '()))))
            (existing (project-presets project))
            (position (position trimmed existing :test #'string-equal
                                                 :key #'processing-preset-name)))
@@ -179,7 +184,9 @@
                     (let ((job (gui-model-selected-job model)))
                       (and job (list job))))))
       (dolist (job jobs)
-        (setf (photo-job-overrides job) (copy-list overrides)))
+        (setf (photo-job-overrides job) (copy-list overrides)
+              (photo-job-disabled-stages job)
+              (copy-list (processing-preset-disabled-stages preset))))
       (length jobs))))
 
 (defun setting-reader (key)

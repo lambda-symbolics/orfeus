@@ -386,7 +386,7 @@
                     (gui-model-selected-indices model) row thumbnail-anchor state)
                  (setf thumbnail-anchor anchor)
                  (gui-model-set-selected-indices model selection)
-                 (when selection
+                 (when (member row selection)
                    (setf (gui-model-selected-index model) row))
                  (clear-previews)
                  (sync-controls)
@@ -625,7 +625,9 @@
               (make-pathname
                :name (format nil "still-~A-~A"
                              (preview-settings-key
-                              (processing-preset-settings preset))
+                              (orfeus::settings-apply-stage-bypass
+                               (processing-preset-settings preset)
+                               (processing-preset-disabled-stages preset)))
                              (or (pathname-name
                                   (processing-preset-source-photo preset))
                                  "none"))
@@ -636,7 +638,10 @@
                    (source (processing-preset-source-photo preset)))
                (when (and source (null (gethash name gallery-thumbs)))
                  (let ((output (still-thumbnail-pathname preset))
-                       (settings (processing-preset-settings preset)))
+                       (settings
+                         (orfeus::settings-apply-stage-bypass
+                          (processing-preset-settings preset)
+                          (processing-preset-disabled-stages preset))))
                    (if (probe-file output)
                        (setf (gethash name gallery-thumbs) output)
                        (enqueue-gui-task
@@ -1346,8 +1351,14 @@
                     (setf (gethash (third event) thumbnail-files) (fourth event))
                     (redraw-thumbnails)))
                  (:still-thumb
-                  (setf (gethash (second event) gallery-thumbs) (third event))
-                  (when gallery-canvas (cl-fltk:redraw gallery-canvas)))
+                  (let ((preset (find (second event) (project-presets project)
+                                      :test #'string-equal
+                                      :key #'processing-preset-name)))
+                    (when (and preset
+                               (equal (third event)
+                                      (still-thumbnail-pathname preset)))
+                      (setf (gethash (second event) gallery-thumbs) (third event))
+                      (when gallery-canvas (cl-fltk:redraw gallery-canvas)))))
                  (:done
                   (set-status (format nil "Exported ~A" (second event))))
                  (:error

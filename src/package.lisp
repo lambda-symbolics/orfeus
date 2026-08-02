@@ -62,6 +62,7 @@
    #:settings-grade-plist
    #:next-still-preset-name
    #:processing-preset
+   #:processing-preset-disabled-stages
    #:processing-preset-name
    #:processing-preset-settings
    #:processing-preset-source-photo

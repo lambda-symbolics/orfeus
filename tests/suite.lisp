@@ -19,7 +19,8 @@
 (defun project-round-trip-p ()
   (let* ((original (project-test-value))
          (decoded (sexp->project (project->sexp original))))
-    (and (= 0.75 (processing-settings-exposure
+    (and (= 2 (second (project->sexp original)))
+         (= 0.75 (processing-settings-exposure
                   (project-defaults decoded)))
          (= 0.65 (processing-settings-lens-correction-strength
                   (project-defaults decoded)))
@@ -54,13 +55,15 @@
                             :name "Night"
                             :settings (make-processing-settings
                                        :exposure 1.25
-                                       :noise-reduction 0.8)))))
+                                       :noise-reduction 0.8)
+                            :disabled-stages '(:film)))))
          (decoded (sexp->project (project->sexp project)))
          (preset (first (project-presets decoded))))
     (and (= 1 (length (project-presets decoded)))
          (string= "Night" (processing-preset-name preset))
          (= 1.25 (processing-settings-exposure
-                  (processing-preset-settings preset))))))
+                  (processing-preset-settings preset)))
+         (equal '(:film) (processing-preset-disabled-stages preset)))))
 
 (defun neural-noise-reduction-round-trip-p ()
   (let* ((project
