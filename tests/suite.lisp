@@ -216,6 +216,25 @@
       (when (probe-file pathname)
         (delete-file pathname)))))
 
+(defun render-accepts-unbounded-nil-dimensions-p ()
+  (let ((input (test-temporary-pathname "orf"))
+        (output (test-temporary-pathname "jpg")))
+    (unwind-protect
+         (progn
+           (with-open-file (stream input :direction :output :if-exists :supersede)
+             (write-string "not a raw" stream))
+           (handler-case
+               (progn
+                 (render-photo input output (make-processing-settings)
+                               :max-width nil :max-height nil
+                               :preserve-metadata-p nil)
+                 nil)
+             (raw-render-error () t)
+             (type-error () nil)))
+      (dolist (pathname (list input output))
+        (when (probe-file pathname)
+          (delete-file pathname))))))
+
 (defun preview-does-not-overwrite-p ()
   (let ((input (test-temporary-pathname "orf"))
         (output (test-temporary-pathname "jpg"))
@@ -338,6 +357,8 @@
              (photo-job-render-output-semantics-p))
       (check "rendering never replaces its input"
              (render-rejects-input-as-output-p))
+      (check "NIL export bounds mean unbounded dimensions"
+             (render-accepts-unbounded-nil-dimensions-p))
       (check "preview does not overwrite an existing export"
              (preview-does-not-overwrite-p))
       (check "embedded preview extraction rejects files without an image"

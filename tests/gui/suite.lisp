@@ -116,7 +116,20 @@
     (check (search "look.cube (100%)" text)
            "Preview status did not use one literal percent sign")
     (check (null (search "100%%" text))
-           "Preview status contains a C-style doubled percent sign")))
+           "Preview status contains a C-style doubled percent sign")
+    (check (search "NR: 35%" text)
+           "Preview status does not report active noise reduction")))
+
+(defun test-thumbnail-hit-testing ()
+  (dolist (case '((0 0 104 0)
+                  (103 0 104 0)
+                  (104 0 104 1)
+                  (207 0 104 1)
+                  (0 104 104 1)))
+    (destructuring-bind (event-y scroll row-height expected) case
+      (check (= expected
+                (orfeus/gui::thumbnail-row-at event-y scroll row-height))
+             "Thumbnail hit test selected the wrong row for ~S" case))))
 
 (defun test-file-filter-syntax ()
   (let ((filter (orfeus/gui::fltk-file-filter "RAW photographs" "*.orf")))
@@ -259,6 +272,7 @@
   (test-preview-job-identity)
   (test-preview-directory)
   (test-preview-status-percent)
+  (test-thumbnail-hit-testing)
   (test-file-filter-syntax)
   (test-direct-open-workflow)
   (test-project-photo-mutations)

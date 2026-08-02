@@ -3,6 +3,19 @@
 (defparameter *preview-debounce-seconds* 0.25d0
   "Delay used to coalesce interactive control changes.")
 
+(defparameter *gui-preview-max-width* 0
+  "Maximum GUI preview width; zero preserves full source resolution.")
+
+(defparameter *gui-preview-max-height* 0
+  "Maximum GUI preview height; zero preserves full source resolution.")
+
+(defparameter *thumbnail-preview-size* 320
+  "Maximum width and height for orientation-correct thumbnail renders.")
+
+(defun thumbnail-row-at (event-y scroll row-height)
+  "Return the zero-based thumbnail row at local EVENT-Y."
+  (floor (+ event-y scroll) row-height))
+
 (defun fltk-file-filter (label pattern)
   "Build FLTK's LABEL<TAB>PATTERN native file chooser syntax."
   (format nil "~A~C~A" label #\Tab pattern))
@@ -24,14 +37,6 @@
           (unless (and (realp value) (= end (length text)))
             (error "Expected a number, got ~S." text))
           value))))
-
-(defun project-table-records (project)
-  (loop for job in (project-photos project)
-        collect (list :file (file-namestring (photo-job-input-path job))
-                      :settings (if (photo-job-overrides job) "Adjusted" "Defaults")
-                      :output (or (and (photo-job-output-path job)
-                                       (file-namestring (photo-job-output-path job)))
-                                  "Automatic"))))
 
 (defun make-gui-preview-directory ()
   "Create and return a private temporary directory for one GUI run."
@@ -72,10 +77,12 @@
 
 (defun preview-status-text (model)
   (let ((temperature (gui-model-setting model :white-balance-temperature))
+        (noise-reduction (gui-model-setting model :noise-reduction))
         (lut (gui-model-setting model :lut-path))
         (strength (gui-model-setting model :lut-strength)))
-    (format nil "RAW preview  |  WB: ~A  |  LUT: ~A"
+    (format nil "RAW preview  |  WB: ~A  |  NR: ~D%  |  LUT: ~A"
             (if temperature "Custom" "As shot")
+            (round (* 100 noise-reduction))
             (if (and lut (plusp strength))
                 (format nil "~A (~D%)" (file-namestring lut)
                         (round (* 100 strength)))
@@ -114,13 +121,14 @@
            (thumbnail-files (make-hash-table :test #'eq))
            (lut-paths (make-hash-table :test #'equal))
            window menu toolbar toolbar-bottom-rule main-tile left-pane center-pane
-           table thumbnail-canvas before-canvas after-canvas before-caption after-caption
+           thumbnail-canvas before-canvas after-canvas before-caption after-caption
            inspector tabs basic-page optics-page effects-page export-page presets-page
            status progress before-preview-file after-preview-file
            lens-name controls inspector-items lut-choice wb-choice target-choice
            export-quality export-max-width export-max-height export-metadata
            preset-browser preset-name-input preset-apply-button
-           debounce-id poll-id comparison-p layout-initialized-p
+           debounce-id layout-id poll-id comparison-p layout-initialized-p
+           layout-running-p
            (thumbnail-scroll 0)
            (preview-generation 0)
            (preview-zoom 1d0)
@@ -193,18 +201,26 @@
                      (values (* source-width scale)
                              (* source-height scale)
                              fit))))))
+           (preview-zoom-limit (canvas path)
+             (multiple-value-bind (scaled-width scaled-height fit)
+                 (preview-scaled-size canvas path 1d0)
+               (declare (ignore scaled-width scaled-height))
+               (if fit (/ (max fit 2d0) fit) 32d0)))
            (zoom-preview (factor &optional canvas pointer-x pointer-y)
-             (let* ((old-zoom preview-zoom)
-                    (new-zoom (min 32d0 (max 1d0 (* old-zoom factor))))
-                    (path (and canvas (preview-path-for-canvas canvas))))
-               (when (and path pointer-x pointer-y (/= old-zoom new-zoom))
+             (let* ((target-canvas (or canvas after-canvas before-canvas))
+                    (path (and target-canvas
+                               (preview-path-for-canvas target-canvas)))
+                    (old-zoom preview-zoom)
+                    (new-zoom (min (if path
+                                       (preview-zoom-limit target-canvas path)
+                                       32d0)
+                                   (max 1d0 (* old-zoom factor)))))
+               (when (and path canvas pointer-x pointer-y (/= old-zoom new-zoom))
                  (multiple-value-bind (old-width old-height)
                      (preview-scaled-size canvas path old-zoom)
                    (when old-width
-                     (let* ((canvas-center-x (+ (cl-fltk:widget-x canvas)
-                                                (/ (cl-fltk:widget-width canvas) 2d0)))
-                            (canvas-center-y (+ (cl-fltk:widget-y canvas)
-                                                (/ (cl-fltk:widget-height canvas) 2d0)))
+                     (let* ((canvas-center-x (/ (cl-fltk:widget-width canvas) 2d0))
+                            (canvas-center-y (/ (cl-fltk:widget-height canvas) 2d0))
                             (source-x (+ preview-center-x
                                          (/ (- pointer-x canvas-center-x) old-width)))
                             (source-y (+ preview-center-y
@@ -282,12 +298,12 @@
            (select-thumbnail-row (row)
              (when (and (>= row 0) (< row (length (project-photos project))))
                (gui-model-set-selected-indices model (list row))
-               (cl-fltk:table-select-row table row)
                (clear-previews)
                (sync-controls)
                (schedule-initial-preview)
                (redraw-thumbnails)))
            (handle-thumbnail-mouse (canvas event value)
+             (declare (ignore canvas))
              (multiple-value-bind (x y button dx dy)
                  (parse-preview-event value)
                (declare (ignore x button dx))
@@ -295,8 +311,8 @@
                  (case event
                    (#.cl-fltk:+event-push+
                     (select-thumbnail-row
-                     (floor (+ (- y (cl-fltk:widget-y canvas)) thumbnail-scroll)
-                            (thumbnail-row-height))))
+                     (thumbnail-row-at y thumbnail-scroll
+                                       (thumbnail-row-height))))
                    (#.cl-fltk:+event-wheel+
                     (incf thumbnail-scroll (* dy 36))
                     (redraw-thumbnails))))))
@@ -325,11 +341,6 @@
                                (gethash (selected-job) thumbnail-files) path)
                          (cl-fltk:redraw after-canvas)
                          (redraw-thumbnails)))))
-           (update-table ()
-             (cl-fltk:table-set-records
-              table '((:file "File" 230) (:settings "Settings" 90)
-                      (:output "Output" 150))
-              (project-table-records project)))
            (sync-export-controls ()
              (when export-quality
                (let ((settings (project-export-settings project)))
@@ -407,7 +418,6 @@
              (handler-case
                  (let* ((name (cl-fltk:value preset-name-input))
                         (count (gui-model-apply-preset model name)))
-                   (update-table)
                    (sync-controls)
                    (schedule-edited-preview)
                    (set-status (format nil "Applied ~A to ~D photo~:P"
@@ -447,13 +457,10 @@
                    thumbnail-scroll 0)
              (clrhash thumbnail-files)
              (gui-model-replace-project model new-project path)
-             (update-table)
              (refresh-preset-browser)
              (sync-controls)
              (if (selected-job)
-                 (progn
-                   (cl-fltk:table-select-row table 0)
-                   (schedule-initial-preview))
+                 (schedule-initial-preview)
                  (set-status "Open a photograph or project to begin")))
            (choose-photos (title)
              (choose-photo-files
@@ -474,11 +481,10 @@
                      (gui-model-add-photos model paths)
                    (if (plusp count)
                        (progn
+                         (gui-model-set-selected-indices model (list first-index))
                          (incf preview-generation)
                          (clear-previews)
-                         (update-table)
                          (sync-controls)
-                         (cl-fltk:table-select-row table first-index)
                          (schedule-initial-preview)
                          (set-status (format nil "Added ~D photograph~:P" count)))
                        (set-status "All selected photographs are already in the project"))))))
@@ -491,12 +497,9 @@
                    (remhash job capture-cache)
                    (remhash job thumbnail-files))
                  (clear-previews)
-                 (update-table)
                  (sync-controls)
                  (if (selected-job)
                      (progn
-                       (cl-fltk:table-select-row
-                        table (gui-model-selected-index model))
                        (schedule-initial-preview)
                        (set-status (format nil "Removed ~D photograph~:P"
                                            (length removed))))
@@ -553,7 +556,10 @@
                                        (list :status generation
                                              (format nil "Developing ~A..."
                                                      (file-namestring input)))))
-                        (render-preview input output settings :if-exists :supersede)
+                        (render-preview input output settings
+                                        :max-width *gui-preview-max-width*
+                                        :max-height *gui-preview-max-height*
+                                        :if-exists :supersede)
                         (when (and publish-p
                                    (= generation preview-generation))
                           (queue-event queue
@@ -568,8 +574,13 @@
                     (lambda ()
                       (handler-case
                           (progn
-                            (photo-extract-embedded-preview
-                             (photo-job-input-path job) output :if-exists :supersede)
+                            (render-preview
+                              (photo-job-input-path job) output
+                              (neutral-preview-settings)
+                              :max-width *thumbnail-preview-size*
+                              :max-height *thumbnail-preview-size*
+                              :jpeg-quality 82
+                              :if-exists :supersede)
                             (queue-event queue
                                          (list :thumbnail generation job output)))
                         (error () nil)))))))
@@ -645,18 +656,8 @@
                    (when (member key '(:white-balance-temperature
                                        :white-balance-tint))
                      (setf (cl-fltk:value wb-choice) "Custom"))
-                   (update-table)
                    (schedule-edited-preview))
                (error (condition) (set-status (princ-to-string condition)))))
-           (select-row ()
-             (let ((rows (cl-fltk:table-selected-rows table)))
-               (when rows
-                 (gui-model-set-selected-indices model rows)
-                 (clear-previews)
-                 (sync-controls)
-                 (schedule-initial-preview)
-                 (when (> (length rows) 1)
-                   (set-status (format nil "~D photos selected" (length rows)))))))
            (render-selected ()
              (let ((job (selected-job)))
                (when job
@@ -666,8 +667,15 @@
                     queue :export
                     (lambda ()
                       (queue-event queue (list :status nil "Exporting current photo..."))
-                      (render-photo-job project job :if-exists :supersede)
-                      (queue-event queue (list :done output))))))))
+                      (handler-case
+                          (progn
+                            (render-photo-job project job :if-exists :supersede)
+                            (queue-event queue (list :done output)))
+                        (error (condition)
+                          (queue-event queue
+                                       (list :status nil
+                                             (format nil "Export failed: ~A"
+                                                     condition)))))))))))
            (render-all ()
              (when (project-photos project)
                (ensure-directories-exist
@@ -752,8 +760,20 @@
                      (register-inspector spinner 202 y :number 26 :page))
                    (register-inspector spinner 110 y :control 26 :page))
                spinner))
+           (schedule-layout (&optional ignored)
+             (declare (ignore ignored))
+             (unless layout-running-p
+               (when layout-id
+                 (ignore-errors (cl-fltk:remove-timeout layout-id)))
+               (setf layout-id
+                     (cl-fltk:add-timeout
+                      0.12d0
+                      (lambda ()
+                        (setf layout-id nil)
+                        (layout-ui))))))
            (layout-ui (&optional ignored)
              (declare (ignore ignored))
+             (setf layout-running-p t)
              (let* ((width (cl-fltk:widget-width window))
                     (height (cl-fltk:widget-height window))
                     (top 64) (bottom 28)
@@ -771,20 +791,15 @@
                                          (cl-fltk:widget-width inspector)
                                          (floor width 3)))))
                     (center (- width left right))
-                    (thumbnail-height
-                      (min (- main-height 120)
-                           (max 140 (if layout-initialized-p
-                                        (cl-fltk:widget-height thumbnail-canvas)
-                                        (floor (* main-height .58))))))
                     (caption-height 22)
                     (viewer-height (max 100 (- main-height caption-height)))
                     (gutter 6)
                     (pane-width (floor (- center gutter) 2)))
                (cl-fltk:resize-widget menu :x 0 :y 0 :width width :height 24)
                (cl-fltk:resize-widget toolbar :x 0 :y 24 :width width :height 40)
-                (when toolbar-bottom-rule
-                  (cl-fltk:resize-widget toolbar-bottom-rule :x 0 :y 38
-                                         :width width :height 2))
+               (when toolbar-bottom-rule
+                 (cl-fltk:resize-widget toolbar-bottom-rule :x 0 :y 38
+                                        :width width :height 2))
                (when lens-name
                  (cl-fltk:resize-widget lens-name :x 342 :y 6
                                         :width (max 120 (- width 352)) :height 28))
@@ -793,9 +808,7 @@
                (cl-fltk:resize-widget left-pane :x 0 :y 0
                                       :width left :height main-height)
                (cl-fltk:resize-widget thumbnail-canvas :x 0 :y 0
-                                      :width left :height thumbnail-height)
-               (cl-fltk:resize-widget table :x 0 :y thumbnail-height
-                                      :width left :height (- main-height thumbnail-height))
+                                      :width left :height main-height)
                (cl-fltk:resize-widget center-pane :x left :y 0
                                       :width center :height main-height)
                (if comparison-p
@@ -845,7 +858,7 @@
                             (case width-mode
                               (:scope-control (max 100 (- right 98)))
                               (:control (max 100 (- basis-width 118)))
-                              (:slider (max 80 (- basis-width 204)))
+                              (:slider (max 64 (- basis-width 204)))
                               (:number 78)
                               (:fill (max 100 (- basis-width 16)))
                               (:half-left (max 70 (floor (- right 30) 2)))
@@ -864,7 +877,8 @@
                       :width item-width :height item-height))))
                (cl-fltk:init-sizes left-pane)
                (cl-fltk:init-sizes main-tile)
-               (setf layout-initialized-p t)
+               (setf layout-initialized-p t
+                     layout-running-p nil)
                (redraw-thumbnails)
                (cl-fltk:redraw before-canvas)
                (cl-fltk:redraw after-canvas)))
@@ -934,16 +948,14 @@
                                  (declare (ignore ignored))
                                  (gui-model-reset-selected model)
                                  (sync-controls)
-                                 (update-table)
-                                 (schedule-edited-preview)))
+                                              (schedule-edited-preview)))
         (cl-fltk:add-menu-item menu "Edit/Reset Defaults"
                                (lambda (&rest ignored)
                                  (declare (ignore ignored))
                                  (setf (project-defaults project)
                                        (gui-default-processing-settings))
                                  (sync-controls)
-                                 (update-table)
-                                 (schedule-edited-preview)))
+                                              (schedule-edited-preview)))
         (cl-fltk:add-menu-item menu "View/Before and After"
                                (lambda (&rest ignored)
                                  (declare (ignore ignored))
@@ -1017,21 +1029,13 @@
         (cl-fltk:set-label-font lens-name 1)
         (setf main-tile (cl-fltk:make-tile :parent window :x 0 :y 64
                                            :width 1280 :height 708)
-              left-pane (cl-fltk:make-tile :parent main-tile :x 0 :y 0
-                                           :width 240 :height 708)
+              left-pane (cl-fltk:make-panel :parent main-tile :x 0 :y 0
+                                            :width 240 :height 708 :label "")
               center-pane (cl-fltk:make-panel :parent main-tile :x 240 :y 0
                                               :width 720 :height 708 :label ""))
-        (setf table (cl-fltk:make-record-table
-                     :parent left-pane :x 0 :y 400 :width 240 :height 308
-                     :columns '((:file "File" 230) (:settings "Settings" 90)
-                                (:output "Output" 150))
-                     :records (project-table-records project)
-                     :callback (lambda (&rest ignored)
-                                 (declare (ignore ignored))
-                                 (select-row))))
         (setf thumbnail-canvas
               (cl-fltk:make-canvas
-               :parent left-pane :x 0 :y 0 :width 240 :height 400
+               :parent left-pane :x 0 :y 0 :width 240 :height 708
                :callback
                (lambda (widget event value)
                  (declare (ignore event value))
@@ -1287,8 +1291,7 @@
                                           (declare (ignore ignored))
                                           (gui-model-reset-selected model)
                                           (sync-controls)
-                                          (update-table)
-                                          (schedule-edited-preview)))
+                                                                (schedule-edited-preview)))
          12 :action-row :half-left 26)
         (register-inspector
          (cl-fltk:make-button :parent inspector :x 166 :y 674
@@ -1307,26 +1310,22 @@
         (cl-fltk:tile-size-range main-tile center-pane :min-width 300)
         (cl-fltk:tile-size-range main-tile inspector
                                  :min-width 280 :max-width 480)
-        (cl-fltk:tile-size-range left-pane thumbnail-canvas :min-height 140)
-        (cl-fltk:tile-size-range left-pane table :min-height 120)
         (cl-fltk:on-resize window #'layout-ui)
-        (cl-fltk:on-resize left-pane #'layout-ui)
-        (cl-fltk:on-resize thumbnail-canvas #'layout-ui)
-        (cl-fltk:on-resize table #'layout-ui)
-        (cl-fltk:on-resize center-pane #'layout-ui)
-        (cl-fltk:on-resize inspector #'layout-ui)
+        (cl-fltk:on-resize left-pane #'schedule-layout)
+        (cl-fltk:on-resize center-pane #'schedule-layout)
+        (cl-fltk:on-resize inspector #'schedule-layout)
         (gui-model-set-selected-indices
          model (if (project-photos project) '(0) '()))
         (sync-controls)
         (layout-ui)
         (setf poll-id (cl-fltk:add-timeout 0.08d0 #'poll :repeat t))
         (when (selected-job)
-          (cl-fltk:table-select-row table 0)
           (schedule-initial-preview))
         (unwind-protect
              (progn (cl-fltk:show window) (cl-fltk:run))
           (when poll-id (ignore-errors (cl-fltk:remove-timeout poll-id)))
           (when debounce-id (ignore-errors (cl-fltk:remove-timeout debounce-id)))
+          (when layout-id (ignore-errors (cl-fltk:remove-timeout layout-id)))
           (stop-gui-queue queue)
           (stop-gui-queue background-queue)
           (clear-preview-cache)

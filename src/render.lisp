@@ -281,8 +281,8 @@ output dimensions; zero leaves a dimension unconstrained."
                  render-input-pathname temporary settings
                  :report-input-pathname input-pathname
                  :grain-seed grain-seed
-                 :max-width max-width
-                 :max-height max-height
+                 :max-width (or max-width 0)
+                 :max-height (or max-height 0)
                  :jpeg-quality jpeg-quality)))
              (when preserve-metadata-p
                (render-copy-metadata input-pathname temporary))
