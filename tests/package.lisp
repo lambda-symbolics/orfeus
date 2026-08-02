@@ -25,6 +25,7 @@
                 #:processing-settings-exposure
                 #:processing-settings-grain-amount
                 #:processing-settings-lens-correction-strength
+                #:processing-settings-neural-noise-reduction
                 #:processing-settings-with-overrides
                 #:project->sexp
                 #:project-defaults
@@ -37,6 +38,7 @@
                 #:raw-render-error
                 #:render-photo
                 #:render-preview
+                #:sexp->processing-settings
                 #:sexp->project)
   (:export #:run-tests))
 
