@@ -16,8 +16,12 @@
                      (string-trim '(#\Space #\Tab #\Return) line))
                    (uiop:split-string output :separator '(#\Newline)))))
 
-(defun photo-lens-description (pathname)
-  "Return PATHNAME's best electronic lens description, or NIL if unavailable."
+(defvar *photo-lens-description-cache*
+  (make-hash-table :test #'equal #+sbcl :synchronized #+sbcl t)
+  "ExifTool lens lookups keyed by path and write date; a spawn per render is
+otherwise the slowest step of an interactive preview.")
+
+(defun read-photo-lens-description (pathname)
   (multiple-value-bind (output error-output status)
       (uiop:run-program
        (list "exiftool" "-s3" "-Lens" "-LensModel" "-LensType"
@@ -25,6 +29,16 @@
        :output :string :error-output :string :ignore-error-status t)
     (declare (ignore error-output))
     (and (zerop status) (preferred-lens-description output))))
+
+(defun photo-lens-description (pathname)
+  "Return PATHNAME's best electronic lens description, or NIL if unavailable."
+  (let* ((key (cons (namestring (pathname pathname))
+                    (ignore-errors (file-write-date pathname))))
+         (cached (gethash key *photo-lens-description-cache* :missing)))
+    (if (eq cached :missing)
+        (setf (gethash key *photo-lens-description-cache*)
+              (read-photo-lens-description pathname))
+        cached)))
 
 (defun capture-description (model iso aperture shutter)
   (let ((parts
