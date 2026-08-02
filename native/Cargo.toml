@@ -9,6 +9,7 @@ publish = false
 crate-type = ["cdylib"]
 
 [dependencies]
+ash = { version = "=0.38.0", default-features = false, features = ["loaded", "std"] }
 flate2 = { version = "=1.1.2", default-features = false, features = ["rust_backend"] }
 image = { version = "=0.25.10", default-features = false, features = ["jpeg", "tiff"] }
 lensfun = "=0.7.0"

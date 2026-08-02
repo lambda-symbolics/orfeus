@@ -1,0 +1,50 @@
+#version 450
+
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0, std430) buffer Pixels {
+    float rgb[];
+};
+
+float transfer(float value) {
+    if (value <= 0.0031308) {
+        return 12.92 * value;
+    }
+    return 1.055 * pow(max(value, 0.0), 1.0 / 2.4) - 0.055;
+}
+
+void main() {
+    uint pixel = gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * 65535u * 256u;
+    uint offset = pixel * 3u;
+    if (offset + 2u >= rgb.length()) {
+        return;
+    }
+    vec3 input_rgb = vec3(rgb[offset], rgb[offset + 1u], rgb[offset + 2u]);
+    float luminance = dot(input_rgb, vec3(0.2126729, 0.7151522, 0.072175));
+    if (!(luminance > 0.0) || isinf(luminance) || isnan(luminance)) {
+        rgb[offset] = 0.0;
+        rgb[offset + 1u] = 0.0;
+        rgb[offset + 2u] = 0.0;
+        return;
+    }
+    float value = max(luminance, 0.0) * 1.6;
+    float tone_value = (value * (1.0 + 8.75 * value)) /
+                       (1.0 + 1.46 * value + 8.75 * value * value);
+    vec3 toned = input_rgb * (tone_value / luminance);
+    float saturation = 1.0;
+    for (uint channel = 0u; channel < 3u; ++channel) {
+        float chroma = toned[channel] - tone_value;
+        if (chroma > 0.0) {
+            saturation = min(saturation, (1.0 - tone_value) / chroma);
+        } else if (chroma < 0.0) {
+            saturation = min(saturation, tone_value / -chroma);
+        }
+    }
+    saturation = clamp(saturation, 0.0, 1.0);
+    vec3 output_rgb = vec3(
+        transfer(tone_value + saturation * (toned.x - tone_value)),
+        transfer(tone_value + saturation * (toned.y - tone_value)),
+        transfer(tone_value + saturation * (toned.z - tone_value)));
+    rgb[offset] = output_rgb.x;
+    rgb[offset + 1u] = output_rgb.y;
+    rgb[offset + 2u] = output_rgb.z;
+}

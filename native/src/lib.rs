@@ -14,6 +14,7 @@ use flate2::read::ZlibDecoder;
 use md5::{Digest, Md5};
 
 mod color;
+mod gpu;
 mod render;
 mod tone;
 

@@ -84,8 +84,16 @@ uses native FLTK tabs for Basic, Optics, and Effects settings, with scope and
 actions kept visible. White-balance mode, LUT state, and preview source remain
 visible in the status bar.
 
-The included test LUT is =data/luts/agfa_precisa_100.cube=. Its provenance and
-license notice are recorded in =THIRD-PARTY.md=.
+The bundled LUT library includes Agfa APX, Precisa, Ultra Color, and Vista looks,
+plus Kodachrome 25, 64, 64 Generic, and 200. Their pinned provenance, checksums,
+and license notice are recorded in =THIRD-PARTY.md=.
+
+The optional Vulkan compute backend fuses display tone and sRGB transfer. It is
+strictly opt-in because one-shot process initialization is expensive; set
+=ORFEUS_GPU=1=. Any Vulkan initialization, dispatch, or readback failure falls
+back to the CPU result. Set =ORFEUS_PROFILE=1= to print per-stage timing, the
+selected Vulkan adapter, GPU transfer-inclusive dispatch time, and fallback
+reason.
 
 * Test
 

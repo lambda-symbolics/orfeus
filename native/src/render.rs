@@ -2,6 +2,7 @@ use std::ffi::{CStr, c_char};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Seek, Write};
 use std::os::unix::fs::MetadataExt;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -1225,8 +1226,41 @@ pub fn render(input: &Path, output: &Path, settings: &RenderSettingsV1) -> Resul
         settings.chroma_noise_reduction,
     );
     profile_stage!("noise-reduction");
-    apply_default_display_tone(&mut image.data);
-    srgb_transfer(&mut image);
+    let gpu_completed = if super::gpu::requested() {
+        match catch_unwind(AssertUnwindSafe(|| {
+            super::gpu::tone_and_transfer(&mut image.data)
+        })) {
+            Ok(Ok(dispatch)) => {
+                if profiling {
+                    eprintln!(
+                        "orfeus-profile gpu-stage=tone-transfer adapter={:?} milliseconds={:.3}",
+                        dispatch.adapter_name, dispatch.milliseconds
+                    );
+                }
+                true
+            }
+            Ok(Err(error)) => {
+                if profiling {
+                    eprintln!(
+                        "orfeus-profile gpu-stage=tone-transfer fallback=cpu error={error:?}"
+                    );
+                }
+                false
+            }
+            Err(_) => {
+                if profiling {
+                    eprintln!("orfeus-profile gpu-stage=tone-transfer fallback=cpu error=panic");
+                }
+                false
+            }
+        }
+    } else {
+        false
+    };
+    if !gpu_completed {
+        apply_default_display_tone(&mut image.data);
+        srgb_transfer(&mut image);
+    }
     profile_stage!("tone-transfer");
     if settings.lut_strength > 0.0 && !settings.lut_path.is_null() {
         let path = unsafe { CStr::from_ptr(settings.lut_path) }
@@ -1509,6 +1543,25 @@ mod tests {
         assert_eq!(identity_cube().values.len(), 8);
         assert!(CubeLut::parse(Cursor::new("LUT_3D_SIZE 66\n")).is_err());
         assert!(CubeLut::parse(Cursor::new("LUT_3D_SIZE 2\n0 0 0")).is_err());
+    }
+
+    #[test]
+    fn bundled_film_luts_are_valid_cubes() {
+        let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("../data/luts");
+        let mut paths = fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "cube")
+            })
+            .collect::<Vec<_>>();
+        paths.sort();
+        assert_eq!(paths.len(), 9, "unexpected bundled LUT count");
+        for path in paths {
+            CubeLut::read(&path)
+                .unwrap_or_else(|error| panic!("invalid bundled LUT {}: {error}", path.display()));
+        }
     }
 
     #[test]

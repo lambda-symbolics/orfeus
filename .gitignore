@@ -1,5 +1,6 @@
 /orfeus
 /native/target/
+/native/target-nix/
 *.fasl
 *.lx64fsl
 *.dx64fsl

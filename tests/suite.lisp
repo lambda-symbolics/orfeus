@@ -305,6 +305,28 @@
         (when (probe-file pathname)
           (delete-file pathname))))))
 
+(defun bundled-film-luts-match-pinned-digests-p ()
+  (let* ((directory (asdf:system-relative-pathname "orfeus" #P"data/luts/"))
+         (expected
+           '(("agfa_apx_100.cube" . "61f692f928d3809a77af2249035f771e47150964ac7243e9a217438cd2ca2858")
+             ("agfa_apx_25.cube" . "5779cd44a2ea912085653054f12ae270343b87e918e27c63113afc52cebbb2cd")
+             ("agfa_precisa_100.cube" . "712dd96ca82535164751ee432548ea4f619218d3025ffcbd2411eb1fbd10c2bb")
+             ("agfa_ultra_color_100.cube" . "5c15b98ef31e836ce371a7725f1740ba7ecbe1e8aef6aaba89024b1d3b00e17b")
+             ("agfa_vista_200.cube" . "b65848b3e217bbb57ca998f0460fe0d6c631228872ad49574d85e07ffeb3548e")
+             ("kodak_kodachrome_200.cube" . "0026d0685796cf2f5cef438633e109f2895abed96a33e614575528f540dbf0cd")
+             ("kodak_kodachrome_25.cube" . "70a9f8106de3a5e87fb2b5e478d708407429d064945b769be8913a814653523e")
+             ("kodak_kodachrome_64.cube" . "6fce987295dac264a689a8ef1b1b3a407f26ffcb3f6d81a356ebc5d9c565d0b4")
+             ("kodak_kodachrome_64_generic.cube" . "19cacda68131b43e153cee643c02e9fd015ec1f6e7b74fa95b7c2168b0979935"))))
+    (and (= (length expected) (length (directory (merge-pathnames "*.cube" directory))))
+         (every (lambda (entry)
+                  (let ((path (merge-pathnames (first entry) directory)))
+                    (and (probe-file path)
+                         (string-equal
+                          (rest entry)
+                          (ironclad:byte-array-to-hex-string
+                           (ironclad:digest-file :sha256 path))))))
+                expected))))
+
 (defun cli-version-p ()
   (let ((output (make-string-output-stream))
         (errors (make-string-output-stream)))
@@ -365,6 +387,8 @@
              (embedded-preview-rejects-missing-image-p))
       (check "a racing writer is not clobbered at publish time"
              (publish-race-does-not-clobber-p))
+      (check "bundled film LUTs match pinned digests"
+             (bundled-film-luts-match-pinned-digests-p))
       (check "CLI reports its version" (cli-version-p))
       (check "CLI rejects unknown commands" (cli-rejects-unknown-command-p)))
     (zerop failures)))

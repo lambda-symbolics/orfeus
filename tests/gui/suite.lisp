@@ -149,6 +149,20 @@
     (check (equal '(2 3 4 5) selection) "Shift-click did not select an inclusive range")
     (check (= 2 anchor) "Shift-click did not preserve the anchor")))
 
+(defun test-bundled-film-lut-menu ()
+  (let ((names (mapcar #'file-namestring (orfeus/gui::gui-bundled-lut-paths))))
+    (check (equal names
+                  '("agfa_apx_100.cube"
+                    "agfa_apx_25.cube"
+                    "agfa_precisa_100.cube"
+                    "agfa_ultra_color_100.cube"
+                    "agfa_vista_200.cube"
+                    "kodak_kodachrome_200.cube"
+                    "kodak_kodachrome_25.cube"
+                    "kodak_kodachrome_64.cube"
+                    "kodak_kodachrome_64_generic.cube"))
+           "Bundled LUT menu does not contain the pinned film set")))
+
 (defun test-file-filter-syntax ()
   (let ((filter (orfeus/gui::fltk-file-filter "RAW photographs" "*.orf")))
     (check (char= #\Tab (char filter (length "RAW photographs")))
@@ -314,6 +328,7 @@
   (test-preview-status-percent)
   (test-thumbnail-hit-testing)
   (test-thumbnail-multi-selection)
+  (test-bundled-film-lut-menu)
   (test-file-filter-syntax)
   (test-direct-open-workflow)
   (test-project-photo-mutations)

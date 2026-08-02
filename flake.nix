@@ -18,6 +18,7 @@
         packages = with pkgs; [
           lisp
           cargo
+          clippy
           cmake
           exiftool
           fltk_1_4
@@ -29,12 +30,26 @@
           libtiff
           pkg-config
           rustc
+          shaderc
+          vulkan-loader
         ];
 
         shellHook = ''
           export CL_SOURCE_REGISTRY="$PWD//:$PWD/../fltk-sun//"
           export ORFEUS_FLTK_SOURCE="$PWD/../fltk-sun"
-          export ORFEUS_NATIVE_LIBRARY="$PWD/native/target/release/liborfeus_native.so"
+          export CARGO_TARGET_DIR="$PWD/native/target-nix"
+          export ORFEUS_NATIVE_LIBRARY="$CARGO_TARGET_DIR/release/liborfeus_native.so"
+          export LD_LIBRARY_PATH="${pkgs.lib.makeLibraryPath [ pkgs.vulkan-loader ]}:/run/opengl-driver/lib:/usr/lib:''${LD_LIBRARY_PATH:-}"
+          if [ -z "''${VK_DRIVER_FILES:-}" ]; then
+            for icd_name in nvidia_icd.json intel_icd.json radeon_icd.json intel_hasvk_icd.json; do
+              for icd_directory in /run/opengl-driver/share/vulkan/icd.d /usr/share/vulkan/icd.d /etc/vulkan/icd.d; do
+                if [ -r "$icd_directory/$icd_name" ]; then
+                  export VK_DRIVER_FILES="$icd_directory/$icd_name"
+                  break 2
+                fi
+              done
+            done
+          fi
         '';
       };
     };
