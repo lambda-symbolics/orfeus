@@ -12,11 +12,17 @@
 (defparameter *thumbnail-preview-size* 320
   "Maximum width and height for orientation-correct thumbnail renders.")
 
-(defparameter *background-preview-workers* 3
-  "Maximum concurrent thumbnail and neighboring-preview renders.")
+(defun available-processor-count ()
+  "Return the number of logical processors reported by Linux, or one."
+  (handler-case
+      (with-open-file (stream #P"/proc/cpuinfo" :direction :input)
+        (max 1 (loop for line = (read-line stream nil)
+                     while line
+                     count (uiop:string-prefix-p "processor" line))))
+    (error () 1)))
 
-(defparameter *background-preview-radius* 2
-  "Number of photos on either side of the selection to pre-render.")
+(defparameter *background-preview-workers* (available-processor-count)
+  "Concurrent thumbnail and full-project preview workers, one per CPU.")
 
 (defconstant +thumbnail-shift-mask+ 1)
 (defconstant +thumbnail-control-mask+ 4)
@@ -25,12 +31,11 @@
   "Return the zero-based thumbnail row at local EVENT-Y."
   (floor (+ event-y scroll) row-height))
 
-(defun preview-neighborhood-indices (count selected radius)
-  "Return valid photo indices within RADIUS of SELECTED."
-  (when (plusp count)
-    (loop for index from (max 0 (- selected radius))
-          to (min (1- count) (+ selected radius))
-          collect index)))
+(defun preview-priority-indices (count selected)
+  "Return every photo index ordered from SELECTED outward."
+  (when (and (plusp count) (<= 0 selected) (< selected count))
+    (stable-sort (loop for index below count collect index)
+                 #'< :key (lambda (index) (abs (- index selected))))))
 
 (defun thumbnail-selection-after-click (selected row anchor state)
   "Return the selection and anchor produced by clicking ROW with modifier STATE."
@@ -597,11 +602,6 @@
                     (lambda ()
                       (when (or (not publish-p)
                                 (= generation preview-generation))
-                        (when publish-p
-                          (queue-event queue
-                                       (list :status generation
-                                             (format nil "Developing ~A..."
-                                                     (file-namestring input)))))
                         (render-preview input output settings
                                         :max-width *gui-preview-max-width*
                                         :max-height *gui-preview-max-height*
@@ -632,21 +632,20 @@
                                          (list :thumbnail generation job output)))
                         (error () nil)))))))
            (enqueue-background-previews (selected-before-p generation)
-             (discard-gui-tasks background-queue)
+             (discard-gui-tasks background-queue :before)
+             (discard-gui-tasks background-queue :after)
              (let* ((photos (project-photos project))
                     (selected-index (gui-model-selected-index model))
                     (selected (selected-job))
-                    (indices (preview-neighborhood-indices
-                              (length photos) selected-index
-                              *background-preview-radius*)))
+                    (indices (preview-priority-indices
+                              (length photos) selected-index)))
                (when (and selected selected-before-p)
                  (enqueue-render background-queue :before selected
                                  selected-index
                                  (neutral-preview-settings) generation t t))
-               (dolist (index indices)
-                 (enqueue-thumbnail (nth index photos) index generation))
-               ;; Only nearby edited previews are speculative. Neutral previews
-               ;; are rendered on selection, avoiding perpetual whole-project work.
+               (when selected-before-p
+                 (dolist (index indices)
+                   (enqueue-thumbnail (nth index photos) index generation)))
                (dolist (index indices)
                  (unless (= index selected-index)
                    (let ((job (nth index photos)))
@@ -670,11 +669,6 @@
              (enqueue-preview t))
            (schedule-edited-preview ()
              (incf preview-generation)
-             (when after-preview-file
-               (forget-preview-file after-preview-file)
-               (setf after-preview-file nil)
-               (cl-fltk:redraw after-canvas))
-             (set-status "Preview update pending...")
              (when debounce-id
                (ignore-errors (cl-fltk:remove-timeout debounce-id)))
              (setf debounce-id
@@ -683,10 +677,6 @@
                     (lambda ()
                       (setf debounce-id nil)
                       (discard-gui-tasks queue :after)
-                      (when after-preview-file
-                        (forget-preview-file after-preview-file)
-                        (setf after-preview-file nil)
-                        (cl-fltk:redraw after-canvas))
                       (enqueue-preview nil)))))
            (setting-changed (key widget &optional allow-empty)
              (handler-case
@@ -981,8 +971,7 @@
                     (publish-preview (fifth event) (sixth event))
                     (set-status (preview-status-text model))))
                  (:thumbnail
-                  (when (and (= (second event) preview-generation)
-                             (member (third event) (project-photos project) :test #'eq)
+                  (when (and (member (third event) (project-photos project) :test #'eq)
                              (null (gethash (third event) thumbnail-files)))
                     (setf (gethash (third event) thumbnail-files) (fourth event))
                     (redraw-thumbnails)))
