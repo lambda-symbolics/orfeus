@@ -1,5 +1,21 @@
 # Third-party material
 
+## FFDNet color denoiser weights
+
+`native/src/ffdnet_color.bin` contains the pretrained FFDNet color model
+released with Kai Zhang's KAIR toolbox, converted to Orfeus's flat
+little-endian layout by `native/tools/ffdnet-pth-to-bin.py`.
+
+Source: <https://github.com/cszn/KAIR/releases/download/v1.0/ffdnet_color.pth>
+
+Retrieved: 2026-08-02. SHA-256 of the retrieved `ffdnet_color.pth`:
+`286f04f7e3a20254c067ba95efb5d3339f4fc8a09a365a93cd469184d4cdb279`.
+
+KAIR is published under the MIT License, preserved in
+`licenses/KAIR-MIT.txt`. The model architecture is described in Kai Zhang,
+Wangmeng Zuo, and Lei Zhang, "FFDNet: Toward a Fast and Flexible Solution for
+CNN-Based Image Denoising", IEEE Transactions on Image Processing, 2018.
+
 ## Film-Luts film-emulation LUTs
 
 The following CUBE LUTs were obtained from Yahia Angelo's Film-Luts repository

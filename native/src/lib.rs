@@ -15,6 +15,7 @@ use md5::{Digest, Md5};
 
 mod color;
 mod gpu;
+mod nn;
 mod render;
 mod tone;
 
