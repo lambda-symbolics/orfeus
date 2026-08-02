@@ -49,8 +49,9 @@ $EDITOR project.sexp
 #+end_src
 
 Projects contain shared defaults and per-photo overrides for exposure, white
-balance, edge-aware noise reduction, lens/TCA correction and correction
-strength, CUBE LUTs, and film grain. They are read with =*read-eval*= disabled.
+balance, edge-aware and neural (FFDNet) noise reduction, lens/TCA correction
+and correction strength, CUBE LUTs, and film grain. They are read with
+=*read-eval*= disabled.
 
 Adapted manual lenses can be associated with exact Lensfun profiles in
 =$XDG_CONFIG_HOME/orfeus/lenses.sexp= (or the path in
