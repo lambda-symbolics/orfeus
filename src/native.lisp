@@ -149,7 +149,7 @@
                  (setting 'chroma-noise-reduction
                           (float noise-reduction 0.0))
                  (setting 'luma-noise-reduction
-                          (float (* noise-reduction 0.5) 0.0))
+                          (float noise-reduction 0.0))
                  (setting 'lut-strength
                           (float (if lut-path lut-strength 0.0) 0.0))
                  (setting 'grain-amount (float grain-amount 0.0))

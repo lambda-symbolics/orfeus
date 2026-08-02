@@ -12,9 +12,26 @@
 (defparameter *thumbnail-preview-size* 320
   "Maximum width and height for orientation-correct thumbnail renders.")
 
+(defconstant +thumbnail-shift-mask+ 1)
+(defconstant +thumbnail-control-mask+ 4)
+
 (defun thumbnail-row-at (event-y scroll row-height)
   "Return the zero-based thumbnail row at local EVENT-Y."
   (floor (+ event-y scroll) row-height))
+
+(defun thumbnail-selection-after-click (selected row anchor state)
+  "Return the selection and anchor produced by clicking ROW with modifier STATE."
+  (cond
+    ((logtest +thumbnail-shift-mask+ state)
+     (values (loop for index from (min anchor row) to (max anchor row)
+                   collect index)
+             anchor))
+    ((logtest +thumbnail-control-mask+ state)
+     (values (if (member row selected)
+                 (remove row selected)
+                 (cons row selected))
+             row))
+    (t (values (list row) row))))
 
 (defun fltk-file-filter (label pattern)
   "Build FLTK's LABEL<TAB>PATTERN native file chooser syntax."
@@ -127,9 +144,9 @@
            lens-name controls inspector-items lut-choice wb-choice target-choice
            export-quality export-max-width export-max-height export-metadata
            preset-browser preset-name-input preset-apply-button
-           debounce-id layout-id poll-id comparison-p layout-initialized-p
-           layout-running-p
+           debounce-id poll-id comparison-p layout-initialized-p
            (thumbnail-scroll 0)
+           (thumbnail-anchor 0)
            (preview-generation 0)
            (preview-zoom 1d0)
            (preview-center-x .5d0)
@@ -172,9 +189,12 @@
              (let ((parts (remove "" (uiop:split-string (or value "")
                                                        :separator '(#\Space))
                                   :test #'string=)))
-               (when (= (length parts) 5)
+               (when (member (length parts) '(5 6))
                  (handler-case
-                     (values-list (mapcar #'parse-integer parts))
+                     (let ((values (mapcar #'parse-integer parts)))
+                       (values-list (if (= (length values) 5)
+                                        (append values '(0))
+                                        values)))
                    (error () nil)))))
            (preview-path-for-canvas (canvas)
              (if (eq canvas before-canvas)
@@ -246,9 +266,9 @@
                      (redraw-previews)
                      (set-status "Preview at 1:1 pixels"))))))
            (handle-preview-mouse (canvas event value)
-             (multiple-value-bind (x y button dx dy)
+             (multiple-value-bind (x y button dx dy state)
                  (parse-preview-event value)
-               (declare (ignore dx))
+               (declare (ignore dx state))
                (when x
                  (case event
                    (#.cl-fltk:+event-push+
@@ -295,16 +315,22 @@
              (when thumbnail-canvas
                (clamp-thumbnail-scroll)
                (cl-fltk:redraw thumbnail-canvas)))
-           (select-thumbnail-row (row)
+           (select-thumbnail-row (row state)
              (when (and (>= row 0) (< row (length (project-photos project))))
-               (gui-model-set-selected-indices model (list row))
-               (clear-previews)
-               (sync-controls)
-               (schedule-initial-preview)
-               (redraw-thumbnails)))
+               (multiple-value-bind (selection anchor)
+                   (thumbnail-selection-after-click
+                    (gui-model-selected-indices model) row thumbnail-anchor state)
+                 (setf thumbnail-anchor anchor)
+                 (gui-model-set-selected-indices model selection)
+                 (when selection
+                   (setf (gui-model-selected-index model) row))
+                 (clear-previews)
+                 (sync-controls)
+                 (when selection (schedule-initial-preview))
+                 (redraw-thumbnails))))
            (handle-thumbnail-mouse (canvas event value)
              (declare (ignore canvas))
-             (multiple-value-bind (x y button dx dy)
+             (multiple-value-bind (x y button dx dy state)
                  (parse-preview-event value)
                (declare (ignore x button dx))
                (when y
@@ -312,7 +338,8 @@
                    (#.cl-fltk:+event-push+
                     (select-thumbnail-row
                      (thumbnail-row-at y thumbnail-scroll
-                                       (thumbnail-row-height))))
+                                       (thumbnail-row-height))
+                     state))
                    (#.cl-fltk:+event-wheel+
                     (incf thumbnail-scroll (* dy 36))
                     (redraw-thumbnails))))))
@@ -454,7 +481,8 @@
              (incf preview-generation)
              (clear-previews)
              (setf project new-project
-                   thumbnail-scroll 0)
+                   thumbnail-scroll 0
+                   thumbnail-anchor 0)
              (clrhash thumbnail-files)
              (gui-model-replace-project model new-project path)
              (refresh-preset-browser)
@@ -760,57 +788,22 @@
                      (register-inspector spinner 202 y :number 26 :page))
                    (register-inspector spinner 110 y :control 26 :page))
                spinner))
-           (schedule-layout (&optional ignored)
+           (layout-left-pane (&optional ignored)
              (declare (ignore ignored))
-             (unless layout-running-p
-               (when layout-id
-                 (ignore-errors (cl-fltk:remove-timeout layout-id)))
-               (setf layout-id
-                     (cl-fltk:add-timeout
-                      0.12d0
-                      (lambda ()
-                        (setf layout-id nil)
-                        (layout-ui))))))
-           (layout-ui (&optional ignored)
+             (cl-fltk:resize-widget
+              thumbnail-canvas :x 0 :y 0
+              :width (cl-fltk:widget-width left-pane)
+              :height (cl-fltk:widget-height left-pane))
+             (redraw-thumbnails)
+             (cl-fltk:redraw left-pane))
+           (layout-center-pane (&optional ignored)
              (declare (ignore ignored))
-             (setf layout-running-p t)
-             (let* ((width (cl-fltk:widget-width window))
-                    (height (cl-fltk:widget-height window))
-                    (top 64) (bottom 28)
-                    (main-height (max 200 (- height top bottom)))
-                    (left (min (max 180 (- width 580))
-                               420
-                               (max 180
-                                    (if layout-initialized-p
-                                        (cl-fltk:widget-width left-pane)
-                                        (floor width 5)))))
-                    (right (min (max 280 (- width left 300))
-                                480
-                                (max 280
-                                     (if layout-initialized-p
-                                         (cl-fltk:widget-width inspector)
-                                         (floor width 3)))))
-                    (center (- width left right))
+             (let* ((center (cl-fltk:widget-width center-pane))
+                    (main-height (cl-fltk:widget-height center-pane))
                     (caption-height 22)
                     (viewer-height (max 100 (- main-height caption-height)))
                     (gutter 6)
                     (pane-width (floor (- center gutter) 2)))
-               (cl-fltk:resize-widget menu :x 0 :y 0 :width width :height 24)
-               (cl-fltk:resize-widget toolbar :x 0 :y 24 :width width :height 40)
-               (when toolbar-bottom-rule
-                 (cl-fltk:resize-widget toolbar-bottom-rule :x 0 :y 38
-                                        :width width :height 2))
-               (when lens-name
-                 (cl-fltk:resize-widget lens-name :x 342 :y 6
-                                        :width (max 120 (- width 352)) :height 28))
-               (cl-fltk:resize-widget main-tile :x 0 :y top
-                                      :width width :height main-height)
-               (cl-fltk:resize-widget left-pane :x 0 :y 0
-                                      :width left :height main-height)
-               (cl-fltk:resize-widget thumbnail-canvas :x 0 :y 0
-                                      :width left :height main-height)
-               (cl-fltk:resize-widget center-pane :x left :y 0
-                                      :width center :height main-height)
                (if comparison-p
                    (progn
                      (cl-fltk:show before-caption)
@@ -834,8 +827,11 @@
                                             :width center :height caption-height)
                      (cl-fltk:resize-widget after-canvas :x 0 :y caption-height
                                             :width center :height viewer-height)))
-               (cl-fltk:resize-widget inspector :x (+ left center) :y 0
-                                      :width right :height main-height)
+               (cl-fltk:redraw center-pane)))
+           (layout-inspector-pane (&optional ignored)
+             (declare (ignore ignored))
+             (let ((right (cl-fltk:widget-width inspector))
+                   (main-height (cl-fltk:widget-height inspector)))
                (cl-fltk:resize-widget tabs :x 4 :y 40
                                       :width (- right 8)
                                       :height (- main-height 80))
@@ -844,10 +840,6 @@
                  (cl-fltk:resize-widget page :x 2 :y 24
                                         :width (- right 12)
                                         :height (- main-height 108)))
-               (cl-fltk:resize-widget progress :x 0 :y (+ top main-height)
-                                      :width 180 :height bottom)
-               (cl-fltk:resize-widget status :x 180 :y (+ top main-height)
-                                      :width (- width 180) :height bottom)
                (dolist (item inspector-items)
                  (destructuring-bind
                      (widget x y width-mode item-height basis) item
@@ -875,13 +867,52 @@
                      (cl-fltk:resize-widget
                       widget :x item-x :y item-y
                       :width item-width :height item-height))))
-               (cl-fltk:init-sizes left-pane)
-               (cl-fltk:init-sizes main-tile)
-               (setf layout-initialized-p t
-                     layout-running-p nil)
-               (redraw-thumbnails)
-               (cl-fltk:redraw before-canvas)
-               (cl-fltk:redraw after-canvas)))
+               (cl-fltk:redraw inspector)))
+           (layout-ui (&optional ignored)
+             (declare (ignore ignored))
+             (let* ((width (cl-fltk:widget-width window))
+                    (height (cl-fltk:widget-height window))
+                    (top 64) (bottom 28)
+                    (main-height (max 200 (- height top bottom)))
+                    (left (min (max 180 (- width 580))
+                               420
+                               (max 180
+                                    (if layout-initialized-p
+                                        (cl-fltk:widget-width left-pane)
+                                        (floor width 5)))))
+                    (right (min (max 280 (- width left 300))
+                                480
+                                (max 280
+                                     (if layout-initialized-p
+                                         (cl-fltk:widget-width inspector)
+                                         (floor width 3)))))
+                    (center (- width left right)))
+               (cl-fltk:resize-widget menu :x 0 :y 0 :width width :height 24)
+               (cl-fltk:resize-widget toolbar :x 0 :y 24 :width width :height 40)
+               (when toolbar-bottom-rule
+                 (cl-fltk:resize-widget toolbar-bottom-rule :x 0 :y 38
+                                        :width width :height 2))
+               (when lens-name
+                 (cl-fltk:resize-widget lens-name :x 342 :y 6
+                                        :width (max 120 (- width 352)) :height 28))
+               (cl-fltk:resize-widget main-tile :x 0 :y top
+                                      :width width :height main-height)
+               (cl-fltk:resize-widget left-pane :x 0 :y 0
+                                      :width left :height main-height)
+               (cl-fltk:resize-widget center-pane :x left :y 0
+                                      :width center :height main-height)
+               (cl-fltk:resize-widget inspector :x (+ left center) :y 0
+                                      :width right :height main-height)
+               (cl-fltk:resize-widget progress :x 0 :y (+ top main-height)
+                                      :width 180 :height bottom)
+               (cl-fltk:resize-widget status :x 180 :y (+ top main-height)
+                                      :width (- width 180) :height bottom)
+               (layout-left-pane)
+               (layout-center-pane)
+               (layout-inspector-pane)
+               (unless layout-initialized-p
+                 (cl-fltk:init-sizes main-tile))
+               (setf layout-initialized-p t)))
            (poll ()
              (dolist (event (drain-events queue))
                (case (first event)
@@ -1311,9 +1342,9 @@
         (cl-fltk:tile-size-range main-tile inspector
                                  :min-width 280 :max-width 480)
         (cl-fltk:on-resize window #'layout-ui)
-        (cl-fltk:on-resize left-pane #'schedule-layout)
-        (cl-fltk:on-resize center-pane #'schedule-layout)
-        (cl-fltk:on-resize inspector #'schedule-layout)
+        (cl-fltk:on-resize left-pane #'layout-left-pane)
+        (cl-fltk:on-resize center-pane #'layout-center-pane)
+        (cl-fltk:on-resize inspector #'layout-inspector-pane)
         (gui-model-set-selected-indices
          model (if (project-photos project) '(0) '()))
         (sync-controls)
@@ -1325,7 +1356,6 @@
              (progn (cl-fltk:show window) (cl-fltk:run))
           (when poll-id (ignore-errors (cl-fltk:remove-timeout poll-id)))
           (when debounce-id (ignore-errors (cl-fltk:remove-timeout debounce-id)))
-          (when layout-id (ignore-errors (cl-fltk:remove-timeout layout-id)))
           (stop-gui-queue queue)
           (stop-gui-queue background-queue)
           (clear-preview-cache)

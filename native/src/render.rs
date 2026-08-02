@@ -425,17 +425,19 @@ fn apply_noise_reduction(image: &mut RgbImage, luma: f32, chroma: f32) {
     if (luma == 0.0 && chroma == 0.0) || image.width < 3 || image.height < 3 {
         return;
     }
-    let source = image.data.clone();
     let pixel_count = image.width * image.height;
     let mut ycbcr = vec![[0.0_f32; 3]; pixel_count];
     ycbcr
         .par_iter_mut()
-        .zip(source.par_chunks_exact(3))
+        .zip(image.data.par_chunks_exact(3))
         .with_min_len(image.width * 16)
         .for_each(|(output, pixel)| {
             let yy = 0.2126 * pixel[0] + 0.7152 * pixel[1] + 0.0722 * pixel[2];
             *output = [yy, pixel[2] - yy, pixel[0] - yy];
         });
+    let luma_mix = luma.clamp(0.0, 1.0) * (2.0 - luma.clamp(0.0, 1.0));
+    let chroma_strength = chroma.clamp(0.0, 1.0);
+    let chroma_mix = chroma_strength * (1.65 - 0.65 * chroma_strength);
     let kernel = [1.0_f32, 4.0, 6.0, 4.0, 1.0];
     let width = image.width;
     let height = image.height;
@@ -446,37 +448,57 @@ fn apply_noise_reduction(image: &mut RgbImage, luma: f32, chroma: f32) {
         .enumerate()
         .for_each(|(y, output_row)| {
             for x in 0..width {
-                let center_index = y * width + x;
-                let center = ycbcr[center_index];
-                let left = ycbcr[y * width + x.saturating_sub(1)][0];
-                let right = ycbcr[y * width + (x + 1).min(width - 1)][0];
-                let above = ycbcr[y.saturating_sub(1) * width + x][0];
-                let below = ycbcr[(y + 1).min(height - 1) * width + x][0];
-                let gradient = (right - left).abs() + (below - above).abs();
-                let edge_protection = 1.0 / (1.0 + gradient * 48.0);
-                let shadow_boost = 1.0 + (1.0 - center[0].clamp(0.0, 1.0)) * 1.25;
-                let luma_mix = (luma * 0.6 * shadow_boost * edge_protection).min(1.0);
-                let chroma_mix = (chroma * shadow_boost * edge_protection).min(1.0);
-                let mut filtered = [0.0_f32; 3];
-                let mut weight_sum = 0.0;
+                let center = ycbcr[y * width + x];
+                let shadow = 1.0 - center[0].clamp(0.0, 1.0);
+                let sigma_y = (0.025 + 0.25 * luma_mix) * (1.0 + 0.65 * shadow);
+                let sigma_c = 0.035 + 0.30 * chroma_mix;
+                let inverse_sigma_y_squared = 1.0 / (sigma_y * sigma_y);
+                let inverse_sigma_c_squared = 1.0 / (sigma_c * sigma_c);
+                let mut filtered_y = 0.0_f32;
+                let mut filtered_cb = 0.0_f32;
+                let mut filtered_cr = 0.0_f32;
+                let mut luma_weight_sum = 0.0_f32;
+                let mut chroma_weight_sum = 0.0_f32;
                 for (ky, dy) in (-2_isize..=2).enumerate() {
                     let sample_y = (y as isize + dy).clamp(0, height as isize - 1) as usize;
                     for (kx, dx) in (-2_isize..=2).enumerate() {
                         let sample_x = (x as isize + dx).clamp(0, width as isize - 1) as usize;
-                        let weight = kernel[kx] * kernel[ky];
+                        let spatial_weight = kernel[kx] * kernel[ky];
                         let sample = ycbcr[sample_y * width + sample_x];
-                        for channel in 0..3 {
-                            filtered[channel] += sample[channel] * weight;
-                        }
-                        weight_sum += weight;
+                        let luma_distance = sample[0] - center[0];
+                        let luma_t = luma_distance * luma_distance * inverse_sigma_y_squared;
+                        let luma_range = if luma_t < 1.0 {
+                            let remaining = 1.0 - luma_t;
+                            remaining * remaining
+                        } else {
+                            0.0
+                        };
+                        let luma_weight = spatial_weight * luma_range;
+                        filtered_y += sample[0] * luma_weight;
+                        luma_weight_sum += luma_weight;
+
+                        let cb_distance = sample[1] - center[1];
+                        let cr_distance = sample[2] - center[2];
+                        let chroma_t = (cb_distance * cb_distance + cr_distance * cr_distance)
+                            * inverse_sigma_c_squared;
+                        let chroma_range = if chroma_t < 1.0 {
+                            let remaining = 1.0 - chroma_t;
+                            remaining * remaining
+                        } else {
+                            0.0
+                        };
+                        let chroma_weight = luma_weight * chroma_range;
+                        filtered_cb += sample[1] * chroma_weight;
+                        filtered_cr += sample[2] * chroma_weight;
+                        chroma_weight_sum += chroma_weight;
                     }
                 }
-                for value in &mut filtered {
-                    *value /= weight_sum;
-                }
-                let yy = center[0] + (filtered[0] - center[0]) * luma_mix;
-                let cb = center[1] + (filtered[1] - center[1]) * chroma_mix;
-                let cr = center[2] + (filtered[2] - center[2]) * chroma_mix;
+                let filtered_y = filtered_y / luma_weight_sum;
+                let filtered_cb = filtered_cb / chroma_weight_sum;
+                let filtered_cr = filtered_cr / chroma_weight_sum;
+                let yy = center[0] + (filtered_y - center[0]) * luma_mix;
+                let cb = center[1] + (filtered_cb - center[1]) * chroma_mix;
+                let cr = center[2] + (filtered_cr - center[2]) * chroma_mix;
                 let output = &mut output_row[x * 3..x * 3 + 3];
                 output[0] = yy + cr;
                 output[2] = yy + cb;
@@ -1290,6 +1312,51 @@ mod tests {
         assert!(magenta.data[0] + magenta.data[2] > magenta.data[1] * 2.0);
         assert!(green.data[1] * 2.0 > green.data[0] + green.data[2]);
         assert!((magenta.data[1] - green.data[1]).abs() > 0.1);
+    }
+
+    fn flat_patch_luma_rms(image: &RgbImage, expected: f32) -> f32 {
+        let squared_error = image
+            .data
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .map(|pixel| {
+                let luma = 0.2126 * pixel[0] + 0.7152 * pixel[1] + 0.0722 * pixel[2];
+                (luma - expected).powi(2)
+            })
+            .sum::<f32>();
+        (squared_error / (image.width * image.height) as f32).sqrt()
+    }
+
+    #[test]
+    fn noise_reduction_materially_smooths_a_flat_noisy_patch() {
+        let mut original = RgbImage {
+            width: 32,
+            height: 24,
+            data: Vec::new(),
+        };
+        for y in 0..original.height {
+            for x in 0..original.width {
+                let hash = ((x * 73 + y * 151 + x * y * 19) % 101) as f32 / 100.0;
+                let value = 0.5 + (hash - 0.5) * 0.16;
+                original.data.extend_from_slice(&[value, value, value]);
+            }
+        }
+        let initial_rms = flat_patch_luma_rms(&original, 0.5);
+        let mut moderate = original.clone();
+        let mut maximum = original;
+        apply_noise_reduction(&mut moderate, 0.35, 0.35);
+        apply_noise_reduction(&mut maximum, 1.0, 1.0);
+        let moderate_rms = flat_patch_luma_rms(&moderate, 0.5);
+        let maximum_rms = flat_patch_luma_rms(&maximum, 0.5);
+        assert!(
+            moderate_rms < initial_rms * 0.75,
+            "moderate NR RMS {moderate_rms} did not materially improve {initial_rms}"
+        );
+        assert!(
+            maximum_rms < moderate_rms * 0.8,
+            "maximum NR RMS {maximum_rms} did not improve moderate {moderate_rms}"
+        );
     }
 
     #[test]

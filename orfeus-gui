@@ -7,9 +7,7 @@ if [ "${ORFEUS_NIX_LAUNCH:-}" != "1" ]; then
   exec env ORFEUS_NIX_LAUNCH=1 nix develop --command ./orfeus-gui "$@"
 fi
 
-if [ ! -f native/target/release/liborfeus_native.so ]; then
-  cargo build --release --manifest-path native/Cargo.toml
-fi
+cargo build --release --manifest-path native/Cargo.toml
 
 fltk_bridge="${ORFEUS_FLTK_SOURCE}/build/libcl_fltk_bridge.so"
 if [ ! -f "$fltk_bridge" ] || ldd "$fltk_bridge" 2>/dev/null | grep -q 'not found'; then
