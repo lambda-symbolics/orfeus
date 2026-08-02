@@ -12,6 +12,9 @@
 (defparameter *thumbnail-preview-size* 320
   "Maximum width and height for orientation-correct thumbnail renders.")
 
+(defparameter *background-preview-workers* 3
+  "Maximum concurrent thumbnail and neighboring-preview renders.")
+
 (defconstant +thumbnail-shift-mask+ 1)
 (defconstant +thumbnail-control-mask+ 4)
 
@@ -119,11 +122,15 @@
   "Open Orfeus. PROJECT-OR-PATH may be NIL, a PROJECT, project file, ORF, or DNG."
   (multiple-value-bind (initial-project initial-path)
       (initial-gui-project project-or-path)
+    ;; Load the CFFI bridge before render workers can race to initialize it.
+    (orfeus:native-bridge-version)
     (let* ((project initial-project)
            (model (make-gui-model :project project
                                   :project-path initial-path))
-           (queue (make-gui-queue))
-           (background-queue (make-gui-queue))
+           (queue (make-gui-queue :name "Orfeus foreground render worker"))
+           (background-queue
+             (make-gui-queue :workers *background-preview-workers*
+                             :name "Orfeus background render worker"))
            (preview-directory (make-gui-preview-directory))
            (picker-directory
              (let ((photo (first (project-photos project))))
@@ -567,7 +574,8 @@
               (photo-job-overrides job)))
            (current-settings ()
              (settings-for-job (selected-job)))
-           (enqueue-render (target-queue role job index settings generation publish-p)
+           (enqueue-render (target-queue role job index settings generation publish-p
+                            &optional front-p)
              (let* ((input (photo-job-input-path job))
                     (output (preview-pathname preview-directory index job role settings)))
                (if (probe-file output)
@@ -592,7 +600,8 @@
                                    (= generation preview-generation))
                           (queue-event queue
                                        (list :preview generation index job role
-                                             output)))))))))
+                                             output)))))
+                    :front-p front-p))))
            (enqueue-thumbnail (job index generation)
              (let ((output (thumbnail-pathname preview-directory index job)))
                (if (probe-file output)
@@ -615,13 +624,13 @@
            (enqueue-background-previews (selected-before-p generation)
              (discard-gui-tasks background-queue)
              (let ((selected (selected-job)))
-               (loop for job in (project-photos project)
-                     for index from 0
-                     do (enqueue-thumbnail job index generation))
                (when (and selected selected-before-p)
                  (enqueue-render background-queue :before selected
                                  (gui-model-selected-index model)
-                                 (neutral-preview-settings) generation t))
+                                 (neutral-preview-settings) generation t t))
+               (loop for job in (project-photos project)
+                     for index from 0
+                     do (enqueue-thumbnail job index generation))
                ;; Make every photograph's useful edited preview ready first;
                ;; neutral comparison renders follow after that hot path.
                (loop for job in (project-photos project)

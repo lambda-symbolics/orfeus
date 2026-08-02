@@ -32,22 +32,14 @@
 (cffi:defcfun ("orfeus_gui_preview_forget" %gui-preview-forget) :void
   (path :string))
 (cffi:defcfun ("orfeus_gui_preview_clear" %gui-preview-clear) :void)
-(cffi:defcfun ("orfeus_gui_choose_files" %gui-choose-files) :pointer
-  (title :string) (filter :string) (preset-path :string))
-(cffi:defcfun ("orfeus_gui_string_free" %gui-string-free) :void
-  (value :pointer))
-
 (defun choose-photo-files (&key (title "Open RAW photographs")
                                 (filter "") (preset-path ""))
-  "Return all photo pathnames selected by the native multi-file chooser."
-  (load-gui-preview-library)
-  (let ((pointer (%gui-choose-files title filter preset-path)))
-    (unless (cffi:null-pointer-p pointer)
-      (unwind-protect
-           (mapcar #'pathname
-                   (uiop:split-string (cffi:foreign-string-to-lisp pointer)
-                                      :separator '(#\Newline)))
-        (%gui-string-free pointer)))))
+  "Return all photo pathnames selected by the canonical FLTK file chooser."
+  (mapcar #'pathname
+          (or (cl-fltk:choose-files :title title
+                                    :filter filter
+                                    :preset-file preset-path)
+              '())))
 
 (defun forget-preview-file (pathname)
   "Evict PATHNAME from the native preview cache after it is overwritten."

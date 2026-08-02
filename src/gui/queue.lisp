@@ -10,15 +10,20 @@
   (tasks '())
   (events '())
   (running 0 :type fixnum)
-  worker
+  (workers '())
   stopping-p)
 
-(defun make-gui-queue ()
-  "Create a bounded-worker render queue for the GUI."
+(defun make-gui-queue (&key (workers 1) (name "Orfeus GUI render worker"))
+  "Create a render queue serviced by WORKERS bounded worker threads."
+  (check-type workers (integer 1 *))
   (let ((queue (%make-gui-queue)))
-    (setf (gui-queue-worker queue)
-          (sb-thread:make-thread (lambda () (gui-queue-worker-loop queue))
-                                 :name "Orfeus GUI render worker"))
+    (setf (gui-queue-workers queue)
+          (loop for index below workers
+                collect (sb-thread:make-thread
+                         (lambda () (gui-queue-worker-loop queue))
+                         :name (if (= workers 1)
+                                   name
+                                   (format nil "~A ~D" name (1+ index))))))
     queue))
 
 (defun queue-event (queue event)
@@ -31,20 +36,23 @@
     (prog1 (gui-queue-events queue)
       (setf (gui-queue-events queue) '()))))
 
-(defun enqueue-gui-task (queue kind function &key replace-kind)
-  "Enqueue FUNCTION on QUEUE's single worker.
+(defun enqueue-gui-task (queue kind function &key replace-kind front-p)
+  "Enqueue FUNCTION on QUEUE.
 
 When REPLACE-KIND is supplied, pending tasks of that kind are discarded. This
-coalesces interactive previews without dropping explicit exports."
+coalesces interactive previews without dropping explicit exports. FRONT-P puts
+latency-sensitive work ahead of ordinary background tasks."
   (sb-thread:with-mutex ((gui-queue-lock queue))
     (unless (gui-queue-stopping-p queue)
       (when replace-kind
         (setf (gui-queue-tasks queue)
               (delete replace-kind (gui-queue-tasks queue)
                       :key #'gui-task-kind)))
-      (setf (gui-queue-tasks queue)
-            (nconc (gui-queue-tasks queue)
-                   (list (make-gui-task :kind kind :function function))))
+      (let ((task (make-gui-task :kind kind :function function)))
+        (setf (gui-queue-tasks queue)
+              (if front-p
+                  (cons task (gui-queue-tasks queue))
+                  (nconc (gui-queue-tasks queue) (list task)))))
       (sb-thread:condition-notify (gui-queue-waitqueue queue))
       t)))
 
@@ -84,13 +92,13 @@ coalesces interactive previews without dropping explicit exports."
         (not (null (gui-queue-tasks queue))))))
 
 (defun stop-gui-queue (queue)
-  "Discard pending work, stop QUEUE's worker, and wait for active work."
+  "Discard pending work, stop QUEUE's workers, and wait for active work."
   (when queue
     (sb-thread:with-mutex ((gui-queue-lock queue))
       (setf (gui-queue-stopping-p queue) t
             (gui-queue-tasks queue) '())
       (sb-thread:condition-broadcast (gui-queue-waitqueue queue)))
-    (let ((worker (gui-queue-worker queue)))
+    (dolist (worker (gui-queue-workers queue))
       (when (and worker (sb-thread:thread-alive-p worker)
                  (not (eq worker sb-thread:*current-thread*)))
         (sb-thread:join-thread worker)))

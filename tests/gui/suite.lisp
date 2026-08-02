@@ -244,6 +244,28 @@
                   "Queue did not run export task"))
       (orfeus/gui::stop-gui-queue queue))))
 
+(defun test-parallel-render-queue ()
+  (let ((queue (orfeus/gui::make-gui-queue :workers 2))
+        (release (sb-thread:make-semaphore :count 0))
+        (lock (sb-thread:make-mutex))
+        (started 0))
+    (unwind-protect
+         (progn
+           (loop repeat 2
+                 do (orfeus/gui::enqueue-gui-task
+                     queue :preview
+                     (lambda ()
+                       (sb-thread:with-mutex (lock) (incf started))
+                       (sb-thread:wait-on-semaphore release))))
+           (loop repeat 100
+                 until (sb-thread:with-mutex (lock) (= started 2))
+                 do (sleep 0.01))
+           (check (sb-thread:with-mutex (lock) (= started 2))
+                  "Render queue did not execute two tasks concurrently"))
+      (sb-thread:signal-semaphore release)
+      (sb-thread:signal-semaphore release)
+      (orfeus/gui::stop-gui-queue queue))))
+
 (defun test-preview-cache-key ()
   (let* ((job (orfeus:make-photo-job :input-path #P"one.orf"))
          (first (orfeus:make-processing-settings :exposure 0.0))
@@ -297,6 +319,7 @@
   (test-project-photo-mutations)
   (test-checkbox-normalization)
   (test-render-queue)
+  (test-parallel-render-queue)
   (test-preview-cache-key)
   (test-discard-pending-tasks)
   t)
