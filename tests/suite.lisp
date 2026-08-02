@@ -62,6 +62,28 @@
          (= 1.25 (processing-settings-exposure
                   (processing-preset-settings preset))))))
 
+(defun neural-noise-reduction-round-trip-p ()
+  (let* ((project
+           (make-project
+            :output-directory #P"exports/"
+            :defaults (make-processing-settings :neural-noise-reduction 0.4)
+            :photos (list (make-photo-job
+                           :input-path #P"input/example.orf"
+                           :overrides '(:neural-noise-reduction 0.9)))))
+         (decoded (sexp->project (project->sexp project)))
+         (effective (processing-settings-with-overrides
+                     (project-defaults decoded)
+                     (photo-job-overrides (first (project-photos decoded))))))
+    (and (= 0.4 (processing-settings-neural-noise-reduction
+                 (project-defaults decoded)))
+         (= 0.9 (processing-settings-neural-noise-reduction effective))
+         (handler-case
+             (progn (sexp->processing-settings '(:neural-noise-reduction 1.5))
+                    nil)
+           (invalid-project-data () t))
+         (= 0.0 (processing-settings-neural-noise-reduction
+                 (make-processing-settings))))))
+
 (defun old-project-export-defaults-p ()
   (let* ((decoded
            (sexp->project
@@ -377,6 +399,8 @@
       (check "project files round trip" (project-file-round-trip-p))
       (check "export settings round trip" (export-settings-round-trip-p))
       (check "processing presets round trip" (processing-presets-round-trip-p))
+      (check "neural noise reduction round trips and validates"
+             (neural-noise-reduction-round-trip-p))
       (check "old projects receive export defaults" (old-project-export-defaults-p))
       (check "project-relative paths resolve beside the project"
              (project-relative-paths-p))

@@ -46,7 +46,8 @@
   (focal-reducer :float)
   (lens-crop-factor :float)
   (lut-path :pointer)
-  (lens-profile-model :pointer))
+  (lens-profile-model :pointer)
+  (neural-noise-reduction :float))
 
 (defcfun ("orfeus_raw_render_capabilities_v1"
           %raw-render-capabilities-v1) :uint32)
@@ -142,7 +143,8 @@
                             lens-profile-model focal-reducer lens-crop-factor
                             lut-path lut-strength grain-amount grain-size
                             (grain-seed 0) (max-width 0) (max-height 0)
-                            (jpeg-quality 92) output-format cache-p)
+                            (jpeg-quality 92) output-format cache-p
+                            neural-noise-reduction)
   (native-library-load)
   (native-render-require-compatible)
   (labels ((invoke (lut-pointer lens-pointer)
@@ -153,7 +155,7 @@
                               value)))
                  (setting 'struct-size
                           (foreign-type-size '(:struct render-settings-v1)))
-                 (setting 'version 2)
+                 (setting 'version 3)
                  (setting 'flags
                           (logior (if lens-correction-p 1 0)
                                   (if chromatic-aberration-correction-p 2 0)))
@@ -169,6 +171,8 @@
                  ;; retain fine luminance texture instead of making it waxy.
                  (setting 'luma-noise-reduction
                           (float (* 0.2 noise-reduction) 0.0))
+                 (setting 'neural-noise-reduction
+                          (float (or neural-noise-reduction 0.0) 0.0))
                  (setting 'tone-blacks (float tone-blacks 0.0))
                  (setting 'tone-shadows (float tone-shadows 0.0))
                  (setting 'tone-dark-mids (float tone-dark-mids 0.0))

@@ -77,6 +77,8 @@ struct orfeus_render_settings_v1 {
        camera/mount matching. */
     const char *lut_path;
     const char *lens_profile_model;
+    /* Since settings version 3: FFDNet neural denoiser strength in [0, 1]. */
+    float neural_noise_reduction;
 };
 
 /* Applies orientation and embeds sRGB ICC. TIFF output is true 16-bit RGB.

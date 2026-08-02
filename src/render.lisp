@@ -207,6 +207,8 @@ The output is published atomically and INPUT-PATHNAME is never modified."
               :tint (processing-settings-white-balance-tint effective-settings)
               :noise-reduction
               (processing-settings-noise-reduction effective-settings)
+              :neural-noise-reduction
+              (processing-settings-neural-noise-reduction effective-settings)
               :tone-blacks (processing-settings-tone-blacks effective-settings)
               :tone-shadows (processing-settings-tone-shadows effective-settings)
               :tone-dark-mids

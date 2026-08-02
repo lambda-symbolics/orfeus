@@ -19,7 +19,7 @@ use super::Error;
 use super::color::intermediate_to_linear_srgb;
 use super::tone::apply_default_display_tone;
 
-pub const SETTINGS_VERSION: u32 = 2;
+pub const SETTINGS_VERSION: u32 = 3;
 pub const OUTPUT_JPEG: u32 = 1;
 pub const OUTPUT_TIFF: u32 = 2;
 pub const FLAG_LENS_DISTORTION: u32 = 1;
@@ -66,6 +66,7 @@ pub struct RenderSettingsV1 {
     pub lens_crop_factor: f32,
     pub lut_path: *const c_char,
     pub lens_profile_model: *const c_char,
+    pub neural_noise_reduction: f32,
 }
 
 impl Default for RenderSettingsV1 {
@@ -99,6 +100,7 @@ impl Default for RenderSettingsV1 {
             lens_crop_factor: 0.0,
             lut_path: std::ptr::null(),
             lens_profile_model: std::ptr::null(),
+            neural_noise_reduction: 0.0,
         }
     }
 }
@@ -129,6 +131,7 @@ impl RenderSettingsV1 {
             (self.exposure_ev, "exposure EV"),
             (self.chroma_noise_reduction, "chroma noise reduction"),
             (self.luma_noise_reduction, "luma noise reduction"),
+            (self.neural_noise_reduction, "neural noise reduction"),
             (self.tone_blacks, "tone blacks"),
             (self.tone_shadows, "tone shadows"),
             (self.tone_dark_mids, "tone dark mids"),
@@ -150,6 +153,7 @@ impl RenderSettingsV1 {
                     "exposure EV" => "exposure EV must be finite",
                     "chroma noise reduction" => "chroma noise reduction must be finite",
                     "luma noise reduction" => "luma noise reduction must be finite",
+                    "neural noise reduction" => "neural noise reduction must be finite",
                     "tone blacks" => "tone blacks must be finite",
                     "tone shadows" => "tone shadows must be finite",
                     "tone dark mids" => "tone dark mids must be finite",
@@ -173,6 +177,7 @@ impl RenderSettingsV1 {
             || !(-10.0..=10.0).contains(&self.exposure_ev)
             || !(0.0..=1.0).contains(&self.chroma_noise_reduction)
             || !(0.0..=1.0).contains(&self.luma_noise_reduction)
+            || !(0.0..=1.0).contains(&self.neural_noise_reduction)
             || !(-2.0..=2.0).contains(&self.tone_blacks)
             || !(-2.0..=2.0).contains(&self.tone_shadows)
             || !(-2.0..=2.0).contains(&self.tone_dark_mids)
@@ -1656,6 +1661,13 @@ pub fn render(
         settings.chroma_noise_reduction,
     );
     profile_stage!("noise-reduction");
+    super::nn::apply_neural_noise_reduction(
+        &mut image.data,
+        image.width,
+        image.height,
+        settings.neural_noise_reduction,
+    )?;
+    profile_stage!("neural-noise-reduction");
     apply_tonal_equalizer(
         &mut image,
         [

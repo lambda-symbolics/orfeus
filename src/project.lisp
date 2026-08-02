@@ -2,7 +2,8 @@
 
 (defparameter *processing-setting-keys*
   '(:exposure :white-balance-temperature :white-balance-tint
-    :noise-reduction :tone-blacks :tone-shadows :tone-dark-mids
+    :noise-reduction :neural-noise-reduction
+    :tone-blacks :tone-shadows :tone-dark-mids
     :tone-midtones :tone-light-mids :tone-highlights :tone-whites
     :lens-correction-p :lens-correction-strength
     :chromatic-aberration-correction-p :lut-path :lut-strength
@@ -15,6 +16,7 @@
   (white-balance-temperature nil)
   (white-balance-tint 0.0)
   (noise-reduction 0.35)
+  (neural-noise-reduction 0.0)
   (tone-blacks 0.0)
   (tone-shadows 0.0)
   (tone-dark-mids 0.0)
@@ -71,6 +73,8 @@
     ((:exposure :white-balance-tint :noise-reduction :lut-strength
       :grain-amount :grain-size)
      (realp value))
+    (:neural-noise-reduction
+     (and (realp value) (<= 0 value 1)))
     ((:tone-blacks :tone-shadows :tone-dark-mids :tone-midtones
       :tone-light-mids :tone-highlights :tone-whites)
      (and (realp value)
@@ -100,6 +104,8 @@
         (processing-settings-white-balance-temperature settings)
         :white-balance-tint (processing-settings-white-balance-tint settings)
         :noise-reduction (processing-settings-noise-reduction settings)
+        :neural-noise-reduction
+        (processing-settings-neural-noise-reduction settings)
         :tone-blacks (processing-settings-tone-blacks settings)
         :tone-shadows (processing-settings-tone-shadows settings)
         :tone-dark-mids (processing-settings-tone-dark-mids settings)
@@ -214,6 +220,8 @@
                 (setf (processing-settings-white-balance-tint result) value))
                (:noise-reduction
                 (setf (processing-settings-noise-reduction result) value))
+               (:neural-noise-reduction
+                (setf (processing-settings-neural-noise-reduction result) value))
                (:tone-blacks
                 (setf (processing-settings-tone-blacks result) value))
                (:tone-shadows

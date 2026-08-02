@@ -66,6 +66,7 @@
    #:processing-settings-lut-path
    #:processing-settings-lut-strength
    #:processing-settings-noise-reduction
+   #:processing-settings-neural-noise-reduction
    #:processing-settings-tone-blacks
    #:processing-settings-tone-shadows
    #:processing-settings-tone-dark-mids
