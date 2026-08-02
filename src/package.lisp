@@ -66,6 +66,13 @@
    #:processing-settings-lut-path
    #:processing-settings-lut-strength
    #:processing-settings-noise-reduction
+   #:processing-settings-tone-blacks
+   #:processing-settings-tone-shadows
+   #:processing-settings-tone-dark-mids
+   #:processing-settings-tone-midtones
+   #:processing-settings-tone-light-mids
+   #:processing-settings-tone-highlights
+   #:processing-settings-tone-whites
    #:processing-settings-white-balance-temperature
    #:processing-settings-white-balance-tint
    #:processing-settings-with-overrides

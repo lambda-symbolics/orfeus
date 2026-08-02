@@ -55,6 +55,13 @@ struct orfeus_render_settings_v1 {
     float exposure_ev;
     float chroma_noise_reduction;
     float luma_noise_reduction;
+    float tone_blacks;
+    float tone_shadows;
+    float tone_dark_mids;
+    float tone_midtones;
+    float tone_light_mids;
+    float tone_highlights;
+    float tone_whites;
     float lut_strength;
     float grain_amount;
     float grain_size;

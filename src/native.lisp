@@ -28,6 +28,13 @@
   (exposure-ev :float)
   (chroma-noise-reduction :float)
   (luma-noise-reduction :float)
+  (tone-blacks :float)
+  (tone-shadows :float)
+  (tone-dark-mids :float)
+  (tone-midtones :float)
+  (tone-light-mids :float)
+  (tone-highlights :float)
+  (tone-whites :float)
   (lut-strength :float)
   (grain-amount :float)
   (grain-size :float)
@@ -120,6 +127,8 @@
 
 (defun native-raw-render (input-pathname output-pathname
                           &key exposure kelvin tint noise-reduction
+                            tone-blacks tone-shadows tone-dark-mids tone-midtones
+                            tone-light-mids tone-highlights tone-whites
                             lens-correction-p lens-correction-strength
                             chromatic-aberration-correction-p
                             lens-profile-model focal-reducer lens-crop-factor
@@ -136,7 +145,7 @@
                               value)))
                  (setting 'struct-size
                           (foreign-type-size '(:struct render-settings-v1)))
-                 (setting 'version 1)
+                 (setting 'version 2)
                  (setting 'flags
                           (logior (if lens-correction-p 1 0)
                                   (if chromatic-aberration-correction-p 2 0)))
@@ -150,6 +159,13 @@
                           (float noise-reduction 0.0))
                  (setting 'luma-noise-reduction
                           (float noise-reduction 0.0))
+                 (setting 'tone-blacks (float tone-blacks 0.0))
+                 (setting 'tone-shadows (float tone-shadows 0.0))
+                 (setting 'tone-dark-mids (float tone-dark-mids 0.0))
+                 (setting 'tone-midtones (float tone-midtones 0.0))
+                 (setting 'tone-light-mids (float tone-light-mids 0.0))
+                 (setting 'tone-highlights (float tone-highlights 0.0))
+                 (setting 'tone-whites (float tone-whites 0.0))
                  (setting 'lut-strength
                           (float (if lut-path lut-strength 0.0) 0.0))
                  (setting 'grain-amount (float grain-amount 0.0))

@@ -158,7 +158,7 @@
            thumbnail-canvas before-canvas after-canvas before-caption after-caption
            inspector tabs basic-page optics-page effects-page export-page presets-page
            status progress before-preview-file after-preview-file
-           lens-name controls inspector-items lut-choice wb-choice target-choice
+           lens-name controls inspector-items tone-items lut-choice wb-choice target-choice
            export-quality export-max-width export-max-height export-metadata
            preset-browser preset-name-input preset-apply-button
            debounce-id poll-id comparison-p layout-initialized-p
@@ -806,6 +806,27 @@
                      (register-inspector spinner 202 y :number 26 :page))
                    (register-inspector spinner 110 y :control 26 :page))
                spinner))
+           (make-tone-band (key short-label full-label index)
+             (let* ((callback (lambda (widget event value)
+                                (declare (ignore event value))
+                                (setting-changed key widget)))
+                    (label (cl-fltk:make-label
+                            :parent basic-page :x 0 :y 172 :width 32 :height 24
+                            :label short-label))
+                    (slider (cl-fltk:make-vertical-slider
+                             :parent basic-page :x 0 :y 198 :width 20 :height 132
+                             :callback callback))
+                    (input (cl-fltk:make-value-input
+                            :parent basic-page :x 0 :y 334 :width 32 :height 24
+                            :callback callback)))
+               (dolist (widget (list slider input))
+                 (cl-fltk:set-range widget -2 2)
+                 (cl-fltk:set-step widget 0.1)
+                 (cl-fltk:set-tooltip widget full-label)
+                 (push (list key widget) controls))
+               (push (list label index :label) tone-items)
+               (push (list slider index :slider) tone-items)
+               (push (list input index :input) tone-items)))
            (layout-left-pane (&optional ignored)
              (declare (ignore ignored))
              (cl-fltk:resize-widget
@@ -885,6 +906,23 @@
                      (cl-fltk:resize-widget
                       widget :x item-x :y item-y
                       :width item-width :height item-height))))
+               (let* ((page-width (- right 12))
+                      (column-width (max 34 (floor (- page-width 16) 7))))
+                 (dolist (item tone-items)
+                   (destructuring-bind (widget index role) item
+                     (let* ((column-x (+ 8 (* index column-width)))
+                            (item-width (ecase role
+                                          (:label column-width)
+                                          (:slider 20)
+                                          (:input (max 30 (- column-width 4)))))
+                            (item-x (ecase role
+                                      (:label column-x)
+                                      (:slider (+ column-x (floor (- column-width 20) 2)))
+                                      (:input (+ column-x 2))))
+                            (item-y (ecase role (:label 172) (:slider 198) (:input 334)))
+                            (item-height (ecase role (:label 24) (:slider 132) (:input 24))))
+                       (cl-fltk:resize-widget widget :x item-x :y item-y
+                                              :width item-width :height item-height)))))
                (cl-fltk:redraw inspector)))
            (layout-ui (&optional ignored)
              (declare (ignore ignored))
@@ -1273,6 +1311,13 @@
         (make-number-field :exposure "Exposure EV" -10 10 0.1 108 basic-page)
         (make-number-field :noise-reduction "Noise reduction" 0 1 0.05 140
                            basic-page)
+        (make-tone-band :tone-blacks "Blk" "Blacks" 0)
+        (make-tone-band :tone-shadows "Shd" "Shadows" 1)
+        (make-tone-band :tone-dark-mids "DkM" "Dark mids" 2)
+        (make-tone-band :tone-midtones "Mid" "Midtones" 3)
+        (make-tone-band :tone-light-mids "LtM" "Light mids" 4)
+        (make-tone-band :tone-highlights "Hi" "Highlights" 5)
+        (make-tone-band :tone-whites "Wht" "Whites" 6)
         (let ((lens (register-inspector
                      (cl-fltk:make-check-button
                       :parent optics-page :x 8 :y 12 :width 292 :height 26

@@ -2,7 +2,9 @@
 
 (defparameter *processing-setting-keys*
   '(:exposure :white-balance-temperature :white-balance-tint
-    :noise-reduction :lens-correction-p :lens-correction-strength
+    :noise-reduction :tone-blacks :tone-shadows :tone-dark-mids
+    :tone-midtones :tone-light-mids :tone-highlights :tone-whites
+    :lens-correction-p :lens-correction-strength
     :chromatic-aberration-correction-p :lut-path :lut-strength
     :grain-amount :grain-size)
   "Keys accepted in processing setting S-expressions.")
@@ -13,6 +15,13 @@
   (white-balance-temperature nil)
   (white-balance-tint 0.0)
   (noise-reduction 0.35)
+  (tone-blacks 0.0)
+  (tone-shadows 0.0)
+  (tone-dark-mids 0.0)
+  (tone-midtones 0.0)
+  (tone-light-mids 0.0)
+  (tone-highlights 0.0)
+  (tone-whites 0.0)
   (lens-correction-p t)
   (lens-correction-strength 1.0)
   (chromatic-aberration-correction-p t)
@@ -62,6 +71,10 @@
     ((:exposure :white-balance-tint :noise-reduction :lut-strength
       :grain-amount :grain-size)
      (realp value))
+    ((:tone-blacks :tone-shadows :tone-dark-mids :tone-midtones
+      :tone-light-mids :tone-highlights :tone-whites)
+     (and (realp value)
+          (ignore-errors (<= -2 value 2))))
     (:lens-correction-strength
      (and (realp value) (<= 0 value 2)))
     (:white-balance-temperature
@@ -87,6 +100,13 @@
         (processing-settings-white-balance-temperature settings)
         :white-balance-tint (processing-settings-white-balance-tint settings)
         :noise-reduction (processing-settings-noise-reduction settings)
+        :tone-blacks (processing-settings-tone-blacks settings)
+        :tone-shadows (processing-settings-tone-shadows settings)
+        :tone-dark-mids (processing-settings-tone-dark-mids settings)
+        :tone-midtones (processing-settings-tone-midtones settings)
+        :tone-light-mids (processing-settings-tone-light-mids settings)
+        :tone-highlights (processing-settings-tone-highlights settings)
+        :tone-whites (processing-settings-tone-whites settings)
         :lens-correction-p (processing-settings-lens-correction-p settings)
         :lens-correction-strength
         (processing-settings-lens-correction-strength settings)
@@ -194,6 +214,20 @@
                 (setf (processing-settings-white-balance-tint result) value))
                (:noise-reduction
                 (setf (processing-settings-noise-reduction result) value))
+               (:tone-blacks
+                (setf (processing-settings-tone-blacks result) value))
+               (:tone-shadows
+                (setf (processing-settings-tone-shadows result) value))
+               (:tone-dark-mids
+                (setf (processing-settings-tone-dark-mids result) value))
+               (:tone-midtones
+                (setf (processing-settings-tone-midtones result) value))
+               (:tone-light-mids
+                (setf (processing-settings-tone-light-mids result) value))
+               (:tone-highlights
+                (setf (processing-settings-tone-highlights result) value))
+               (:tone-whites
+                (setf (processing-settings-tone-whites result) value))
                (:lens-correction-p
                 (setf (processing-settings-lens-correction-p result) value))
                (:lens-correction-strength

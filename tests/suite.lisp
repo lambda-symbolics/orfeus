@@ -10,6 +10,7 @@
   (make-project
    :output-directory #P"exports/"
    :defaults (make-processing-settings :exposure 0.75 :grain-amount 0.12
+                                       :tone-shadows 0.6 :tone-highlights -0.4
                                        :lens-correction-strength 0.65)
    :photos (list (make-photo-job
                   :input-path #P"input/example.orf"
@@ -21,6 +22,10 @@
     (and (= 0.75 (processing-settings-exposure
                   (project-defaults decoded)))
          (= 0.65 (processing-settings-lens-correction-strength
+                  (project-defaults decoded)))
+         (= 0.6 (orfeus:processing-settings-tone-shadows
+                 (project-defaults decoded)))
+         (= -0.4 (orfeus:processing-settings-tone-highlights
                   (project-defaults decoded)))
          (= 1 (length (project-photos decoded)))
          (equal '(:exposure -0.25 :lut-strength 0.8)
@@ -160,6 +165,20 @@
            '(:exposure -1.0 :grain-amount 0.2))))
     (and (= -1.0 (processing-settings-exposure settings))
          (= 0.2 (processing-settings-grain-amount settings)))))
+
+(defun tonal-settings-default-and-validation-p ()
+  (let* ((old (sexp->project
+               '(:orfeus-project 1 :output-directory "exports/"
+                 :defaults (:exposure 0.0) :photos ())))
+         (settings (project-defaults old)))
+    (and (zerop (orfeus:processing-settings-tone-blacks settings))
+         (zerop (orfeus:processing-settings-tone-midtones settings))
+         (zerop (orfeus:processing-settings-tone-whites settings))
+         (handler-case
+             (progn
+               (processing-settings-with-overrides settings '(:tone-shadows 2.1))
+               nil)
+           (invalid-project-data () t)))))
 
 (defun project-relative-paths-p ()
   (let ((pathname (test-temporary-pathname "sexp")))
@@ -375,6 +394,8 @@
              (lens-alias-reader-evaluation-disabled-p))
       (check "per-photo overrides produce effective settings"
              (processing-overrides-p))
+      (check "tonal settings default safely and reject invalid ranges"
+             (tonal-settings-default-and-validation-p))
       (check "photo outputs follow project path semantics"
              (photo-job-render-output-semantics-p))
       (check "rendering never replaces its input"

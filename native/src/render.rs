@@ -20,7 +20,7 @@ use super::Error;
 use super::color::intermediate_to_linear_srgb;
 use super::tone::apply_default_display_tone;
 
-pub const SETTINGS_VERSION: u32 = 1;
+pub const SETTINGS_VERSION: u32 = 2;
 pub const OUTPUT_JPEG: u32 = 1;
 pub const OUTPUT_TIFF: u32 = 2;
 pub const FLAG_LENS_DISTORTION: u32 = 1;
@@ -42,6 +42,13 @@ pub struct RenderSettingsV1 {
     pub exposure_ev: f32,
     pub chroma_noise_reduction: f32,
     pub luma_noise_reduction: f32,
+    pub tone_blacks: f32,
+    pub tone_shadows: f32,
+    pub tone_dark_mids: f32,
+    pub tone_midtones: f32,
+    pub tone_light_mids: f32,
+    pub tone_highlights: f32,
+    pub tone_whites: f32,
     pub lut_strength: f32,
     pub grain_amount: f32,
     pub grain_size: f32,
@@ -68,6 +75,13 @@ impl Default for RenderSettingsV1 {
             exposure_ev: 0.0,
             chroma_noise_reduction: 0.0,
             luma_noise_reduction: 0.0,
+            tone_blacks: 0.0,
+            tone_shadows: 0.0,
+            tone_dark_mids: 0.0,
+            tone_midtones: 0.0,
+            tone_light_mids: 0.0,
+            tone_highlights: 0.0,
+            tone_whites: 0.0,
             lut_strength: 0.0,
             grain_amount: 0.0,
             grain_size: 1.0,
@@ -110,6 +124,13 @@ impl RenderSettingsV1 {
             (self.exposure_ev, "exposure EV"),
             (self.chroma_noise_reduction, "chroma noise reduction"),
             (self.luma_noise_reduction, "luma noise reduction"),
+            (self.tone_blacks, "tone blacks"),
+            (self.tone_shadows, "tone shadows"),
+            (self.tone_dark_mids, "tone dark mids"),
+            (self.tone_midtones, "tone midtones"),
+            (self.tone_light_mids, "tone light mids"),
+            (self.tone_highlights, "tone highlights"),
+            (self.tone_whites, "tone whites"),
             (self.lut_strength, "LUT strength"),
             (self.grain_amount, "grain amount"),
             (self.grain_size, "grain size"),
@@ -124,6 +145,13 @@ impl RenderSettingsV1 {
                     "exposure EV" => "exposure EV must be finite",
                     "chroma noise reduction" => "chroma noise reduction must be finite",
                     "luma noise reduction" => "luma noise reduction must be finite",
+                    "tone blacks" => "tone blacks must be finite",
+                    "tone shadows" => "tone shadows must be finite",
+                    "tone dark mids" => "tone dark mids must be finite",
+                    "tone midtones" => "tone midtones must be finite",
+                    "tone light mids" => "tone light mids must be finite",
+                    "tone highlights" => "tone highlights must be finite",
+                    "tone whites" => "tone whites must be finite",
                     "LUT strength" => "LUT strength must be finite",
                     "grain amount" => "grain amount must be finite",
                     "grain size" => "grain size must be finite",
@@ -140,6 +168,13 @@ impl RenderSettingsV1 {
             || !(-10.0..=10.0).contains(&self.exposure_ev)
             || !(0.0..=1.0).contains(&self.chroma_noise_reduction)
             || !(0.0..=1.0).contains(&self.luma_noise_reduction)
+            || !(-2.0..=2.0).contains(&self.tone_blacks)
+            || !(-2.0..=2.0).contains(&self.tone_shadows)
+            || !(-2.0..=2.0).contains(&self.tone_dark_mids)
+            || !(-2.0..=2.0).contains(&self.tone_midtones)
+            || !(-2.0..=2.0).contains(&self.tone_light_mids)
+            || !(-2.0..=2.0).contains(&self.tone_highlights)
+            || !(-2.0..=2.0).contains(&self.tone_whites)
             || !(0.0..=1.0).contains(&self.lut_strength)
             || !(0.0..=1.0).contains(&self.grain_amount)
             || !(0.25..=16.0).contains(&self.grain_size)
@@ -420,6 +455,30 @@ fn apply_white_adaptation(image: &mut RgbImage, kelvin: f32, tint: f32) {
         }
         *pixel = mat_vec(xyz_to_rgb, mat_vec(inverse, lms));
     }
+}
+
+fn tone_adjustment_ev(luminance: f32, adjustments: &[f32; 7]) -> f32 {
+    if !luminance.is_finite() || luminance <= 0.0 {
+        return 0.0;
+    }
+    let position = (luminance / 0.18).log2().clamp(-6.0, 6.0);
+    let interval = ((position + 6.0) * 0.5).floor().clamp(0.0, 5.0) as usize;
+    let t = ((position - (-6.0 + interval as f32 * 2.0)) * 0.5).clamp(0.0, 1.0);
+    let smooth = t * t * (3.0 - 2.0 * t);
+    adjustments[interval] * (1.0 - smooth) + adjustments[interval + 1] * smooth
+}
+
+fn apply_tonal_equalizer(image: &mut RgbImage, adjustments: [f32; 7]) {
+    if adjustments.iter().all(|adjustment| *adjustment == 0.0) {
+        return;
+    }
+    image.data.par_chunks_exact_mut(3).for_each(|pixel| {
+        let luminance = 0.212_672_9 * pixel[0] + 0.715_152_2 * pixel[1] + 0.072_175 * pixel[2];
+        let gain = tone_adjustment_ev(luminance, &adjustments).exp2();
+        pixel[0] *= gain;
+        pixel[1] *= gain;
+        pixel[2] *= gain;
+    });
 }
 
 fn apply_noise_reduction(image: &mut RgbImage, luma: f32, chroma: f32) {
@@ -1226,6 +1285,19 @@ pub fn render(input: &Path, output: &Path, settings: &RenderSettingsV1) -> Resul
         settings.chroma_noise_reduction,
     );
     profile_stage!("noise-reduction");
+    apply_tonal_equalizer(
+        &mut image,
+        [
+            settings.tone_blacks,
+            settings.tone_shadows,
+            settings.tone_dark_mids,
+            settings.tone_midtones,
+            settings.tone_light_mids,
+            settings.tone_highlights,
+            settings.tone_whites,
+        ],
+    );
+    profile_stage!("tonal-equalizer");
     let gpu_completed = if super::gpu::requested() {
         match catch_unwind(AssertUnwindSafe(|| {
             super::gpu::tone_and_transfer(&mut image.data)
@@ -1417,6 +1489,58 @@ mod tests {
         let noisy = (before.data[0] - before.data[2]).abs();
         let reduced = (image.data[0] - image.data[2]).abs();
         assert!(reduced < noisy * 0.8, "chroma noise was not reduced");
+    }
+
+    #[test]
+    fn zero_tonal_equalizer_is_exact_identity() {
+        let mut image = RgbImage {
+            width: 2,
+            height: 1,
+            data: vec![0.01, 0.02, 0.03, 0.2, 0.4, 0.8],
+        };
+        let before = image.data.clone();
+        apply_tonal_equalizer(&mut image, [0.0; 7]);
+        assert_eq!(image.data, before);
+    }
+
+    #[test]
+    fn tonal_equalizer_applies_each_anchor_gain() {
+        let anchors = [0.002_812_5, 0.011_25, 0.045, 0.18, 0.72, 2.88, 11.52];
+        for (index, luminance) in anchors.into_iter().enumerate() {
+            let mut adjustments = [0.0; 7];
+            adjustments[index] = 1.0;
+            let mut image = RgbImage {
+                width: 1,
+                height: 1,
+                data: vec![luminance; 3],
+            };
+            apply_tonal_equalizer(&mut image, adjustments);
+            for value in image.data {
+                assert!((value - luminance * 2.0).abs() < luminance * 1.0e-5 + 1.0e-7);
+            }
+        }
+    }
+
+    #[test]
+    fn tonal_equalizer_is_smooth_and_preserves_chromaticity() {
+        let adjustments = [-1.0, -0.5, 0.0, 0.5, 1.0, 0.25, -0.25];
+        let boundary = 0.18;
+        let below = tone_adjustment_ev(boundary * 2.0_f32.powf(-0.001), &adjustments);
+        let above = tone_adjustment_ev(boundary * 2.0_f32.powf(0.001), &adjustments);
+        assert!((below - above).abs() < 0.001);
+
+        let mut image = RgbImage {
+            width: 1,
+            height: 1,
+            data: vec![0.09, 0.18, 0.36],
+        };
+        let before = image.data.clone();
+        apply_tonal_equalizer(&mut image, adjustments);
+        let red_gain = image.data[0] / before[0];
+        let green_gain = image.data[1] / before[1];
+        let blue_gain = image.data[2] / before[2];
+        assert!((red_gain - green_gain).abs() < 1.0e-6);
+        assert!((green_gain - blue_gain).abs() < 1.0e-6);
     }
 
     #[test]
