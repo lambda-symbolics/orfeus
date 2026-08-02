@@ -15,12 +15,22 @@
 (defparameter *background-preview-workers* 3
   "Maximum concurrent thumbnail and neighboring-preview renders.")
 
+(defparameter *background-preview-radius* 2
+  "Number of photos on either side of the selection to pre-render.")
+
 (defconstant +thumbnail-shift-mask+ 1)
 (defconstant +thumbnail-control-mask+ 4)
 
 (defun thumbnail-row-at (event-y scroll row-height)
   "Return the zero-based thumbnail row at local EVENT-Y."
   (floor (+ event-y scroll) row-height))
+
+(defun preview-neighborhood-indices (count selected radius)
+  "Return valid photo indices within RADIUS of SELECTED."
+  (when (plusp count)
+    (loop for index from (max 0 (- selected radius))
+          to (min (1- count) (+ selected radius))
+          collect index)))
 
 (defun thumbnail-selection-after-click (selected row anchor state)
   "Return the selection and anchor produced by clicking ROW with modifier STATE."
@@ -623,26 +633,25 @@
                         (error () nil)))))))
            (enqueue-background-previews (selected-before-p generation)
              (discard-gui-tasks background-queue)
-             (let ((selected (selected-job)))
+             (let* ((photos (project-photos project))
+                    (selected-index (gui-model-selected-index model))
+                    (selected (selected-job))
+                    (indices (preview-neighborhood-indices
+                              (length photos) selected-index
+                              *background-preview-radius*)))
                (when (and selected selected-before-p)
                  (enqueue-render background-queue :before selected
-                                 (gui-model-selected-index model)
+                                 selected-index
                                  (neutral-preview-settings) generation t t))
-               (loop for job in (project-photos project)
-                     for index from 0
-                     do (enqueue-thumbnail job index generation))
-               ;; Make every photograph's useful edited preview ready first;
-               ;; neutral comparison renders follow after that hot path.
-               (loop for job in (project-photos project)
-                     for index from 0
-                     unless (eq job selected)
-                       do (enqueue-render background-queue :after job index
-                                          (settings-for-job job) nil nil))
-               (loop for job in (project-photos project)
-                     for index from 0
-                     unless (eq job selected)
-                       do (enqueue-render background-queue :before job index
-                                          (neutral-preview-settings) nil nil))))
+               (dolist (index indices)
+                 (enqueue-thumbnail (nth index photos) index generation))
+               ;; Only nearby edited previews are speculative. Neutral previews
+               ;; are rendered on selection, avoiding perpetual whole-project work.
+               (dolist (index indices)
+                 (unless (= index selected-index)
+                   (let ((job (nth index photos)))
+                     (enqueue-render background-queue :after job index
+                                     (settings-for-job job) nil nil))))))
            (enqueue-preview (initial-p)
              (let ((job (selected-job))
                    (index (gui-model-selected-index model))
