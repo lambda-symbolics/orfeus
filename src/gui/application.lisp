@@ -1,6 +1,6 @@
 (in-package #:orfeus/gui)
 
-(defparameter *preview-debounce-seconds* 0.25d0
+(defparameter *preview-debounce-seconds* 0.15d0
   "Delay used to coalesce interactive control changes.")
 
 (defparameter *gui-preview-max-width* 0
@@ -8,6 +8,9 @@
 
 (defparameter *gui-preview-max-height* 0
   "Maximum GUI preview height; zero preserves full source resolution.")
+
+(defparameter *gui-draft-preview-size* 2048
+  "Bounding size of the fast draft preview rendered before the full one.")
 
 (defparameter *thumbnail-preview-size* 320
   "Maximum width and height for orientation-correct thumbnail renders.")
@@ -590,9 +593,17 @@
            (current-settings ()
              (settings-for-job (selected-job)))
            (enqueue-render (target-queue role job index settings generation publish-p
-                            &optional front-p)
+                            &key front-p draft-p cache-p)
              (let* ((input (photo-job-input-path job))
-                    (output (preview-pathname preview-directory index job role settings)))
+                    (file-role (if draft-p :draft role))
+                    (output (preview-pathname preview-directory index job
+                                              file-role settings))
+                    (max-width (if draft-p
+                                   *gui-draft-preview-size*
+                                   *gui-preview-max-width*))
+                    (max-height (if draft-p
+                                    *gui-draft-preview-size*
+                                    *gui-preview-max-height*)))
                (if (probe-file output)
                    (when publish-p
                      (queue-event queue
@@ -603,8 +614,9 @@
                       (when (or (not publish-p)
                                 (= generation preview-generation))
                         (render-preview input output settings
-                                        :max-width *gui-preview-max-width*
-                                        :max-height *gui-preview-max-height*
+                                        :max-width max-width
+                                        :max-height max-height
+                                        :cache-p cache-p
                                         :if-exists :supersede)
                         (when (and publish-p
                                    (= generation preview-generation))
@@ -642,7 +654,8 @@
                (when (and selected selected-before-p)
                  (enqueue-render background-queue :before selected
                                  selected-index
-                                 (neutral-preview-settings) generation t t))
+                                 (neutral-preview-settings) generation t
+                                 :front-p t :cache-p t))
                (when selected-before-p
                  (dolist (index indices)
                    (enqueue-thumbnail (nth index photos) index generation)))
@@ -656,8 +669,15 @@
                    (index (gui-model-selected-index model))
                    (generation preview-generation))
                (when job
-                 (enqueue-render queue :after job index
-                                 (current-settings) generation t)
+                 ;; A bounded draft lands quickly while the full-resolution
+                 ;; preview renders behind it; both reuse the decoded RAW.
+                 (let ((settings (current-settings)))
+                   (unless (probe-file (preview-pathname preview-directory index
+                                                         job :after settings))
+                     (enqueue-render queue :after job index settings generation t
+                                     :front-p t :draft-p t :cache-p t))
+                   (enqueue-render queue :after job index settings generation t
+                                   :cache-p t))
                  (enqueue-background-previews initial-p generation))))
            (schedule-initial-preview ()
              (when debounce-id
