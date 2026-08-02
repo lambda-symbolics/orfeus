@@ -53,9 +53,18 @@
    #:photo-job-input-path
    #:photo-job-output-path
    #:photo-job-overrides
+   #:photo-job-disabled-stages
+   #:photo-job-apply-grade
+   #:photo-render-settings
+   #:grade-stages
+   #:grade-stage-keys
+   #:settings-apply-stage-bypass
+   #:settings-grade-plist
+   #:next-still-preset-name
    #:processing-preset
    #:processing-preset-name
    #:processing-preset-settings
+   #:processing-preset-source-photo
    #:processing-settings
    #:processing-settings-chromatic-aberration-correction-p
    #:processing-settings-exposure

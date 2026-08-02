@@ -18,8 +18,7 @@
     (render-photo
      (photo-job-input-path photo)
      (photo-job-render-output project photo)
-     (processing-settings-with-overrides
-      (project-defaults project) (photo-job-overrides photo))
+     (photo-render-settings project photo)
      :if-exists if-exists
      :jpeg-quality (export-settings-jpeg-quality export)
      :max-width (export-settings-max-width export)

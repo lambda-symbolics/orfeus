@@ -84,6 +84,109 @@
          (= 0.0 (processing-settings-neural-noise-reduction
                  (make-processing-settings))))))
 
+(defun grade-stages-partition-setting-keys-p ()
+  (let ((stage-keys (loop for stage in (grade-stages)
+                          append (grade-stage-keys stage)))
+        (identity-keys (loop for (key nil) on orfeus::*stage-identity-plist*
+                             by #'cddr collect key)))
+    (and (null (set-difference stage-keys orfeus::*processing-setting-keys*))
+         (null (set-difference orfeus::*processing-setting-keys* stage-keys))
+         (= (length stage-keys) (length (remove-duplicates stage-keys)))
+         (null (set-exclusive-or stage-keys identity-keys)))))
+
+(defun stage-bypass-renders-identity-p ()
+  (let* ((project
+           (make-project
+            :output-directory #P"exports/"
+            :photos (list (make-photo-job
+                           :input-path #P"input/example.orf"
+                           :overrides '(:exposure 1.5 :noise-reduction 0.8
+                                        :lut-path "film.cube" :lut-strength 1.0)
+                           :disabled-stages '(:exposure :film)))))
+         (photo (first (project-photos project)))
+         (rendered (photo-render-settings project photo)))
+    (and (= 0.0 (processing-settings-exposure rendered))
+         (null (processing-settings-lut-path rendered))
+         (= 0.0 (processing-settings-lut-strength rendered))
+         (= 0.8 (processing-settings-noise-reduction rendered))
+         ;; The underlying grade is remembered, only rendering bypasses it.
+         (equal '(:exposure 1.5 :noise-reduction 0.8
+                  :lut-path "film.cube" :lut-strength 1.0)
+                (photo-job-overrides photo))
+         (handler-case
+             (progn (orfeus::disabled-stages-validate '(:no-such-stage)) nil)
+           (invalid-project-data () t)))))
+
+(defun disabled-stages-round-trip-p ()
+  (let* ((original
+           (make-project
+            :output-directory #P"exports/"
+            :photos (list (make-photo-job
+                           :input-path #P"input/example.orf"
+                           :disabled-stages '(:tone :optics)))))
+         (decoded (sexp->project (project->sexp original))))
+    (and (equal '(:tone :optics)
+                (photo-job-disabled-stages (first (project-photos decoded))))
+         (handler-case
+             (progn
+               (sexp->project
+                '(:orfeus-project 1
+                  :output-directory "exports/"
+                  :defaults (:exposure 0.0)
+                  :export-settings (:jpeg-quality 92)
+                  :photos ((:input "a.orf" :disabled-stages (:bogus)))))
+               nil)
+           (invalid-project-data () t)))))
+
+(defun grade-copy-paste-p ()
+  (let* ((settings (make-processing-settings :exposure 0.7 :tone-shadows 0.4
+                                             :grain-amount 0.3))
+         (grade (settings-grade-plist settings '(:exposure :tone)))
+         (target (make-photo-job :input-path #P"b.orf"
+                                 :overrides '(:noise-reduction 0.5))))
+    (photo-job-apply-grade target grade '(:film))
+    (and (= 0.7 (getf grade :exposure))
+         (= 0.4 (getf grade :tone-shadows))
+         (null (member :grain-amount grade))
+         (= 0.7 (getf (photo-job-overrides target) :exposure))
+         (= 0.5 (getf (photo-job-overrides target) :noise-reduction))
+         (equal '(:film) (photo-job-disabled-stages target))
+         (= 0.7 (processing-settings-exposure
+                 (photo-render-settings
+                  (make-project :output-directory #P"exports/"
+                                :photos (list target))
+                  target))))))
+
+(defun still-preset-source-photo-round-trip-p ()
+  (let ((pathname (test-temporary-pathname "sexp")))
+    (unwind-protect
+         (progn
+           (project-write
+            (make-project
+             :output-directory #P"exports/"
+             :presets (list (make-processing-preset
+                             :name "Still 001 (example)"
+                             :settings (make-processing-settings :exposure 0.5)
+                             :source-photo #P"input/example.orf")))
+            pathname)
+           (let* ((project (project-read pathname))
+                  (preset (first (project-presets project)))
+                  (base (uiop:pathname-directory-pathname pathname)))
+             (equal (processing-preset-source-photo preset)
+                    (merge-pathnames #P"input/example.orf" base))))
+      (when (probe-file pathname)
+        (delete-file pathname)))))
+
+(defun still-names-increment-p ()
+  (let* ((photo (make-photo-job :input-path #P"input/example.orf"))
+         (project (make-project
+                   :output-directory #P"exports/"
+                   :photos (list photo)
+                   :presets (list (make-processing-preset
+                                   :name "Still 001 (example)")))))
+    (string= "Still 002 (example)"
+             (next-still-preset-name project photo))))
+
 (defun old-project-export-defaults-p ()
   (let* ((decoded
            (sexp->project
@@ -401,6 +504,18 @@
       (check "processing presets round trip" (processing-presets-round-trip-p))
       (check "neural noise reduction round trips and validates"
              (neural-noise-reduction-round-trip-p))
+      (check "grade stages partition the setting keys"
+             (grade-stages-partition-setting-keys-p))
+      (check "bypassed stages render as identity yet keep their grade"
+             (stage-bypass-renders-identity-p))
+      (check "disabled stages round trip and reject unknown names"
+             (disabled-stages-round-trip-p))
+      (check "grades copy selectively and paste onto photos"
+             (grade-copy-paste-p))
+      (check "still presets remember and resolve their source photo"
+             (still-preset-source-photo-round-trip-p))
+      (check "still names increment past taken gallery names"
+             (still-names-increment-p))
       (check "old projects receive export defaults" (old-project-export-defaults-p))
       (check "project-relative paths resolve beside the project"
              (project-relative-paths-p))

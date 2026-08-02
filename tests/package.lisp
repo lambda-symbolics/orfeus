@@ -22,11 +22,23 @@
                 #:photo-job-render-output
                 #:processing-preset-name
                 #:processing-preset-settings
+                #:grade-stage-keys
+                #:grade-stages
+                #:next-still-preset-name
+                #:photo-job-apply-grade
+                #:photo-job-disabled-stages
+                #:photo-render-settings
+                #:processing-preset-source-photo
                 #:processing-settings-exposure
                 #:processing-settings-grain-amount
                 #:processing-settings-lens-correction-strength
+                #:processing-settings-lut-path
+                #:processing-settings-lut-strength
                 #:processing-settings-neural-noise-reduction
+                #:processing-settings-noise-reduction
+                #:processing-settings-tone-shadows
                 #:processing-settings-with-overrides
+                #:settings-grade-plist
                 #:project->sexp
                 #:project-defaults
                 #:project-export-settings

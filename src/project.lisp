@@ -32,10 +32,47 @@
   (grain-amount 0.0)
   (grain-size 1.0))
 
+(defparameter *grade-stages*
+  '((:white-balance (:white-balance-temperature :white-balance-tint))
+    (:exposure (:exposure))
+    (:noise-reduction (:noise-reduction :neural-noise-reduction))
+    (:tone (:tone-blacks :tone-shadows :tone-dark-mids :tone-midtones
+            :tone-light-mids :tone-highlights :tone-whites))
+    (:optics (:lens-correction-p :lens-correction-strength
+              :chromatic-aberration-correction-p))
+    (:film (:lut-path :lut-strength :grain-amount :grain-size)))
+  "The fixed processing pipeline as named stages over setting keys.
+Together the stages partition *PROCESSING-SETTING-KEYS*; frontends present
+them as a copyable node chain.")
+
+(defparameter *stage-identity-plist*
+  '(:white-balance-temperature nil :white-balance-tint 0.0
+    :exposure 0.0
+    :noise-reduction 0.0 :neural-noise-reduction 0.0
+    :tone-blacks 0.0 :tone-shadows 0.0 :tone-dark-mids 0.0 :tone-midtones 0.0
+    :tone-light-mids 0.0 :tone-highlights 0.0 :tone-whites 0.0
+    :lens-correction-p nil :lens-correction-strength 1.0
+    :chromatic-aberration-correction-p nil
+    :lut-path nil :lut-strength 0.0 :grain-amount 0.0 :grain-size 1.0)
+  "Setting values under which every stage passes pixels through unchanged.")
+
+(defun grade-stage-keys (stage)
+  "Return the setting keys belonging to pipeline STAGE."
+  (or (second (assoc stage *grade-stages*))
+      (error "Unknown grade stage ~S." stage)))
+
+(defun grade-stages ()
+  "Return the pipeline stage names in processing order."
+  (mapcar #'first *grade-stages*))
+
 (defstruct processing-preset
-  "A named, portable snapshot of processing settings."
+  "A named, portable snapshot of processing settings.
+
+A preset grabbed from a specific photograph remembers that photograph in
+SOURCE-PHOTO so galleries can render a representative still thumbnail."
   (name "" :type string)
-  (settings (make-processing-settings) :type processing-settings))
+  (settings (make-processing-settings) :type processing-settings)
+  (source-photo nil))
 
 (defstruct export-settings
   "Frontend-independent options for encoded photo exports."
@@ -45,10 +82,14 @@
   (preserve-metadata-p t :type boolean))
 
 (defstruct photo-job
-  "One input photograph and its optional per-photo setting overrides."
+  "One input photograph and its optional per-photo setting overrides.
+
+DISABLED-STAGES lists pipeline stages bypassed for this photograph; their
+settings are remembered but render as identity, like a disabled node."
   input-path
   output-path
-  (overrides '()))
+  (overrides '())
+  (disabled-stages '()))
 
 (defstruct project
   "A batch of photographs sharing processing defaults and an output directory."
@@ -128,21 +169,30 @@
   (apply #'make-processing-settings sexp))
 
 (defun processing-preset->sexp (preset)
-  (list :name (processing-preset-name preset)
-        :settings (processing-settings->sexp
-                   (processing-preset-settings preset))))
+  (append
+   (list :name (processing-preset-name preset)
+         :settings (processing-settings->sexp
+                    (processing-preset-settings preset)))
+   (let ((source (processing-preset-source-photo preset)))
+     (when source
+       (list :source-photo (namestring source))))))
 
 (defun sexp->processing-preset (sexp)
   (unless (and (listp sexp)
-               (plist-known-keys-p sexp '(:name :settings)))
+               (plist-known-keys-p sexp '(:name :settings :source-photo)))
     (project-invalid sexp "expected a preset property list"))
   (let ((name (getf sexp :name))
-        (settings (getf sexp :settings)))
+        (settings (getf sexp :settings))
+        (source-photo (getf sexp :source-photo)))
     (unless (and (stringp name)
                  (plusp (length (string-trim '(#\Space #\Tab) name))))
       (project-invalid sexp "preset :name must be a nonempty string"))
+    (unless (or (null source-photo) (stringp source-photo))
+      (project-invalid sexp "preset :source-photo must be NIL or a pathname string"))
     (make-processing-preset :name name
-                            :settings (sexp->processing-settings settings))))
+                            :settings (sexp->processing-settings settings)
+                            :source-photo (when source-photo
+                                            (pathname source-photo)))))
 
 (defun sexp->processing-presets (sexp)
   (unless (listp sexp)
@@ -183,27 +233,44 @@
                           :max-height max-height
                           :preserve-metadata-p preserve-metadata-p)))
 
+(defun disabled-stages-validate (stages)
+  (unless (and (listp stages)
+               (every (lambda (stage) (assoc stage *grade-stages*)) stages)
+               (= (length stages)
+                  (length (remove-duplicates stages))))
+    (project-invalid stages
+                     "disabled stages must be unique pipeline stage names"))
+  stages)
+
 (defun photo-job->sexp (photo)
-  (list :input (namestring (photo-job-input-path photo))
-        :output (when (photo-job-output-path photo)
-                  (namestring (photo-job-output-path photo)))
-        :overrides (copy-list (photo-job-overrides photo))))
+  (append
+   (list :input (namestring (photo-job-input-path photo))
+         :output (when (photo-job-output-path photo)
+                   (namestring (photo-job-output-path photo)))
+         :overrides (copy-list (photo-job-overrides photo)))
+   (when (photo-job-disabled-stages photo)
+     (list :disabled-stages
+           (copy-list (photo-job-disabled-stages photo))))))
 
 (defun sexp->photo-job (sexp)
   (unless (and (listp sexp)
-               (plist-known-keys-p sexp '(:input :output :overrides)))
+               (plist-known-keys-p
+                sexp '(:input :output :overrides :disabled-stages)))
     (project-invalid sexp "expected a photo property list"))
   (let ((input (getf sexp :input))
         (output (getf sexp :output))
-        (overrides (getf sexp :overrides '())))
+        (overrides (getf sexp :overrides '()))
+        (disabled-stages (getf sexp :disabled-stages '())))
     (unless (stringp input)
       (project-invalid sexp ":input must be a pathname string"))
     (unless (or (null output) (stringp output))
       (project-invalid sexp ":output must be NIL or a pathname string"))
     (processing-plist-validate overrides)
+    (disabled-stages-validate disabled-stages)
     (make-photo-job :input-path (pathname input)
                     :output-path (when output (pathname output))
-                    :overrides overrides)))
+                    :overrides overrides
+                    :disabled-stages disabled-stages)))
 
 (defun processing-settings-with-overrides (settings overrides)
   "Return a copy of SETTINGS with validated OVERRIDES applied."
@@ -254,6 +321,65 @@
                (:grain-size
                 (setf (processing-settings-grain-size result) value))))
     result))
+
+(defun settings-apply-stage-bypass (settings disabled-stages)
+  "Return a copy of SETTINGS whose DISABLED-STAGES render as identity."
+  (disabled-stages-validate disabled-stages)
+  (let ((identity-overrides
+          (loop for stage in disabled-stages
+                append (loop for key in (grade-stage-keys stage)
+                             collect key
+                             collect (getf *stage-identity-plist* key)))))
+    (if identity-overrides
+        (processing-settings-with-overrides settings identity-overrides)
+        (copy-processing-settings settings))))
+
+(defun photo-render-settings (project photo)
+  "Return PHOTO's settings as rendered: overrides applied, bypasses honored."
+  (settings-apply-stage-bypass
+   (processing-settings-with-overrides (project-defaults project)
+                                       (photo-job-overrides photo))
+   (photo-job-disabled-stages photo)))
+
+(defun settings-grade-plist (settings &optional (stages (grade-stages)))
+  "Return the grade of SETTINGS as a plist restricted to STAGES."
+  (let ((complete (processing-settings->sexp settings)))
+    (loop for stage in stages
+          append (loop for key in (grade-stage-keys stage)
+                       collect key
+                       collect (getf complete key)))))
+
+(defun plist-merge (base additions)
+  "Return BASE with every key of ADDITIONS added or replaced."
+  (let ((merged (copy-list base)))
+    (loop for (key value) on additions by #'cddr
+          do (if (member key merged)
+                 (setf (getf merged key) value)
+                 (setf merged (list* key value merged))))
+    merged))
+
+(defun photo-job-apply-grade (photo grade &optional (disabled-stages nil
+                                                     disabled-supplied-p))
+  "Merge the validated GRADE plist into PHOTO's overrides.
+
+When DISABLED-STAGES is supplied it replaces the photograph's bypass list,
+so pasting a grade also carries which nodes were switched off."
+  (processing-plist-validate grade)
+  (setf (photo-job-overrides photo)
+        (plist-merge (photo-job-overrides photo) grade))
+  (when disabled-supplied-p
+    (setf (photo-job-disabled-stages photo)
+          (copy-list (disabled-stages-validate disabled-stages))))
+  photo)
+
+(defun next-still-preset-name (project photo)
+  "Return an unused gallery name like \"Still 003 (photo)\" for PROJECT."
+  (let ((taken (mapcar #'processing-preset-name (project-presets project)))
+        (source (pathname-name (photo-job-input-path photo))))
+    (loop for index from 1
+          for candidate = (format nil "Still ~3,'0D (~A)" index source)
+          unless (member candidate taken :test #'string-equal)
+            return candidate)))
 
 (defun project->sexp (project)
   "Convert PROJECT to its portable, versioned S-expression representation."
@@ -308,7 +434,11 @@
                                    base-directory)))
   (project-resolve-lut-path (project-defaults project) base-directory)
   (dolist (preset (project-presets project))
-    (project-resolve-lut-path (processing-preset-settings preset) base-directory))
+    (project-resolve-lut-path (processing-preset-settings preset) base-directory)
+    (when (processing-preset-source-photo preset)
+      (setf (processing-preset-source-photo preset)
+            (project-resolve-pathname
+             (processing-preset-source-photo preset) base-directory))))
   (dolist (photo (project-photos project))
     (setf (photo-job-input-path photo)
           (project-resolve-pathname (photo-job-input-path photo)
