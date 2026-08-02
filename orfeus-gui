@@ -3,16 +3,19 @@ set -eu
 
 cd "$(dirname "$0")"
 
-if [ "${IN_NIX_SHELL:-}" = "" ]; then
-  exec nix develop --command ./orfeus-gui "$@"
+if [ "${ORFEUS_NIX_LAUNCH:-}" != "1" ]; then
+  exec env ORFEUS_NIX_LAUNCH=1 nix develop --command ./orfeus-gui "$@"
 fi
 
 if [ ! -f native/target/release/liborfeus_native.so ]; then
   cargo build --release --manifest-path native/Cargo.toml
 fi
-if [ ! -f native/build/liborfeus_gui_preview.so ]; then
-  make gui-native
+
+fltk_bridge="${ORFEUS_FLTK_SOURCE}/build/libcl_fltk_bridge.so"
+if [ ! -f "$fltk_bridge" ] || ldd "$fltk_bridge" 2>/dev/null | grep -q 'not found'; then
+  make -B -C "$ORFEUS_FLTK_SOURCE" cl-fltk-bridge
 fi
+make gui-native
 
 exec sbcl --no-userinit --non-interactive \
   --eval '(require :asdf)' \
