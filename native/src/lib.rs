@@ -409,9 +409,12 @@ where
 }
 
 /// Return the C ABI version implemented by this library.
+///
+/// Version 2 adds `orfeus_raw_render_v2` with an opt-in decode cache while
+/// keeping every version 1 entry point unchanged.
 #[unsafe(no_mangle)]
 pub extern "C" fn orfeus_bridge_abi_version() -> u32 {
-    1
+    2
 }
 
 /// Read `OriginalRawFileName` from a classic TIFF/DNG into a caller buffer.
@@ -504,6 +507,39 @@ pub unsafe extern "C" fn orfeus_raw_render_v1(
     error_buffer: *mut c_char,
     error_capacity: usize,
 ) -> i32 {
+    // SAFETY: The v2 entry point upholds the identical contract.
+    unsafe {
+        orfeus_raw_render_v2(
+            input_path,
+            output_path,
+            settings,
+            render::CACHE_NONE,
+            error_buffer,
+            error_capacity,
+        )
+    }
+}
+
+/// Render like `orfeus_raw_render_v1`, optionally reusing decoded scene data.
+///
+/// `cache_mode` 0 always decodes the input fresh. Mode 1 serves repeated
+/// renders of an unchanged input file from a small in-process cache of decoded
+/// scene-linear images, which interactive frontends use to re-render quickly
+/// while adjusting settings. The cache key covers path, size, and modification
+/// time.
+///
+/// # Safety
+///
+/// Identical to `orfeus_raw_render_v1`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn orfeus_raw_render_v2(
+    input_path: *const c_char,
+    output_path: *const c_char,
+    settings: *const render::RenderSettingsV1,
+    cache_mode: u32,
+    error_buffer: *mut c_char,
+    error_capacity: usize,
+) -> i32 {
     // SAFETY: Pointer validation and dereferences remain inside the panic boundary.
     unsafe {
         ffi_result(error_buffer, error_capacity, || {
@@ -512,7 +548,7 @@ pub unsafe extern "C" fn orfeus_raw_render_v1(
             }
             let input = path_from_c(input_path)?;
             let output = path_from_c(output_path)?;
-            render::render(input, output, &*settings)
+            render::render(input, output, &*settings, cache_mode)
         })
     }
 }
@@ -590,7 +626,7 @@ mod tests {
 
     #[test]
     fn reports_current_abi_version() {
-        assert_eq!(orfeus_bridge_abi_version(), 1);
+        assert_eq!(orfeus_bridge_abi_version(), 2);
         assert_eq!(orfeus_raw_render_capabilities_v1(), 1 | 2 | 4 | 16);
     }
 

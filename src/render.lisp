@@ -191,6 +191,7 @@ The output is published atomically and INPUT-PATHNAME is never modified."
 
 (defun render-native-photo (input-pathname output-pathname settings
                             &key max-width max-height jpeg-quality grain-seed
+                              cache-p
                               (report-input-pathname input-pathname))
   (multiple-value-bind (lens-profile focal-reducer lens-crop-factor)
       (resolve-lens-profile-alias
@@ -198,6 +199,7 @@ The output is published atomically and INPUT-PATHNAME is never modified."
     (labels ((invoke (effective-settings)
                (native-raw-render
                 input-pathname output-pathname
+              :cache-p cache-p
               :output-format (render-output-format output-pathname)
               :exposure (processing-settings-exposure effective-settings)
               :kelvin
@@ -256,13 +258,15 @@ The output is published atomically and INPUT-PATHNAME is never modified."
                      &key (if-exists :error)
                        (max-width 0) (max-height 0)
                        (jpeg-quality 92) (grain-seed 0)
-                       (preserve-metadata-p t))
+                       (preserve-metadata-p t) cache-p)
   "Render INPUT-PATHNAME to JPEG or TIFF using PROCESSING-SETTINGS.
 
 This frontend-independent operation is shared by the CLI and GUI. It renders
 through the Rust bridge, optionally copies source metadata with ExifTool, and
 publishes the completed file atomically. MAX-WIDTH and MAX-HEIGHT bound preview
-output dimensions; zero leaves a dimension unconstrained."
+output dimensions; zero leaves a dimension unconstrained. CACHE-P asks the
+bridge to reuse decoded scene data across renders of the same unchanged input;
+interactive frontends enable it for the photograph under adjustment."
   (check-type settings processing-settings)
   (when (pathname-same-file-p input-pathname output-pathname)
     (error 'raw-render-error
@@ -293,7 +297,8 @@ output dimensions; zero leaves a dimension unconstrained."
                  :grain-seed grain-seed
                  :max-width (or max-width 0)
                  :max-height (or max-height 0)
-                 :jpeg-quality jpeg-quality)))
+                 :jpeg-quality jpeg-quality
+                 :cache-p cache-p)))
              (when preserve-metadata-p
                (render-copy-metadata input-pathname temporary))
              (render-publish temporary output-pathname publish-policy)
@@ -304,7 +309,7 @@ output dimensions; zero leaves a dimension unconstrained."
 (defun render-preview (input-pathname output-pathname settings
                        &key (if-exists :error)
                          (max-width 1600) (max-height 1200)
-                         (jpeg-quality 88) (grain-seed 0))
+                         (jpeg-quality 88) (grain-seed 0) cache-p)
   "Render a bounded JPEG preview without metadata-copy overhead."
   (render-photo input-pathname output-pathname settings
                 :max-width max-width
@@ -312,4 +317,5 @@ output dimensions; zero leaves a dimension unconstrained."
                 :jpeg-quality jpeg-quality
                 :grain-seed grain-seed
                 :preserve-metadata-p nil
-                :if-exists if-exists))
+                :if-exists if-exists
+                :cache-p cache-p))

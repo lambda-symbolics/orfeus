@@ -58,6 +58,14 @@
   (error-buffer :pointer)
   (error-capacity :size))
 
+(defcfun ("orfeus_raw_render_v2" %raw-render-v2) :int32
+  (input-path :string)
+  (output-path :string)
+  (settings (:pointer (:struct render-settings-v1)))
+  (cache-mode :uint32)
+  (error-buffer :pointer)
+  (error-capacity :size))
+
 (defparameter *native-error-buffer-size* 1024
   "Bytes reserved for a diagnostic returned by the Rust bridge.")
 
@@ -134,7 +142,7 @@
                             lens-profile-model focal-reducer lens-crop-factor
                             lut-path lut-strength grain-amount grain-size
                             (grain-seed 0) (max-width 0) (max-height 0)
-                            (jpeg-quality 92) output-format)
+                            (jpeg-quality 92) output-format cache-p)
   (native-library-load)
   (native-render-require-compatible)
   (labels ((invoke (lut-pointer lens-pointer)
@@ -189,16 +197,16 @@
                          (sb-int:with-float-traps-masked
                              (:invalid :divide-by-zero :overflow
                               :underflow :inexact)
-                           (%raw-render-v1
+                           (%raw-render-v2
                             (namestring input-pathname)
                             (namestring output-pathname)
-                            settings error-buffer
+                            settings (if cache-p 1 0) error-buffer
                             *native-error-buffer-size*))
                          #-sbcl
-                         (%raw-render-v1
+                         (%raw-render-v2
                           (namestring input-pathname)
                           (namestring output-pathname)
-                          settings error-buffer
+                          settings (if cache-p 1 0) error-buffer
                           *native-error-buffer-size*)))
                    (unless (zerop status)
                      (error 'raw-render-error

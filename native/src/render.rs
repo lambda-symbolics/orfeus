@@ -4,7 +4,7 @@ use std::io::{BufRead, BufReader, BufWriter, Seek, Write};
 use std::os::unix::fs::MetadataExt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use image::codecs::tiff::TiffEncoder;
@@ -24,6 +24,11 @@ pub const OUTPUT_JPEG: u32 = 1;
 pub const OUTPUT_TIFF: u32 = 2;
 pub const FLAG_LENS_DISTORTION: u32 = 1;
 pub const FLAG_LENS_TCA: u32 = 2;
+pub const CACHE_NONE: u32 = 0;
+pub const CACHE_USE: u32 = 1;
+/// Full-resolution scene-linear images retained for interactive re-rendering.
+/// Two slots cover the selected photograph plus its neutral Before preview.
+const DECODE_CACHE_CAPACITY: usize = 2;
 const KNOWN_FLAGS: u32 = FLAG_LENS_DISTORTION | FLAG_LENS_TCA;
 const MAX_LUT_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_LUT_SIZE: usize = 65;
@@ -1134,36 +1139,52 @@ fn native_downscale_bounds(orientation: u16, max_width: u32, max_height: u32) ->
 }
 
 fn downscale(image: RgbImage, max_width: u32, max_height: u32) -> RgbImage {
+    match downscale_from(&image.data, image.width, image.height, max_width, max_height) {
+        Some(scaled) => scaled,
+        None => image,
+    }
+}
+
+/// Area-averages SOURCE into the bounded size, or returns None when the
+/// bounds do not require shrinking. Reading borrowed pixels lets bounded
+/// renders start straight from the shared decode cache without copying it.
+fn downscale_from(
+    source: &[f32],
+    source_width: usize,
+    source_height: usize,
+    max_width: u32,
+    max_height: u32,
+) -> Option<RgbImage> {
     if max_width == 0 && max_height == 0 {
-        return image;
+        return None;
     }
     let sx = if max_width == 0 {
         1.0
     } else {
-        max_width as f32 / image.width as f32
+        max_width as f32 / source_width as f32
     };
     let sy = if max_height == 0 {
         1.0
     } else {
-        max_height as f32 / image.height as f32
+        max_height as f32 / source_height as f32
     };
     let scale = sx.min(sy).min(1.0);
     if scale >= 1.0 {
-        return image;
+        return None;
     }
-    let width = ((image.width as f32 * scale).round() as usize).max(1);
-    let height = ((image.height as f32 * scale).round() as usize).max(1);
+    let width = ((source_width as f32 * scale).round() as usize).max(1);
+    let height = ((source_height as f32 * scale).round() as usize).max(1);
     // Minification uses exact area averaging: each output pixel integrates the
     // source cells it covers, which suppresses the aliasing that point-sampled
     // bilinear reduction produced on fine detail.
-    let x_coverage = area_coverage(image.width, width);
-    let y_coverage = area_coverage(image.height, height);
-    let mut horizontal = vec![0.0_f32; width * image.height * 3];
+    let x_coverage = area_coverage(source_width, width);
+    let y_coverage = area_coverage(source_height, height);
+    let mut horizontal = vec![0.0_f32; width * source_height * 3];
     horizontal
         .par_chunks_mut(width * 3)
         .enumerate()
         .for_each(|(y, output_row)| {
-            let source_row = &image.data[y * image.width * 3..(y + 1) * image.width * 3];
+            let source_row = &source[y * source_width * 3..(y + 1) * source_width * 3];
             for (x, pixel) in output_row.as_chunks_mut::<3>().0.iter_mut().enumerate() {
                 let (start, ref weights) = x_coverage[x];
                 let mut sum = [0.0_f32; 3];
@@ -1198,7 +1219,7 @@ fn downscale(image: RgbImage, max_width: u32, max_height: u32) -> RgbImage {
                 *pixel = sum;
             }
         });
-    output
+    Some(output)
 }
 
 /// Per-output-pixel source range and normalized area weights for one axis.
@@ -1417,10 +1438,36 @@ fn atomic_encode(
     result
 }
 
-pub fn render(input: &Path, output: &Path, settings: &RenderSettingsV1) -> Result<(), Error> {
-    let profiling = std::env::var_os("ORFEUS_PROFILE").is_some();
-    let render_started = Instant::now();
-    let mut stage_started = render_started;
+/// Scene-linear sRGB pixels and the source description needed to render them.
+struct DecodedRaw {
+    width: usize,
+    height: usize,
+    data: Vec<f32>,
+    orientation: u16,
+    make: String,
+    model: String,
+    lens_name: String,
+    focal: f32,
+}
+
+type DecodeCacheKey = (PathBuf, SystemTime, u64);
+
+fn decode_cache() -> &'static Mutex<Vec<(DecodeCacheKey, Arc<DecodedRaw>)>> {
+    static CACHE: OnceLock<Mutex<Vec<(DecodeCacheKey, Arc<DecodedRaw>)>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn decode_cache_key(input: &Path) -> Result<DecodeCacheKey, Error> {
+    let metadata = fs::metadata(input)?;
+    Ok((
+        input.to_path_buf(),
+        metadata.modified()?,
+        metadata.len(),
+    ))
+}
+
+fn decode_linear_srgb(input: &Path, profiling: bool) -> Result<DecodedRaw, Error> {
+    let mut stage_started = Instant::now();
     macro_rules! profile_stage {
         ($name:literal) => {
             if profiling {
@@ -1433,12 +1480,6 @@ pub fn render(input: &Path, output: &Path, settings: &RenderSettingsV1) -> Resul
                 stage_started = now;
             }
         };
-    }
-    settings.validate()?;
-    if same_file(input, output)? {
-        return Err(Error::InvalidArgument(
-            "input and output refer to the same file",
-        ));
     }
     let source = RawSource::new(input)?;
     let loader = RawLoader::new();
@@ -1472,28 +1513,117 @@ pub fn render(input: &Path, output: &Path, settings: &RenderSettingsV1) -> Resul
     let white_balance = raw.wb_coeffs;
     let linear_srgb = intermediate_to_linear_srgb(developed, &raw.color_matrix, white_balance)
         .map_err(Error::Color)?;
-    let mut image = RgbImage {
+    profile_stage!("camera-to-srgb");
+    Ok(DecodedRaw {
         width: linear_srgb.width,
         height: linear_srgb.height,
         data: linear_srgb.data,
+        orientation: metadata.exif.orientation.unwrap_or(1),
+        make: metadata.make.clone(),
+        model: metadata.model.clone(),
+        lens_name: metadata
+            .lens
+            .as_ref()
+            .map_or_else(String::new, |lens| lens.lens_name.clone()),
+        focal: metadata
+            .exif
+            .focal_length
+            .as_ref()
+            .map_or(0.0, |value| value.as_f32()),
+    })
+}
+
+fn decoded_for_render(
+    input: &Path,
+    cache_mode: u32,
+    profiling: bool,
+) -> Result<Arc<DecodedRaw>, Error> {
+    if cache_mode != CACHE_USE {
+        return Ok(Arc::new(decode_linear_srgb(input, profiling)?));
+    }
+    let key = decode_cache_key(input)?;
+    if let Some(cached) = {
+        let mut cache = decode_cache().lock().expect("decode cache poisoned");
+        if let Some(position) = cache.iter().position(|(entry, _)| *entry == key) {
+            let entry = cache.remove(position);
+            let decoded = entry.1.clone();
+            cache.push(entry);
+            Some(decoded)
+        } else {
+            None
+        }
+    } {
+        if profiling {
+            eprintln!("orfeus-profile stage=decode-cache hit=true");
+        }
+        return Ok(cached);
+    }
+    let decoded = Arc::new(decode_linear_srgb(input, profiling)?);
+    let mut cache = decode_cache().lock().expect("decode cache poisoned");
+    cache.retain(|(entry, _)| *entry != key);
+    if cache.len() >= DECODE_CACHE_CAPACITY {
+        cache.remove(0);
+    }
+    cache.push((key, decoded.clone()));
+    Ok(decoded)
+}
+
+pub fn render(
+    input: &Path,
+    output: &Path,
+    settings: &RenderSettingsV1,
+    cache_mode: u32,
+) -> Result<(), Error> {
+    let profiling = std::env::var_os("ORFEUS_PROFILE").is_some();
+    let render_started = Instant::now();
+    settings.validate()?;
+    if !matches!(cache_mode, CACHE_NONE | CACHE_USE) {
+        return Err(Error::InvalidArgument("unsupported decode cache mode"));
+    }
+    if same_file(input, output)? {
+        return Err(Error::InvalidArgument(
+            "input and output refer to the same file",
+        ));
+    }
+    let decoded = decoded_for_render(input, cache_mode, profiling)?;
+    let mut stage_started = Instant::now();
+    macro_rules! profile_stage {
+        ($name:literal) => {
+            if profiling {
+                let now = Instant::now();
+                eprintln!(
+                    "orfeus-profile stage={} milliseconds={:.3}",
+                    $name,
+                    now.duration_since(stage_started).as_secs_f64() * 1000.0
+                );
+                stage_started = now;
+            }
+        };
+    }
+    let orientation = decoded.orientation;
+    let (native_max_width, native_max_height) =
+        native_downscale_bounds(orientation, settings.max_width, settings.max_height);
+    // Downscaling first commutes with the linear white adaptation and exposure
+    // gains, and bounded renders then read the shared decode cache directly
+    // instead of copying the full-resolution image.
+    let mut image = match downscale_from(
+        &decoded.data,
+        decoded.width,
+        decoded.height,
+        native_max_width,
+        native_max_height,
+    ) {
+        Some(scaled) => scaled,
+        None => RgbImage {
+            width: decoded.width,
+            height: decoded.height,
+            data: decoded.data.clone(),
+        },
     };
+    profile_stage!("downscale");
     apply_white_adaptation(&mut image, settings.kelvin, settings.tint);
     apply_exposure(&mut image, settings.exposure_ev);
     profile_stage!("color");
-    let orientation = metadata.exif.orientation.unwrap_or(1);
-    let (native_max_width, native_max_height) =
-        native_downscale_bounds(orientation, settings.max_width, settings.max_height);
-    image = downscale(image, native_max_width, native_max_height);
-    profile_stage!("downscale");
-    let lens_name = metadata
-        .lens
-        .as_ref()
-        .map_or("", |lens| lens.lens_name.as_str());
-    let focal = metadata
-        .exif
-        .focal_length
-        .as_ref()
-        .map_or(0.0, |value| value.as_f32());
     let explicit_profile = if settings.lens_profile_model.is_null() {
         None
     } else {
@@ -1506,10 +1636,10 @@ pub fn render(input: &Path, output: &Path, settings: &RenderSettingsV1) -> Resul
     apply_lens(
         &mut image,
         &LensCorrectionOptions {
-            make: &metadata.make,
-            model: &metadata.model,
-            lens_name,
-            focal,
+            make: &decoded.make,
+            model: &decoded.model,
+            lens_name: &decoded.lens_name,
+            focal: decoded.focal,
             flags: settings.flags,
             strength: settings.lens_correction_strength,
             explicit_profile,

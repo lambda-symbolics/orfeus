@@ -90,6 +90,22 @@ int32_t orfeus_raw_render_v1(const char *input_path,
                              char *error_buffer,
                              size_t error_capacity);
 
+enum orfeus_render_cache_mode {
+    ORFEUS_RENDER_CACHE_NONE = 0,
+    ORFEUS_RENDER_CACHE_USE = 1
+};
+
+/* Renders like orfeus_raw_render_v1. Cache mode ORFEUS_RENDER_CACHE_USE keeps
+   a small in-process cache of decoded scene-linear images keyed by input path,
+   size, and modification time so interactive setting changes skip RAW
+   decoding. Batch work should pass ORFEUS_RENDER_CACHE_NONE. */
+int32_t orfeus_raw_render_v2(const char *input_path,
+                             const char *output_path,
+                             const struct orfeus_render_settings_v1 *settings,
+                             uint32_t cache_mode,
+                             char *error_buffer,
+                             size_t error_capacity);
+
 int32_t orfeus_dng_original_filename(const char *dng_path,
                                      char *filename_buffer,
                                      size_t filename_capacity,
