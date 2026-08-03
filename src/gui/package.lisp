@@ -3,6 +3,7 @@
   (:import-from #:orfeus
                 #:export-settings-jpeg-quality #:export-settings-max-height
                 #:export-settings-max-width #:export-settings-preserve-metadata-p
+                #:export-settings-timestamp-filenames-p
                 #:make-photo-job #:make-processing-preset
                 #:make-processing-settings #:make-project
                 #:photo-capture-description #:photo-extract-embedded-preview
@@ -17,17 +18,27 @@
                 #:project-output-directory #:project-photos #:project-presets
                 #:project-read #:project-render #:project-write
                 #:render-photo-job #:render-preview)
-  (:export #:gui-model #:gui-model-add-photos #:gui-model-apply-preset
-           #:gui-model-copy-grade #:gui-model-edit-target #:gui-model-grab-still
-           #:gui-model-paste-grade #:gui-model-project #:gui-model-remove-selected
+  (:export #:gui-model #:gui-model-add-photos #:gui-model-add-node
+           #:gui-model-apply-preset #:gui-model-apply-preset-graph
+           #:gui-model-copy-grade #:gui-model-copy-graph
+           #:gui-model-delete-node #:gui-model-display-graph
+           #:gui-model-edit-target #:gui-model-ensure-graph
+           #:gui-model-grab-still #:gui-model-move-node
+           #:gui-model-node-for-key
+           #:gui-model-paste-grade #:gui-model-paste-graph
+           #:gui-model-preset-graph
+           #:gui-model-project #:gui-model-remove-selected
            #:gui-model-render-settings #:gui-model-reset-selected
            #:gui-model-save-preset
+           #:gui-model-selected-graph-node
            #:gui-model-selected-index #:gui-model-selected-indices
            #:gui-model-selected-job #:gui-model-selected-jobs
+           #:gui-model-selected-node
            #:gui-model-selected-settings #:gui-model-set-selected-indices
+           #:gui-model-set-node-params
            #:gui-model-setting #:gui-model-set-setting
            #:gui-model-stage-adjusted-p #:gui-model-stage-bypassed-p
-           #:gui-model-toggle-stage
+           #:gui-model-toggle-node #:gui-model-toggle-stage
            #:main #:make-gui-model #:run-gui))
 
 (in-package #:orfeus/gui)

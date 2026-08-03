@@ -1,11 +1,15 @@
 (in-package #:orfeus/gui)
 
 (defstruct gui-model
-  "Frontend state that does not belong in an Orfeus project."
+  "Frontend state that does not belong in an Orfeus project.
+
+SELECTED-NODE holds the graph node object under edit; node structs survive
+renumbering, so the selection stays valid across graph edits."
   project
   (selected-index 0 :type fixnum)
   (selected-indices '() :type list)
   (edit-target :photo :type (member :photo :defaults))
+  (selected-node nil)
   project-path)
 
 (defun gui-bundled-lut-paths ()
@@ -172,22 +176,26 @@
       preset)))
 
 (defun gui-model-apply-preset (model name)
-  "Apply named preset NAME to all selected photos and return the changed count."
+  "Apply named preset NAME to all selected photos and return the changed count.
+
+Presets carrying a node graph apply it wholesale; flat presets keep the
+override semantics."
   (let* ((project (gui-model-project model))
          (preset (find name (project-presets project)
                        :test #'string-equal :key #'processing-preset-name)))
     (unless preset
       (error "Unknown preset ~S." name))
-    (let ((overrides (orfeus::processing-settings->sexp
-                      (processing-preset-settings preset)))
-          (jobs (or (gui-model-selected-jobs model)
-                    (let ((job (gui-model-selected-job model)))
-                      (and job (list job))))))
-      (dolist (job jobs)
-        (setf (photo-job-overrides job) (copy-list overrides)
-              (photo-job-disabled-stages job)
-              (copy-list (processing-preset-disabled-stages preset))))
-      (length jobs))))
+    (if (orfeus:processing-preset-graph preset)
+        (gui-model-apply-preset-graph model preset)
+        (let ((overrides (orfeus::processing-settings->sexp
+                          (processing-preset-settings preset)))
+              (jobs (gui-model-acting-jobs model)))
+          (dolist (job jobs)
+            (setf (photo-job-overrides job) (copy-list overrides)
+                  (photo-job-disabled-stages job)
+                  (copy-list (processing-preset-disabled-stages preset))
+                  (photo-job-graph job) nil))
+          (length jobs)))))
 
 (defun setting-reader (key)
   (ecase key
@@ -213,8 +221,20 @@
     (:grain-size #'orfeus:processing-settings-grain-size)))
 
 (defun gui-model-setting (model key)
-  "Read one effective setting from MODEL."
-  (funcall (setting-reader key) (gui-model-selected-settings model)))
+  "Read one effective setting from MODEL.
+
+On a graph-graded photo the value comes from the node a control for KEY
+addresses: the selected node when it covers the key, otherwise the most
+downstream node of that stage, otherwise the stage's identity value."
+  (let ((job (gui-model-selected-job model)))
+    (if (and job (photo-job-graph job)
+             (eq (gui-model-edit-target model) :photo))
+        (let ((node (gui-model-node-for-key model key)))
+          (if node
+              (getf (orfeus:graph-node-params node) key
+                    (getf orfeus::*stage-identity-plist* key))
+              (getf orfeus::*stage-identity-plist* key)))
+        (funcall (setting-reader key) (gui-model-selected-settings model)))))
 
 (defun plist-put (plist key value)
   (let ((copy (copy-list plist)))
@@ -256,17 +276,33 @@
                 (member value '("" "0" "false" "nil")
                         :test #'string-equal)))))
 
+(defun stage-of-setting-key (key)
+  (loop for (stage keys) in orfeus::*grade-stages*
+        when (member key keys) return stage))
+
 (defun gui-model-set-setting (model key value)
-  "Set KEY to VALUE at MODEL's current :PHOTO or :DEFAULTS edit target."
+  "Set KEY to VALUE at MODEL's current :PHOTO or :DEFAULTS edit target.
+
+Graph-graded photos route the edit to the node a control for KEY addresses;
+when no node of that stage exists yet, one is created at the end of the
+chain, exactly like adding a node before dragging its slider."
   (when (member key '(:lens-correction-p
                       :chromatic-aberration-correction-p))
     (setf value (gui-boolean-value value)))
-  (if (eq (gui-model-edit-target model) :defaults)
-      (set-default-setting (project-defaults (gui-model-project model)) key value)
-      (let ((job (or (gui-model-selected-job model)
-                     (error "Cannot edit a photo in an empty project."))))
-        (setf (photo-job-overrides job)
-              (plist-put (photo-job-overrides job) key value))))
+  (cond
+    ((eq (gui-model-edit-target model) :defaults)
+     (set-default-setting (project-defaults (gui-model-project model))
+                          key value))
+    (t
+     (let ((job (or (gui-model-selected-job model)
+                    (error "Cannot edit a photo in an empty project."))))
+       (if (photo-job-graph job)
+           (let ((node (or (gui-model-node-for-key model key)
+                           (gui-model-add-node model
+                                               (stage-of-setting-key key)))))
+             (gui-model-set-node-params model node (list key value)))
+           (setf (photo-job-overrides job)
+                 (plist-put (photo-job-overrides job) key value))))))
   value)
 
 (defun gui-model-acting-jobs (model)
@@ -276,10 +312,12 @@
         (and job (list job)))))
 
 (defun gui-model-reset-selected (model)
-  "Clear overrides and stage bypasses from all selected photos."
+  "Clear overrides, stage bypasses, and node graphs from selected photos."
   (dolist (job (gui-model-acting-jobs model))
     (setf (photo-job-overrides job) '()
-          (orfeus:photo-job-disabled-stages job) '()))
+          (orfeus:photo-job-disabled-stages job) '()
+          (photo-job-graph job) nil))
+  (setf (gui-model-selected-node model) nil)
   model)
 
 (defun gui-model-render-settings (model)
@@ -341,14 +379,18 @@ Returns :BYPASSED, :ENABLED, or :NONE without a photograph."
                              (getf orfeus::*stage-identity-plist* key)))))))
 
 (defun gui-model-grab-still (model)
-  "Capture the rendered look as an auto-named still preset, or NIL."
+  "Capture the current grade as an auto-named still preset, or NIL.
+
+The still stores the full node graph (deriving one for flat photos), so
+applying it reproduces the grade node for node."
   (let ((job (gui-model-selected-job model)))
     (when job
       (let* ((project (gui-model-project model))
              (preset (orfeus:make-processing-preset
                       :name (orfeus:next-still-preset-name project job)
                       :settings (orfeus:photo-render-settings project job)
-                      :source-photo (photo-job-input-path job))))
+                      :source-photo (photo-job-input-path job)
+                      :graph (gui-model-copy-graph model))))
         (setf (project-presets project)
               (append (project-presets project) (list preset)))
         preset))))
@@ -366,6 +408,160 @@ Returns :BYPASSED, :ENABLED, or :NONE without a photograph."
     (dolist (job jobs)
       (orfeus:photo-job-apply-grade job grade disabled-stages))
     (length jobs)))
+
+;;; Node graph editing.
+
+(defun gui-model-display-graph (model)
+  "Return the graph to draw for the selected photo, without converting it.
+
+Photographs still on flat settings get an equivalent throwaway graph."
+  (let ((job (gui-model-selected-job model)))
+    (when job
+      (or (photo-job-graph job)
+          (orfeus:settings->graph (gui-model-selected-settings model)
+                                  (photo-job-disabled-stages job))))))
+
+(defun gui-model-ensure-graph (model)
+  "Convert the selected photo to graph grading when it is still flat."
+  (let ((job (gui-model-selected-job model)))
+    (when job
+      (or (photo-job-graph job)
+          (let ((graph (orfeus:settings->graph
+                        (gui-model-selected-settings model)
+                        (photo-job-disabled-stages job))))
+            (setf (photo-job-graph job) graph
+                  (photo-job-overrides job) '()
+                  (orfeus:photo-job-disabled-stages job) '())
+            graph)))))
+
+(defun gui-model-selected-graph-node (model)
+  "Return the selected node when it still belongs to the photo's graph."
+  (let ((graph (let ((job (gui-model-selected-job model)))
+                 (and job (photo-job-graph job))))
+        (node (gui-model-selected-node model)))
+    (when (and graph node
+               (member node (orfeus:processing-graph-nodes graph)))
+      node)))
+
+(defun gui-node-covers-key-p (node key)
+  (and (orfeus:graph-node-filter-p node)
+       (member key (orfeus:grade-stage-keys (orfeus:graph-node-kind node)))
+       t))
+
+(defun gui-model-node-for-key (model key)
+  "Return the node a sidebar control for KEY reads and writes.
+
+The selected node wins when its stage covers KEY; otherwise the most
+downstream node of that stage."
+  (let ((job (gui-model-selected-job model)))
+    (when (and job (photo-job-graph job))
+      (let ((selected (gui-model-selected-graph-node model)))
+        (if (and selected (gui-node-covers-key-p selected key))
+            selected
+            (orfeus:graph-last-node-covering-key (photo-job-graph job) key))))))
+
+(defun gui-model-add-node (model kind &key after params)
+  "Insert a KIND node into the selected photo's graph and select it.
+
+Without AFTER, film nodes append at the output and every other kind lands at
+the end of the scene-linear chain. Signals INVALID-PROJECT-DATA when the
+placement breaks the film-domain rules."
+  (let ((graph (gui-model-ensure-graph model)))
+    (when graph
+      (let* ((after-id (or after
+                           (if (eq kind :film)
+                               (orfeus:processing-graph-output graph)
+                               (orfeus:graph-tail-linear-node-id graph))))
+             (node (orfeus:graph-insert-node graph after-id kind
+                                             :params params)))
+        (setf (gui-model-selected-node model) node)
+        node))))
+
+(defun gui-model-delete-node (model node)
+  "Delete NODE from the selected photo's graph."
+  (let ((job (gui-model-selected-job model)))
+    (when (and job (photo-job-graph job))
+      (orfeus:graph-delete-node (photo-job-graph job)
+                                (orfeus:graph-node-id node))
+      (when (eq node (gui-model-selected-node model))
+        (setf (gui-model-selected-node model) nil))
+      t)))
+
+(defun gui-model-move-node (model node direction)
+  "Move NODE one step :EARLIER or :LATER along its chain; true on success."
+  (let ((job (gui-model-selected-job model)))
+    (when (and job (photo-job-graph job))
+      (let ((graph (photo-job-graph job)))
+        (ecase direction
+          (:earlier (orfeus:graph-swap-with-upstream
+                     graph (orfeus:graph-node-id node)))
+          (:later
+           (let ((consumers (orfeus:graph-consumers
+                             graph (orfeus:graph-node-id node))))
+             (when (and (= 1 (length consumers))
+                        (not (orfeus:graph-node-blend-p (first consumers))))
+               (orfeus:graph-swap-with-upstream
+                graph (orfeus:graph-node-id (first consumers)))))))))))
+
+(defun gui-model-toggle-node (model node)
+  "Toggle NODE's bypass; returns :BYPASSED or :ENABLED."
+  (declare (ignore model))
+  (setf (orfeus:graph-node-bypassed-p node)
+        (not (orfeus:graph-node-bypassed-p node)))
+  (if (orfeus:graph-node-bypassed-p node) :bypassed :enabled))
+
+(defun gui-model-set-node-params (model node new-params)
+  "Merge NEW-PARAMS into NODE's parameters, validating the graph."
+  (let* ((job (gui-model-selected-job model))
+         (graph (and job (photo-job-graph job)))
+         (previous (orfeus:graph-node-params node)))
+    (setf (orfeus:graph-node-params node)
+          (orfeus::plist-merge previous new-params))
+    (when graph
+      (handler-case (orfeus:graph-validate graph)
+        (error (condition)
+          (setf (orfeus:graph-node-params node) previous)
+          (error condition))))
+    node))
+
+(defun gui-model-copy-graph (model)
+  "Return an independent copy of the selected photo's grading graph, or NIL."
+  (let ((graph (gui-model-display-graph model)))
+    (when graph
+      (orfeus:graph-copy graph))))
+
+(defun graph-with-bypassed-kinds (graph kinds)
+  (let ((copy (orfeus:graph-copy graph)))
+    (dolist (node (orfeus:processing-graph-nodes copy))
+      (when (member (orfeus:graph-node-kind node) kinds)
+        (setf (orfeus:graph-node-bypassed-p node) t)))
+    copy))
+
+(defun gui-model-paste-graph (model graph &key bypass-kinds)
+  "Set an independent copy of GRAPH on every selected photo.
+
+BYPASS-KINDS lists node kinds switched off in the applied copies, so a grade
+can be taken without, say, its optics or white balance. Returns the count."
+  (let ((jobs (gui-model-acting-jobs model))
+        (template (if bypass-kinds
+                      (graph-with-bypassed-kinds graph bypass-kinds)
+                      graph)))
+    (dolist (job jobs)
+      (setf (photo-job-graph job) (orfeus:graph-copy template)
+            (photo-job-overrides job) '()
+            (orfeus:photo-job-disabled-stages job) '()))
+    (length jobs)))
+
+(defun gui-model-preset-graph (preset)
+  "Return PRESET's graph, deriving one from flat settings when needed."
+  (or (orfeus:processing-preset-graph preset)
+      (orfeus:settings->graph (processing-preset-settings preset)
+                              (processing-preset-disabled-stages preset))))
+
+(defun gui-model-apply-preset-graph (model preset &key bypass-kinds)
+  "Apply PRESET's node graph to the whole selection; returns the count."
+  (gui-model-paste-graph model (gui-model-preset-graph preset)
+                         :bypass-kinds bypass-kinds))
 
 (defun gui-photo-output-path (model job)
   "Return JOB's render output using the shared core project semantics."
