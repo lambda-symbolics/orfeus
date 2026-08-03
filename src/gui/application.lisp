@@ -1210,10 +1210,33 @@
                       (after-graph-edit
                        (format nil "Node graph pasted to ~D photo~:P" count))
                       (set-status "No photograph selected"))))))
+           (merge-local-stills ()
+             ;; The per-user gallery joins the project's own stills; the
+             ;; project copy wins name collisions so saved projects stay
+             ;; authoritative.
+             (handler-case
+                 (dolist (preset (orfeus:still-store-list))
+                   (unless (find (processing-preset-name preset)
+                                 (project-presets project)
+                                 :key #'processing-preset-name
+                                 :test #'string-equal)
+                     (setf (project-presets project)
+                           (append (project-presets project)
+                                   (list preset)))))
+               (error (condition)
+                 (set-status (princ-to-string condition)))))
+           (persist-still (preset)
+             ;; The local gallery copy survives removable source media and
+             ;; unsaved projects.
+             (handler-case (orfeus:still-store-write preset)
+               (error (condition)
+                 (set-status (format nil "Still kept in project only: ~A"
+                                     condition)))))
            (grab-still ()
              (let ((preset (gui-model-grab-still model)))
                (if preset
                    (progn
+                     (persist-still preset)
                      (refresh-gallery)
                      (setf (cl-fltk:value preset-name-input)
                            (processing-preset-name preset))
@@ -1237,30 +1260,47 @@
                :type "jpg")
               preview-directory))
            (request-still-thumbnail (preset)
-             (let ((name (processing-preset-name preset))
-                   (source (processing-preset-source-photo preset)))
-               (when (and source (null (gethash name gallery-thumbs)))
-                 (let* ((output (still-thumbnail-pathname preset))
-                        (recipe (still-recipe preset))
-                        (graph-p (typep recipe 'orfeus:processing-graph)))
-                   (if (probe-file output)
-                       (setf (gethash name gallery-thumbs) output)
-                       (enqueue-gui-task
-                        background-queue :still
-                        (lambda ()
-                          (handler-case
-                              (progn
-                                (render-preview
-                                 source output
-                                 (if graph-p nil recipe)
-                                 :graph (when graph-p recipe)
-                                 :max-width *thumbnail-preview-size*
-                                 :max-height *thumbnail-preview-size*
-                                 :jpeg-quality 82
-                                 :if-exists :supersede)
-                                (queue-event queue
-                                             (list :still-thumb name output)))
-                            (error () nil)))))))))
+             (let* ((name (processing-preset-name preset))
+                    (source (processing-preset-source-photo preset))
+                    (stored (ignore-errors
+                              (orfeus:still-store-thumbnail-pathname name))))
+               (when (null (gethash name gallery-thumbs))
+                 (cond
+                   ((and source (probe-file source))
+                    (let* ((output (still-thumbnail-pathname preset))
+                           (recipe (still-recipe preset))
+                           (graph-p (typep recipe
+                                           'orfeus:processing-graph)))
+                      (if (probe-file output)
+                          (progn
+                            (when (and stored (not (probe-file stored)))
+                              (ignore-errors
+                                (uiop:copy-file output stored)))
+                            (setf (gethash name gallery-thumbs) output))
+                          (enqueue-gui-task
+                           background-queue :still
+                           (lambda ()
+                             (handler-case
+                                 (progn
+                                   (render-preview
+                                    source output
+                                    (if graph-p nil recipe)
+                                    :graph (when graph-p recipe)
+                                    :max-width *thumbnail-preview-size*
+                                    :max-height *thumbnail-preview-size*
+                                    :jpeg-quality 82
+                                    :if-exists :supersede)
+                                   (when stored
+                                     (ignore-errors
+                                       (uiop:copy-file output stored)))
+                                   (queue-event queue
+                                                (list :still-thumb name
+                                                      output)))
+                               (error () nil)))))))
+                   ;; Source gone (card ejected, file moved): fall back to
+                   ;; the persisted local copy of the thumbnail.
+                   ((and stored (probe-file stored))
+                    (setf (gethash name gallery-thumbs) stored))))))
            (refresh-gallery ()
              (when gallery-canvas
                (dolist (preset (project-presets project))
@@ -1371,10 +1411,45 @@
              (setf (project-presets project)
                    (remove preset (project-presets project)))
              (remhash (processing-preset-name preset) gallery-thumbs)
+             (ignore-errors
+               (orfeus:still-store-delete (processing-preset-name preset)))
              (setf gallery-selected nil)
              (refresh-gallery)
              (set-status (format nil "Deleted ~A"
                                  (processing-preset-name preset))))
+           (rename-still (preset)
+             (let* ((old-name (processing-preset-name preset))
+                    (answer (cl-fltk:input-dialog "Still name"
+                                                  :initial old-name)))
+               (when answer
+                 (let ((new-name (string-trim '(#\Space #\Tab) answer)))
+                   (cond
+                     ((zerop (length new-name)))
+                     ((string= new-name old-name))
+                     ((find new-name (project-presets project)
+                            :key #'processing-preset-name
+                            :test #'string-equal)
+                      (set-status
+                       (format nil "A still named ~A already exists"
+                               new-name)))
+                     (t
+                      (setf (processing-preset-name preset) new-name)
+                      (let ((thumb (gethash old-name gallery-thumbs)))
+                        (remhash old-name gallery-thumbs)
+                        (when thumb
+                          (setf (gethash new-name gallery-thumbs) thumb)))
+                      (when (and gallery-selected
+                                 (eq preset (nth gallery-selected
+                                                 (project-presets project))))
+                        (setf (cl-fltk:value preset-name-input) new-name))
+                      (refresh-gallery)
+                      (handler-case
+                          (progn
+                            (orfeus:still-store-rename preset old-name)
+                            (set-status (format nil "Renamed ~A to ~A"
+                                                old-name new-name)))
+                        (error (condition)
+                          (set-status (princ-to-string condition))))))))))
            (gallery-context-menu (preset)
              (let ((actions
                      (list (cons (format nil "Apply Graph to ~D Photo~:P"
@@ -1394,6 +1469,8 @@
                                                 :description
                                                 "without white balance")))
                            (cons "-" nil)
+                           (cons "Rename Still..."
+                                 (lambda () (rename-still preset)))
                            (cons "Delete Still"
                                  (lambda () (delete-still preset))))))
                (let ((chosen (cl-fltk:popup-menu (mapcar #'first actions))))
@@ -1437,6 +1514,7 @@
                  (let ((preset (gui-model-save-preset
                                 model (cl-fltk:value preset-name-input))))
                    (remhash (processing-preset-name preset) gallery-thumbs)
+                   (persist-still preset)
                    (refresh-gallery)
                    (setf (cl-fltk:value preset-name-input)
                          (processing-preset-name preset))
@@ -1493,6 +1571,7 @@
                    pick-color-node nil)
              (gui-model-replace-project model new-project path)
              (setf (gui-model-selected-node model) nil)
+             (merge-local-stills)
              (refresh-gallery)
              (sync-node-tools)
              (when node-strip (cl-fltk:redraw node-strip))
@@ -2496,6 +2575,7 @@
                             (declare (ignore ignored))
                             (apply-current-preset)))
                158 270 :half-right 26 :page))
+        (merge-local-stills)
         (refresh-gallery)
         (section-frame basic-page "White Balance" 16 110)
         (setf wb-choice
