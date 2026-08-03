@@ -91,6 +91,12 @@ latency-sensitive work ahead of ordinary background tasks."
     (or (plusp (gui-queue-running queue))
         (not (null (gui-queue-tasks queue))))))
 
+(defun gui-queue-load (queue)
+  "Return the number of QUEUE's pending plus running tasks."
+  (sb-thread:with-mutex ((gui-queue-lock queue))
+    (+ (gui-queue-running queue)
+       (length (gui-queue-tasks queue)))))
+
 (defun stop-gui-queue (queue)
   "Discard pending work, stop QUEUE's workers, and wait for active work."
   (when queue
