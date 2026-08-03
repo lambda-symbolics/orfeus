@@ -110,8 +110,10 @@
    #:processing-preset-settings
    #:processing-preset-source-photo
    #:still-store-directory
+   #:still-store-identity
    #:still-store-list
    #:still-store-write
+   #:still-store-write-thumbnail
    #:still-store-delete
    #:still-store-rename
    #:still-store-thumbnail-pathname

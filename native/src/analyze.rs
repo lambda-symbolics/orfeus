@@ -43,9 +43,7 @@ fn channel_median(values: &mut [f32]) -> f32 {
         return 0.0;
     }
     let middle = values.len() / 2;
-    *values
-        .select_nth_unstable_by(middle, f32::total_cmp)
-        .1
+    *values.select_nth_unstable_by(middle, f32::total_cmp).1
 }
 
 fn analysis_image(decoded: &DecodedRaw) -> RgbImage {
@@ -71,14 +69,12 @@ fn border_base_color(image: &RgbImage) -> [f32; 3] {
     let mut channels: [Vec<f32>; 3] = [Vec::new(), Vec::new(), Vec::new()];
     for y in 0..image.height {
         for x in 0..image.width {
-            let on_ring = y < ring_y
-                || y >= image.height - ring_y
-                || x < ring_x
-                || x >= image.width - ring_x;
+            let on_ring =
+                y < ring_y || y >= image.height - ring_y || x < ring_x || x >= image.width - ring_x;
             if on_ring {
                 let offset = (y * image.width + x) * 3;
-                for channel in 0..3 {
-                    channels[channel].push(image.data[offset + channel]);
+                for (channel, values) in channels.iter_mut().enumerate() {
+                    values.push(image.data[offset + channel]);
                 }
             }
         }
@@ -92,8 +88,7 @@ fn border_base_color(image: &RgbImage) -> [f32; 3] {
 
 fn base_like(pixel: &[f32], base: &[f32; 3]) -> bool {
     (0..3).all(|channel| {
-        (pixel[channel] - base[channel]).abs() / base[channel].max(0.02)
-            < BASE_LIKENESS_THRESHOLD
+        (pixel[channel] - base[channel]).abs() / base[channel].max(0.02) < BASE_LIKENESS_THRESHOLD
     })
 }
 
@@ -239,8 +234,7 @@ pub(crate) fn analyze_negative_frame(decoded: &DecodedRaw) -> NegativeFrame {
     let (rect, sensor_angle) = match (rows, columns) {
         (Some((row_start, row_length)), Some((column_start, column_length)))
             if row_length as f32 / image.height as f32 > MINIMUM_FRAME_FRACTION
-                && column_length as f32 / image.width as f32
-                    > MINIMUM_FRAME_FRACTION =>
+                && column_length as f32 / image.width as f32 > MINIMUM_FRAME_FRACTION =>
         {
             let angle = estimate_frame_angle(
                 &image,
@@ -252,12 +246,8 @@ pub(crate) fn analyze_negative_frame(decoded: &DecodedRaw) -> NegativeFrame {
             let inset_y = FRAME_INSET_FRACTION;
             let left = column_start as f32 / image.width as f32 + inset_x;
             let top = row_start as f32 / image.height as f32 + inset_y;
-            let width = (column_length as f32 / image.width as f32
-                - 2.0 * inset_x)
-                .max(0.05);
-            let height = (row_length as f32 / image.height as f32
-                - 2.0 * inset_y)
-                .max(0.05);
+            let width = (column_length as f32 / image.width as f32 - 2.0 * inset_x).max(0.05);
+            let height = (row_length as f32 / image.height as f32 - 2.0 * inset_y).max(0.05);
             (
                 [
                     left.clamp(0.0, 0.95),
@@ -296,15 +286,15 @@ pub(crate) fn sample_linear(
         ));
     }
     if !(0.0..=0.25).contains(&radius) {
-        return Err(Error::InvalidArgument("sample radius must be within 0..0.25"));
+        return Err(Error::InvalidArgument(
+            "sample radius must be within 0..0.25",
+        ));
     }
     // Map the oriented point into the sensor frame via the rect mapping.
-    let point =
-        super::graphex::map_oriented_rect(decoded.orientation, [x, y, 0.0, 0.0]);
-    let center_x = (point[0] * decoded.width as f32) as isize;
-    let center_y = (point[1] * decoded.height as f32) as isize;
-    let pixel_radius =
-        ((radius * decoded.width.min(decoded.height) as f32) as isize).max(0);
+    let point = super::graphex::map_oriented_rect(decoded.orientation, [x, y, 0.0, 0.0]);
+    let center_x = (point[0] * decoded.width.saturating_sub(1) as f32).round() as isize;
+    let center_y = (point[1] * decoded.height.saturating_sub(1) as f32).round() as isize;
+    let pixel_radius = ((radius * decoded.width.min(decoded.height) as f32) as isize).max(0);
     let mut sum = [0.0_f64; 3];
     let mut count = 0_u64;
     for sample_y in center_y - pixel_radius..=center_y + pixel_radius {
@@ -315,10 +305,9 @@ pub(crate) fn sample_linear(
             if sample_x < 0 || sample_x >= decoded.width as isize {
                 continue;
             }
-            let offset =
-                (sample_y as usize * decoded.width + sample_x as usize) * 3;
-            for channel in 0..3 {
-                sum[channel] += decoded.data[offset + channel] as f64;
+            let offset = (sample_y as usize * decoded.width + sample_x as usize) * 3;
+            for (channel, total) in sum.iter_mut().enumerate() {
+                *total += decoded.data[offset + channel] as f64;
             }
             count += 1;
         }
@@ -338,6 +327,7 @@ pub(crate) fn analyze_negative_frame_file(
     input: &Path,
     cache_mode: u32,
 ) -> Result<NegativeFrame, Error> {
+    render::validate_cache_mode(cache_mode)?;
     let decoded = render::decoded_for_render(input, cache_mode, false)?;
     Ok(analyze_negative_frame(&decoded))
 }
@@ -350,6 +340,7 @@ pub(crate) fn sample_linear_file(
     y: f32,
     radius: f32,
 ) -> Result<[f32; 3], Error> {
+    render::validate_cache_mode(cache_mode)?;
     let decoded = render::decoded_for_render(input, cache_mode, false)?;
     sample_linear(&decoded, x, y, radius)
 }
@@ -452,8 +443,7 @@ mod tests {
                 let dy = y as f32 - center_y;
                 let local_x = cos * dx + sin * dy;
                 let local_y = -sin * dx + cos * dy;
-                let inside =
-                    local_x.abs() < half_width && local_y.abs() < half_height;
+                let inside = local_x.abs() < half_width && local_y.abs() < half_height;
                 if inside {
                     data.extend_from_slice(&[0.12, 0.2, 0.25]);
                 } else {
@@ -478,11 +468,7 @@ mod tests {
         let tilt = 3.0_f32;
         let negative = tilted_negative(tilt);
         let frame = analyze_negative_frame(&negative);
-        assert!(
-            frame.angle.abs() > 1.0,
-            "no tilt detected: {}",
-            frame.angle
-        );
+        assert!(frame.angle.abs() > 1.0, "no tilt detected: {}", frame.angle);
         // Applying the crop with the reported angle must straighten the
         // frame: probe points just inside each mid-edge must be tile-colored.
         let image = RgbImage {
@@ -490,14 +476,8 @@ mod tests {
             height: negative.height,
             data: negative.data.clone(),
         };
-        let cropped = super::super::graphex::rotate_crop_for_tests(
-            &image,
-            frame.rect,
-            frame.angle,
-        );
-        let probe = |x: usize, y: usize| -> f32 {
-            cropped.data[(y * cropped.width + x) * 3]
-        };
+        let cropped = super::super::graphex::rotate_crop_for_tests(&image, frame.rect, frame.angle);
+        let probe = |x: usize, y: usize| -> f32 { cropped.data[(y * cropped.width + x) * 3] };
         let inset = 6;
         let tile = 0.12_f32;
         for (x, y) in [
@@ -532,5 +512,35 @@ mod tests {
         let border = sample_linear(&negative, 0.02, 0.02, 0.01).unwrap();
         assert!((border[0] - 0.82).abs() < 1.0e-4);
         assert!(sample_linear(&negative, 1.5, 0.5, 0.01).is_err());
+    }
+
+    #[test]
+    fn normalized_sample_endpoints_address_edge_pixels() {
+        let mut negative = synthetic_negative(1);
+        let last = (negative.width * negative.height - 1) * 3;
+        negative.data[last..last + 3].copy_from_slice(&[0.1, 0.2, 0.3]);
+        assert_eq!(
+            sample_linear(&negative, 1.0, 1.0, 0.0).unwrap(),
+            [0.1, 0.2, 0.3]
+        );
+
+        negative.data[0..3].copy_from_slice(&[0.4, 0.5, 0.6]);
+        assert_eq!(
+            sample_linear(&negative, 0.0, 0.0, 0.0).unwrap(),
+            [0.4, 0.5, 0.6]
+        );
+    }
+
+    #[test]
+    fn file_analysis_rejects_unknown_cache_modes_before_decoding() {
+        let missing = Path::new("definitely-missing-analysis-input.orf");
+        assert!(matches!(
+            analyze_negative_frame_file(missing, 99),
+            Err(Error::InvalidArgument("unsupported decode cache mode"))
+        ));
+        assert!(matches!(
+            sample_linear_file(missing, 99, 0.5, 0.5, 0.0),
+            Err(Error::InvalidArgument("unsupported decode cache mode"))
+        ));
     }
 }

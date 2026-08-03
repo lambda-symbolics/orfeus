@@ -470,6 +470,9 @@ so pasting a grade also carries which nodes were switched off."
              (project-resolve-pathname (pathname lut-path) base-directory)))))
   settings)
 
+(declaim (ftype (function (t t) t) project-resolve-graph-lut-paths)
+                  (ftype (function (t) t) still-store-canonicalize-graph-lut-paths))
+
 (defun project-resolve-relative-paths (project base-directory)
   (setf (project-output-directory project)
         (uiop:ensure-directory-pathname
@@ -478,11 +481,14 @@ so pasting a grade also carries which nodes were switched off."
   (project-resolve-lut-path (project-defaults project) base-directory)
   (dolist (preset (project-presets project))
     (project-resolve-lut-path (processing-preset-settings preset) base-directory)
+    (project-resolve-graph-lut-paths (processing-preset-graph preset)
+                                     base-directory)
     (when (processing-preset-source-photo preset)
       (setf (processing-preset-source-photo preset)
             (project-resolve-pathname
              (processing-preset-source-photo preset) base-directory))))
   (dolist (photo (project-photos project))
+    (project-resolve-graph-lut-paths (photo-job-graph photo) base-directory)
     (setf (photo-job-input-path photo)
           (project-resolve-pathname (photo-job-input-path photo)
                                     base-directory))
@@ -525,49 +531,131 @@ so pasting a grade also carries which nodes were switched off."
 ;;; directory, so a grade survives removable source media and unsaved
 ;;; projects. Each still is one readable sidecar plus an optional thumbnail.
 
+(defvar *still-store-lock*
+  (sb-thread:make-mutex :name "Orfeus still store")
+  "Process-local serialization around the store's interprocess lock.")
+
+(defun still-store-protect (pathname mode)
+  "Apply POSIX MODE to PATHNAME when the host supports it."
+  (ignore-errors (sb-posix:chmod (namestring pathname) mode))
+  pathname)
+
 (defun still-store-directory ()
-  "Return the per-user still gallery directory, creating it when missing."
+  "Return the private per-user still gallery directory, creating it when missing."
   (let ((directory (uiop:xdg-data-home "orfeus/stills/")))
     (ensure-directories-exist directory)
+    (still-store-protect directory #o700)
     directory))
 
-(defun still-store-slug (name)
-  "A filesystem-safe base name for still NAME."
-  (let ((slug (string-trim
-               "-"
-               (string-downcase
-                (map 'string
-                     (lambda (character)
-                       (if (alphanumericp character) character #\-))
-                     name)))))
-    (if (plusp (length slug)) slug "still")))
+(defun call-with-still-store-lock (directory thunk)
+  (ensure-directories-exist directory)
+  (still-store-protect directory #o700)
+  (sb-thread:with-mutex (*still-store-lock*)
+    (let ((lock-path (merge-pathnames ".lock" directory)))
+      (with-open-file (stream lock-path
+                              :direction :io
+                              :if-exists :overwrite
+                              :if-does-not-exist :create)
+        (still-store-protect lock-path #o600)
+        (let ((descriptor (sb-sys:fd-stream-fd stream)))
+          (unwind-protect
+               (progn
+                 (sb-posix:lockf descriptor sb-posix:f-lock 0)
+                 (funcall thunk))
+            (ignore-errors
+              (sb-posix:lockf descriptor sb-posix:f-ulock 0))))))))
+
+(defun still-store-identity (name)
+  "Return the collision-resistant filesystem identity of exact still NAME."
+  (ironclad:byte-array-to-hex-string
+   (ironclad:digest-sequence
+    :sha256 (sb-ext:string-to-octets name :external-format :utf-8))))
 
 (defun still-store-sexp-pathname (name &key (directory
                                              (still-store-directory)))
-  (merge-pathnames (make-pathname :name (still-store-slug name) :type "sexp")
+  (merge-pathnames (make-pathname :name (still-store-identity name) :type "sexp")
                    directory))
 
 (defun still-store-thumbnail-pathname (name &key (directory
                                                   (still-store-directory)))
-  (merge-pathnames (make-pathname :name (still-store-slug name) :type "jpg")
-                   directory))
-
-(defun still-store-write (preset &key (directory (still-store-directory)))
-  "Persist PRESET in the local still gallery; returns the sidecar pathname."
-  (let ((pathname (still-store-sexp-pathname
-                   (processing-preset-name preset) :directory directory)))
-    (with-open-file (stream pathname
-                            :direction :output
-                            :if-exists :supersede
-                            :if-does-not-exist :create)
-      (with-standard-io-syntax
-        (let ((*print-pretty* t)
-              (*print-readably* nil)
-              (*print-escape* t))
-          (write (list :orfeus-still 1 (processing-preset->sexp preset))
-                 :stream stream)
-          (terpri stream))))
+  (let ((pathname
+          (merge-pathnames
+           (make-pathname :name (still-store-identity name) :type "jpg")
+           directory)))
+    (when (probe-file pathname)
+      (still-store-protect pathname #o600))
     pathname))
+
+(defun still-store-canonical-pathname (path)
+  (when path
+    (or (ignore-errors (truename path))
+        (uiop:ensure-absolute-pathname path (uiop:getcwd)))))
+
+(defun still-store-canonical-preset (preset)
+  "Copy PRESET and canonicalize every stored external path."
+  (let ((copy (sexp->processing-preset (processing-preset->sexp preset))))
+    (when (processing-preset-source-photo copy)
+      (setf (processing-preset-source-photo copy)
+            (still-store-canonical-pathname
+             (processing-preset-source-photo copy))))
+    (let ((lut-path (processing-settings-lut-path
+                     (processing-preset-settings copy))))
+      (when lut-path
+        (setf (processing-settings-lut-path
+               (processing-preset-settings copy))
+              (namestring (still-store-canonical-pathname lut-path)))))
+    (still-store-canonicalize-graph-lut-paths
+     (processing-preset-graph copy))
+    copy))
+
+(defun still-store-write-unlocked (preset directory if-exists)
+  (ensure-directories-exist directory)
+  (still-store-protect directory #o700)
+  (let* ((pathname (still-store-sexp-pathname
+                    (processing-preset-name preset) :directory directory))
+         (temporary (merge-pathnames
+                     (make-pathname
+                      :name (format nil ".~A-~36R-~36R"
+                                    (pathname-name pathname)
+                                    (get-internal-real-time)
+                                    (random most-positive-fixnum))
+                      :type "tmp")
+                     directory))
+         (stored (still-store-canonical-preset preset)))
+    (unless (member if-exists '(:error :supersede))
+      (error "Unknown still-store :if-exists policy ~S" if-exists))
+    (when (and (eq if-exists :error) (probe-file pathname))
+      (error "A local still named ~A already exists"
+             (processing-preset-name preset)))
+    (unwind-protect
+         (progn
+           (with-open-file (stream temporary
+                                   :direction :output
+                                   :if-exists nil
+                                   :if-does-not-exist :create)
+             (with-standard-io-syntax
+               (let ((*print-pretty* t)
+                     (*print-readably* nil)
+                     (*print-escape* t))
+                 (write (list :orfeus-still 1
+                              (processing-preset->sexp stored))
+                        :stream stream)
+                 (terpri stream)
+                 (finish-output stream))))
+           (still-store-protect temporary #o600)
+           (sb-posix:rename (namestring temporary) (namestring pathname))
+           (still-store-protect pathname #o600)
+           pathname)
+      (when (probe-file temporary)
+        (delete-file temporary)))))
+
+(defun still-store-write (preset &key (directory (still-store-directory))
+                                       (if-exists :supersede))
+  "Atomically persist PRESET in the local still gallery; return its sidecar.
+IF-EXISTS is either :SUPERSEDE or :ERROR."
+  (call-with-still-store-lock
+   directory
+   (lambda () (still-store-write-unlocked preset directory if-exists))))
 
 (defun still-store-read (pathname)
   "Read one still sidecar, validating like project data."
@@ -582,33 +670,78 @@ so pasting a grade also carries which nodes were switched off."
 
 (defun still-store-list (&key (directory (still-store-directory)))
   "Return every readable still in the local gallery, oldest first."
-  (loop for file in (sort (uiop:directory-files directory "*.sexp")
-                          #'< :key #'file-write-date)
-        for preset = (handler-case (still-store-read file)
-                       (error () nil))
-        when preset collect preset))
+  (call-with-still-store-lock
+   directory
+   (lambda ()
+     (loop for file in (sort (uiop:directory-files directory "*.sexp")
+                             #'< :key #'file-write-date)
+           for preset = (handler-case (still-store-read file)
+                          (error () nil))
+           when preset collect preset))))
 
 (defun still-store-delete (name &key (directory (still-store-directory)))
   "Remove NAME's sidecar and thumbnail from the local gallery."
-  (let ((sexp (still-store-sexp-pathname name :directory directory))
-        (thumbnail (still-store-thumbnail-pathname name :directory directory)))
-    (when (probe-file sexp) (delete-file sexp))
-    (when (probe-file thumbnail) (delete-file thumbnail))))
+  (call-with-still-store-lock
+   directory
+   (lambda ()
+     (let ((sexp (still-store-sexp-pathname name :directory directory))
+           (thumbnail (still-store-thumbnail-pathname name :directory directory)))
+       (when (probe-file sexp) (delete-file sexp))
+       (when (probe-file thumbnail) (delete-file thumbnail))))))
+
+(defun still-store-write-thumbnail (name source
+                                    &key (directory (still-store-directory)))
+  "Atomically copy SOURCE into NAME's private local gallery thumbnail."
+  (call-with-still-store-lock
+   directory
+   (lambda ()
+     (let* ((destination (still-store-thumbnail-pathname
+                          name :directory directory))
+            (temporary (merge-pathnames
+                        (make-pathname
+                         :name (format nil ".~A-~36R-~36R"
+                                       (pathname-name destination)
+                                       (get-internal-real-time)
+                                       (random most-positive-fixnum))
+                         :type "tmp")
+                        directory)))
+       (unwind-protect
+            (progn
+              (uiop:copy-file source temporary)
+              (still-store-protect temporary #o600)
+              (sb-posix:rename (namestring temporary)
+                               (namestring destination))
+              (still-store-protect destination #o600)
+              destination)
+         (when (probe-file temporary)
+           (delete-file temporary)))))))
 
 (defun still-store-rename (preset old-name &key (directory
                                                  (still-store-directory)))
-  "Move PRESET's stored files off OLD-NAME's slug and rewrite the sidecar."
-  (let ((old-slug (still-store-slug old-name))
-        (new-name (processing-preset-name preset)))
-    (unless (string= old-slug (still-store-slug new-name))
-      (let ((old-thumbnail (still-store-thumbnail-pathname
-                            old-name :directory directory))
-            (new-thumbnail (still-store-thumbnail-pathname
-                            new-name :directory directory))
-            (old-sexp (still-store-sexp-pathname old-name
-                                                 :directory directory)))
-        (when (probe-file old-thumbnail)
-          (rename-file old-thumbnail new-thumbnail))
-        (when (probe-file old-sexp)
-          (delete-file old-sexp))))
-    (still-store-write preset :directory directory)))
+  "Rename exactly OLD-NAME's local files and atomically rewrite its sidecar."
+  (call-with-still-store-lock
+   directory
+   (lambda ()
+     (let ((new-name (processing-preset-name preset)))
+       (if (string= old-name new-name)
+           (still-store-write-unlocked preset directory :supersede)
+           (let ((old-thumbnail (still-store-thumbnail-pathname
+                                 old-name :directory directory))
+                 (new-thumbnail (still-store-thumbnail-pathname
+                                 new-name :directory directory))
+                 (old-sexp (still-store-sexp-pathname old-name
+                                                      :directory directory))
+                 (new-sexp (still-store-sexp-pathname new-name
+                                                      :directory directory)))
+             (when (probe-file new-sexp)
+               (error "A local still named ~A already exists" new-name))
+             ;; Publish the new sidecar first. If the process stops mid-rename,
+             ;; at worst both readable names remain; no sidecar is paired with
+             ;; another still's thumbnail.
+             (still-store-write-unlocked preset directory :supersede)
+             (when (probe-file old-thumbnail)
+               (sb-posix:rename (namestring old-thumbnail)
+                                (namestring new-thumbnail))
+               (still-store-protect new-thumbnail #o600))
+             (when (probe-file old-sexp)
+               (delete-file old-sexp))))))))

@@ -16,9 +16,7 @@ use std::sync::Arc;
 use rayon::prelude::*;
 
 use super::Error;
-use super::render::{
-    self, DecodedRaw, LensCorrectionOptions, RgbImage,
-};
+use super::render::{self, DecodedRaw, LensCorrectionOptions, RgbImage};
 
 const GRAPH_MAGIC: u32 = 0x4746_524F; // "ORFG" little-endian
 const GRAPH_VERSION: u32 = 1;
@@ -58,7 +56,10 @@ impl RenderFrameV1 {
         if self.version != 1 {
             return Err(Error::InvalidArgument("unsupported render frame version"));
         }
-        if !matches!(self.output_format, render::OUTPUT_JPEG | render::OUTPUT_TIFF) {
+        if !matches!(
+            self.output_format,
+            render::OUTPUT_JPEG | render::OUTPUT_TIFF
+        ) {
             return Err(Error::InvalidArgument("unsupported output format"));
         }
         if !(1..=100).contains(&self.jpeg_quality) {
@@ -67,9 +68,7 @@ impl RenderFrameV1 {
         if !self.focal_reducer.is_finite() || !(0.1..=2.0).contains(&self.focal_reducer) {
             return Err(Error::InvalidArgument("focal reducer must be 0.1..2"));
         }
-        if !self.lens_crop_factor.is_finite()
-            || !(0.0..=10.0).contains(&self.lens_crop_factor)
-        {
+        if !self.lens_crop_factor.is_finite() || !(0.0..=10.0).contains(&self.lens_crop_factor) {
             return Err(Error::InvalidArgument("lens crop factor must be 0..10"));
         }
         Ok(())
@@ -136,16 +135,16 @@ impl<'a> GraphReader<'a> {
 
 fn expected_param_count(kind: u32) -> Result<usize, Error> {
     Ok(match kind {
-        NODE_WHITE_BALANCE => 2, // kelvin (0 = as shot), tint
-        NODE_EXPOSURE => 1,      // ev
+        NODE_WHITE_BALANCE => 2,   // kelvin (0 = as shot), tint
+        NODE_EXPOSURE => 1,        // ev
         NODE_NOISE_REDUCTION => 2, // edge-aware, neural
-        NODE_TONE => 7,          // blacks..whites
-        NODE_OPTICS => 3,        // distortion?, strength, tca?
-        NODE_FILM => 3,          // lut strength, grain amount, grain size
-        NODE_BLEND => 1,         // opacity toward input B
-        NODE_COLOR_SUBTRACT => 3, // picked color, subtracted per channel
-        NODE_CROP => 5,          // left, top, width, height, angle (degrees)
-        NODE_CURVES => 24,       // three channels x four (x, y) points
+        NODE_TONE => 7,            // blacks..whites
+        NODE_OPTICS => 3,          // distortion?, strength, tca?
+        NODE_FILM => 3,            // lut strength, grain amount, grain size
+        NODE_BLEND => 1,           // opacity toward input B
+        NODE_COLOR_SUBTRACT => 3,  // picked color, subtracted per channel
+        NODE_CROP => 5,            // left, top, width, height, angle (degrees)
+        NODE_CURVES => 24,         // three channels x four (x, y) points
         _ => return Err(Error::InvalidArgument("unknown graph node kind")),
     })
 }
@@ -186,8 +185,8 @@ fn srgb_decode_value(value: f32) -> f32 {
 fn curve_tangents(xs: &[f32; 4], ys: &[f32; 4]) -> [f32; 4] {
     let mut slopes = [0.0f32; 3];
     for segment in 0..3 {
-        slopes[segment] = (ys[segment + 1] - ys[segment])
-            / (xs[segment + 1] - xs[segment]).max(1.0e-4);
+        slopes[segment] =
+            (ys[segment + 1] - ys[segment]) / (xs[segment + 1] - xs[segment]).max(1.0e-4);
     }
     let mut tangents = [0.0f32; 4];
     tangents[0] = slopes[0];
@@ -301,8 +300,8 @@ fn validate_param(kind: u32, index: usize, value: f32) -> Result<(), Error> {
 ///
 /// Returns the ops in execution order together with the display-domain flags
 /// implied by film nodes, enforcing the same structural rules as the Lisp
-/// core: inputs reference earlier nodes only, blends stay scene-linear, and
-/// only film nodes may consume film output.
+/// core: inputs reference earlier nodes only, blends stay scene-linear, optics
+/// precede crop, and only film nodes may consume film output.
 pub(crate) fn parse_graph(bytes: &[u8]) -> Result<Vec<GraphOp>, Error> {
     let mut reader = GraphReader { bytes, offset: 0 };
     if reader.u32()? != GRAPH_MAGIC {
@@ -317,6 +316,7 @@ pub(crate) fn parse_graph(bytes: &[u8]) -> Result<Vec<GraphOp>, Error> {
     }
     let mut ops = Vec::with_capacity(count);
     let mut display = vec![false; count + 1];
+    let mut cropped = vec![false; count + 1];
     for index in 1..=count {
         let kind = reader.u32()?;
         let input_a = reader.i32()?;
@@ -336,9 +336,7 @@ pub(crate) fn parse_graph(bytes: &[u8]) -> Result<Vec<GraphOp>, Error> {
         }
         let text = reader.text()?;
         if text.is_some() && kind != NODE_FILM {
-            return Err(Error::InvalidArgument(
-                "only film nodes may carry a string",
-            ));
+            return Err(Error::InvalidArgument("only film nodes may carry a string"));
         }
         let check_input = |input: i32| -> Result<usize, Error> {
             if input < 0 || input as usize >= index {
@@ -358,6 +356,12 @@ pub(crate) fn parse_graph(bytes: &[u8]) -> Result<Vec<GraphOp>, Error> {
             }
             0
         };
+        cropped[index] = cropped[input_a] || (kind == NODE_BLEND && cropped[input_b]);
+        if kind == NODE_OPTICS && cropped[input_a] {
+            return Err(Error::InvalidArgument(
+                "optics nodes cannot consume cropped output",
+            ));
+        }
         match kind {
             NODE_BLEND => {
                 if display[input_a] || display[input_b] {
@@ -370,14 +374,12 @@ pub(crate) fn parse_graph(bytes: &[u8]) -> Result<Vec<GraphOp>, Error> {
                 display[index] = true;
             }
             NODE_CROP => {
-                // Crops keep their branch's domain.
+                // Crops keep their branch's domain and mark its geometry.
                 display[index] = display[input_a];
-                let (left, top, width, height) =
-                    (params[0], params[1], params[2], params[3]);
+                cropped[index] = true;
+                let (left, top, width, height) = (params[0], params[1], params[2], params[3]);
                 if left + width > 1.0001 || top + height > 1.0001 {
-                    return Err(Error::InvalidArgument(
-                        "crop rectangle leaves the frame",
-                    ));
+                    return Err(Error::InvalidArgument("crop rectangle leaves the frame"));
                 }
             }
             _ => {
@@ -461,10 +463,9 @@ fn crop_image(image: &RgbImage, rect: [f32; 4]) -> Result<RgbImage, Error> {
     let [left, top, width, height] = rect;
     let x0 = ((left * image.width as f32).round() as usize).min(image.width - 1);
     let y0 = ((top * image.height as f32).round() as usize).min(image.height - 1);
-    let target_width = (((width) * image.width as f32).round() as usize)
-        .clamp(1, image.width - x0);
-    let target_height = (((height) * image.height as f32).round() as usize)
-        .clamp(1, image.height - y0);
+    let target_width = (((width) * image.width as f32).round() as usize).clamp(1, image.width - x0);
+    let target_height =
+        (((height) * image.height as f32).round() as usize).clamp(1, image.height - y0);
     let mut data = Vec::with_capacity(target_width * target_height * 3);
     for row in 0..target_height {
         let start = ((y0 + row) * image.width + x0) * 3;
@@ -485,12 +486,13 @@ fn rotate_crop_image(
     sensor_angle: f32,
 ) -> Result<RgbImage, Error> {
     let [left, top, width, height] = rect;
-    let x0 = (left * image.width as f32).round().max(0.0);
-    let y0 = (top * image.height as f32).round().max(0.0);
-    let target_width = ((width * image.width as f32).round() as usize)
-        .clamp(1, image.width);
-    let target_height = ((height * image.height as f32).round() as usize)
-        .clamp(1, image.height);
+    let x0 = ((left * image.width as f32).round() as usize).min(image.width - 1);
+    let y0 = ((top * image.height as f32).round() as usize).min(image.height - 1);
+    let target_width = ((width * image.width as f32).round() as usize).clamp(1, image.width - x0);
+    let target_height =
+        ((height * image.height as f32).round() as usize).clamp(1, image.height - y0);
+    let x0 = x0 as f32;
+    let y0 = y0 as f32;
     let center_x = x0 + target_width as f32 * 0.5;
     let center_y = y0 + target_height as f32 * 0.5;
     let radians = sensor_angle.to_radians();
@@ -506,20 +508,14 @@ fn rotate_crop_image(
         .enumerate()
         .for_each(|(row, output_row)| {
             let offset_y = y0 + row as f32 + 0.5 - center_y;
-            for (column, pixel) in
-                output_row.as_chunks_mut::<3>().0.iter_mut().enumerate()
-            {
+            for (column, pixel) in output_row.as_chunks_mut::<3>().0.iter_mut().enumerate() {
                 let offset_x = x0 + column as f32 + 0.5 - center_x;
                 // Rotating the image by theta samples the source rotated the
                 // other way around the crop center.
-                let source_x =
-                    center_x + cos * offset_x + sin * offset_y - 0.5;
-                let source_y =
-                    center_y - sin * offset_x + cos * offset_y - 0.5;
+                let source_x = center_x + cos * offset_x + sin * offset_y - 0.5;
+                let source_y = center_y - sin * offset_x + cos * offset_y - 0.5;
                 for (channel, value) in pixel.iter_mut().enumerate() {
-                    *value = render::bilinear(
-                        image, source_x, source_y, channel,
-                    );
+                    *value = render::bilinear(image, source_x, source_y, channel);
                 }
             }
         });
@@ -547,16 +543,20 @@ pub(crate) fn execute_graph(
     }
     uses[count] += 1; // The final node feeds the output.
     if count == 0 {
-        let mut image = source;
+        let mut image = render::orient(source, context.orientation);
         to_display(&mut image);
         return Ok(image);
     }
     let mut registers: Vec<Option<RgbImage>> = (0..=count).map(|_| None).collect();
     let mut domains = vec![Domain::Linear; count + 1];
+    let mut oriented = vec![false; count + 1];
+    let mut film_ordinal = 0_u64;
     registers[0] = Some(source);
     for (index, op) in ops.iter().enumerate() {
         let slot = index + 1;
-        let take = |registers: &mut Vec<Option<RgbImage>>, uses: &mut Vec<usize>, from: usize|
+        let take = |registers: &mut Vec<Option<RgbImage>>,
+                    uses: &mut Vec<usize>,
+                    from: usize|
          -> Result<RgbImage, Error> {
             let image = if uses[from] <= 1 {
                 registers[from]
@@ -573,6 +573,20 @@ pub(crate) fn execute_graph(
         };
         let mut image = take(&mut registers, &mut uses, op.input_a)?;
         domains[slot] = domains[op.input_a];
+        oriented[slot] = oriented[op.input_a];
+        if matches!(
+            op.kind,
+            NODE_NOISE_REDUCTION
+                | NODE_TONE
+                | NODE_FILM
+                | NODE_COLOR_SUBTRACT
+                | NODE_CROP
+                | NODE_CURVES
+        ) && !oriented[slot]
+        {
+            image = render::orient(image, context.orientation);
+            oriented[slot] = true;
+        }
         match op.kind {
             NODE_WHITE_BALANCE => {
                 render::apply_white_adaptation(&mut image, op.params[0], op.params[1]);
@@ -626,21 +640,33 @@ pub(crate) fn execute_graph(
                     to_display(&mut image);
                     domains[slot] = Domain::Display;
                 }
-                if op.params[0] > 0.0 {
-                    if let Some(path) = &op.text {
-                        let lut = render::CubeLut::read(Path::new(path))?;
-                        render::apply_lut(&mut image, &lut, op.params[0]);
-                    }
+                if op.params[0] > 0.0
+                    && let Some(path) = &op.text
+                {
+                    let lut = render::CubeLut::read(Path::new(path))?;
+                    render::apply_lut(&mut image, &lut, op.params[0]);
                 }
-                render::apply_grain(
-                    &mut image,
-                    op.params[1],
-                    op.params[2],
-                    context.grain_seed ^ (slot as u64).wrapping_mul(0x9e37_79b9),
-                );
+                if op.params[1] > 0.0 {
+                    render::apply_grain(
+                        &mut image,
+                        op.params[1],
+                        op.params[2],
+                        context.grain_seed ^ film_ordinal.wrapping_mul(0x9e37_79b9),
+                    );
+                    film_ordinal += 1;
+                }
             }
             NODE_BLEND => {
-                let other = take(&mut registers, &mut uses, op.input_b)?;
+                let mut other = take(&mut registers, &mut uses, op.input_b)?;
+                let other_oriented = oriented[op.input_b];
+                if oriented[slot] != other_oriented {
+                    if oriented[slot] {
+                        other = render::orient(other, context.orientation);
+                    } else {
+                        image = render::orient(image, context.orientation);
+                        oriented[slot] = true;
+                    }
+                }
                 image = blend_images(&image, &other, op.params[0])?;
             }
             NODE_COLOR_SUBTRACT => {
@@ -668,23 +694,12 @@ pub(crate) fn execute_graph(
                 });
             }
             NODE_CROP => {
-                let rect = map_oriented_rect(
-                    context.orientation,
-                    [op.params[0], op.params[1], op.params[2], op.params[3]],
-                );
+                let rect = [op.params[0], op.params[1], op.params[2], op.params[3]];
                 let angle = op.params[4];
                 if angle.abs() < 0.01 {
                     image = crop_image(&image, rect)?;
                 } else {
-                    // Mirrored orientations conjugate the rotation, flipping
-                    // its direction in sensor space.
-                    let sensor_angle =
-                        if matches!(context.orientation, 2 | 4 | 5 | 7) {
-                            -angle
-                        } else {
-                            angle
-                        };
-                    image = rotate_crop_image(&image, rect, sensor_angle)?;
+                    image = rotate_crop_image(&image, rect, angle)?;
                 }
             }
             _ => unreachable!("kinds were validated during parsing"),
@@ -694,6 +709,9 @@ pub(crate) fn execute_graph(
     let mut image = registers[count]
         .take()
         .ok_or(Error::Render("graph produced no output".into()))?;
+    if !oriented[count] {
+        image = render::orient(image, context.orientation);
+    }
     if domains[count] == Domain::Linear {
         to_display(&mut image);
     }
@@ -702,11 +720,7 @@ pub(crate) fn execute_graph(
 
 /// Test hook: rotate-crop with display-convention angle at orientation 1.
 #[cfg(test)]
-pub(crate) fn rotate_crop_for_tests(
-    image: &RgbImage,
-    rect: [f32; 4],
-    angle: f32,
-) -> RgbImage {
+pub(crate) fn rotate_crop_for_tests(image: &RgbImage, rect: [f32; 4], angle: f32) -> RgbImage {
     if angle.abs() < 0.01 {
         crop_image(image, rect).expect("test crop")
     } else {
@@ -746,11 +760,8 @@ pub fn render_graph(
         None
     };
     let decoded: Arc<DecodedRaw> = render::decoded_for_render(input, cache_mode, profiling)?;
-    let (native_max_width, native_max_height) = render::native_downscale_bounds(
-        decoded.orientation,
-        frame.max_width,
-        frame.max_height,
-    );
+    let (native_max_width, native_max_height) =
+        render::native_downscale_bounds(decoded.orientation, frame.max_width, frame.max_height);
     let source = match render::downscale_from(
         &decoded.data,
         decoded.width,
@@ -786,7 +797,6 @@ pub fn render_graph(
         orientation: decoded.orientation,
     };
     let image = execute_graph(&ops, source, &context)?;
-    let image = render::orient(image, decoded.orientation);
     render::atomic_encode(
         input,
         output,
@@ -828,7 +838,8 @@ mod tests {
             self.bytes
                 .extend_from_slice(&(params.len() as u32).to_le_bytes());
             for parameter in params {
-                self.bytes.extend_from_slice(&parameter.to_bits().to_le_bytes());
+                self.bytes
+                    .extend_from_slice(&parameter.to_bits().to_le_bytes());
             }
             match text {
                 Some(text) => {
@@ -897,7 +908,13 @@ mod tests {
             &GraphBuilder::new()
                 .node(NODE_WHITE_BALANCE, 0, -1, &[6500.0, 3.0], None)
                 .node(NODE_EXPOSURE, 1, -1, &[0.5], None)
-                .node(NODE_TONE, 2, -1, &[0.3, 0.0, 0.0, -0.2, 0.0, 0.0, 0.1], None)
+                .node(
+                    NODE_TONE,
+                    2,
+                    -1,
+                    &[0.3, 0.0, 0.0, -0.2, 0.0, 0.0, 0.1],
+                    None,
+                )
                 .build(),
         )
         .unwrap();
@@ -906,12 +923,98 @@ mod tests {
         let mut reference = gradient_image();
         render::apply_white_adaptation(&mut reference, 6500.0, 3.0);
         render::apply_exposure(&mut reference, 0.5);
-        render::apply_tonal_equalizer(
-            &mut reference,
-            [0.3, 0.0, 0.0, -0.2, 0.0, 0.0, 0.1],
-        );
+        render::apply_tonal_equalizer(&mut reference, [0.3, 0.0, 0.0, -0.2, 0.0, 0.0, 0.1]);
         to_display(&mut reference);
         assert!(max_difference(&via_graph, &reference) < 1.0e-6);
+    }
+
+    #[test]
+    fn graph_uses_flat_pipeline_orientation_and_first_grain_seed() {
+        let ops = parse_graph(
+            &GraphBuilder::new()
+                .node(NODE_WHITE_BALANCE, 0, -1, &[6500.0, 3.0], None)
+                .node(NODE_EXPOSURE, 1, -1, &[0.5], None)
+                .node(NODE_NOISE_REDUCTION, 2, -1, &[0.0, 0.0], None)
+                .node(
+                    NODE_TONE,
+                    3,
+                    -1,
+                    &[0.3, 0.0, 0.0, -0.2, 0.0, 0.0, 0.1],
+                    None,
+                )
+                .node(NODE_FILM, 4, -1, &[0.0, 0.25, 1.0], None)
+                .build(),
+        )
+        .unwrap();
+        let mut graph_context = context(17);
+        graph_context.orientation = 6;
+        let via_graph = execute_graph(&ops, gradient_image(), &graph_context).unwrap();
+
+        let mut reference = gradient_image();
+        render::apply_white_adaptation(&mut reference, 6500.0, 3.0);
+        render::apply_exposure(&mut reference, 0.5);
+        reference = render::orient(reference, 6);
+        render::apply_noise_reduction(&mut reference, 0.0, 0.0);
+        super::super::nn::apply_neural_noise_reduction(
+            &mut reference.data,
+            reference.width,
+            reference.height,
+            0.0,
+        )
+        .unwrap();
+        render::apply_tonal_equalizer(&mut reference, [0.3, 0.0, 0.0, -0.2, 0.0, 0.0, 0.1]);
+        to_display(&mut reference);
+        render::apply_grain(&mut reference, 0.25, 1.0, 17);
+
+        assert_eq!(via_graph.width, reference.width);
+        assert_eq!(via_graph.height, reference.height);
+        assert!(max_difference(&via_graph, &reference) < 1.0e-6);
+    }
+
+    #[test]
+    fn first_film_seed_does_not_depend_on_node_slot() {
+        let direct = parse_graph(
+            &GraphBuilder::new()
+                .node(NODE_FILM, 0, -1, &[0.0, 0.25, 1.0], None)
+                .build(),
+        )
+        .unwrap();
+        let preceded = parse_graph(
+            &GraphBuilder::new()
+                .node(NODE_EXPOSURE, 0, -1, &[0.0], None)
+                .node(NODE_FILM, 1, -1, &[0.0, 0.25, 1.0], None)
+                .build(),
+        )
+        .unwrap();
+        let direct = execute_graph(&direct, gradient_image(), &context(23)).unwrap();
+        let preceded = execute_graph(&preceded, gradient_image(), &context(23)).unwrap();
+        assert_eq!(direct.data, preceded.data);
+    }
+
+    #[test]
+    fn inert_film_does_not_advance_the_grain_seed() {
+        let direct = parse_graph(
+            &GraphBuilder::new()
+                .node(NODE_FILM, 0, -1, &[0.0, 0.25, 1.0], None)
+                .build(),
+        )
+        .unwrap();
+        let preceded = parse_graph(
+            &GraphBuilder::new()
+                .node(NODE_FILM, 0, -1, &[0.0, 0.0, 1.0], None)
+                .node(NODE_FILM, 1, -1, &[0.0, 0.25, 1.0], None)
+                .build(),
+        )
+        .unwrap();
+        let direct = execute_graph(&direct, gradient_image(), &context(23)).unwrap();
+        let preceded = execute_graph(&preceded, gradient_image(), &context(23)).unwrap();
+        assert_eq!(direct.data, preceded.data);
+    }
+
+    #[test]
+    fn rotated_crop_clamps_dimensions_at_the_source_bounds() {
+        let cropped = rotate_crop_image(&gradient_image(), [0.9, 0.9, 0.2, 0.2], 3.0).unwrap();
+        assert_eq!((cropped.width, cropped.height), (2, 2));
     }
 
     #[test]
@@ -973,13 +1076,15 @@ mod tests {
 
     #[test]
     fn film_after_film_is_legal_but_tone_after_film_is_not() {
-        assert!(parse_graph(
-            &GraphBuilder::new()
-                .node(NODE_FILM, 0, -1, &[0.0, 0.3, 1.0], None)
-                .node(NODE_FILM, 1, -1, &[0.0, 0.1, 2.0], None)
-                .build(),
-        )
-        .is_ok());
+        assert!(
+            parse_graph(
+                &GraphBuilder::new()
+                    .node(NODE_FILM, 0, -1, &[0.0, 0.3, 1.0], None)
+                    .node(NODE_FILM, 1, -1, &[0.0, 0.1, 2.0], None)
+                    .build(),
+            )
+            .is_ok()
+        );
         assert!(matches!(
             parse_graph(
                 &GraphBuilder::new()
@@ -1001,36 +1106,57 @@ mod tests {
     }
 
     #[test]
+    fn optics_after_crop_is_rejected() {
+        assert!(matches!(
+            parse_graph(
+                &GraphBuilder::new()
+                    .node(NODE_CROP, 0, -1, &[0.1, 0.1, 0.8, 0.8, 0.0], None)
+                    .node(NODE_OPTICS, 1, -1, &[1.0, 1.0, 1.0], None)
+                    .build(),
+            ),
+            Err(Error::InvalidArgument(_))
+        ));
+    }
+
+    #[test]
     fn parser_rejects_malformed_programs() {
         assert!(parse_graph(b"junk").is_err());
         // Forward reference.
-        assert!(parse_graph(
-            &GraphBuilder::new()
-                .node(NODE_EXPOSURE, 3, -1, &[0.5], None)
-                .build(),
-        )
-        .is_err());
+        assert!(
+            parse_graph(
+                &GraphBuilder::new()
+                    .node(NODE_EXPOSURE, 3, -1, &[0.5], None)
+                    .build(),
+            )
+            .is_err()
+        );
         // Bad parameter count.
-        assert!(parse_graph(
-            &GraphBuilder::new()
-                .node(NODE_TONE, 0, -1, &[0.0; 3], None)
-                .build(),
-        )
-        .is_err());
+        assert!(
+            parse_graph(
+                &GraphBuilder::new()
+                    .node(NODE_TONE, 0, -1, &[0.0; 3], None)
+                    .build(),
+            )
+            .is_err()
+        );
         // Out-of-range opacity.
-        assert!(parse_graph(
-            &GraphBuilder::new()
-                .node(NODE_BLEND, 0, 0, &[1.5], None)
-                .build(),
-        )
-        .is_err());
+        assert!(
+            parse_graph(
+                &GraphBuilder::new()
+                    .node(NODE_BLEND, 0, 0, &[1.5], None)
+                    .build(),
+            )
+            .is_err()
+        );
         // Strings on non-film nodes.
-        assert!(parse_graph(
-            &GraphBuilder::new()
-                .node(NODE_EXPOSURE, 0, -1, &[0.5], Some("nope"))
-                .build(),
-        )
-        .is_err());
+        assert!(
+            parse_graph(
+                &GraphBuilder::new()
+                    .node(NODE_EXPOSURE, 0, -1, &[0.5], Some("nope"))
+                    .build(),
+            )
+            .is_err()
+        );
         // Trailing bytes.
         let mut program = GraphBuilder::new()
             .node(NODE_EXPOSURE, 0, -1, &[0.5], None)
@@ -1121,8 +1247,7 @@ mod tests {
 
     #[test]
     fn identity_curves_pass_the_image_through() {
-        let params =
-            curves_params(&IDENTITY_CURVE, &IDENTITY_CURVE, &IDENTITY_CURVE);
+        let params = curves_params(&IDENTITY_CURVE, &IDENTITY_CURVE, &IDENTITY_CURVE);
         let ops = parse_graph(
             &GraphBuilder::new()
                 .node(NODE_CURVES, 0, -1, &params, None)
@@ -1167,41 +1292,49 @@ mod tests {
     fn curves_reject_unsorted_points() {
         let bad = [0.0, 0.0, 0.6, 0.5, 0.3, 0.7, 1.0, 1.0];
         let params = curves_params(&bad, &IDENTITY_CURVE, &IDENTITY_CURVE);
-        assert!(parse_graph(
-            &GraphBuilder::new()
-                .node(NODE_CURVES, 0, -1, &params, None)
-                .build(),
-        )
-        .is_err());
+        assert!(
+            parse_graph(
+                &GraphBuilder::new()
+                    .node(NODE_CURVES, 0, -1, &params, None)
+                    .build(),
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn crop_keeps_film_domain_and_blend_rejects_mismatched_sizes() {
         // film -> crop -> film stays legal.
-        assert!(parse_graph(
-            &GraphBuilder::new()
-                .node(NODE_FILM, 0, -1, &[0.0, 0.2, 1.0], None)
-                .node(NODE_CROP, 1, -1, &[0.0, 0.0, 0.5, 0.5, 0.0], None)
-                .node(NODE_FILM, 2, -1, &[0.0, 0.1, 1.0], None)
-                .build(),
-        )
-        .is_ok());
+        assert!(
+            parse_graph(
+                &GraphBuilder::new()
+                    .node(NODE_FILM, 0, -1, &[0.0, 0.2, 1.0], None)
+                    .node(NODE_CROP, 1, -1, &[0.0, 0.0, 0.5, 0.5, 0.0], None)
+                    .node(NODE_FILM, 2, -1, &[0.0, 0.1, 1.0], None)
+                    .build(),
+            )
+            .is_ok()
+        );
         // film -> crop -> tone must stay illegal.
-        assert!(parse_graph(
-            &GraphBuilder::new()
-                .node(NODE_FILM, 0, -1, &[0.0, 0.2, 1.0], None)
-                .node(NODE_CROP, 1, -1, &[0.0, 0.0, 0.5, 0.5, 0.0], None)
-                .node(NODE_TONE, 2, -1, &[0.0; 7], None)
-                .build(),
-        )
-        .is_err());
+        assert!(
+            parse_graph(
+                &GraphBuilder::new()
+                    .node(NODE_FILM, 0, -1, &[0.0, 0.2, 1.0], None)
+                    .node(NODE_CROP, 1, -1, &[0.0, 0.0, 0.5, 0.5, 0.0], None)
+                    .node(NODE_TONE, 2, -1, &[0.0; 7], None)
+                    .build(),
+            )
+            .is_err()
+        );
         // A crop leaving the frame is rejected at parse time.
-        assert!(parse_graph(
-            &GraphBuilder::new()
-                .node(NODE_CROP, 0, -1, &[0.75, 0.0, 0.5, 1.0, 0.0], None)
-                .build(),
-        )
-        .is_err());
+        assert!(
+            parse_graph(
+                &GraphBuilder::new()
+                    .node(NODE_CROP, 0, -1, &[0.75, 0.0, 0.5, 1.0, 0.0], None)
+                    .build(),
+            )
+            .is_err()
+        );
         // Blending a cropped branch against the full frame errors clearly.
         let ops = parse_graph(
             &GraphBuilder::new()
@@ -1221,6 +1354,7 @@ mod tests {
         let ops = parse_graph(
             &GraphBuilder::new()
                 .node(NODE_FILM, 0, -1, &[0.0, 0.5, 1.0], None)
+                .node(NODE_FILM, 1, -1, &[0.0, 0.25, 2.0], None)
                 .build(),
         )
         .unwrap();
@@ -1228,6 +1362,12 @@ mod tests {
         let plain = execute_graph(&[], gradient_image(), &context(11)).unwrap();
         assert!(max_difference(&grained, &plain) > 0.005);
         assert!(grained.data.iter().all(|value| (0.0..=1.0).contains(value)));
+
+        let mut reference = gradient_image();
+        to_display(&mut reference);
+        render::apply_grain(&mut reference, 0.5, 1.0, 11);
+        render::apply_grain(&mut reference, 0.25, 2.0, 11 ^ 0x9e37_79b9);
+        assert_eq!(grained.data, reference.data);
 
         let repeat = execute_graph(&ops, gradient_image(), &context(11)).unwrap();
         assert_eq!(grained.data, repeat.data, "grain must stay deterministic");

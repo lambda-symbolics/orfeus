@@ -188,30 +188,77 @@
                     #P"/tmp/")))
     (ensure-directories-exist directory)
     (unwind-protect
-         (let ((preset (make-processing-preset
-                        :name "Portra 400 +1!"
-                        :settings (make-processing-settings :exposure 0.5)
-                        :source-photo #P"input/example.orf"
+         (let* ((lut-target (merge-pathnames "target.cube" directory))
+                (lut-link (merge-pathnames "linked.cube" directory))
+                (first (make-processing-preset
+                        :name "A B" :source-photo #P"input/example.orf"
+                        :settings (make-processing-settings :lut-path "film.cube")
                         :graph (settings->graph
-                                (make-processing-settings :exposure 0.5)))))
-           (still-store-write preset :directory directory)
-           (let ((loaded (still-store-list :directory directory)))
-             (and (= 1 (length loaded))
-                  (string= "Portra 400 +1!"
-                           (processing-preset-name (first loaded)))
-                  (not (null (processing-preset-graph (first loaded))))
-                  (progn
-                    (setf (processing-preset-name preset) "Gold 200")
-                    (still-store-rename preset "Portra 400 +1!"
+                                (make-processing-settings
+                                 :lut-path (namestring lut-link)
+                                 :lut-strength 1.0))))
+                (second (make-processing-preset :name "A-B"))
+                (thumbnail-source (merge-pathnames "source.jpg" directory)))
+           (with-open-file (stream lut-target :direction :output
+                                              :if-exists :supersede)
+             (write-line "TITLE test" stream))
+           (sb-posix:symlink (namestring lut-target) (namestring lut-link))
+           (with-open-file (stream thumbnail-source :direction :output
+                                                   :element-type '(unsigned-byte 8)
+                                                   :if-exists :supersede)
+             (write-sequence #(1 2 3 4 5) stream))
+           (still-store-write first :directory directory)
+           (still-store-write second :directory directory)
+           (still-store-write-thumbnail "A B" thumbnail-source
                                         :directory directory)
-                    (let ((renamed (still-store-list :directory directory)))
-                      (and (= 1 (length renamed))
-                           (string= "Gold 200"
-                                    (processing-preset-name
-                                     (first renamed))))))
+           (let* ((loaded (still-store-list :directory directory))
+                  (stored-first (find "A B" loaded
+                                      :key #'processing-preset-name
+                                      :test #'string=))
+                  (film (find :film
+                              (processing-graph-nodes
+                               (processing-preset-graph stored-first))
+                              :key #'graph-node-kind)))
+             (and (= 2 (length loaded))
+                  (not (string= (still-store-identity "A B")
+                                (still-store-identity "A-B")))
+                  (handler-case
+                      (progn
+                        (still-store-write second :directory directory
+                                                  :if-exists :error)
+                        nil)
+                    (error () t))
+                  (uiop:absolute-pathname-p
+                   (processing-preset-source-photo stored-first))
+                  (equal (namestring (truename lut-target))
+                         (getf (graph-node-params film) :lut-path))
                   (progn
-                    (still-store-delete "Gold 200" :directory directory)
-                    (null (still-store-list :directory directory))))))
+                    (setf (processing-preset-name first) "Renamed")
+                    (still-store-rename first "A B" :directory directory)
+                    (let ((names (mapcar #'processing-preset-name
+                                        (still-store-list :directory directory))))
+                      (and (member "Renamed" names :test #'string=)
+                           (member "A-B" names :test #'string=)
+                           (probe-file
+                            (orfeus:still-store-thumbnail-pathname
+                             "Renamed" :directory directory))
+                           (not (probe-file
+                                 (orfeus:still-store-thumbnail-pathname
+                                  "A B" :directory directory))))))
+                  (progn
+                    (setf (processing-preset-name second) "Renamed")
+                    (handler-case
+                        (progn
+                          (still-store-rename second "A-B"
+                                              :directory directory)
+                          nil)
+                      (error () t)))
+                  (progn
+                    (still-store-delete "Renamed" :directory directory)
+                    (let ((remaining (still-store-list :directory directory)))
+                      (and (= 1 (length remaining))
+                           (string= "A-B" (processing-preset-name
+                                            (first remaining)))))))))
       (uiop:delete-directory-tree directory :validate t
                                             :if-does-not-exist :ignore))))
 
@@ -284,6 +331,17 @@
                   :nodes (list (make-graph-node :id 1 :kind :blend
                                                 :opacity 1.5 :inputs '(0 0)))
                   :output 1))
+     ;; Lens correction must run in the uncropped sensor geometry.
+     (rejected-p (make-processing-graph
+                  :nodes (list (make-graph-node
+                                :id 1 :kind :crop
+                                :params '(:left 0.1 :top 0.1
+                                          :width 0.8 :height 0.8)
+                                :inputs '(0))
+                               (make-graph-node :id 2 :kind :optics
+                                                :params '()
+                                                :inputs '(1)))
+                  :output 2))
      ;; Film chained after film stays legal.
      (not (rejected-p (make-processing-graph
                        :nodes (list (make-graph-node :id 1 :kind :film
@@ -438,6 +496,108 @@
                (equal before (graph->sexp graph))
                (progn (graph-validate graph) t)))))))
 
+(defun graph-edit-rollback-and-copy-p ()
+  (let* ((graph (graph-validate
+                 (make-processing-graph
+                  :nodes (list
+                          (make-graph-node :id 1 :kind :exposure
+                                           :params '(:exposure 0.5)
+                                           :inputs '(0))
+                          (make-graph-node :id 2 :kind :film
+                                           :params '(:lut-path "film.cube")
+                                           :inputs '(1)))
+                  :output 2)))
+         (before (graph->sexp graph))
+         (points (list 0.0 0.0 0.33 0.4 0.67 0.8 1.0 1.0))
+         (curve-graph (make-processing-graph))
+         (curve (graph-insert-node curve-graph 0 :curves
+                                   :params (list :red-points points)))
+         (copy (orfeus:graph-copy curve-graph))
+         (copied-curve (first (processing-graph-nodes copy))))
+    (and
+     ;; Inserting a scene-linear node after film fails without mutating GRAPH.
+     (handler-case
+         (progn (graph-insert-node graph 2 :exposure
+                                   :params '(:exposure 1.0))
+                nil)
+       (invalid-project-data () t))
+     (equal before (graph->sexp graph))
+     ;; Film nodes cannot cross either side of a swap.
+     (null (graph-swap-with-upstream graph 2))
+     (equal before (graph->sexp graph))
+     ;; Insertion and graph copies own nested curve point lists.
+     (progn
+       (setf (second points) 0.2)
+       (= 0.0 (second (getf (graph-node-params curve) :red-points))))
+     (progn
+       (setf (second (getf (graph-node-params copied-curve) :red-points)) 0.3)
+       (= 0.0 (second (getf (graph-node-params curve) :red-points)))))))
+
+(defun graph-crop-branch-compatibility-p ()
+  (let* ((crop '(:left 0.1 :top 0.1 :width 0.8 :height 0.8))
+         (graph (graph-validate
+                 (make-processing-graph
+                  :nodes (list
+                          (make-graph-node :id 1 :kind :crop
+                                           :params (copy-list crop) :inputs '(0))
+                          (make-graph-node :id 2 :kind :crop
+                                           :params (copy-list crop) :inputs '(0))
+                          (make-graph-node :id 3 :kind :blend
+                                           :inputs '(1 2) :opacity 0.5))
+                  :output 3)))
+         (before (graph->sexp graph)))
+    (and
+     ;; Equal crops on separate branches have compatible image geometry.
+     (graph-validate graph)
+     ;; Removing one branch's crop is rejected and leaves every wire intact.
+     (handler-case
+         (progn (graph-delete-node graph 1) nil)
+       (invalid-project-data () t))
+     (equal before (graph->sexp graph))
+     ;; Moving one crop below the other is likewise incompatible and atomic.
+     (handler-case
+         (progn (graph-move-node-after graph 2 1) nil)
+       (invalid-project-data () t))
+     (equal before (graph->sexp graph))
+     (graph-validate graph)
+     ;; A bypassed crop resolves to its input, so it cannot disguise a
+     ;; geometry mismatch against an active crop.
+     (handler-case
+         (progn
+           (graph-validate
+            (make-processing-graph
+             :nodes (list
+                     (make-graph-node :id 1 :kind :crop
+                                      :params (copy-list crop) :inputs '(0))
+                     (make-graph-node :id 2 :kind :crop
+                                      :params (copy-list crop) :inputs '(0)
+                                      :bypassed-p t)
+                     (make-graph-node :id 3 :kind :blend
+                                      :inputs '(1 2) :opacity 0.5))
+             :output 3))
+           nil)
+       (invalid-project-data () t))
+     ;; Bypassed filters and blends both inherit only their first input's
+     ;; effective geometry, irrespective of their inactive crop branches.
+     (graph-validate
+      (make-processing-graph
+       :nodes (list
+               (make-graph-node :id 1 :kind :crop
+                                :params (copy-list crop) :inputs '(0)
+                                :bypassed-p t)
+               (make-graph-node :id 2 :kind :crop
+                                :params '(:left 0.2 :top 0.2
+                                          :width 0.6 :height 0.6)
+                                :inputs '(0) :bypassed-p t)
+               (make-graph-node :id 3 :kind :blend
+                                :inputs '(1 2) :opacity 0.5)
+               (make-graph-node :id 4 :kind :crop
+                                :params (copy-list crop) :inputs '(3))
+               (make-graph-node :id 5 :kind :blend
+                                :inputs '(4 0) :opacity 0.5
+                                :bypassed-p t))
+       :output 5)))))
+
 (defun photo-graph-round-trip-p ()
   (let* ((original
            (make-project
@@ -461,19 +621,53 @@
                            :photos ((:input "a.orf")))))))))))
 
 (defun timestamped-output-names-p ()
-  (let* ((project (make-project
+  (let* ((first (make-photo-job :input-path #P"one/photo.orf"))
+         (second (make-photo-job :input-path #P"two/photo.orf"))
+         (project (make-project
                    :output-directory #P"/tmp/orfeus-exports/"
                    :export-settings (make-export-settings
                                      :timestamp-filenames-p t)
-                   :photos (list (make-photo-job
-                                  :input-path #P"source/photo.orf"))))
-         (photo (first (project-photos project))))
+                   :photos (list first second))))
     (and (string= "20260802-183512"
                   (orfeus::timestamp-token "2026:08:02 18:35:12"))
          (null (orfeus::timestamp-token "no digits here"))
          ;; Without readable EXIF the original name survives untouched.
          (equal #P"/tmp/orfeus-exports/photo.jpg"
-                (photo-job-render-output project photo))
+                (photo-job-render-output project first))
+         ;; Equal timestamp/name pairs from different directories cannot collide.
+         (let ((original (symbol-function 'orfeus::photo-capture-timestamp)))
+           (unwind-protect
+                (progn
+                  (setf (symbol-function 'orfeus::photo-capture-timestamp)
+                        (lambda (pathname)
+                          (declare (ignore pathname))
+                          "20260802-183512"))
+                  (let* ((duplicate (make-photo-job
+                                     :input-path #P"three/foo.orf"))
+                         (same (make-photo-job
+                                :input-path #P"four/foo.orf"))
+                         (literal-suffix (make-photo-job
+                                          :input-path #P"five/foo-2.orf"))
+                         (collision-project
+                           (make-project
+                            :output-directory #P"/tmp/orfeus-exports/"
+                            :export-settings (make-export-settings
+                                              :timestamp-filenames-p t)
+                            :photos (list duplicate same literal-suffix))))
+                    (and (equal #P"/tmp/orfeus-exports/20260802-183512-photo.jpg"
+                                (photo-job-render-output project first))
+                         (equal #P"/tmp/orfeus-exports/20260802-183512-photo-2.jpg"
+                                (photo-job-render-output project second))
+                         ;; The duplicate's generated -2 name reserves that
+                         ;; final stem against a later literal foo-2 input.
+                         (equal #P"/tmp/orfeus-exports/20260802-183512-foo.jpg"
+                                (photo-job-render-output collision-project duplicate))
+                         (equal #P"/tmp/orfeus-exports/20260802-183512-foo-2.jpg"
+                                (photo-job-render-output collision-project same))
+                         (equal #P"/tmp/orfeus-exports/20260802-183512-foo-2-2.jpg"
+                                (photo-job-render-output collision-project
+                                                         literal-suffix)))))
+             (setf (symbol-function 'orfeus::photo-capture-timestamp) original)))
          (let ((decoded (sexp->project (project->sexp project))))
            (export-settings-timestamp-filenames-p
             (project-export-settings decoded))))))
@@ -603,14 +797,47 @@
            (project-write
             (make-project
              :output-directory #P"exports/"
-             :photos (list (make-photo-job :input-path #P"input.orf")))
+             :presets (list
+                       (make-processing-preset
+                        :name "Graph preset"
+                        :graph (graph-validate
+                                (make-processing-graph
+                                 :nodes (list
+                                         (make-graph-node
+                                          :id 1 :kind :film
+                                          :params '(:lut-path "preset.cube")
+                                          :inputs '(0)))
+                                 :output 1))))
+             :photos (list
+                      (make-photo-job
+                       :input-path #P"input.orf"
+                       :graph (graph-validate
+                               (make-processing-graph
+                                :nodes (list
+                                        (make-graph-node
+                                         :id 1 :kind :film
+                                         :params '(:lut-path "photo.cube")
+                                         :inputs '(0)))
+                                :output 1)))))
             pathname)
            (let* ((project (project-read pathname))
-                  (base (uiop:pathname-directory-pathname pathname)))
+                  (base (uiop:pathname-directory-pathname pathname))
+                  (photo (first (project-photos project)))
+                  (preset (first (project-presets project))))
              (and (equal (project-output-directory project)
                          (merge-pathnames #P"exports/" base))
-                  (equal (photo-job-input-path (first (project-photos project)))
-                         (merge-pathnames #P"input.orf" base)))))
+                  (equal (photo-job-input-path photo)
+                         (merge-pathnames #P"input.orf" base))
+                  (string= (getf (graph-node-params
+                                  (first (processing-graph-nodes
+                                          (photo-job-graph photo))))
+                                 :lut-path)
+                           (namestring (merge-pathnames #P"photo.cube" base)))
+                  (string= (getf (graph-node-params
+                                  (first (processing-graph-nodes
+                                          (processing-preset-graph preset))))
+                                 :lut-path)
+                           (namestring (merge-pathnames #P"preset.cube" base))))))
       (when (probe-file pathname)
         (delete-file pathname)))))
 
@@ -1077,6 +1304,10 @@
              (graph-editing-p))
       (check "nodes splice anywhere and invalid wires roll back"
              (graph-rewire-p))
+      (check "failed graph edits roll back and graph copies own nested params"
+             (graph-edit-rollback-and-copy-p))
+      (check "blends require compatible crop geometry on both branches"
+             (graph-crop-branch-compatibility-p))
       (check "curves nodes validate, serialize, and round trip"
              (graph-curves-p))
       (check "photo graphs round trip as project version 3"

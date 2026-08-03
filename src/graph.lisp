@@ -128,14 +128,55 @@ negatives.")
             do (graph-invalid params "key ~S does not belong to stage ~S"
                               key (graph-node-kind node)))))
 
+(defun project-resolve-graph-lut-paths (graph base-directory)
+  "Resolve relative film LUT paths in GRAPH against BASE-DIRECTORY."
+  (when graph
+    (dolist (node (processing-graph-nodes graph))
+      (when (eq :film (graph-node-kind node))
+        (let* ((params (copy-tree (graph-node-params node)))
+               (lut-path (getf params :lut-path)))
+          (when lut-path
+            (setf (getf params :lut-path)
+                  (namestring
+                   (project-resolve-pathname (pathname lut-path)
+                                             base-directory))
+                  (graph-node-params node) params))))))
+  graph)
+
+(defun still-store-canonicalize-graph-lut-paths (graph)
+  "Canonicalize every film LUT path in GRAPH for durable local storage."
+  (when graph
+    (dolist (node (processing-graph-nodes graph))
+      (when (eq :film (graph-node-kind node))
+        (let* ((params (copy-tree (graph-node-params node)))
+               (lut-path (getf params :lut-path)))
+          (when lut-path
+            (setf (getf params :lut-path)
+                  (namestring (still-store-canonical-pathname lut-path))
+                  (graph-node-params node) params))))))
+  graph)
+
+(defun graph-crop-geometry (upstream node)
+  "Return NODE's canonical crop history appended to UPSTREAM geometry."
+  (let ((params (graph-node-params node)))
+    (append upstream
+            (list (list (getf params :left 0.0)
+                        (getf params :top 0.0)
+                        (getf params :width 1.0)
+                        (getf params :height 1.0)
+                        (getf params :angle 0.0))))))
+
 (defun graph-validate (graph)
   "Signal INVALID-PROJECT-DATA unless GRAPH is well formed; return GRAPH.
 
 Checks topological id order, input arity and reference validity, per-stage
-parameter keys, blend opacities, and the display-domain rule that only film
-nodes may consume film output while blends stay scene-linear."
+parameter keys, blend opacities, compatible branch crop geometry, optics before
+crop, and the display-domain rule that only film nodes may consume film output
+while blends stay scene-linear."
   (let ((seen (list *graph-source-id*))
-        (display '()))
+        (display '())
+        (geometry (make-hash-table)))
+    (setf (gethash *graph-source-id* geometry) '())
     (dolist (node (processing-graph-nodes graph))
       (let ((id (graph-node-id node))
             (kind (graph-node-kind node))
@@ -184,12 +225,36 @@ nodes may consume film output while blends stay scene-linear."
            (unless (= 1 (length inputs))
              (graph-invalid node "filter node ~S needs exactly one input" id))
            (graph-node-params-validate node)
+           (when (and (eq kind :optics)
+                      (not (graph-node-bypassed-p node))
+                      (gethash (first inputs) geometry))
+             (graph-invalid node
+                            "optics node ~S cannot process cropped output" id))
            (if (eq kind :film)
                (pushnew id display)
                (when (member (first inputs) display)
                  (graph-invalid node
                                 "node ~S cannot process film output" id))))
           (t (graph-invalid node "unknown node kind ~S" kind)))
+        (setf (gethash id geometry)
+              (cond
+                ;; Match GRAPH-EFFECTIVE-NODES exactly: every bypassed node,
+                ;; including blends, resolves to its first input.
+                ((graph-node-bypassed-p node)
+                 (copy-tree (gethash (first inputs) geometry)))
+                ((graph-node-blend-p node)
+                 (let ((first-geometry (gethash (first inputs) geometry))
+                       (second-geometry (gethash (second inputs) geometry)))
+                   (unless (equalp first-geometry second-geometry)
+                     (graph-invalid node
+                                    "blend node ~S inputs have incompatible crop geometry"
+                                    id))
+                   (copy-tree first-geometry)))
+                ((eq kind :crop)
+                 (graph-crop-geometry
+                  (copy-tree (gethash (first inputs) geometry)) node))
+                (t
+                 (copy-tree (gethash (first inputs) geometry)))))
         (push id seen)))
     (let ((output (processing-graph-output graph)))
       (unless (member output seen)
@@ -201,7 +266,7 @@ nodes may consume film output while blends stay scene-linear."
                 :kind (graph-node-kind node)
                 :inputs (copy-list (graph-node-inputs node)))
           (when (graph-node-params node)
-            (list :params (copy-list (graph-node-params node))))
+            (list :params (copy-tree (graph-node-params node))))
           (when (graph-node-blend-p node)
             (list :opacity (graph-node-opacity node)))
           (when (graph-node-bypassed-p node)
@@ -358,35 +423,43 @@ Returns the new node after normalizing GRAPH."
                                 :key #'graph-node-id
                                 :initial-value *graph-source-id*))
                 :kind kind
-                :params (and (not blend) (copy-list params))
+                :params (and (not blend) (copy-tree params))
                 :opacity (if blend opacity 1.0)
                 :inputs (if blend
                             (list after-id (or second-input *graph-source-id*))
                             (list after-id)))))
-    (dolist (consumer (graph-consumers graph after-id))
-      (setf (graph-node-inputs consumer)
-            (substitute (graph-node-id node) after-id
-                        (graph-node-inputs consumer))))
-    (when (eql (processing-graph-output graph) after-id)
-      (setf (processing-graph-output graph) (graph-node-id node)))
-    (setf (processing-graph-nodes graph)
-          (append (processing-graph-nodes graph) (list node)))
-    (graph-normalize graph)
-    node))
+    (call-with-graph-rollback
+     graph
+     (lambda ()
+       (dolist (consumer (graph-consumers graph after-id))
+         (setf (graph-node-inputs consumer)
+               (substitute (graph-node-id node) after-id
+                           (graph-node-inputs consumer))))
+       (when (eql (processing-graph-output graph) after-id)
+         (setf (processing-graph-output graph) (graph-node-id node)))
+       (setf (processing-graph-nodes graph)
+             (append (processing-graph-nodes graph) (list node)))
+       (graph-normalize graph)
+       node))))
 
 (defun graph-delete-node (graph id)
-  "Remove node ID; its consumers re-read the node's first input."
+  "Remove node ID; its consumers re-read the node's first input.
+
+An invalid result rolls GRAPH back and re-signals."
   (let ((node (or (graph-find-node graph id)
                   (graph-invalid graph "cannot delete unknown node ~S" id))))
-    (let ((replacement (first (graph-node-inputs node))))
-      (dolist (consumer (graph-consumers graph id))
-        (setf (graph-node-inputs consumer)
-              (substitute replacement id (graph-node-inputs consumer))))
-      (when (eql (processing-graph-output graph) id)
-        (setf (processing-graph-output graph) replacement))
-      (setf (processing-graph-nodes graph)
-            (remove node (processing-graph-nodes graph)))
-      (graph-normalize graph))))
+    (call-with-graph-rollback
+     graph
+     (lambda ()
+       (let ((replacement (first (graph-node-inputs node))))
+         (dolist (consumer (graph-consumers graph id))
+           (setf (graph-node-inputs consumer)
+                 (substitute replacement id (graph-node-inputs consumer))))
+         (when (eql (processing-graph-output graph) id)
+           (setf (processing-graph-output graph) replacement))
+         (setf (processing-graph-nodes graph)
+               (remove node (processing-graph-nodes graph)))
+         (graph-normalize graph))))))
 
 (defun graph-swap-with-upstream (graph id)
   "Swap filter node ID with its single upstream filter neighbor, when both
@@ -397,23 +470,28 @@ sides of the pair are plain single-input filters. Returns true on success."
     (when (and node upstream
                (not (graph-node-blend-p node))
                (not (graph-node-blend-p upstream))
+               (not (eq :film (graph-node-kind node)))
+               (not (eq :film (graph-node-kind upstream)))
                (= 1 (length (graph-consumers graph upstream-id))))
-      (let ((below (first (graph-node-inputs upstream))))
-        (dolist (consumer (graph-consumers graph id))
-          (setf (graph-node-inputs consumer)
-                (substitute upstream-id id (graph-node-inputs consumer))))
-        (when (eql (processing-graph-output graph) id)
-          (setf (processing-graph-output graph) upstream-id))
-        (setf (graph-node-inputs node) (list below)
-              (graph-node-inputs upstream) (list id))
-        (setf (processing-graph-nodes graph)
-              (let ((nodes (remove node (processing-graph-nodes graph))))
-                (let ((position (position upstream nodes)))
-                  (append (subseq nodes 0 position)
-                          (list node)
-                          (subseq nodes position)))))
-        (graph-normalize graph)
-        t))))
+      (call-with-graph-rollback
+       graph
+       (lambda ()
+         (let ((below (first (graph-node-inputs upstream))))
+           (dolist (consumer (graph-consumers graph id))
+             (setf (graph-node-inputs consumer)
+                   (substitute upstream-id id (graph-node-inputs consumer))))
+           (when (eql (processing-graph-output graph) id)
+             (setf (processing-graph-output graph) upstream-id))
+           (setf (graph-node-inputs node) (list below)
+                 (graph-node-inputs upstream) (list id))
+           (setf (processing-graph-nodes graph)
+                 (let ((nodes (remove node (processing-graph-nodes graph))))
+                   (let ((position (position upstream nodes)))
+                     (append (subseq nodes 0 position)
+                             (list node)
+                             (subseq nodes position)))))
+           (graph-normalize graph)
+           t))))))
 
 (defun call-with-graph-rollback (graph thunk)
   "Run THUNK; restore GRAPH's ids, inputs, order, and output on any error."
@@ -518,7 +596,7 @@ rolls the graph back and re-signals."
    :nodes (mapcar (lambda (node)
                     (let ((copy (copy-graph-node node)))
                       (setf (graph-node-params copy)
-                            (copy-list (graph-node-params node))
+                            (copy-tree (graph-node-params node))
                             (graph-node-inputs copy)
                             (copy-list (graph-node-inputs node)))
                       copy))

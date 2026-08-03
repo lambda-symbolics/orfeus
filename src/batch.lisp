@@ -1,25 +1,58 @@
 (in-package #:orfeus)
 
+(defun photo-job-automatic-output-stem (project photo)
+  (let* ((base (pathname-name (photo-job-input-path photo)))
+         (timestamp (and (export-settings-timestamp-filenames-p
+                          (project-export-settings project))
+                         (photo-capture-timestamp
+                          (photo-job-input-path photo)))))
+    (values (if timestamp (format nil "~A-~A" timestamp base) base)
+            timestamp)))
+
+(defun allocate-automatic-output-stem (stem allocated)
+  "Return an unused variant of STEM and record it in ALLOCATED."
+  (let ((candidate stem)
+        (suffix 2))
+    (loop while (gethash candidate allocated)
+          do (setf candidate (format nil "~A-~D" stem suffix))
+             (incf suffix))
+    (setf (gethash candidate allocated) t)
+    candidate))
+
+(defun photo-job-timestamp-output-stem (project photo stem)
+  "Allocate PHOTO's stable automatic STEM among preceding project photos."
+  (if (not (export-settings-timestamp-filenames-p
+            (project-export-settings project)))
+      stem
+      (let ((position (position photo (project-photos project) :test #'eq)))
+        (if (null position)
+            stem
+            (let ((allocated (make-hash-table :test #'equal)))
+              (dolist (prior (subseq (project-photos project) 0 position))
+                (unless (photo-job-output-path prior)
+                  (allocate-automatic-output-stem
+                   (photo-job-automatic-output-stem project prior)
+                   allocated)))
+              (allocate-automatic-output-stem stem allocated))))))
+
 (defun photo-job-render-output (project photo)
   "Return PHOTO's output pathname using PROJECT's output-directory semantics.
 
 Automatic names keep the original filename; with the project's
 TIMESTAMP-FILENAMES-P export option they gain a capture-time prefix like
-20260802-183512-PB020123.jpg. Explicit :output paths are never rewritten."
+20260802-183512-PB020123.jpg. Repeated timestamp/name pairs gain a stable
+one-based suffix. Explicit :output paths are never rewritten."
   (let ((specified (photo-job-output-path photo)))
     (if specified
         (if (uiop:absolute-pathname-p specified)
             specified
             (merge-pathnames specified (project-output-directory project)))
-        (let* ((base (pathname-name (photo-job-input-path photo)))
-               (timestamp (and (export-settings-timestamp-filenames-p
-                                (project-export-settings project))
-                               (photo-capture-timestamp
-                                (photo-job-input-path photo)))))
+        (multiple-value-bind (stem timestamp)
+            (photo-job-automatic-output-stem project photo)
+          (declare (ignore timestamp))
           (merge-pathnames
-           (make-pathname :name (if timestamp
-                                    (format nil "~A-~A" timestamp base)
-                                    base)
+           (make-pathname :name (photo-job-timestamp-output-stem
+                                 project photo stem)
                           :type "jpg")
            (project-output-directory project))))))
 

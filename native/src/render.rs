@@ -28,6 +28,14 @@ pub const FLAG_LENS_DISTORTION: u32 = 1;
 pub const FLAG_LENS_TCA: u32 = 2;
 pub const CACHE_NONE: u32 = 0;
 pub const CACHE_USE: u32 = 1;
+
+pub(crate) fn validate_cache_mode(cache_mode: u32) -> Result<(), Error> {
+    if matches!(cache_mode, CACHE_NONE | CACHE_USE) {
+        Ok(())
+    } else {
+        Err(Error::InvalidArgument("unsupported decode cache mode"))
+    }
+}
 /// Full-resolution scene-linear images retained for interactive re-rendering.
 /// Two slots cover the selected photograph plus its neutral Before preview.
 const DECODE_CACHE_CAPACITY: usize = 2;
@@ -529,10 +537,9 @@ unsafe fn bilateral_span_avx(
     tap_guides: [*const f32; 5],
 ) {
     use std::arch::x86_64::{
-        _mm256_add_ps, _mm256_div_ps, _mm256_fmadd_ps, _mm256_fnmadd_ps,
-        _mm256_loadu_ps, _mm256_max_ps, _mm256_mul_ps, _mm256_rcp_ps,
-        _mm256_set1_ps, _mm256_setzero_ps, _mm256_sqrt_ps, _mm256_storeu_ps,
-        _mm256_sub_ps,
+        _mm256_add_ps, _mm256_div_ps, _mm256_fmadd_ps, _mm256_fnmadd_ps, _mm256_loadu_ps,
+        _mm256_max_ps, _mm256_mul_ps, _mm256_rcp_ps, _mm256_set1_ps, _mm256_setzero_ps,
+        _mm256_sqrt_ps, _mm256_storeu_ps, _mm256_sub_ps,
     };
     let kernel = [1.0_f32, 4.0, 6.0, 4.0, 1.0];
     // SAFETY: The caller guarantees every pointer stays readable for
@@ -555,25 +562,15 @@ unsafe fn bilateral_span_avx(
                 let guide_value = _mm256_loadu_ps(tap_guides[tap].add(x));
                 let source_value = _mm256_loadu_ps(tap_sources[tap].add(x));
                 let distance = _mm256_sub_ps(guide_value, center);
-                let denominator = _mm256_fmadd_ps(
-                    _mm256_mul_ps(distance, distance),
-                    inverse,
-                    ones,
-                );
+                let denominator = _mm256_fmadd_ps(_mm256_mul_ps(distance, distance), inverse, ones);
                 // Refined reciprocal: rcp * (2 - denominator * rcp).
                 let rcp = _mm256_rcp_ps(denominator);
-                let refined = _mm256_mul_ps(
-                    rcp,
-                    _mm256_fnmadd_ps(denominator, rcp, two),
-                );
+                let refined = _mm256_mul_ps(rcp, _mm256_fnmadd_ps(denominator, rcp, two));
                 let weight = _mm256_mul_ps(_mm256_set1_ps(kernel[tap]), refined);
                 sum = _mm256_fmadd_ps(source_value, weight, sum);
                 weight_sum = _mm256_add_ps(weight_sum, weight);
             }
-            _mm256_storeu_ps(
-                output.as_mut_ptr().add(x),
-                _mm256_div_ps(sum, weight_sum),
-            );
+            _mm256_storeu_ps(output.as_mut_ptr().add(x), _mm256_div_ps(sum, weight_sum));
             x += 8;
         }
         // The scalar tail matches the vector math via the same refinement.
@@ -598,18 +595,24 @@ unsafe fn bilateral_span_avx(
     }
 }
 
-fn bilateral_pass_scalar(
-    output: &mut [f32],
-    source: &[f32],
-    guide: &[f32],
+struct BilateralPass {
     width: usize,
     row: usize,
     stride: isize,
     limit: usize,
     step: usize,
-) {
-    // Taps run along either axis: STRIDE 1 walks x, STRIDE width walks y;
-    // LIMIT is the axis length used for clamping.
+}
+
+fn bilateral_pass_scalar(output: &mut [f32], source: &[f32], guide: &[f32], pass: BilateralPass) {
+    // Taps run along either axis: stride 1 walks x, stride width walks y;
+    // limit is the axis length used for clamping.
+    let BilateralPass {
+        width,
+        row,
+        stride,
+        limit,
+        step,
+    } = pass;
     let kernel = [1.0_f32, 4.0, 6.0, 4.0, 1.0];
     for (x, value) in output.iter_mut().enumerate() {
         let center = guide[row * width + x];
@@ -654,12 +657,10 @@ fn bilateral_row_horizontal(
         // SAFETY: Every tap pointer covers `interior` + 7 lanes inside this
         // row because the interior excludes the clamped borders.
         unsafe {
-            let taps: [*const f32; 5] = std::array::from_fn(|tap| {
-                source.as_ptr().add(row_base + tap * step)
-            });
-            let guides: [*const f32; 5] = std::array::from_fn(|tap| {
-                guide.as_ptr().add(row_base + tap * step)
-            });
+            let taps: [*const f32; 5] =
+                std::array::from_fn(|tap| source.as_ptr().add(row_base + tap * step));
+            let guides: [*const f32; 5] =
+                std::array::from_fn(|tap| guide.as_ptr().add(row_base + tap * step));
             bilateral_span_avx(
                 &mut row_output[reach..reach + interior],
                 guide.as_ptr().add(row_base + reach),
@@ -675,12 +676,11 @@ fn bilateral_row_horizontal(
             let mut sum = 0.0;
             let mut weight_sum = 0.0;
             for (kernel_index, offset) in (-2_isize..=2).enumerate() {
-                let sample_x = (x as isize + offset * step as isize)
-                    .clamp(0, width as isize - 1) as usize;
+                let sample_x =
+                    (x as isize + offset * step as isize).clamp(0, width as isize - 1) as usize;
                 let index = y * width + sample_x;
                 let distance = guide[index] - center;
-                let weight =
-                    kernel[kernel_index] / (1.0 + distance * distance * inverse);
+                let weight = kernel[kernel_index] / (1.0 + distance * distance * inverse);
                 sum += source[index] * weight;
                 weight_sum += weight;
             }
@@ -689,7 +689,18 @@ fn bilateral_row_horizontal(
         return;
     }
     let _ = use_avx;
-    bilateral_pass_scalar(row_output, source, guide, width, y, 1, width, step);
+    bilateral_pass_scalar(
+        row_output,
+        source,
+        guide,
+        BilateralPass {
+            width,
+            row: y,
+            stride: 1,
+            limit: width,
+            step,
+        },
+    );
 }
 
 /// Rows processed per band; the fused band keeps the horizontal intermediate
@@ -714,89 +725,69 @@ fn edge_guided_blur_into(
     output
         .par_chunks_mut(width * BILATERAL_BAND_ROWS)
         .enumerate()
-        .for_each_init(
-            || Vec::<f32>::new(),
-            |band_buffer, (band_index, band_output)| {
-                let y0 = band_index * BILATERAL_BAND_ROWS;
-                let band_rows = band_output.len() / width;
-                let halo_lo = y0.saturating_sub(reach);
-                let halo_hi = (y0 + band_rows + reach).min(height);
-                let halo_rows = halo_hi - halo_lo;
-                band_buffer.clear();
-                band_buffer.resize(halo_rows * width, 0.0);
-                // Fused pass one: horizontal blur for the band plus halo.
-                for row in 0..halo_rows {
-                    let y = halo_lo + row;
-                    bilateral_row_horizontal(
-                        &mut band_buffer[row * width..(row + 1) * width],
-                        source,
-                        guide,
-                        width,
-                        y,
-                        step,
-                        use_avx,
-                    );
-                }
-                // Fused pass two: vertical blur reading the cached band.
-                for row in 0..band_rows {
-                    let y = y0 + row;
-                    let row_output =
-                        &mut band_output[row * width..(row + 1) * width];
-                    let tap_rows: [usize; 5] = std::array::from_fn(|tap| {
-                        ((y as isize + (tap as isize - 2) * step as isize)
-                            .clamp(0, height as isize - 1)
-                            as usize)
-                            - halo_lo
-                    });
-                    #[cfg(target_arch = "x86_64")]
-                    if use_avx && width >= 8 {
-                        // SAFETY: Tap rows live inside the band buffer, each
-                        // a full row of `width` lanes.
-                        unsafe {
-                            let taps: [*const f32; 5] =
-                                std::array::from_fn(|tap| {
-                                    band_buffer
-                                        .as_ptr()
-                                        .add(tap_rows[tap] * width)
-                                });
-                            let guides: [*const f32; 5] =
-                                std::array::from_fn(|tap| {
-                                    guide.as_ptr().add(
-                                        (tap_rows[tap] + halo_lo) * width,
-                                    )
-                                });
-                            bilateral_span_avx(
-                                row_output,
-                                guide.as_ptr().add(y * width),
-                                taps,
-                                guides,
-                            );
-                        }
-                        continue;
+        .for_each_init(Vec::<f32>::new, |band_buffer, (band_index, band_output)| {
+            let y0 = band_index * BILATERAL_BAND_ROWS;
+            let band_rows = band_output.len() / width;
+            let halo_lo = y0.saturating_sub(reach);
+            let halo_hi = (y0 + band_rows + reach).min(height);
+            let halo_rows = halo_hi - halo_lo;
+            band_buffer.clear();
+            band_buffer.resize(halo_rows * width, 0.0);
+            // Fused pass one: horizontal blur for the band plus halo.
+            for row in 0..halo_rows {
+                let y = halo_lo + row;
+                bilateral_row_horizontal(
+                    &mut band_buffer[row * width..(row + 1) * width],
+                    source,
+                    guide,
+                    width,
+                    y,
+                    step,
+                    use_avx,
+                );
+            }
+            // Fused pass two: vertical blur reading the cached band.
+            for row in 0..band_rows {
+                let y = y0 + row;
+                let row_output = &mut band_output[row * width..(row + 1) * width];
+                let tap_rows: [usize; 5] = std::array::from_fn(|tap| {
+                    ((y as isize + (tap as isize - 2) * step as isize).clamp(0, height as isize - 1)
+                        as usize)
+                        - halo_lo
+                });
+                #[cfg(target_arch = "x86_64")]
+                if use_avx && width >= 8 {
+                    // SAFETY: Tap rows live inside the band buffer, each
+                    // a full row of `width` lanes.
+                    unsafe {
+                        let taps: [*const f32; 5] = std::array::from_fn(|tap| {
+                            band_buffer.as_ptr().add(tap_rows[tap] * width)
+                        });
+                        let guides: [*const f32; 5] = std::array::from_fn(|tap| {
+                            guide.as_ptr().add((tap_rows[tap] + halo_lo) * width)
+                        });
+                        bilateral_span_avx(row_output, guide.as_ptr().add(y * width), taps, guides);
                     }
-                    let _ = use_avx;
-                    for (x, value) in row_output.iter_mut().enumerate() {
-                        let center = guide[y * width + x];
-                        let sigma = 0.012 + 0.055 * center.max(0.0).sqrt();
-                        let inverse = 1.0 / (sigma * sigma);
-                        let mut sum = 0.0;
-                        let mut weight_sum = 0.0;
-                        for (kernel_index, tap_row) in
-                            tap_rows.iter().enumerate()
-                        {
-                            let guide_index =
-                                (tap_row + halo_lo) * width + x;
-                            let distance = guide[guide_index] - center;
-                            let weight = kernel[kernel_index]
-                                / (1.0 + distance * distance * inverse);
-                            sum += band_buffer[tap_row * width + x] * weight;
-                            weight_sum += weight;
-                        }
-                        *value = sum / weight_sum;
-                    }
+                    continue;
                 }
-            },
-        );
+                let _ = use_avx;
+                for (x, value) in row_output.iter_mut().enumerate() {
+                    let center = guide[y * width + x];
+                    let sigma = 0.012 + 0.055 * center.max(0.0).sqrt();
+                    let inverse = 1.0 / (sigma * sigma);
+                    let mut sum = 0.0;
+                    let mut weight_sum = 0.0;
+                    for (kernel_index, tap_row) in tap_rows.iter().enumerate() {
+                        let guide_index = (tap_row + halo_lo) * width + x;
+                        let distance = guide[guide_index] - center;
+                        let weight = kernel[kernel_index] / (1.0 + distance * distance * inverse);
+                        sum += band_buffer[tap_row * width + x] * weight;
+                        weight_sum += weight;
+                    }
+                    *value = sum / weight_sum;
+                }
+            }
+        });
 }
 
 fn median_of_9(mut samples: [f32; 9]) -> f32 {
@@ -1161,7 +1152,10 @@ pub(crate) struct LensCorrectionOptions<'a> {
     pub(crate) crop_factor: f32,
 }
 
-pub(crate) fn apply_lens(image: &mut RgbImage, options: &LensCorrectionOptions<'_>) -> Result<(), Error> {
+pub(crate) fn apply_lens(
+    image: &mut RgbImage,
+    options: &LensCorrectionOptions<'_>,
+) -> Result<(), Error> {
     let make = options.make;
     let model = options.model;
     let lens_name = options.lens_name;
@@ -1355,7 +1349,11 @@ pub(crate) fn orient(image: RgbImage, orientation: u16) -> RgbImage {
     output
 }
 
-pub(crate) fn native_downscale_bounds(orientation: u16, max_width: u32, max_height: u32) -> (u32, u32) {
+pub(crate) fn native_downscale_bounds(
+    orientation: u16,
+    max_width: u32,
+    max_height: u32,
+) -> (u32, u32) {
     if (5..=8).contains(&orientation) {
         (max_height, max_width)
     } else {
@@ -1466,9 +1464,9 @@ fn area_coverage(source: usize, target: usize) -> Vec<(usize, Vec<f32>)> {
         .collect()
 }
 
-/// Applies the default display tone and sRGB transfer, on the GPU when the
-/// Vulkan backend is available (the default; `ORFEUS_GPU=0` opts out) and on
-/// the CPU otherwise. Failures leave the input intact and fall back.
+/// Applies the default display tone and sRGB transfer, on the GPU when
+/// explicitly enabled with `ORFEUS_GPU=1` and on the CPU otherwise. Failures
+/// leave the input intact and fall back.
 pub(crate) fn apply_display_transform(image: &mut RgbImage, profiling: bool) {
     let gpu_completed = if super::gpu::requested() {
         match catch_unwind(AssertUnwindSafe(|| {
@@ -1901,9 +1899,7 @@ pub fn render(
     let profiling = std::env::var_os("ORFEUS_PROFILE").is_some();
     let render_started = Instant::now();
     settings.validate()?;
-    if !matches!(cache_mode, CACHE_NONE | CACHE_USE) {
-        return Err(Error::InvalidArgument("unsupported decode cache mode"));
-    }
+    validate_cache_mode(cache_mode)?;
     if same_file(input, output)? {
         return Err(Error::InvalidArgument(
             "input and output refer to the same file",

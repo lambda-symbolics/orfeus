@@ -143,6 +143,28 @@ exactly the curve the render applies."
 (defparameter *gallery-cell-height* 92
   "Height of one still cell in the gallery grid.")
 
+(defstruct gallery-still
+  "One gallery row with an explicit project or local origin."
+  origin
+  identity
+  preset)
+
+(defun gallery-still-key (still)
+  "Return the cache/task key for STILL, including its provenance."
+  (list (gallery-still-origin still) (gallery-still-identity still)))
+
+(defun make-project-gallery-still (preset)
+  (make-gallery-still :origin :project
+                      :identity (orfeus:still-store-identity
+                                 (processing-preset-name preset))
+                      :preset preset))
+
+(defun make-local-gallery-still (preset)
+  (make-gallery-still :origin :local
+                      :identity (orfeus:still-store-identity
+                                 (processing-preset-name preset))
+                      :preset preset))
+
 (defun thumbnail-row-at (event-y scroll row-height)
   "Return the zero-based thumbnail row at local EVENT-Y."
   (floor (+ event-y scroll) row-height))
@@ -166,6 +188,11 @@ exactly the curve the render applies."
                  (cons row selected))
              row))
     (t (values (list row) row))))
+
+(defun crop-preview-current-p (preview-generation published-generation)
+  "True when the displayed preview uses the current crop-edit generation."
+  (and published-generation
+       (= preview-generation published-generation)))
 
 (defun fltk-file-filter (label pattern)
   "Build FLTK's LABEL<TAB>PATTERN native file chooser syntax."
@@ -200,6 +227,15 @@ exactly the curve the render applies."
   "Delete the private preview DIRECTORY and all files created in it."
   (when directory
     (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore)))
+
+(defun preview-recipe-snapshot (recipe)
+  "Return an immutable deep copy of a settings or graph render RECIPE."
+  (etypecase recipe
+    (orfeus:processing-graph
+     (orfeus:sexp->graph (orfeus:graph->sexp recipe)))
+    (orfeus:processing-settings
+     (orfeus::sexp->processing-settings
+      (orfeus::processing-settings->sexp recipe)))))
 
 (defun preview-settings-key (recipe)
   "Return a content hash covering a settings or graph render RECIPE."
@@ -275,6 +311,8 @@ exactly the curve the render applies."
            (background-queue
              (make-gui-queue :workers *background-preview-workers*
                              :name "Orfeus background render worker"))
+           (histogram-queue
+             (make-gui-queue :name "Orfeus histogram worker"))
            (preview-directory (make-gui-preview-directory))
            (picker-directory
              (let ((photo (first (project-photos project))))
@@ -298,14 +336,17 @@ exactly the curve the render applies."
            inspector tabs basic-page optics-page effects-page export-page presets-page
            curves-page curve-canvas curve-drag
            (curve-channel :red-points)
-           curve-histogram curve-histogram-file
+           curve-histogram
            status progress before-preview-file after-preview-file
+           after-preview-generation
            lens-name controls inspector-items tone-items lut-choice wb-choice target-choice
            export-quality export-max-width export-max-height export-metadata
            export-timestamp
            gallery-canvas preset-name-input preset-apply-button
            (gallery-scroll 0)
            (gallery-selected nil)
+           (gallery-stills '())
+           (gallery-generation 0)
            (gallery-thumbs (make-hash-table :test #'equal))
            (gallery-click (cons 0 -1))
            debounce-id poll-id comparison-p layout-initialized-p
@@ -550,7 +591,9 @@ exactly the curve the render applies."
                                    cosine sine frame-x frame-y
                                    frame-width frame-height)
                  (crop-overlay-geometry canvas)
-               (when center-x
+               (when (and center-x
+                          (crop-preview-current-p preview-generation
+                                                  after-preview-generation))
                  (let ((corner (crop-corner-at canvas x y)))
                    (cond
                      (corner
@@ -709,16 +752,20 @@ exactly the curve the render applies."
                (:red-points "Red")
                (:green-points "Green")
                (:blue-points "Blue")))
-           (refresh-curve-histogram ()
-             (when (and after-preview-file
-                        (not (equal after-preview-file
-                                    curve-histogram-file)))
-               (setf curve-histogram-file after-preview-file
-                     curve-histogram
-                     (multiple-value-bind (red green blue)
-                         (ignore-errors
-                           (preview-histogram after-preview-file))
-                       (when red (list red green blue))))))
+           (schedule-curve-histogram (path generation)
+             ;; Histogram decoding is bounded to one pending background task;
+             ;; draw callbacks only consume the last completed result.
+             (discard-gui-tasks histogram-queue :histogram)
+             (setf curve-histogram nil)
+             (enqueue-gui-task
+              histogram-queue :histogram
+              (lambda ()
+                (multiple-value-bind (red green blue)
+                    (ignore-errors (preview-histogram path))
+                  (when red
+                    (queue-event queue
+                                 (list :histogram generation path
+                                       (list red green blue))))))))
            (curve-chart-geometry ()
              ;; The chart rectangle, widget-relative.
              (values 12 8
@@ -738,9 +785,8 @@ exactly the curve the render applies."
                        (top (+ y chart-y)))
                    (cl-fltk:draw-color-rgb :red 16 :green 16 :blue 18)
                    (cl-fltk:draw-filled-rect left top chart-w chart-h)
-                   ;; Channel occupancy: dim RGB histogram bars behind the
-                   ;; grid, the waveform check for stretched negatives.
-                   (refresh-curve-histogram)
+                   ;; Channel occupancy: dim cached RGB histogram bars behind
+                   ;; the grid. Decoding runs on the background queue.
                    (when curve-histogram
                      (loop for plane in curve-histogram
                            for (red green blue) in '((120 50 50)
@@ -1001,7 +1047,20 @@ exactly the curve the render applies."
                  (sync-controls)
                  (sync-node-tools)
                  (when node-strip (cl-fltk:redraw node-strip))
-                 (when selection (schedule-initial-preview))
+                 (if selection
+                     (schedule-initial-preview)
+                     (progn
+                       (incf preview-generation)
+                       (when debounce-id
+                         (ignore-errors (cl-fltk:remove-timeout debounce-id))
+                         (setf debounce-id nil))
+                       (discard-gui-tasks queue :before)
+                       (discard-gui-tasks queue :after)
+                       (discard-gui-tasks background-queue :before)
+                       (discard-gui-tasks background-queue :after)
+                       (discard-gui-tasks histogram-queue :histogram)
+                       (setf after-preview-generation nil
+                             curve-histogram nil)))
                  (redraw-thumbnails))))
            (handle-thumbnail-mouse (canvas event value)
              (declare (ignore canvas))
@@ -1029,7 +1088,7 @@ exactly the curve the render applies."
                    after-preview-file nil)
              (when before-canvas (cl-fltk:redraw before-canvas))
              (when after-canvas (cl-fltk:redraw after-canvas)))
-           (publish-preview (role path)
+           (publish-preview (role path generation)
              (let ((old-path (ecase role
                                (:before before-preview-file)
                                (:after after-preview-file))))
@@ -1040,7 +1099,9 @@ exactly the curve the render applies."
                  (:before (setf before-preview-file path)
                           (cl-fltk:redraw before-canvas))
                  (:after (setf after-preview-file path
+                               after-preview-generation generation
                                (gethash (selected-job) thumbnail-files) path)
+                         (schedule-curve-histogram path generation)
                          (cl-fltk:redraw after-canvas)
                          (when curve-canvas
                            (cl-fltk:redraw curve-canvas))
@@ -1641,64 +1702,82 @@ exactly the curve the render applies."
                       (after-graph-edit
                        (format nil "Node graph pasted to ~D photo~:P" count))
                       (set-status "No photograph selected"))))))
-           (merge-local-stills ()
-             ;; The per-user gallery joins the project's own stills; the
-             ;; project copy wins name collisions so saved projects stay
-             ;; authoritative.
-             (handler-case
-                 (dolist (preset (orfeus:still-store-list))
-                   (unless (find (processing-preset-name preset)
-                                 (project-presets project)
-                                 :key #'processing-preset-name
-                                 :test #'string-equal)
-                     (setf (project-presets project)
-                           (append (project-presets project)
-                                   (list preset)))))
-               (error (condition)
-                 (set-status (princ-to-string condition)))))
+           (reload-gallery-stills ()
+             ;; Local stills are view-only gallery entries, never project data.
+             (incf gallery-generation)
+             (discard-gui-tasks background-queue :still)
+             (clrhash gallery-thumbs)
+             (setf gallery-stills
+                   (append (mapcar #'make-project-gallery-still
+                                   (project-presets project))
+                           (handler-case
+                               (mapcar #'make-local-gallery-still
+                                       (orfeus:still-store-list))
+                             (error (condition)
+                               (set-status (princ-to-string condition))
+                               '()))))
+             (when (and gallery-selected
+                        (>= gallery-selected (length gallery-stills)))
+               (setf gallery-selected nil)))
            (persist-still (preset)
              ;; The local gallery copy survives removable source media and
-             ;; unsaved projects.
-             (handler-case (orfeus:still-store-write preset)
+             ;; unsaved projects, but never replaces an unrelated exact name.
+             (handler-case
+                 (values (orfeus:still-store-write preset :if-exists :error) nil)
                (error (condition)
-                 (set-status (format nil "Still kept in project only: ~A"
-                                     condition)))))
+                 (values nil condition))))
            (grab-still ()
              (let ((preset (gui-model-grab-still model)))
                (if preset
-                   (progn
-                     (persist-still preset)
+                   (multiple-value-bind (stored condition)
+                       (persist-still preset)
                      (refresh-gallery)
                      (setf (cl-fltk:value preset-name-input)
                            (processing-preset-name preset))
                      (sync-preset-action-label)
-                     (set-status (format nil "Grabbed ~A"
-                                         (processing-preset-name preset))))
+                     (set-status
+                      (if stored
+                          (format nil "Grabbed ~A"
+                                  (processing-preset-name preset))
+                          (format nil "Grabbed ~A in project only: ~A"
+                                  (processing-preset-name preset) condition))))
                    (set-status "No photograph selected"))))
            (still-recipe (preset)
              (or (orfeus:processing-preset-graph preset)
                  (orfeus::settings-apply-stage-bypass
                   (processing-preset-settings preset)
                   (processing-preset-disabled-stages preset))))
-           (still-thumbnail-pathname (preset)
-             (merge-pathnames
-              (make-pathname
-               :name (format nil "still-~A-~A"
-                             (preview-settings-key (still-recipe preset))
-                             (or (pathname-name
-                                  (processing-preset-source-photo preset))
-                                 "none"))
-               :type "jpg")
-              preview-directory))
-           (request-still-thumbnail (preset)
-             (let* ((name (processing-preset-name preset))
+           (still-thumbnail-pathname (still)
+             (let* ((preset (gallery-still-preset still))
                     (source (processing-preset-source-photo preset))
-                    (stored (ignore-errors
-                              (orfeus:still-store-thumbnail-pathname name))))
-               (when (null (gethash name gallery-thumbs))
+                    (source-identity
+                      (orfeus:still-store-identity
+                       (if source
+                           (namestring
+                            (or (ignore-errors (truename source)) source))
+                           "none"))))
+               (merge-pathnames
+                (make-pathname
+                 :name (format nil "still-~(~A~)-~A-~A-~A"
+                               (gallery-still-origin still)
+                               (gallery-still-identity still)
+                               source-identity
+                               (preview-settings-key (still-recipe preset)))
+                 :type "jpg")
+                preview-directory)))
+           (request-still-thumbnail (still)
+             (let* ((preset (gallery-still-preset still))
+                    (key (gallery-still-key still))
+                    (generation gallery-generation)
+                    (name (processing-preset-name preset))
+                    (source (processing-preset-source-photo preset))
+                    (stored (when (eq :local (gallery-still-origin still))
+                              (ignore-errors
+                                (orfeus:still-store-thumbnail-pathname name)))))
+               (when (null (gethash key gallery-thumbs))
                  (cond
                    ((and source (probe-file source))
-                    (let* ((output (still-thumbnail-pathname preset))
+                    (let* ((output (still-thumbnail-pathname still))
                            (recipe (still-recipe preset))
                            (graph-p (typep recipe
                                            'orfeus:processing-graph)))
@@ -1706,8 +1785,8 @@ exactly the curve the render applies."
                           (progn
                             (when (and stored (not (probe-file stored)))
                               (ignore-errors
-                                (uiop:copy-file output stored)))
-                            (setf (gethash name gallery-thumbs) output))
+                                (orfeus:still-store-write-thumbnail name output)))
+                            (setf (gethash key gallery-thumbs) output))
                           (enqueue-gui-task
                            background-queue :still
                            (lambda ()
@@ -1721,21 +1800,19 @@ exactly the curve the render applies."
                                     :max-height *thumbnail-preview-size*
                                     :jpeg-quality 82
                                     :if-exists :supersede)
-                                   (when stored
-                                     (ignore-errors
-                                       (uiop:copy-file output stored)))
                                    (queue-event queue
-                                                (list :still-thumb name
-                                                      output)))
+                                                (list :still-thumb generation
+                                                      key output stored)))
                                (error () nil)))))))
                    ;; Source gone (card ejected, file moved): fall back to
                    ;; the persisted local copy of the thumbnail.
                    ((and stored (probe-file stored))
-                    (setf (gethash name gallery-thumbs) stored))))))
+                    (setf (gethash key gallery-thumbs) stored))))))
            (refresh-gallery ()
+             (reload-gallery-stills)
              (when gallery-canvas
-               (dolist (preset (project-presets project))
-                 (request-still-thumbnail preset))
+               (dolist (still gallery-stills)
+                 (request-still-thumbnail still))
                (cl-fltk:redraw gallery-canvas)))
            (gallery-columns ()
              (max 1 (floor (- (cl-fltk:widget-width gallery-canvas) 8)
@@ -1747,11 +1824,11 @@ exactly the curve the render applies."
                                 *gallery-cell-height*))
                     (index (+ (* row columns) (min column (1- columns)))))
                (when (and (>= column 0) (< column columns) (>= row 0)
-                          (< index (length (project-presets project))))
+                          (< index (length gallery-stills)))
                  index)))
            (gallery-scroll-limit ()
              (let ((columns (gallery-columns)))
-               (max 0 (- (* (ceiling (length (project-presets project))
+               (max 0 (- (* (ceiling (length gallery-stills)
                                      columns)
                             *gallery-cell-height*)
                          (- (cl-fltk:widget-height gallery-canvas) 8)))))
@@ -1763,7 +1840,8 @@ exactly the curve the render applies."
                    (columns (gallery-columns)))
                (cl-fltk:draw-color-rgb :red 255 :green 255 :blue 255)
                (cl-fltk:draw-filled-rect x y width height)
-               (loop for preset in (project-presets project)
+               (loop for still in gallery-stills
+                     for preset = (gallery-still-preset still)
                      for index from 0
                      for column = (mod index columns)
                      for row = (floor index columns)
@@ -1779,7 +1857,7 @@ exactly the curve the render applies."
                               (cl-fltk:draw-filled-rect
                                cell-x cell-y (- *gallery-cell-width* 6)
                                (- *gallery-cell-height* 6)))
-                            (let ((thumb (gethash name gallery-thumbs)))
+                            (let ((thumb (gethash (gallery-still-key still) gallery-thumbs)))
                               (if thumb
                                   (draw-thumbnail-file
                                    widget thumb (+ cell-x 3) (+ cell-y 3)
@@ -1804,7 +1882,8 @@ exactly the curve the render applies."
                             (cl-fltk:draw-font :size 12)))))
            (gallery-select (index)
              (setf gallery-selected index)
-             (let ((preset (nth index (project-presets project))))
+             (let* ((still (nth index gallery-stills))
+                    (preset (and still (gallery-still-preset still))))
                (when preset
                  (setf (cl-fltk:value preset-name-input)
                        (processing-preset-name preset))))
@@ -1838,51 +1917,67 @@ exactly the curve the render applies."
                    (redraw-thumbnails))
                (error (condition)
                  (set-status (princ-to-string condition)))))
-           (delete-still (preset)
-             (setf (project-presets project)
-                   (remove preset (project-presets project)))
-             (remhash (processing-preset-name preset) gallery-thumbs)
-             (ignore-errors
-               (orfeus:still-store-delete (processing-preset-name preset)))
-             (setf gallery-selected nil)
-             (refresh-gallery)
-             (set-status (format nil "Deleted ~A"
-                                 (processing-preset-name preset))))
-           (rename-still (preset)
-             (let* ((old-name (processing-preset-name preset))
+           (delete-still (still)
+             (let ((preset (gallery-still-preset still)))
+               (ecase (gallery-still-origin still)
+                 (:project
+                  (setf (project-presets project)
+                        (remove preset (project-presets project) :test #'eq)))
+                 (:local
+                  (orfeus:still-store-delete (processing-preset-name preset))))
+               (setf gallery-selected nil)
+               (refresh-gallery)
+               (set-status (format nil "Deleted ~A ~A"
+                                   (string-downcase
+                                    (symbol-name (gallery-still-origin still)))
+                                   (processing-preset-name preset)))))
+           (rename-still (still)
+             (let* ((preset (gallery-still-preset still))
+                    (old-name (processing-preset-name preset))
                     (answer (cl-fltk:input-dialog "Still name"
                                                   :initial old-name)))
                (when answer
                  (let ((new-name (string-trim '(#\Space #\Tab) answer)))
-                   (cond
-                     ((zerop (length new-name)))
-                     ((string= new-name old-name))
-                     ((find new-name (project-presets project)
-                            :key #'processing-preset-name
-                            :test #'string-equal)
-                      (set-status
-                       (format nil "A still named ~A already exists"
-                               new-name)))
-                     (t
-                      (setf (processing-preset-name preset) new-name)
-                      (let ((thumb (gethash old-name gallery-thumbs)))
-                        (remhash old-name gallery-thumbs)
-                        (when thumb
-                          (setf (gethash new-name gallery-thumbs) thumb)))
-                      (when (and gallery-selected
-                                 (eq preset (nth gallery-selected
-                                                 (project-presets project))))
-                        (setf (cl-fltk:value preset-name-input) new-name))
-                      (refresh-gallery)
-                      (handler-case
-                          (progn
-                            (orfeus:still-store-rename preset old-name)
-                            (set-status (format nil "Renamed ~A to ~A"
-                                                old-name new-name)))
-                        (error (condition)
-                          (set-status (princ-to-string condition))))))))))
-           (gallery-context-menu (preset)
-             (let ((actions
+                   (unless (or (zerop (length new-name))
+                               (string= new-name old-name))
+                     (let* ((local-p (eq :local (gallery-still-origin still)))
+                            (siblings
+                              (remove preset
+                                      (if local-p
+                                          (mapcar #'gallery-still-preset
+                                                  (remove-if-not
+                                                   (lambda (entry)
+                                                     (eq :local
+                                                         (gallery-still-origin
+                                                          entry)))
+                                                   gallery-stills))
+                                          (project-presets project))
+                                      :test #'eq)))
+                       (if (find new-name siblings :key #'processing-preset-name
+                                               :test #'string=)
+                           (set-status (format nil "A still named ~A already exists"
+                                               new-name))
+                           (handler-case
+                               (progn
+                                 (if local-p
+                                     (let ((candidate
+                                             (orfeus::sexp->processing-preset
+                                              (orfeus::processing-preset->sexp
+                                               preset))))
+                                       (setf (processing-preset-name candidate)
+                                             new-name)
+                                       (orfeus:still-store-rename candidate old-name))
+                                     (setf (processing-preset-name preset)
+                                           new-name))
+                                 (setf (cl-fltk:value preset-name-input) new-name)
+                                 (refresh-gallery)
+                                 (set-status (format nil "Renamed ~A to ~A"
+                                                     old-name new-name)))
+                             (error (condition)
+                               (set-status (princ-to-string condition)))))))))))
+           (gallery-context-menu (still)
+             (let* ((preset (gallery-still-preset still))
+                    (actions
                      (list (cons (format nil "Apply Graph to ~D Photo~:P"
                                          (selected-photo-count))
                                  (lambda () (apply-still preset)))
@@ -1901,9 +1996,9 @@ exactly the curve the render applies."
                                                 "without white balance")))
                            (cons "-" nil)
                            (cons "Rename Still..."
-                                 (lambda () (rename-still preset)))
+                                 (lambda () (rename-still still)))
                            (cons "Delete Still"
-                                 (lambda () (delete-still preset))))))
+                                 (lambda () (delete-still still))))))
                (let ((chosen (cl-fltk:popup-menu (mapcar #'first actions))))
                  (when chosen
                    (let ((action (rest (nth chosen actions))))
@@ -1922,13 +2017,14 @@ exactly the curve the render applies."
                         (gallery-select index)
                         (cond
                           ((= button 3)
-                           (let ((preset (nth index
-                                              (project-presets project))))
-                             (when preset (gallery-context-menu preset))))
+                           (let ((still (nth index gallery-stills)))
+                             (when still (gallery-context-menu still))))
                           ((and (eql index (cdr gallery-click))
                                 (< (- now (car gallery-click))
                                    (* 0.4 internal-time-units-per-second)))
-                           (apply-current-preset))
+                           (let ((still (nth index gallery-stills)))
+                             (when still
+                               (apply-still (gallery-still-preset still)))))
                           (t (setf gallery-click (cons now index)))))))
                    (#.cl-fltk:+event-wheel+
                     (setf gallery-scroll
@@ -1945,12 +2041,17 @@ exactly the curve the render applies."
                  (let ((preset (gui-model-save-preset
                                 model (cl-fltk:value preset-name-input))))
                    (remhash (processing-preset-name preset) gallery-thumbs)
-                   (persist-still preset)
-                   (refresh-gallery)
-                   (setf (cl-fltk:value preset-name-input)
-                         (processing-preset-name preset))
-                   (set-status (format nil "Saved preset ~A"
-                                       (processing-preset-name preset))))
+                   (multiple-value-bind (stored condition)
+                       (persist-still preset)
+                     (refresh-gallery)
+                     (setf (cl-fltk:value preset-name-input)
+                           (processing-preset-name preset))
+                     (set-status
+                      (if stored
+                          (format nil "Saved preset ~A"
+                                  (processing-preset-name preset))
+                          (format nil "Saved preset ~A in project only: ~A"
+                                  (processing-preset-name preset) condition)))))
                (error (condition)
                  (set-status (princ-to-string condition)))))
            (apply-current-preset ()
@@ -2002,8 +2103,7 @@ exactly the curve the render applies."
                    pick-color-node nil)
              (gui-model-replace-project model new-project path)
              (setf (gui-model-selected-node model) nil)
-             (merge-local-stills)
-             (refresh-gallery)
+               (refresh-gallery)
              (sync-node-tools)
              (when node-strip (cl-fltk:redraw node-strip))
              (sync-controls)
@@ -2091,22 +2191,24 @@ exactly the curve the render applies."
              ;; While a crop node is selected its stage is bypassed in the
              ;; preview: the full frame stays visible under the editing
              ;; overlay, and rect changes cost a redraw, not a render.
-             (let ((settings (settings-for-job (selected-job)))
+             (let ((settings (preview-recipe-snapshot
+                              (settings-for-job (selected-job))))
                    (node (crop-editing-node)))
-               (if (and node
-                        (typep settings 'orfeus:processing-graph)
-                        (not (orfeus:graph-node-bypassed-p node)))
-                   (let* ((copy (orfeus:graph-copy settings))
-                          (twin (find (orfeus:graph-node-id node)
-                                      (orfeus:processing-graph-nodes copy)
-                                      :key #'orfeus:graph-node-id)))
-                     (when twin
-                       (setf (orfeus:graph-node-bypassed-p twin) t))
-                     copy)
-                   settings)))
+               (when (and node
+                          (typep settings 'orfeus:processing-graph)
+                          (not (orfeus:graph-node-bypassed-p node)))
+                 (let ((twin (find (orfeus:graph-node-id node)
+                                   (orfeus:processing-graph-nodes settings)
+                                   :key #'orfeus:graph-node-id)))
+                   (when twin
+                     (setf (orfeus:graph-node-bypassed-p twin) t))))
+               settings))
            (enqueue-render (target-queue role job index settings generation publish-p
                             &key front-p draft-p cache-p)
-             (let* ((input (photo-job-input-path job))
+             ;; Freeze once before deriving the cache path, then pass that same
+             ;; immutable recipe to the worker.
+             (let* ((settings (preview-recipe-snapshot settings))
+                    (input (photo-job-input-path job))
                     (file-role (if draft-p :draft role))
                     (output (preview-pathname preview-directory index job
                                               file-role settings))
@@ -2557,21 +2659,32 @@ exactly the curve the render applies."
                     (set-status (third event))))
                  (:preview
                   (when (gui-preview-event-current-p model event preview-generation)
-                    (publish-preview (fifth event) (sixth event))
+                    (publish-preview (fifth event) (sixth event) (second event))
                     (set-status (preview-status-text model))))
+                 (:histogram
+                  (when (and (= (second event) preview-generation)
+                             (equal (third event) after-preview-file))
+                    (setf curve-histogram (fourth event))
+                    (when curve-canvas (cl-fltk:redraw curve-canvas))))
                  (:thumbnail
                   (when (and (member (third event) (project-photos project) :test #'eq)
                              (null (gethash (third event) thumbnail-files)))
                     (setf (gethash (third event) thumbnail-files) (fourth event))
                     (redraw-thumbnails)))
                  (:still-thumb
-                  (let ((preset (find (second event) (project-presets project)
-                                      :test #'string-equal
-                                      :key #'processing-preset-name)))
-                    (when (and preset
-                               (equal (third event)
-                                      (still-thumbnail-pathname preset)))
-                      (setf (gethash (second event) gallery-thumbs) (third event))
+                  (let ((still (and (= (second event) gallery-generation)
+                                    (find (third event) gallery-stills
+                                          :key #'gallery-still-key
+                                          :test #'equal))))
+                    (when still
+                      (when (fifth event)
+                        (ignore-errors
+                          (orfeus:still-store-write-thumbnail
+                           (processing-preset-name
+                            (gallery-still-preset still))
+                           (fourth event))))
+                      (setf (gethash (third event) gallery-thumbs)
+                            (fourth event))
                       (when gallery-canvas (cl-fltk:redraw gallery-canvas)))))
                  (:done
                   (set-status (format nil "Exported ~A" (second event))))
@@ -3053,8 +3166,7 @@ exactly the curve the render applies."
                       (declare (ignore ignored))
                       (reset-curve-channel)))
          12 334 :fill 26 :page)
-        (merge-local-stills)
-        (refresh-gallery)
+               (refresh-gallery)
         (section-frame basic-page "White Balance" 16 110)
         (setf wb-choice
               (cl-fltk:field-control
@@ -3191,6 +3303,7 @@ exactly the curve the render applies."
           (when debounce-id (ignore-errors (cl-fltk:remove-timeout debounce-id)))
           (stop-gui-queue queue)
           (stop-gui-queue background-queue)
+          (stop-gui-queue histogram-queue)
           (orfeus::clear-render-source-cache)
           (clear-preview-cache)
           (ignore-errors (delete-gui-preview-directory preview-directory))

@@ -25,6 +25,8 @@
                 #:processing-preset-settings
                 #:processing-preset-graph
                 #:still-store-write
+                #:still-store-write-thumbnail
+                #:still-store-identity
                 #:still-store-list
                 #:still-store-rename
                 #:still-store-delete
