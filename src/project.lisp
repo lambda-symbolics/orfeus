@@ -518,3 +518,97 @@ so pasting a grade also carries which nodes were switched off."
         (project-resolve-relative-paths
          (sexp->project (read stream t nil nil))
          base-directory)))))
+
+;;; The local still store.
+;;;
+;;; Grabbed stills are copied into a per-user gallery under the XDG data
+;;; directory, so a grade survives removable source media and unsaved
+;;; projects. Each still is one readable sidecar plus an optional thumbnail.
+
+(defun still-store-directory ()
+  "Return the per-user still gallery directory, creating it when missing."
+  (let ((directory (uiop:xdg-data-home "orfeus/stills/")))
+    (ensure-directories-exist directory)
+    directory))
+
+(defun still-store-slug (name)
+  "A filesystem-safe base name for still NAME."
+  (let ((slug (string-trim
+               "-"
+               (string-downcase
+                (map 'string
+                     (lambda (character)
+                       (if (alphanumericp character) character #\-))
+                     name)))))
+    (if (plusp (length slug)) slug "still")))
+
+(defun still-store-sexp-pathname (name &key (directory
+                                             (still-store-directory)))
+  (merge-pathnames (make-pathname :name (still-store-slug name) :type "sexp")
+                   directory))
+
+(defun still-store-thumbnail-pathname (name &key (directory
+                                                  (still-store-directory)))
+  (merge-pathnames (make-pathname :name (still-store-slug name) :type "jpg")
+                   directory))
+
+(defun still-store-write (preset &key (directory (still-store-directory)))
+  "Persist PRESET in the local still gallery; returns the sidecar pathname."
+  (let ((pathname (still-store-sexp-pathname
+                   (processing-preset-name preset) :directory directory)))
+    (with-open-file (stream pathname
+                            :direction :output
+                            :if-exists :supersede
+                            :if-does-not-exist :create)
+      (with-standard-io-syntax
+        (let ((*print-pretty* t)
+              (*print-readably* nil)
+              (*print-escape* t))
+          (write (list :orfeus-still 1 (processing-preset->sexp preset))
+                 :stream stream)
+          (terpri stream))))
+    pathname))
+
+(defun still-store-read (pathname)
+  "Read one still sidecar, validating like project data."
+  (with-open-file (stream pathname :direction :input)
+    (let ((*read-eval* nil))
+      (let ((sexp (read stream t nil nil)))
+        (unless (and (listp sexp)
+                     (eq (first sexp) :orfeus-still)
+                     (eql (second sexp) 1))
+          (project-invalid sexp "expected an (:orfeus-still 1 ...) file"))
+        (sexp->processing-preset (third sexp))))))
+
+(defun still-store-list (&key (directory (still-store-directory)))
+  "Return every readable still in the local gallery, oldest first."
+  (loop for file in (sort (uiop:directory-files directory "*.sexp")
+                          #'< :key #'file-write-date)
+        for preset = (handler-case (still-store-read file)
+                       (error () nil))
+        when preset collect preset))
+
+(defun still-store-delete (name &key (directory (still-store-directory)))
+  "Remove NAME's sidecar and thumbnail from the local gallery."
+  (let ((sexp (still-store-sexp-pathname name :directory directory))
+        (thumbnail (still-store-thumbnail-pathname name :directory directory)))
+    (when (probe-file sexp) (delete-file sexp))
+    (when (probe-file thumbnail) (delete-file thumbnail))))
+
+(defun still-store-rename (preset old-name &key (directory
+                                                 (still-store-directory)))
+  "Move PRESET's stored files off OLD-NAME's slug and rewrite the sidecar."
+  (let ((old-slug (still-store-slug old-name))
+        (new-name (processing-preset-name preset)))
+    (unless (string= old-slug (still-store-slug new-name))
+      (let ((old-thumbnail (still-store-thumbnail-pathname
+                            old-name :directory directory))
+            (new-thumbnail (still-store-thumbnail-pathname
+                            new-name :directory directory))
+            (old-sexp (still-store-sexp-pathname old-name
+                                                 :directory directory)))
+        (when (probe-file old-thumbnail)
+          (rename-file old-thumbnail new-thumbnail))
+        (when (probe-file old-sexp)
+          (delete-file old-sexp))))
+    (still-store-write preset :directory directory)))

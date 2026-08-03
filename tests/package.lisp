@@ -23,6 +23,11 @@
                 #:photo-job-render-output
                 #:processing-preset-name
                 #:processing-preset-settings
+                #:processing-preset-graph
+                #:still-store-write
+                #:still-store-list
+                #:still-store-rename
+                #:still-store-delete
                 #:default-processing-graph
                 #:grade-stage-keys
                 #:grade-stages

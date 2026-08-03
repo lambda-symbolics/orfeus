@@ -180,6 +180,41 @@
       (when (probe-file pathname)
         (delete-file pathname)))))
 
+(defun still-store-round-trip-p ()
+  (let ((directory (merge-pathnames
+                    (format nil "orfeus-still-store-~D-~D/"
+                            (get-universal-time)
+                            (random most-positive-fixnum))
+                    #P"/tmp/")))
+    (ensure-directories-exist directory)
+    (unwind-protect
+         (let ((preset (make-processing-preset
+                        :name "Portra 400 +1!"
+                        :settings (make-processing-settings :exposure 0.5)
+                        :source-photo #P"input/example.orf"
+                        :graph (settings->graph
+                                (make-processing-settings :exposure 0.5)))))
+           (still-store-write preset :directory directory)
+           (let ((loaded (still-store-list :directory directory)))
+             (and (= 1 (length loaded))
+                  (string= "Portra 400 +1!"
+                           (processing-preset-name (first loaded)))
+                  (not (null (processing-preset-graph (first loaded))))
+                  (progn
+                    (setf (processing-preset-name preset) "Gold 200")
+                    (still-store-rename preset "Portra 400 +1!"
+                                        :directory directory)
+                    (let ((renamed (still-store-list :directory directory)))
+                      (and (= 1 (length renamed))
+                           (string= "Gold 200"
+                                    (processing-preset-name
+                                     (first renamed))))))
+                  (progn
+                    (still-store-delete "Gold 200" :directory directory)
+                    (null (still-store-list :directory directory))))))
+      (uiop:delete-directory-tree directory :validate t
+                                            :if-does-not-exist :ignore))))
+
 (defun still-names-increment-p ()
   (let* ((photo (make-photo-job :input-path #P"input/example.orf"))
          (project (make-project
@@ -948,6 +983,8 @@
              (still-preset-source-photo-round-trip-p))
       (check "still names increment past taken gallery names"
              (still-names-increment-p))
+      (check "the local still store writes, renames, and deletes stills"
+             (still-store-round-trip-p))
       (check "graphs round trip through S-expressions"
              (graph-round-trip-p))
       (check "graph validation rejects malformed graphs"

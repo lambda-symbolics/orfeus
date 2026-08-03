@@ -104,6 +104,12 @@
    #:processing-preset-name
    #:processing-preset-settings
    #:processing-preset-source-photo
+   #:still-store-directory
+   #:still-store-list
+   #:still-store-write
+   #:still-store-delete
+   #:still-store-rename
+   #:still-store-thumbnail-pathname
    #:processing-settings
    #:processing-settings-chromatic-aberration-correction-p
    #:processing-settings-exposure
