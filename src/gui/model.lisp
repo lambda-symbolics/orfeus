@@ -503,6 +503,30 @@ placement breaks the film-domain rules."
                (orfeus:graph-swap-with-upstream
                 graph (orfeus:graph-node-id (first consumers)))))))))))
 
+(defun gui-model-rewire-node (model node after-id)
+  "Splice NODE to read AFTER-ID on the selected photo's graph.
+
+Returns true when the graph changed; invalid placements signal after the
+core rolls the graph back."
+  (let* ((job (gui-model-selected-job model))
+         (graph (and job (photo-job-graph job))))
+    (when (and graph
+               (member node (orfeus:processing-graph-nodes graph)))
+      (orfeus:graph-move-node-after graph (orfeus:graph-node-id node)
+                                    after-id))))
+
+(defun gui-model-set-blend-input (model blend source-node)
+  "Point BLEND's second branch at SOURCE-NODE (or NIL for the source)."
+  (let* ((job (gui-model-selected-job model))
+         (graph (and job (photo-job-graph job))))
+    (when (and graph
+               (member blend (orfeus:processing-graph-nodes graph)))
+      (orfeus:graph-set-blend-input
+       graph (orfeus:graph-node-id blend)
+       (if source-node
+           (orfeus:graph-node-id source-node)
+           orfeus:*graph-source-id*)))))
+
 (defun gui-model-toggle-node (model node)
   "Toggle NODE's bypass; returns :BYPASSED or :ENABLED."
   (declare (ignore model))

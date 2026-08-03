@@ -239,7 +239,7 @@
            thumbnail-canvas thumbnail-scrollbar
            before-canvas after-canvas before-caption after-caption
            node-strip still-button copy-grade-button paste-grade-button
-           node-opacity-slider pick-color-node crop-drag
+           node-opacity-slider pick-color-node crop-drag node-drag
            (node-click (cons 0 -1))
            grade-clipboard
            inspector tabs basic-page optics-page effects-page export-page presets-page
@@ -954,7 +954,41 @@
                                 (cl-fltk:draw-line node-x
                                                    (+ top node-height -1)
                                                    (+ node-x node-width -1)
-                                                   top))))))))
+                                                   top))))
+                   ;; Rubber band and drop target while dragging a node.
+                   (when (and node-drag (getf node-drag :active-p))
+                     (let* ((dragged (getf node-drag :node))
+                            (drag-x (getf node-drag :x))
+                            (drag-y (getf node-drag :y))
+                            (source (position dragged nodes)))
+                       (when source
+                         (multiple-value-bind (kind target)
+                             (node-drop-target drag-x count)
+                           (let ((pitch (+ node-width wire)))
+                             (cl-fltk:draw-color-rgb :red 0 :green 0
+                                                     :blue 128)
+                             (case kind
+                               (:node
+                                (let ((target-x (+ x 8 (* target pitch))))
+                                  (cl-fltk:draw-rect
+                                   (1- target-x) (1- top)
+                                   (+ node-width 2) (+ node-height 2))))
+                               (:gap
+                                (let ((gap-x (+ x 8 (* target pitch)
+                                                node-width
+                                                (floor wire 2))))
+                                  (cl-fltk:draw-filled-rect
+                                   (1- gap-x) (+ top 2) 3
+                                   (- node-height 4))))
+                               (:source
+                                (cl-fltk:draw-filled-rect
+                                 (+ x 2) (+ top 2) 3
+                                 (- node-height 4))))
+                             (cl-fltk:draw-line
+                              (+ x 8 (* source pitch)
+                                 (floor node-width 2))
+                              middle (+ x drag-x)
+                              (+ y drag-y)))))))))))
            (after-graph-edit (message)
              (sync-controls)
              (sync-node-tools)
@@ -1057,52 +1091,142 @@
                (when chosen
                  (let ((action (rest (nth chosen actions))))
                    (when action (funcall action))))))
-           (handle-node-strip-mouse (widget event value)
-             (declare (ignore widget event))
-             (multiple-value-bind (x y button) (parse-preview-event value)
-               (declare (ignore y))
-               (when (and x (selected-job))
-                 (let ((index (node-index-at x))
-                       (now (get-internal-real-time)))
-                   (cond
-                     ((and index (= button 3))
-                      (let ((node (select-strip-node index)))
-                        (when node
-                          (show-node-menu
-                           (append (graph-node-menu-actions node)
-                                   (list (cons "-" nil))
-                                   (add-node-menu-actions node))))))
-                     ((= button 3)
-                      (gui-model-ensure-graph model)
-                      (show-node-menu (add-node-menu-actions nil)))
-                     (index
-                      (let ((node (select-strip-node index)))
-                        (when (and node
-                                   (eql index (cdr node-click))
-                                   (< (- now (car node-click))
-                                      (* 0.4 internal-time-units-per-second)))
-                          (let ((state (gui-model-toggle-node model node)))
+           (node-drop-target (x count)
+             ;; Where a drag at strip X lands: a node, the gap after one,
+             ;; or the source well left of the first node.
+             (when (plusp count)
+               (multiple-value-bind (node-width wire)
+                   (node-strip-metrics count)
+                 (let ((relative (- x 8)))
+                   (if (minusp relative)
+                       (values :source nil)
+                       (let* ((pitch (+ node-width wire))
+                              (index (floor relative pitch))
+                              (offset (- relative (* index pitch))))
+                         (cond ((>= index count)
+                                (values :gap (1- count)))
+                               ((< offset node-width)
+                                (values :node index))
+                               (t (values :gap index)))))))))
+           (drop-node-drag (drag)
+             (let* ((node (getf drag :node))
+                    (x (getf drag :x))
+                    (y (getf drag :y))
+                    (nodes (strip-nodes))
+                    (count (length nodes)))
+               (handler-case
+                   (multiple-value-bind (kind index)
+                       (node-drop-target x count)
+                     (cond
+                       ((eq kind :source)
+                        (if (gui-model-rewire-node
+                             model node orfeus:*graph-source-id*)
                             (after-graph-edit
-                             (format nil "~A ~A"
-                                     (if (eq state :bypassed)
-                                         "Bypassed"
-                                         "Enabled")
+                             (format nil "~A moved to the head"
                                      (node-kind-label
-                                      (orfeus:graph-node-kind node))))))
-                        (setf node-click (cons now index))))
-                     ((and (= button 1)
-                           (gui-model-selected-graph-node model))
-                      ;; Clicking empty strip space drops the selection,
-                      ;; which also commits crop editing back into the
-                      ;; rendered preview.
-                      (let ((was-cropping (crop-editing-node)))
-                        (setf (gui-model-selected-node model) nil)
-                        (sync-controls)
-                        (sync-node-tools)
-                        (cl-fltk:redraw node-strip)
-                        (when was-cropping
-                          (schedule-edited-preview))
-                        (set-status "Node deselected"))))))))
+                                      (orfeus:graph-node-kind node))))
+                            (cl-fltk:redraw node-strip)))
+                       ((null kind) (cl-fltk:redraw node-strip))
+                       (t
+                        (let ((target (nth index nodes)))
+                          (cond
+                            ((or (null target) (eq target node))
+                             (cl-fltk:redraw node-strip))
+                            ((and (eq kind :node)
+                                  (orfeus:graph-node-blend-p target)
+                                  (< y 23))
+                             ;; Dropping on a blend's top half feeds its
+                             ;; second branch.
+                             (if (gui-model-set-blend-input model target
+                                                            node)
+                                 (after-graph-edit
+                                  (format nil "Blend branch reads ~A"
+                                          (node-kind-label
+                                           (orfeus:graph-node-kind node))))
+                                 (cl-fltk:redraw node-strip)))
+                            (t
+                             (if (gui-model-rewire-node
+                                  model node
+                                  (orfeus:graph-node-id target))
+                                 (after-graph-edit
+                                  (format nil "~A moved after ~A"
+                                          (node-kind-label
+                                           (orfeus:graph-node-kind node))
+                                          (node-kind-label
+                                           (orfeus:graph-node-kind
+                                            target))))
+                                 (cl-fltk:redraw node-strip))))))))
+                 (error (condition)
+                   (cl-fltk:redraw node-strip)
+                   (set-status (princ-to-string condition))))))
+           (handle-node-strip-mouse (widget event value)
+             (declare (ignore widget))
+             (multiple-value-bind (x y button) (parse-preview-event value)
+               (when (and x (selected-job))
+                 (case event
+                   (#.cl-fltk:+event-drag+
+                    (when node-drag
+                      (setf (getf node-drag :x) x
+                            (getf node-drag :y) y)
+                      (when (and (not (getf node-drag :active-p))
+                                 (> (abs (- x (getf node-drag :start-x))) 8))
+                        (setf (getf node-drag :active-p) t))
+                      (when (getf node-drag :active-p)
+                        (cl-fltk:redraw node-strip))))
+                   (#.cl-fltk:+event-release+
+                    (when node-drag
+                      (let ((drag node-drag))
+                        (setf node-drag nil)
+                        (when (getf drag :active-p)
+                          (drop-node-drag drag)))))
+                   (#.cl-fltk:+event-push+
+                    (let ((index (node-index-at x))
+                          (now (get-internal-real-time)))
+                      (cond
+                        ((and index (= button 3))
+                         (let ((node (select-strip-node index)))
+                           (when node
+                             (show-node-menu
+                              (append (graph-node-menu-actions node)
+                                      (list (cons "-" nil))
+                                      (add-node-menu-actions node))))))
+                        ((= button 3)
+                         (gui-model-ensure-graph model)
+                         (show-node-menu (add-node-menu-actions nil)))
+                        (index
+                         (let ((node (select-strip-node index)))
+                           (when (and node
+                                      (eql index (cdr node-click))
+                                      (< (- now (car node-click))
+                                         (* 0.4
+                                            internal-time-units-per-second)))
+                             (let ((state (gui-model-toggle-node model
+                                                                 node)))
+                               (after-graph-edit
+                                (format nil "~A ~A"
+                                        (if (eq state :bypassed)
+                                            "Bypassed"
+                                            "Enabled")
+                                        (node-kind-label
+                                         (orfeus:graph-node-kind node))))))
+                           (when (and node (= button 1))
+                             (setf node-drag
+                                   (list :node node :start-x x
+                                         :active-p nil :x x :y y)))
+                           (setf node-click (cons now index))))
+                        ((and (= button 1)
+                              (gui-model-selected-graph-node model))
+                         ;; Clicking empty strip space drops the selection,
+                         ;; which also commits crop editing back into the
+                         ;; rendered preview.
+                         (let ((was-cropping (crop-editing-node)))
+                           (setf (gui-model-selected-node model) nil)
+                           (sync-controls)
+                           (sync-node-tools)
+                           (cl-fltk:redraw node-strip)
+                           (when was-cropping
+                             (schedule-edited-preview))
+                           (set-status "Node deselected"))))))))))
            (autocrop-negative (node)
              (let ((job (selected-job)))
                (when job
@@ -2421,8 +2545,10 @@
         (cl-fltk:set-box node-strip cl-fltk:+box-flat-box+)
         (cl-fltk:set-tooltip node-strip
                              "Pipeline nodes: click one to bypass its stage")
-        (cl-fltk:on node-strip #'handle-node-strip-mouse
-                    :event cl-fltk:+event-push+)
+        (dolist (event (list cl-fltk:+event-push+
+                             cl-fltk:+event-drag+
+                             cl-fltk:+event-release+))
+          (cl-fltk:on node-strip #'handle-node-strip-mouse :event event))
         (flet ((grade-button (label tooltip action)
                  (let ((button (cl-fltk:make-button
                                 :parent center-pane :x 560 :y 672
