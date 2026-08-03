@@ -104,7 +104,11 @@ enum orfeus_graph_node_kind {
     ORFEUS_NODE_TONE = 4,
     ORFEUS_NODE_OPTICS = 5,
     ORFEUS_NODE_FILM = 6,
-    ORFEUS_NODE_BLEND = 7
+    ORFEUS_NODE_BLEND = 7,
+    ORFEUS_NODE_COLOR_SUBTRACT = 8,
+    ORFEUS_NODE_CROP = 9,
+    /* Three channels x four (x, y) spline points on the encoded signal. */
+    ORFEUS_NODE_CURVES = 10
 };
 
 struct orfeus_render_frame_v1 {

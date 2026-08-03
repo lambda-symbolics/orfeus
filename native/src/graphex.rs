@@ -33,6 +33,7 @@ pub const NODE_FILM: u32 = 6;
 pub const NODE_BLEND: u32 = 7;
 pub const NODE_COLOR_SUBTRACT: u32 = 8;
 pub const NODE_CROP: u32 = 9;
+pub const NODE_CURVES: u32 = 10;
 
 /// Frame-level settings shared by every node of one graph render.
 #[repr(C)]
@@ -144,8 +145,126 @@ fn expected_param_count(kind: u32) -> Result<usize, Error> {
         NODE_BLEND => 1,         // opacity toward input B
         NODE_COLOR_SUBTRACT => 3, // picked color, subtracted per channel
         NODE_CROP => 5,          // left, top, width, height, angle (degrees)
+        NODE_CURVES => 24,       // three channels x four (x, y) points
         _ => return Err(Error::InvalidArgument("unknown graph node kind")),
     })
+}
+
+fn validate_curve_points(params: &[f32]) -> Result<(), Error> {
+    for channel in 0..3 {
+        let points = &params[channel * 8..channel * 8 + 8];
+        for segment in 0..3 {
+            if points[segment * 2] + 1.0e-3 > points[segment * 2 + 2] {
+                return Err(Error::InvalidArgument(
+                    "curve points must have ascending positions",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+const CURVE_LUT_SIZE: usize = 4096;
+
+fn srgb_encode_value(value: f32) -> f32 {
+    if value <= 0.003_130_8 {
+        12.92 * value
+    } else {
+        1.055 * value.max(0.0).powf(1.0 / 2.4) - 0.055
+    }
+}
+
+fn srgb_decode_value(value: f32) -> f32 {
+    if value <= 0.040_45 {
+        value / 12.92
+    } else {
+        ((value + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+/// Monotone cubic tangents (Fritsch-Carlson) for four ascending points.
+fn curve_tangents(xs: &[f32; 4], ys: &[f32; 4]) -> [f32; 4] {
+    let mut slopes = [0.0f32; 3];
+    for segment in 0..3 {
+        slopes[segment] = (ys[segment + 1] - ys[segment])
+            / (xs[segment + 1] - xs[segment]).max(1.0e-4);
+    }
+    let mut tangents = [0.0f32; 4];
+    tangents[0] = slopes[0];
+    tangents[3] = slopes[2];
+    for point in 1..3 {
+        tangents[point] = if slopes[point - 1] * slopes[point] <= 0.0 {
+            0.0
+        } else {
+            let before = xs[point] - xs[point - 1];
+            let after = xs[point + 1] - xs[point];
+            3.0 * (before + after)
+                / ((2.0 * after + before) / slopes[point - 1]
+                    + (after + 2.0 * before) / slopes[point])
+        };
+    }
+    tangents
+}
+
+fn eval_curve(xs: &[f32; 4], ys: &[f32; 4], tangents: &[f32; 4], x: f32) -> f32 {
+    if x <= xs[0] {
+        return ys[0];
+    }
+    if x >= xs[3] {
+        return ys[3];
+    }
+    let segment = if x < xs[1] {
+        0
+    } else if x < xs[2] {
+        1
+    } else {
+        2
+    };
+    let width = (xs[segment + 1] - xs[segment]).max(1.0e-4);
+    let t = (x - xs[segment]) / width;
+    let t2 = t * t;
+    let t3 = t2 * t;
+    let h00 = 2.0 * t3 - 3.0 * t2 + 1.0;
+    let h10 = t3 - 2.0 * t2 + t;
+    let h01 = -2.0 * t3 + 3.0 * t2;
+    let h11 = t3 - t2;
+    (h00 * ys[segment]
+        + h10 * width * tangents[segment]
+        + h01 * ys[segment + 1]
+        + h11 * width * tangents[segment + 1])
+        .clamp(0.0, 1.0)
+}
+
+/// Linear-domain LUT with square-root spacing: entry i maps the scene-linear
+/// value (i / (N-1))^2 through encode -> curve -> decode, so pixels avoid the
+/// per-value transfer powf.
+fn curve_lut(points: &[f32]) -> Vec<f32> {
+    let xs = [points[0], points[2], points[4], points[6]];
+    let ys = [points[1], points[3], points[5], points[7]];
+    let tangents = curve_tangents(&xs, &ys);
+    (0..CURVE_LUT_SIZE)
+        .map(|index| {
+            let root = index as f32 / (CURVE_LUT_SIZE - 1) as f32;
+            let encoded = srgb_encode_value(root * root);
+            srgb_decode_value(eval_curve(&xs, &ys, &tangents, encoded))
+        })
+        .collect()
+}
+
+fn apply_curve_value(lut: &[f32], value: f32) -> f32 {
+    let last = lut.len() - 1;
+    if value <= 0.0 {
+        // Out-of-gamut negatives ride along so gradients stay smooth.
+        return lut[0] + value;
+    }
+    if value >= 1.0 {
+        return lut[last] + (value - 1.0);
+    }
+    let position = value.sqrt() * last as f32;
+    let index = position as usize;
+    let fraction = position - index as f32;
+    let next = (index + 1).min(last);
+    lut[index] * (1.0 - fraction) + lut[next] * fraction
 }
 
 fn validate_param(kind: u32, index: usize, value: f32) -> Result<(), Error> {
@@ -168,6 +287,7 @@ fn validate_param(kind: u32, index: usize, value: f32) -> Result<(), Error> {
         (NODE_CROP, 0) | (NODE_CROP, 1) => (0.0..=1.0).contains(&value),
         (NODE_CROP, 2) | (NODE_CROP, 3) => (0.05..=1.0).contains(&value),
         (NODE_CROP, 4) => (-45.0..=45.0).contains(&value),
+        (NODE_CURVES, _) => (0.0..=1.0).contains(&value),
         _ => false,
     };
     if ok {
@@ -210,6 +330,9 @@ pub(crate) fn parse_graph(bytes: &[u8]) -> Result<Vec<GraphOp>, Error> {
             let value = reader.f32()?;
             validate_param(kind, parameter, value)?;
             params.push(value);
+        }
+        if kind == NODE_CURVES {
+            validate_curve_points(&params)?;
         }
         let text = reader.text()?;
         if text.is_some() && kind != NODE_FILM {
@@ -527,6 +650,20 @@ pub(crate) fn execute_graph(
                 image.data.par_chunks_exact_mut(3).for_each(|pixel| {
                     for (value, base) in pixel.iter_mut().zip(color) {
                         *value = base - *value;
+                    }
+                });
+            }
+            NODE_CURVES => {
+                // Per-channel monotone curves on the encoded signal: the
+                // film-stock "decompression" for inverted negatives.
+                let luts = [
+                    curve_lut(&op.params[0..8]),
+                    curve_lut(&op.params[8..16]),
+                    curve_lut(&op.params[16..24]),
+                ];
+                image.data.par_chunks_exact_mut(3).for_each(|pixel| {
+                    for (value, lut) in pixel.iter_mut().zip(&luts) {
+                        *value = apply_curve_value(lut, *value);
                     }
                 });
             }
@@ -961,6 +1098,81 @@ mod tests {
         // Opposite angles differ from each other too.
         let counter = rotate_crop_image(&source, rect, -10.0).unwrap();
         assert!(max_difference(&tilted, &counter) > 1.0e-3);
+    }
+
+    const IDENTITY_CURVE: [f32; 8] = [
+        0.0,
+        0.0,
+        1.0 / 3.0,
+        1.0 / 3.0,
+        2.0 / 3.0,
+        2.0 / 3.0,
+        1.0,
+        1.0,
+    ];
+
+    fn curves_params(red: &[f32; 8], green: &[f32; 8], blue: &[f32; 8]) -> Vec<f32> {
+        let mut params = Vec::with_capacity(24);
+        params.extend_from_slice(red);
+        params.extend_from_slice(green);
+        params.extend_from_slice(blue);
+        params
+    }
+
+    #[test]
+    fn identity_curves_pass_the_image_through() {
+        let params =
+            curves_params(&IDENTITY_CURVE, &IDENTITY_CURVE, &IDENTITY_CURVE);
+        let ops = parse_graph(
+            &GraphBuilder::new()
+                .node(NODE_CURVES, 0, -1, &params, None)
+                .build(),
+        )
+        .unwrap();
+        let source = gradient_image();
+        let curved = execute_graph(&ops, source.clone(), &context(7)).unwrap();
+        let mut reference = source;
+        to_display(&mut reference);
+        assert!(max_difference(&curved, &reference) < 3.0e-3);
+    }
+
+    #[test]
+    fn curve_luts_lift_midtones_and_keep_the_identity() {
+        // Channel independence holds in linear space; the shared display
+        // tone couples channels afterwards, so assert on the LUT itself.
+        let red = [0.0, 0.0, 1.0 / 3.0, 0.55, 2.0 / 3.0, 0.85, 1.0, 1.0];
+        let red_lut = curve_lut(&red);
+        let identity_lut = curve_lut(&IDENTITY_CURVE);
+        for step in 0..=20 {
+            let value = step as f32 / 20.0;
+            let unchanged = apply_curve_value(&identity_lut, value);
+            assert!(
+                (unchanged - value).abs() < 2.0e-3,
+                "identity drift at {value}: {unchanged}"
+            );
+            if (0.05..=0.6).contains(&value) {
+                let lifted = apply_curve_value(&red_lut, value);
+                assert!(
+                    lifted > unchanged + 0.01,
+                    "no lift at {value}: {lifted} vs {unchanged}"
+                );
+            }
+        }
+        // Out-of-range values ride through continuously.
+        assert!(apply_curve_value(&identity_lut, -0.25) < 0.0);
+        assert!(apply_curve_value(&identity_lut, 1.5) > 1.4);
+    }
+
+    #[test]
+    fn curves_reject_unsorted_points() {
+        let bad = [0.0, 0.0, 0.6, 0.5, 0.3, 0.7, 1.0, 1.0];
+        let params = curves_params(&bad, &IDENTITY_CURVE, &IDENTITY_CURVE);
+        assert!(parse_graph(
+            &GraphBuilder::new()
+                .node(NODE_CURVES, 0, -1, &params, None)
+                .build(),
+        )
+        .is_err());
     }
 
     #[test]
