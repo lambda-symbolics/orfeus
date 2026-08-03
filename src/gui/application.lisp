@@ -237,17 +237,61 @@ exactly the curve the render applies."
             (error "Expected a number, got ~S." text))
           value))))
 
-(defun make-gui-preview-directory ()
-  "Create and return a private temporary directory for one GUI run."
-  (uiop:ensure-directory-pathname
-   (sb-posix:mkdtemp
-    (namestring (merge-pathnames "orfeus-gui-XXXXXX"
-                                 (uiop:temporary-directory))))))
+(defun gui-preview-cache-directory ()
+  "The persistent preview cache under XDG, keyed by photo content."
+  (let ((directory (uiop:xdg-cache-home "orfeus/previews/")))
+    (ensure-directories-exist directory)
+    directory))
 
-(defun delete-gui-preview-directory (directory)
-  "Delete the private preview DIRECTORY and all files created in it."
-  (when directory
-    (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore)))
+(defun photo-content-key (pathname)
+  "A quick content fingerprint: size plus head and tail samples, hashed.
+
+Renaming or moving a photograph keeps its previews valid; editing the file
+invalidates them."
+  (with-open-file (stream pathname :element-type '(unsigned-byte 8))
+    (let* ((size (file-length stream))
+           (sample (min 65536 size))
+           (digest (ironclad:make-digest :sha256))
+           (buffer (make-array sample :element-type '(unsigned-byte 8))))
+      (read-sequence buffer stream)
+      (ironclad:update-digest digest buffer)
+      (when (> size sample)
+        (file-position stream (- size sample))
+        (let ((count (read-sequence buffer stream)))
+          (ironclad:update-digest digest buffer :end count)))
+      (let ((size-bytes (make-array 8 :element-type '(unsigned-byte 8))))
+        (dotimes (index 8)
+          (setf (aref size-bytes index) (ldb (byte 8 (* 8 index)) size)))
+        (ironclad:update-digest digest size-bytes))
+      (subseq (ironclad:byte-array-to-hex-string
+               (ironclad:produce-digest digest))
+              0 16))))
+
+(defun evict-stale-previews (directory &key (max-age-days 45)
+                                            (max-bytes (* 4 1024 1024 1024)))
+  "Delete cached previews older than MAX-AGE-DAYS, then trim to MAX-BYTES.
+
+Trimming removes the oldest files first. Errors are swallowed: eviction is
+best effort housekeeping."
+  (let* ((files (ignore-errors (uiop:directory-files directory)))
+         (cutoff (- (get-universal-time) (* max-age-days 24 60 60)))
+         (entries '()))
+    (dolist (file files)
+      (let ((date (or (ignore-errors (file-write-date file)) 0))
+            (size (or (ignore-errors
+                        (with-open-file (stream file :element-type
+                                                '(unsigned-byte 8))
+                          (file-length stream)))
+                      0)))
+        (if (< date cutoff)
+            (ignore-errors (delete-file file))
+            (push (list file date size) entries))))
+    (let ((total (reduce #'+ entries :key #'third)))
+      (dolist (entry (sort entries #'< :key #'second))
+        (when (<= total max-bytes)
+          (return))
+        (ignore-errors (delete-file (first entry)))
+        (decf total (third entry))))))
 
 (defun preview-recipe-snapshot (recipe)
   "Return an immutable deep copy of a settings or graph render RECIPE."
@@ -271,18 +315,17 @@ exactly the curve the render applies."
                   (sb-ext:string-to-octets text :external-format :utf-8))))
     (subseq (ironclad:byte-array-to-hex-string digest) 0 16)))
 
-(defun preview-pathname (preview-directory index job role settings)
+(defun preview-pathname (preview-directory content-key role settings)
   (merge-pathnames
-   (make-pathname :name (format nil "~(~A~)-~D-~A-~A"
-                                role index (preview-settings-key settings)
-                                (pathname-name (photo-job-input-path job)))
+   (make-pathname :name (format nil "~(~A~)-~A-~A"
+                                role content-key
+                                (preview-settings-key settings))
                   :type "jpg")
    preview-directory))
 
-(defun thumbnail-pathname (preview-directory index job)
+(defun thumbnail-pathname (preview-directory content-key)
   (merge-pathnames
-   (make-pathname :name (format nil "thumbnail-~D-~A"
-                                index (pathname-name (photo-job-input-path job)))
+   (make-pathname :name (format nil "thumbnail-~A" content-key)
                   :type "jpg")
    preview-directory))
 
@@ -334,7 +377,7 @@ exactly the curve the render applies."
                              :name "Orfeus background render worker"))
            (histogram-queue
              (make-gui-queue :name "Orfeus histogram worker"))
-           (preview-directory (make-gui-preview-directory))
+           (preview-directory (gui-preview-cache-directory))
            (picker-directory
              (let ((photo (first (project-photos project))))
                (cond (initial-path
@@ -347,6 +390,7 @@ exactly the curve the render applies."
            (capture-cache (make-hash-table :test #'eq))
            (thumbnail-files (make-hash-table :test #'eq))
            (lut-paths (make-hash-table :test #'equal))
+           (content-keys (make-hash-table :test #'eq))
            window menu toolbar toolbar-bottom-rule main-tile left-column
            filmstrip-pane gallery-pane center-pane
            thumbnail-canvas thumbnail-scrollbar
@@ -379,6 +423,7 @@ exactly the curve the render applies."
            (gallery-thumbs (make-hash-table :test #'equal))
            (gallery-click (cons 0 -1))
            debounce-id poll-id comparison-p layout-initialized-p
+           (progress-total 0)
            (thumbnail-scroll 0)
            (thumbnail-anchor 0)
            (preview-generation 0)
@@ -1042,6 +1087,20 @@ exactly the curve the render applies."
              (setf (cl-fltk:value status) text))
            (selected-job ()
              (gui-model-selected-job model))
+           (photo-content-key-for (job)
+             ;; Memoized per job object; the key survives renames and moves
+             ;; because it fingerprints file content, not the path.
+             (or (gethash job content-keys)
+                 (setf (gethash job content-keys)
+                       (handler-case
+                           (photo-content-key (photo-job-input-path job))
+                         (error ()
+                           (format nil "path~16,'0X"
+                                   (ldb (byte 64 0)
+                                        (sxhash
+                                         (namestring
+                                          (photo-job-input-path
+                                           job))))))))))
            (thumbnail-row-height () 104)
            (thumbnail-scroll-limit ()
              (if thumbnail-canvas
@@ -2297,6 +2356,7 @@ exactly the curve the render applies."
                    pick-color-node nil)
              (gui-model-replace-project model new-project path)
              (setf (gui-model-selected-node model) nil)
+             (clrhash content-keys)
                (refresh-gallery)
              (sync-node-tools)
              (when graph-canvas (cl-fltk:redraw graph-canvas))
@@ -2404,7 +2464,8 @@ exactly the curve the render applies."
              (let* ((settings (preview-recipe-snapshot settings))
                     (input (photo-job-input-path job))
                     (file-role (if draft-p :draft role))
-                    (output (preview-pathname preview-directory index job
+                    (output (preview-pathname preview-directory
+                                              (photo-content-key-for job)
                                               file-role settings))
                     (max-width (if draft-p
                                    *gui-draft-preview-size*
@@ -2440,7 +2501,8 @@ exactly the curve the render applies."
                                              output)))))
                     :front-p front-p))))
            (enqueue-thumbnail (job index generation)
-             (let ((output (thumbnail-pathname preview-directory index job)))
+             (let ((output (thumbnail-pathname preview-directory
+                                               (photo-content-key-for job))))
                (if (probe-file output)
                    (queue-event queue (list :thumbnail generation job output))
                    (enqueue-gui-task
@@ -2487,8 +2549,12 @@ exactly the curve the render applies."
                  ;; A bounded draft lands quickly while the full-resolution
                  ;; preview renders behind it; both reuse the decoded RAW.
                  (let ((settings (current-settings)))
-                   (unless (probe-file (preview-pathname preview-directory index
-                                                         job :after settings))
+                   (unless (probe-file
+                             (preview-pathname preview-directory
+                                               (photo-content-key-for job)
+                                               :after
+                                               (preview-recipe-snapshot
+                                                settings)))
                      (enqueue-render queue :after job index settings generation t
                                      :front-p t :draft-p t :cache-p t))
                    (enqueue-render queue :after job index settings generation t
@@ -2951,8 +3017,25 @@ exactly the curve the render applies."
                   (set-status (format nil "Exported ~A" (second event))))
                  (:error
                   (set-status (format nil "Error: ~A" (second event))))))
-             (setf (cl-fltk:value progress)
-                   (if (gui-queue-busy-p queue) "55" "0"))))
+             ;; Honest progress: completed over the batch's high-water
+             ;; total, across every render queue.
+             (let ((load (+ (gui-queue-load queue)
+                            (gui-queue-load background-queue)
+                            (gui-queue-load histogram-queue))))
+               (if (zerop load)
+                   (progn
+                     (setf progress-total 0)
+                     (setf (cl-fltk:value progress) "0"))
+                   (progn
+                     (setf progress-total (max progress-total load))
+                     (setf (cl-fltk:value progress)
+                           (format nil "~D"
+                                   (max 2
+                                        (min 99
+                                             (round (* 100
+                                                       (- progress-total
+                                                          load))
+                                                    progress-total))))))))))
         (setf window (cl-fltk:make-window :width 1280 :height 800
                                           :label "Orfeus"
                                           :app-id "org.orfeus.Orfeus"))
@@ -3733,6 +3816,11 @@ exactly the curve the render applies."
         (sync-node-tools)
         (layout-ui)
         (setf poll-id (cl-fltk:add-timeout 0.08d0 #'poll :repeat t))
+        ;; Best-effort housekeeping of the persistent preview cache.
+        (enqueue-gui-task background-queue :evict
+                          (lambda ()
+                            (ignore-errors
+                              (evict-stale-previews preview-directory))))
         (when (selected-job)
           (schedule-initial-preview))
         (unwind-protect
@@ -3744,7 +3832,6 @@ exactly the curve the render applies."
           (stop-gui-queue histogram-queue)
           (orfeus::clear-render-source-cache)
           (clear-preview-cache)
-          (ignore-errors (delete-gui-preview-directory preview-directory))
           (when window (ignore-errors (cl-fltk:destroy window))))))))
 
 (defun main (&optional pathname)
