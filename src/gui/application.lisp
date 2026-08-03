@@ -740,6 +740,7 @@ new cache entry is published."
            (gallery-click (cons 0 -1))
            debounce-id poll-id comparison-p layout-initialized-p
            (progress-total 0)
+           (last-render-ms 10000)
            (progress-generation -1)
            (thumbnail-scroll 0)
            (thumbnail-anchor 0)
@@ -2781,7 +2782,8 @@ new cache entry is published."
                 target-queue role
                 (lambda ()
                   (when (or (not publish-p) (= generation preview-generation))
-                    (loop for attempt below 3
+                    (let ((render-started (get-internal-real-time)))
+                      (loop for attempt below 3
                           for digest = (photo-content-key-for job generation
                                                               (plusp attempt))
                           for settings-key = (preview-settings-key
@@ -2834,7 +2836,14 @@ new cache entry is published."
                                                           role display))))
                                    (return))
                                (error (condition)
-                                 (when (= attempt 2) (error condition)))))))
+                                 (when (= attempt 2) (error condition)))))
+                      ;; The interactive path adapts its debounce and draft
+                      ;; use to how fast full previews actually come back.
+                      (when (and publish-p (not draft-p) (eq role :after))
+                        (setf last-render-ms
+                              (/ (* 1000.0 (- (get-internal-real-time)
+                                              render-started))
+                                 internal-time-units-per-second))))))
                 :front-p front-p :generation generation)))
            (enqueue-thumbnail (job generation)
              (enqueue-gui-task
@@ -2904,9 +2913,13 @@ new cache entry is published."
                (when job
                  ;; A bounded draft lands quickly while the full-resolution
                  ;; preview renders behind it; both reuse the decoded RAW.
+                 ;; Once checkpointed re-renders come back fast enough, the
+                 ;; draft layer only adds churn, so it is skipped.
                  (let ((settings (current-settings)))
-                   (enqueue-render queue :after job index settings generation t
-                                   :front-p t :draft-p t :cache-p t)
+                   (when (>= last-render-ms 300)
+                     (enqueue-render queue :after job index settings
+                                     generation t
+                                     :front-p t :draft-p t :cache-p t))
                    (enqueue-render queue :after job index settings generation t
                                    :cache-p t))
                  (enqueue-background-previews initial-p generation))))
@@ -2928,7 +2941,10 @@ new cache entry is published."
                (ignore-errors (cl-fltk:remove-timeout debounce-id)))
              (setf debounce-id
                    (cl-fltk:add-timeout
-                    *preview-debounce-seconds*
+                    ;; When the executor resumes from its checkpoint the
+                    ;; re-render is near instant, so track drags tightly.
+                    (if (< last-render-ms 250) 0.04d0
+                        *preview-debounce-seconds*)
                     (lambda ()
                       (setf debounce-id nil)
                       (discard-gui-tasks queue :after)
