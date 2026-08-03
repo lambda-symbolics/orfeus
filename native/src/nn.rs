@@ -273,7 +273,7 @@ fn accumulate_triple_portable(
     accumulate_triple_body!(layer, input, size, out_y, weight_rows, acc0, acc1, acc2);
 }
 
-fn fma_available() -> bool {
+pub(crate) fn fma_available() -> bool {
     #[cfg(target_arch = "x86_64")]
     {
         static AVAILABLE: OnceLock<bool> = OnceLock::new();

@@ -517,6 +517,185 @@ pub(crate) fn apply_tonal_equalizer(image: &mut RgbImage, adjustments: [f32; 7])
     });
 }
 
+/// One bilateral tap accumulated eight pixels wide: SUM/WEIGHT accumulate
+/// `kernel / (1 + (guide - center)^2 * inverse_sigma^2)` weighted values.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn bilateral_span_avx(
+    output: &mut [f32],
+    guide_center: *const f32,
+    tap_sources: [*const f32; 5],
+    tap_guides: [*const f32; 5],
+) {
+    use std::arch::x86_64::{
+        _mm256_add_ps, _mm256_div_ps, _mm256_fmadd_ps, _mm256_fnmadd_ps,
+        _mm256_loadu_ps, _mm256_max_ps, _mm256_mul_ps, _mm256_rcp_ps,
+        _mm256_set1_ps, _mm256_setzero_ps, _mm256_sqrt_ps, _mm256_storeu_ps,
+        _mm256_sub_ps,
+    };
+    let kernel = [1.0_f32, 4.0, 6.0, 4.0, 1.0];
+    // SAFETY: The caller guarantees every pointer stays readable for
+    // output.len() + 7 lanes; the loop only issues full 8-wide iterations.
+    unsafe {
+        let ones = _mm256_set1_ps(1.0);
+        let two = _mm256_set1_ps(2.0);
+        let mut x = 0;
+        while x + 8 <= output.len() {
+            let center = _mm256_loadu_ps(guide_center.add(x));
+            let sigma = _mm256_fmadd_ps(
+                _mm256_set1_ps(0.055),
+                _mm256_sqrt_ps(_mm256_max_ps(center, _mm256_setzero_ps())),
+                _mm256_set1_ps(0.012),
+            );
+            let inverse = _mm256_div_ps(ones, _mm256_mul_ps(sigma, sigma));
+            let mut sum = _mm256_setzero_ps();
+            let mut weight_sum = _mm256_setzero_ps();
+            for tap in 0..5 {
+                let guide_value = _mm256_loadu_ps(tap_guides[tap].add(x));
+                let source_value = _mm256_loadu_ps(tap_sources[tap].add(x));
+                let distance = _mm256_sub_ps(guide_value, center);
+                let denominator = _mm256_fmadd_ps(
+                    _mm256_mul_ps(distance, distance),
+                    inverse,
+                    ones,
+                );
+                // Refined reciprocal: rcp * (2 - denominator * rcp).
+                let rcp = _mm256_rcp_ps(denominator);
+                let refined = _mm256_mul_ps(
+                    rcp,
+                    _mm256_fnmadd_ps(denominator, rcp, two),
+                );
+                let weight = _mm256_mul_ps(_mm256_set1_ps(kernel[tap]), refined);
+                sum = _mm256_fmadd_ps(source_value, weight, sum);
+                weight_sum = _mm256_add_ps(weight_sum, weight);
+            }
+            _mm256_storeu_ps(
+                output.as_mut_ptr().add(x),
+                _mm256_div_ps(sum, weight_sum),
+            );
+            x += 8;
+        }
+        // The scalar tail matches the vector math via the same refinement.
+        for tail in x..output.len() {
+            let center = *guide_center.add(tail);
+            let sigma = 0.012 + 0.055 * center.max(0.0).sqrt();
+            let inverse = 1.0 / (sigma * sigma);
+            let mut sum = 0.0;
+            let mut weight_sum = 0.0;
+            for tap in 0..5 {
+                let guide_value = *tap_guides[tap].add(tail);
+                let source_value = *tap_sources[tap].add(tail);
+                let distance = guide_value - center;
+                let denominator = 1.0 + distance * distance * inverse;
+                let rcp = 1.0 / denominator;
+                let weight = kernel[tap] * rcp;
+                sum += source_value * weight;
+                weight_sum += weight;
+            }
+            *output.get_unchecked_mut(tail) = sum / weight_sum;
+        }
+    }
+}
+
+fn bilateral_pass_scalar(
+    output: &mut [f32],
+    source: &[f32],
+    guide: &[f32],
+    width: usize,
+    row: usize,
+    stride: isize,
+    limit: usize,
+    step: usize,
+) {
+    // Taps run along either axis: STRIDE 1 walks x, STRIDE width walks y;
+    // LIMIT is the axis length used for clamping.
+    let kernel = [1.0_f32, 4.0, 6.0, 4.0, 1.0];
+    for (x, value) in output.iter_mut().enumerate() {
+        let center = guide[row * width + x];
+        let sigma = 0.012 + 0.055 * center.max(0.0).sqrt();
+        let inverse_sigma_squared = 1.0 / (sigma * sigma);
+        let mut sum = 0.0;
+        let mut weight_sum = 0.0;
+        for (kernel_index, offset) in (-2_isize..=2).enumerate() {
+            let along = if stride == 1 { x } else { row };
+            let sample =
+                (along as isize + offset * step as isize).clamp(0, limit as isize - 1) as usize;
+            let index = if stride == 1 {
+                row * width + sample
+            } else {
+                sample * width + x
+            };
+            let distance = guide[index] - center;
+            let range_weight = 1.0 / (1.0 + distance * distance * inverse_sigma_squared);
+            let weight = kernel[kernel_index] * range_weight;
+            sum += source[index] * weight;
+            weight_sum += weight;
+        }
+        *value = sum / weight_sum;
+    }
+}
+
+/// Horizontal bilateral pass for one row into ROW-OUTPUT.
+fn bilateral_row_horizontal(
+    row_output: &mut [f32],
+    source: &[f32],
+    guide: &[f32],
+    width: usize,
+    y: usize,
+    step: usize,
+    use_avx: bool,
+) {
+    let reach = 2 * step;
+    #[cfg(target_arch = "x86_64")]
+    if use_avx && width > 2 * reach + 8 {
+        let interior = width - 2 * reach;
+        let row_base = y * width;
+        // SAFETY: Every tap pointer covers `interior` + 7 lanes inside this
+        // row because the interior excludes the clamped borders.
+        unsafe {
+            let taps: [*const f32; 5] = std::array::from_fn(|tap| {
+                source.as_ptr().add(row_base + tap * step)
+            });
+            let guides: [*const f32; 5] = std::array::from_fn(|tap| {
+                guide.as_ptr().add(row_base + tap * step)
+            });
+            bilateral_span_avx(
+                &mut row_output[reach..reach + interior],
+                guide.as_ptr().add(row_base + reach),
+                taps,
+                guides,
+            );
+        }
+        let kernel = [1.0_f32, 4.0, 6.0, 4.0, 1.0];
+        for x in (0..reach).chain(reach + interior..width) {
+            let center = guide[y * width + x];
+            let sigma = 0.012 + 0.055 * center.max(0.0).sqrt();
+            let inverse = 1.0 / (sigma * sigma);
+            let mut sum = 0.0;
+            let mut weight_sum = 0.0;
+            for (kernel_index, offset) in (-2_isize..=2).enumerate() {
+                let sample_x = (x as isize + offset * step as isize)
+                    .clamp(0, width as isize - 1) as usize;
+                let index = y * width + sample_x;
+                let distance = guide[index] - center;
+                let weight =
+                    kernel[kernel_index] / (1.0 + distance * distance * inverse);
+                sum += source[index] * weight;
+                weight_sum += weight;
+            }
+            row_output[x] = sum / weight_sum;
+        }
+        return;
+    }
+    let _ = use_avx;
+    bilateral_pass_scalar(row_output, source, guide, width, y, 1, width, step);
+}
+
+/// Rows processed per band; the fused band keeps the horizontal intermediate
+/// resident in cache instead of round-tripping the whole plane through DRAM.
+const BILATERAL_BAND_ROWS: usize = 64;
+
 fn edge_guided_blur_into(
     source: &[f32],
     guide: &[f32],
@@ -526,58 +705,98 @@ fn edge_guided_blur_into(
     horizontal: &mut Vec<f32>,
     output: &mut Vec<f32>,
 ) {
-    let kernel = [1.0_f32, 4.0, 6.0, 4.0, 1.0];
-    horizontal.clear();
-    horizontal.resize(source.len(), 0.0);
+    let _ = horizontal;
     output.clear();
     output.resize(source.len(), 0.0);
-    horizontal
-        .par_chunks_mut(width)
-        .enumerate()
-        .for_each(|(y, output)| {
-            for (x, value) in output.iter_mut().enumerate() {
-                let center = guide[y * width + x];
-                let sigma = 0.012 + 0.055 * center.max(0.0).sqrt();
-                let inverse_sigma_squared = 1.0 / (sigma * sigma);
-                let mut sum = 0.0;
-                let mut weight_sum = 0.0;
-                for (kernel_index, offset) in (-2_isize..=2).enumerate() {
-                    let sample_x =
-                        (x as isize + offset * step as isize).clamp(0, width as isize - 1) as usize;
-                    let index = y * width + sample_x;
-                    let distance = guide[index] - center;
-                    let range_weight = 1.0 / (1.0 + distance * distance * inverse_sigma_squared);
-                    let weight = kernel[kernel_index] * range_weight;
-                    sum += source[index] * weight;
-                    weight_sum += weight;
-                }
-                *value = sum / weight_sum;
-            }
-        });
-    let horizontal = &*horizontal;
+    let use_avx = super::nn::fma_available();
+    let reach = 2 * step;
+    let kernel = [1.0_f32, 4.0, 6.0, 4.0, 1.0];
     output
-        .par_chunks_mut(width)
+        .par_chunks_mut(width * BILATERAL_BAND_ROWS)
         .enumerate()
-        .for_each(|(y, output_row)| {
-            for (x, value) in output_row.iter_mut().enumerate() {
-                let center = guide[y * width + x];
-                let sigma = 0.012 + 0.055 * center.max(0.0).sqrt();
-                let inverse_sigma_squared = 1.0 / (sigma * sigma);
-                let mut sum = 0.0;
-                let mut weight_sum = 0.0;
-                for (kernel_index, offset) in (-2_isize..=2).enumerate() {
-                    let sample_y = (y as isize + offset * step as isize)
-                        .clamp(0, height as isize - 1) as usize;
-                    let index = sample_y * width + x;
-                    let distance = guide[index] - center;
-                    let range_weight = 1.0 / (1.0 + distance * distance * inverse_sigma_squared);
-                    let weight = kernel[kernel_index] * range_weight;
-                    sum += horizontal[index] * weight;
-                    weight_sum += weight;
+        .for_each_init(
+            || Vec::<f32>::new(),
+            |band_buffer, (band_index, band_output)| {
+                let y0 = band_index * BILATERAL_BAND_ROWS;
+                let band_rows = band_output.len() / width;
+                let halo_lo = y0.saturating_sub(reach);
+                let halo_hi = (y0 + band_rows + reach).min(height);
+                let halo_rows = halo_hi - halo_lo;
+                band_buffer.clear();
+                band_buffer.resize(halo_rows * width, 0.0);
+                // Fused pass one: horizontal blur for the band plus halo.
+                for row in 0..halo_rows {
+                    let y = halo_lo + row;
+                    bilateral_row_horizontal(
+                        &mut band_buffer[row * width..(row + 1) * width],
+                        source,
+                        guide,
+                        width,
+                        y,
+                        step,
+                        use_avx,
+                    );
                 }
-                *value = sum / weight_sum;
-            }
-        });
+                // Fused pass two: vertical blur reading the cached band.
+                for row in 0..band_rows {
+                    let y = y0 + row;
+                    let row_output =
+                        &mut band_output[row * width..(row + 1) * width];
+                    let tap_rows: [usize; 5] = std::array::from_fn(|tap| {
+                        ((y as isize + (tap as isize - 2) * step as isize)
+                            .clamp(0, height as isize - 1)
+                            as usize)
+                            - halo_lo
+                    });
+                    #[cfg(target_arch = "x86_64")]
+                    if use_avx && width >= 8 {
+                        // SAFETY: Tap rows live inside the band buffer, each
+                        // a full row of `width` lanes.
+                        unsafe {
+                            let taps: [*const f32; 5] =
+                                std::array::from_fn(|tap| {
+                                    band_buffer
+                                        .as_ptr()
+                                        .add(tap_rows[tap] * width)
+                                });
+                            let guides: [*const f32; 5] =
+                                std::array::from_fn(|tap| {
+                                    guide.as_ptr().add(
+                                        (tap_rows[tap] + halo_lo) * width,
+                                    )
+                                });
+                            bilateral_span_avx(
+                                row_output,
+                                guide.as_ptr().add(y * width),
+                                taps,
+                                guides,
+                            );
+                        }
+                        continue;
+                    }
+                    let _ = use_avx;
+                    for (x, value) in row_output.iter_mut().enumerate() {
+                        let center = guide[y * width + x];
+                        let sigma = 0.012 + 0.055 * center.max(0.0).sqrt();
+                        let inverse = 1.0 / (sigma * sigma);
+                        let mut sum = 0.0;
+                        let mut weight_sum = 0.0;
+                        for (kernel_index, tap_row) in
+                            tap_rows.iter().enumerate()
+                        {
+                            let guide_index =
+                                (tap_row + halo_lo) * width + x;
+                            let distance = guide[guide_index] - center;
+                            let weight = kernel[kernel_index]
+                                / (1.0 + distance * distance * inverse);
+                            sum += band_buffer[tap_row * width + x] * weight;
+                            weight_sum += weight;
+                        }
+                        *value = sum / weight_sum;
+                    }
+                }
+            },
+        );
 }
 
 fn median_of_9(mut samples: [f32; 9]) -> f32 {
@@ -1247,6 +1466,47 @@ fn area_coverage(source: usize, target: usize) -> Vec<(usize, Vec<f32>)> {
         .collect()
 }
 
+/// Applies the default display tone and sRGB transfer, on the GPU when the
+/// Vulkan backend is available (the default; `ORFEUS_GPU=0` opts out) and on
+/// the CPU otherwise. Failures leave the input intact and fall back.
+pub(crate) fn apply_display_transform(image: &mut RgbImage, profiling: bool) {
+    let gpu_completed = if super::gpu::requested() {
+        match catch_unwind(AssertUnwindSafe(|| {
+            super::gpu::tone_and_transfer(&mut image.data)
+        })) {
+            Ok(Ok(dispatch)) => {
+                if profiling {
+                    eprintln!(
+                        "orfeus-profile gpu-stage=tone-transfer adapter={:?} milliseconds={:.3}",
+                        dispatch.adapter_name, dispatch.milliseconds
+                    );
+                }
+                true
+            }
+            Ok(Err(error)) => {
+                if profiling {
+                    eprintln!(
+                        "orfeus-profile gpu-stage=tone-transfer fallback=cpu error={error:?}"
+                    );
+                }
+                false
+            }
+            Err(_) => {
+                if profiling {
+                    eprintln!("orfeus-profile gpu-stage=tone-transfer fallback=cpu error=panic");
+                }
+                false
+            }
+        }
+    } else {
+        false
+    };
+    if !gpu_completed {
+        apply_default_display_tone(&mut image.data);
+        srgb_transfer(image);
+    }
+}
+
 pub(crate) fn srgb_transfer(image: &mut RgbImage) {
     image.data.par_iter_mut().for_each(|value| {
         *value = if *value <= 0.003_130_8 {
@@ -1752,41 +2012,7 @@ pub fn render(
         ],
     );
     profile_stage!("tonal-equalizer");
-    let gpu_completed = if super::gpu::requested() {
-        match catch_unwind(AssertUnwindSafe(|| {
-            super::gpu::tone_and_transfer(&mut image.data)
-        })) {
-            Ok(Ok(dispatch)) => {
-                if profiling {
-                    eprintln!(
-                        "orfeus-profile gpu-stage=tone-transfer adapter={:?} milliseconds={:.3}",
-                        dispatch.adapter_name, dispatch.milliseconds
-                    );
-                }
-                true
-            }
-            Ok(Err(error)) => {
-                if profiling {
-                    eprintln!(
-                        "orfeus-profile gpu-stage=tone-transfer fallback=cpu error={error:?}"
-                    );
-                }
-                false
-            }
-            Err(_) => {
-                if profiling {
-                    eprintln!("orfeus-profile gpu-stage=tone-transfer fallback=cpu error=panic");
-                }
-                false
-            }
-        }
-    } else {
-        false
-    };
-    if !gpu_completed {
-        apply_default_display_tone(&mut image.data);
-        srgb_transfer(&mut image);
-    }
+    apply_display_transform(&mut image, profiling);
     profile_stage!("tone-transfer");
     if settings.lut_strength > 0.0 && !settings.lut_path.is_null() {
         let path = unsafe { CStr::from_ptr(settings.lut_path) }

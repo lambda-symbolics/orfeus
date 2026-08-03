@@ -19,7 +19,6 @@ use super::Error;
 use super::render::{
     self, DecodedRaw, LensCorrectionOptions, RgbImage,
 };
-use super::tone::apply_default_display_tone;
 
 const GRAPH_MAGIC: u32 = 0x4746_524F; // "ORFG" little-endian
 const GRAPH_VERSION: u32 = 1;
@@ -302,8 +301,7 @@ enum Domain {
 }
 
 fn to_display(image: &mut RgbImage) {
-    apply_default_display_tone(&mut image.data);
-    render::srgb_transfer(image);
+    render::apply_display_transform(image, false);
 }
 
 pub(crate) struct GraphContext<'a> {
@@ -698,8 +696,7 @@ mod tests {
             &mut reference,
             [0.3, 0.0, 0.0, -0.2, 0.0, 0.0, 0.1],
         );
-        apply_default_display_tone(&mut reference.data);
-        render::srgb_transfer(&mut reference);
+        to_display(&mut reference);
         assert!(max_difference(&via_graph, &reference) < 1.0e-6);
     }
 
@@ -748,8 +745,7 @@ mod tests {
         for value in &mut reference.data {
             *value *= 1.25;
         }
-        apply_default_display_tone(&mut reference.data);
-        render::srgb_transfer(&mut reference);
+        to_display(&mut reference);
         assert!(max_difference(&blended, &reference) < 1.0e-5);
     }
 
@@ -757,8 +753,7 @@ mod tests {
     fn empty_graph_passes_the_source_to_display() {
         let via_graph = execute_graph(&[], gradient_image(), &context(1)).unwrap();
         let mut reference = gradient_image();
-        apply_default_display_tone(&mut reference.data);
-        render::srgb_transfer(&mut reference);
+        to_display(&mut reference);
         assert!(max_difference(&via_graph, &reference) < 1.0e-6);
     }
 
@@ -847,8 +842,7 @@ mod tests {
             pixel[1] = 0.8 - pixel[1];
             pixel[2] = 0.7 - pixel[2];
         }
-        apply_default_display_tone(&mut reference.data);
-        render::srgb_transfer(&mut reference);
+        to_display(&mut reference);
         assert!(max_difference(&inverted, &reference) < 1.0e-6);
     }
 
