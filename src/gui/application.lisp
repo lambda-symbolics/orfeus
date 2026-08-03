@@ -239,7 +239,7 @@
            thumbnail-canvas thumbnail-scrollbar
            before-canvas after-canvas before-caption after-caption
            node-strip still-button copy-grade-button paste-grade-button
-           node-opacity-slider pick-color-node
+           node-opacity-slider pick-color-node crop-drag
            (node-click (cons 0 -1))
            grade-clipboard
            inspector tabs basic-page optics-page effects-page export-page presets-page
@@ -373,6 +373,254 @@
                            preview-center-y .5d0)
                      (redraw-previews)
                      (set-status "Preview at 1:1 pixels"))))))
+           (crop-node-rect (node)
+             (let ((params (orfeus:graph-node-params node)))
+               (values (float (getf params :left 0.0) 1d0)
+                       (float (getf params :top 0.0) 1d0)
+                       (float (getf params :width 1.0) 1d0)
+                       (float (getf params :height 1.0) 1d0)
+                       (float (getf params :angle 0.0) 1d0))))
+           (preview-image-frame (canvas path)
+             ;; Widget-relative placement of the drawn preview, mirroring
+             ;; the native adapter's pan clamping so overlays land on the
+             ;; same pixels the image occupies.
+             (multiple-value-bind (scaled-width scaled-height)
+                 (preview-scaled-size canvas path preview-zoom)
+               (when scaled-width
+                 (let* ((width (cl-fltk:widget-width canvas))
+                        (height (cl-fltk:widget-height canvas))
+                        (visible-x (min 1d0 (/ width scaled-width)))
+                        (visible-y (min 1d0 (/ height scaled-height)))
+                        (center-x (min (- 1d0 (/ visible-x 2))
+                                       (max (/ visible-x 2)
+                                            preview-center-x)))
+                        (center-y (min (- 1d0 (/ visible-y 2))
+                                       (max (/ visible-y 2)
+                                            preview-center-y))))
+                   (values (- (/ width 2d0) (* center-x scaled-width))
+                           (- (/ height 2d0) (* center-y scaled-height))
+                           scaled-width scaled-height)))))
+           (crop-overlay-geometry (canvas)
+             ;; The crop footprint on the displayed preview in widget
+             ;; pixels: rect center, half extents, rotation basis, and the
+             ;; image frame. Only the after canvas hosts the overlay.
+             (let ((node (crop-editing-node))
+                   (path (preview-path-for-canvas canvas)))
+               (when (and node path (eq canvas after-canvas))
+                 (multiple-value-bind (frame-x frame-y frame-width
+                                       frame-height)
+                     (preview-image-frame canvas path)
+                   (when frame-x
+                     (multiple-value-bind (left top width height angle)
+                         (crop-node-rect node)
+                       (let ((radians (* angle (/ pi 180))))
+                         (values (+ frame-x (* (+ left (/ width 2))
+                                               frame-width))
+                                 (+ frame-y (* (+ top (/ height 2))
+                                               frame-height))
+                                 (/ (* width frame-width) 2)
+                                 (/ (* height frame-height) 2)
+                                 (cos radians) (sin radians)
+                                 frame-x frame-y
+                                 frame-width frame-height))))))))
+           (crop-corner-offsets (half-width half-height)
+             (list (list (- half-width) (- half-height))
+                   (list half-width (- half-height))
+                   (list half-width half-height)
+                   (list (- half-width) half-height)))
+           (crop-corner-point (center-x center-y cosine sine dx dy)
+             ;; The source-space footprint of a crop corner: the executor
+             ;; samples output offsets at (cos*dx+sin*dy, cos*dy-sin*dx).
+             (values (+ center-x (* cosine dx) (* sine dy))
+                     (+ center-y (- (* cosine dy) (* sine dx)))))
+           (crop-corner-at (canvas x y)
+             (multiple-value-bind (center-x center-y half-width half-height
+                                   cosine sine)
+                 (crop-overlay-geometry canvas)
+               (when center-x
+                 (loop for index from 0
+                       for (dx dy) in (crop-corner-offsets half-width
+                                                           half-height)
+                       do (multiple-value-bind (px py)
+                              (crop-corner-point center-x center-y
+                                                 cosine sine dx dy)
+                            (when (and (<= (abs (- x px)) 9)
+                                       (<= (abs (- y py)) 9))
+                              (return index)))))))
+           (crop-rect-contains-p (canvas x y)
+             (multiple-value-bind (center-x center-y half-width half-height
+                                   cosine sine)
+                 (crop-overlay-geometry canvas)
+               (when center-x
+                 (let* ((dx (- x center-x))
+                        (dy (- y center-y))
+                        (local-x (- (* cosine dx) (* sine dy)))
+                        (local-y (+ (* sine dx) (* cosine dy))))
+                   (and (<= (abs local-x) half-width)
+                        (<= (abs local-y) half-height))))))
+           (apply-crop-rect (node left top width height)
+             (let* ((width (min 1.0 (max 0.05 width)))
+                    (height (min 1.0 (max 0.05 height)))
+                    (left (min (- 1.0 width) (max 0.0 left)))
+                    (top (min (- 1.0 height) (max 0.0 top))))
+               (handler-case
+                   (progn
+                     (gui-model-set-node-params
+                      model node
+                      (list :left (float left 1.0) :top (float top 1.0)
+                            :width (float width 1.0)
+                            :height (float height 1.0)))
+                     (when after-canvas (cl-fltk:redraw after-canvas))
+                     (set-status
+                      (format nil "Crop ~,2F ~,2F ~,2Fx~,2F"
+                              left top width height)))
+                 (error (condition)
+                   (set-status (princ-to-string condition))))))
+           (set-crop-node-angle (node angle)
+             ;; The crop stage is bypassed while its node is selected, so
+             ;; an angle change only moves the overlay; no re-render.
+             (handler-case
+                 (progn
+                   (gui-model-set-node-params model node (list :angle angle))
+                   (when after-canvas (cl-fltk:redraw after-canvas))
+                   (set-status (format nil "Crop angle ~,1F deg" angle)))
+               (error (condition)
+                 (set-status (princ-to-string condition)))))
+           (begin-crop-drag (canvas x y)
+             ;; A left press while a crop node is selected: corners resize,
+             ;; the interior moves the rectangle. Returns true when the
+             ;; gesture is claimed so panning is untouched elsewhere.
+             (multiple-value-bind (center-x center-y half-width half-height
+                                   cosine sine frame-x frame-y
+                                   frame-width frame-height)
+                 (crop-overlay-geometry canvas)
+               (when center-x
+                 (let ((corner (crop-corner-at canvas x y)))
+                   (cond
+                     (corner
+                      (destructuring-bind (dx dy)
+                          (nth corner (crop-corner-offsets half-width
+                                                           half-height))
+                        (multiple-value-bind (anchor-x anchor-y)
+                            (crop-corner-point center-x center-y cosine sine
+                                               (- dx) (- dy))
+                          (setf crop-drag
+                                (list :resize
+                                      :sign-x (if (minusp dx) -1 1)
+                                      :sign-y (if (minusp dy) -1 1)
+                                      :anchor-x anchor-x :anchor-y anchor-y
+                                      :cosine cosine :sine sine
+                                      :frame (list frame-x frame-y
+                                                   frame-width
+                                                   frame-height)))))
+                      t)
+                     ((crop-rect-contains-p canvas x y)
+                      (multiple-value-bind (left top)
+                          (crop-node-rect (crop-editing-node))
+                        (setf crop-drag
+                              (list :move
+                                    :offset-u (- (/ (- x frame-x)
+                                                    frame-width)
+                                                 left)
+                                    :offset-v (- (/ (- y frame-y)
+                                                    frame-height)
+                                                 top)
+                                    :frame (list frame-x frame-y
+                                                 frame-width
+                                                 frame-height))))
+                      t))))))
+           (update-crop-drag (x y)
+             (let ((node (crop-editing-node))
+                   (plist (rest crop-drag)))
+               (when (and node crop-drag)
+                 (destructuring-bind (frame-x frame-y frame-width
+                                      frame-height)
+                     (getf plist :frame)
+                   (ecase (first crop-drag)
+                     (:resize
+                      (let* ((sign-x (getf plist :sign-x))
+                             (sign-y (getf plist :sign-y))
+                             (anchor-x (getf plist :anchor-x))
+                             (anchor-y (getf plist :anchor-y))
+                             (cosine (getf plist :cosine))
+                             (sine (getf plist :sine))
+                             (dx (- x anchor-x))
+                             (dy (- y anchor-y))
+                             ;; Pointer in the rect's rotated frame,
+                             ;; measured from the fixed opposite corner.
+                             (local-x (- (* cosine dx) (* sine dy)))
+                             (local-y (+ (* sine dx) (* cosine dy)))
+                             (span-x (min frame-width
+                                          (max (* frame-width 0.05)
+                                               (* sign-x local-x))))
+                             (span-y (min frame-height
+                                          (max (* frame-height 0.05)
+                                               (* sign-y local-y))))
+                             (center-dx (* sign-x span-x 0.5))
+                             (center-dy (* sign-y span-y 0.5))
+                             (center-x (+ anchor-x
+                                          (* cosine center-dx)
+                                          (* sine center-dy)))
+                             (center-y (+ anchor-y
+                                          (- (* cosine center-dy)
+                                             (* sine center-dx))))
+                             (width (/ span-x frame-width))
+                             (height (/ span-y frame-height)))
+                        (apply-crop-rect
+                         node
+                         (- (/ (- center-x frame-x) frame-width)
+                            (/ width 2))
+                         (- (/ (- center-y frame-y) frame-height)
+                            (/ height 2))
+                         width height)))
+                     (:move
+                      (multiple-value-bind (left top width height)
+                          (crop-node-rect node)
+                        (declare (ignore left top))
+                        (apply-crop-rect
+                         node
+                         (- (/ (- x frame-x) frame-width)
+                            (getf plist :offset-u))
+                         (- (/ (- y frame-y) frame-height)
+                            (getf plist :offset-v))
+                         width height))))))))
+           (draw-crop-overlay (widget)
+             (multiple-value-bind (center-x center-y half-width half-height
+                                   cosine sine)
+                 (crop-overlay-geometry widget)
+               (when center-x
+                 (let* ((x (cl-fltk:widget-x widget))
+                        (y (cl-fltk:widget-y widget))
+                        (corners
+                          (loop for (dx dy) in (crop-corner-offsets
+                                                half-width half-height)
+                                collect
+                                (multiple-value-bind (px py)
+                                    (crop-corner-point center-x center-y
+                                                       cosine sine dx dy)
+                                  (list (round (+ x px))
+                                        (round (+ y py)))))))
+                   (cl-fltk:draw-push-clip x y
+                                           (cl-fltk:widget-width widget)
+                                           (cl-fltk:widget-height widget))
+                   (loop for (from to) in '((0 1) (1 2) (2 3) (3 0))
+                         do (destructuring-bind (x1 y1) (nth from corners)
+                              (destructuring-bind (x2 y2) (nth to corners)
+                                (cl-fltk:draw-color-rgb :red 20 :green 22
+                                                        :blue 26)
+                                (cl-fltk:draw-line (1+ x1) (1+ y1)
+                                                   (1+ x2) (1+ y2))
+                                (cl-fltk:draw-color-rgb :red 235 :green 235
+                                                        :blue 240)
+                                (cl-fltk:draw-line x1 y1 x2 y2))))
+                   (loop for (px py) in corners
+                         do (cl-fltk:draw-color-rgb :red 20 :green 22
+                                                    :blue 26)
+                            (cl-fltk:draw-filled-circle px py 5)
+                            (cl-fltk:draw-color-rgb :red 235 :green 235
+                                                    :blue 240)
+                            (cl-fltk:draw-filled-circle px py 4))
+                   (cl-fltk:draw-pop-clip)))))
            (handle-preview-mouse (canvas event value)
              (multiple-value-bind (x y button dx dy state)
                  (parse-preview-event value)
@@ -383,6 +631,7 @@
                     (cond
                       (pick-color-node
                        (sample-base-at canvas x y))
+                      ((and (= button 1) (begin-crop-drag canvas x y)))
                       ((or (= button 1) (= button 2))
                        (setf preview-drag-p t
                              preview-drag-x x
@@ -390,21 +639,24 @@
                              preview-drag-center-x preview-center-x
                              preview-drag-center-y preview-center-y))))
                    (#.cl-fltk:+event-drag+
-                    (when preview-drag-p
-                      (let ((path (preview-path-for-canvas canvas)))
-                        (when path
-                          (multiple-value-bind (width height)
-                              (preview-scaled-size canvas path preview-zoom)
-                            (when width
-                              (setf preview-center-x
-                                    (- preview-drag-center-x
-                                       (/ (- x preview-drag-x) width))
-                                    preview-center-y
-                                    (- preview-drag-center-y
-                                       (/ (- y preview-drag-y) height)))
-                              (redraw-previews)))))))
+                    (cond
+                      (crop-drag (update-crop-drag x y))
+                      (preview-drag-p
+                       (let ((path (preview-path-for-canvas canvas)))
+                         (when path
+                           (multiple-value-bind (width height)
+                               (preview-scaled-size canvas path preview-zoom)
+                             (when width
+                               (setf preview-center-x
+                                     (- preview-drag-center-x
+                                        (/ (- x preview-drag-x) width))
+                                     preview-center-y
+                                     (- preview-drag-center-y
+                                        (/ (- y preview-drag-y) height)))
+                               (redraw-previews))))))))
                    (#.cl-fltk:+event-release+
-                    (setf preview-drag-p nil))
+                    (setf crop-drag nil
+                          preview-drag-p nil))
                    (#.cl-fltk:+event-wheel+
                     (zoom-preview (if (minusp dy) 1.25d0 .8d0)
                                   canvas x y))))))
@@ -568,16 +820,32 @@
                    (when (and (>= x 8) (>= index 0) (< index count)
                               (< offset node-width))
                      index)))))
-           (sync-node-tools ()
-             ;; The opacity slider tracks blend selection.
+           (crop-editing-node ()
              (let ((node (gui-model-selected-graph-node model)))
-               (if (and node (orfeus:graph-node-blend-p node))
-                   (progn
-                     (setf (cl-fltk:value node-opacity-slider)
-                           (format nil "~,2F"
-                                   (orfeus:graph-node-opacity node)))
-                     (cl-fltk:show node-opacity-slider))
-                   (cl-fltk:hide node-opacity-slider))))
+               (and node (eq :crop (orfeus:graph-node-kind node)) node)))
+           (sync-node-tools ()
+             ;; One tool slider: blend opacity or crop straightening angle.
+             (let ((node (gui-model-selected-graph-node model)))
+               (cond
+                 ((and node (orfeus:graph-node-blend-p node))
+                  (cl-fltk:set-range node-opacity-slider 0 1)
+                  (cl-fltk:set-step node-opacity-slider 0.05)
+                  (cl-fltk:set-tooltip node-opacity-slider "Blend opacity")
+                  (setf (cl-fltk:value node-opacity-slider)
+                        (format nil "~,2F"
+                                (orfeus:graph-node-opacity node)))
+                  (cl-fltk:show node-opacity-slider))
+                 ((and node (eq :crop (orfeus:graph-node-kind node)))
+                  (cl-fltk:set-range node-opacity-slider -45 45)
+                  (cl-fltk:set-step node-opacity-slider 0.1)
+                  (cl-fltk:set-tooltip node-opacity-slider
+                                       "Crop angle (degrees)")
+                  (setf (cl-fltk:value node-opacity-slider)
+                        (format nil "~,1F"
+                                (getf (orfeus:graph-node-params node)
+                                      :angle 0.0)))
+                  (cl-fltk:show node-opacity-slider))
+                 (t (cl-fltk:hide node-opacity-slider)))))
            (draw-node-strip (widget)
              (let* ((nodes (strip-nodes))
                     (count (length nodes)))
@@ -691,17 +959,22 @@
              (sync-controls)
              (sync-node-tools)
              (when node-strip (cl-fltk:redraw node-strip))
+             (redraw-previews)
              (schedule-edited-preview)
              (when message (set-status message)))
            (select-strip-node (index)
              ;; Selecting a node upgrades flat photos to graph grading so the
-             ;; selection can drive the sidebar and later edits.
+             ;; selection can drive the sidebar and later edits. Entering or
+             ;; leaving crop editing changes the preview recipe.
              (when (selected-job)
                (let* ((graph (gui-model-ensure-graph model))
                       (node (nth index
-                                 (orfeus:processing-graph-nodes graph))))
+                                 (orfeus:processing-graph-nodes graph)))
+                      (was-cropping (crop-editing-node)))
                  (when node
                    (setf (gui-model-selected-node model) node)
+                   (unless (eq was-cropping (crop-editing-node))
+                     (schedule-edited-preview))
                    (sync-controls)
                    (sync-node-tools)
                    (cl-fltk:redraw node-strip)
@@ -743,7 +1016,8 @@
                               (lambda ()
                                 (gui-model-set-node-params
                                  model node '(:left 0.0 :top 0.0
-                                              :width 1.0 :height 1.0))
+                                              :width 1.0 :height 1.0
+                                              :angle 0.0))
                                 (after-graph-edit "Crop reset to full frame")))))
                 (when (eq kind :color-subtract)
                   (list (cons "-" nil)
@@ -815,23 +1089,38 @@
                                          "Enabled")
                                      (node-kind-label
                                       (orfeus:graph-node-kind node))))))
-                        (setf node-click (cons now index)))))))))
+                        (setf node-click (cons now index))))
+                     ((and (= button 1)
+                           (gui-model-selected-graph-node model))
+                      ;; Clicking empty strip space drops the selection,
+                      ;; which also commits crop editing back into the
+                      ;; rendered preview.
+                      (let ((was-cropping (crop-editing-node)))
+                        (setf (gui-model-selected-node model) nil)
+                        (sync-controls)
+                        (sync-node-tools)
+                        (cl-fltk:redraw node-strip)
+                        (when was-cropping
+                          (schedule-edited-preview))
+                        (set-status "Node deselected"))))))))
            (autocrop-negative (node)
              (let ((job (selected-job)))
                (when job
                  (handler-case
-                     (multiple-value-bind (rect base)
+                     (multiple-value-bind (rect base angle)
                          (orfeus:analyze-negative-frame
                           (photo-job-input-path job) :cache-p t)
                        (declare (ignore base))
                        (gui-model-set-node-params
                         model node
                         (list :left (first rect) :top (second rect)
-                              :width (third rect) :height (fourth rect)))
+                              :width (third rect) :height (fourth rect)
+                              :angle (or angle 0.0)))
                        (after-graph-edit
-                        (format nil "Autocrop: ~,2F ~,2F ~,2Fx~,2F"
+                        (format nil "Autocrop: ~,2F ~,2F ~,2Fx~,2F tilt ~,1F"
                                 (first rect) (second rect)
-                                (third rect) (fourth rect))))
+                                (third rect) (fourth rect)
+                                (or angle 0.0))))
                    (error (condition)
                      (set-status (princ-to-string condition)))))))
            (auto-base-from-border (node)
@@ -1289,7 +1578,22 @@
              (or (orfeus:photo-job-graph job)
                  (orfeus:photo-render-settings project job)))
            (current-settings ()
-             (settings-for-job (selected-job)))
+             ;; While a crop node is selected its stage is bypassed in the
+             ;; preview: the full frame stays visible under the editing
+             ;; overlay, and rect changes cost a redraw, not a render.
+             (let ((settings (settings-for-job (selected-job)))
+                   (node (crop-editing-node)))
+               (if (and node
+                        (typep settings 'orfeus:processing-graph)
+                        (not (orfeus:graph-node-bypassed-p node)))
+                   (let* ((copy (orfeus:graph-copy settings))
+                          (twin (find (orfeus:graph-node-id node)
+                                      (orfeus:processing-graph-nodes copy)
+                                      :key #'orfeus:graph-node-id)))
+                     (when twin
+                       (setf (orfeus:graph-node-bypassed-p twin) t))
+                     copy)
+                   settings)))
            (enqueue-render (target-queue role job index settings generation publish-p
                             &key front-p draft-p cache-p)
              (let* ((input (photo-job-input-path job))
@@ -2006,10 +2310,13 @@
                                   (:before before-preview-file)
                                   (:after after-preview-file))))
                       (if path
-                          (draw-preview-file widget path
-                                             :zoom preview-zoom
-                                             :center-x preview-center-x
-                                             :center-y preview-center-y)
+                          (progn
+                            (draw-preview-file widget path
+                                               :zoom preview-zoom
+                                               :center-x preview-center-x
+                                               :center-y preview-center-y)
+                            (when (eq role :after)
+                              (draw-crop-overlay widget)))
                           (progn
                             (cl-fltk:draw-color-rgb :red 205 :green 208 :blue 210)
                             (cl-fltk:draw-text "Developing RAW preview..."
@@ -2063,16 +2370,22 @@
                (lambda (widget event value)
                  (declare (ignore event value))
                  (let ((node (gui-model-selected-graph-node model)))
-                   (when (and node (orfeus:graph-node-blend-p node))
-                     (handler-case
-                         (let ((opacity (parse-number
-                                         (cl-fltk:value widget))))
-                           (setf (orfeus:graph-node-opacity node)
-                                 (float (max 0 (min 1 opacity)) 1.0))
-                           (cl-fltk:redraw node-strip)
-                           (schedule-edited-preview))
-                       (error (condition)
-                         (set-status (princ-to-string condition)))))))))
+                   (handler-case
+                       (cond
+                         ((and node (orfeus:graph-node-blend-p node))
+                          (let ((opacity (parse-number
+                                          (cl-fltk:value widget))))
+                            (setf (orfeus:graph-node-opacity node)
+                                  (float (max 0 (min 1 opacity)) 1.0))
+                            (cl-fltk:redraw node-strip)
+                            (schedule-edited-preview)))
+                         ((and node (eq :crop (orfeus:graph-node-kind node)))
+                          (let ((angle (parse-number
+                                        (cl-fltk:value widget))))
+                            (set-crop-node-angle
+                             node (float (max -45 (min 45 angle)) 1.0)))))
+                     (error (condition)
+                       (set-status (princ-to-string condition))))))))
         (cl-fltk:set-range node-opacity-slider 0 1)
         (cl-fltk:set-step node-opacity-slider 0.05)
         (cl-fltk:set-tooltip node-opacity-slider "Blend opacity")
