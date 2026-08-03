@@ -44,6 +44,9 @@
                 #:graph-node-params
                 #:graph-node-id
                 #:graph-swap-with-upstream
+                #:graph-move-node-after
+                #:graph-set-blend-input
+                #:*graph-source-id*
                 #:graph-validate
                 #:make-graph-node
                 #:make-processing-graph

@@ -356,6 +356,59 @@
            (= 3 (length (graph-effective-nodes graph)))
            (progn (graph-validate graph) t)))))
 
+(defun graph-rewire-p ()
+  (let ((graph (graph-validate
+                (make-processing-graph
+                 :nodes (list (make-graph-node :id 1 :kind :optics
+                                               :params '(:lens-correction-p t)
+                                               :inputs '(0))
+                              (make-graph-node :id 2 :kind :noise-reduction
+                                               :params '(:noise-reduction 0.4)
+                                               :inputs '(1))
+                              (make-graph-node :id 3 :kind :tone
+                                               :params '(:tone-shadows 0.5)
+                                               :inputs '(2)))
+                 :output 3))))
+    (flet ((kind-node (kind)
+             (find kind (processing-graph-nodes graph)
+                   :key #'graph-node-kind))
+           (kinds ()
+             (mapcar #'graph-node-kind (processing-graph-nodes graph))))
+      ;; Drag the tail node to the head of the chain.
+      (unless (graph-move-node-after graph (graph-node-id (kind-node :tone))
+                                     *graph-source-id*)
+        (return-from graph-rewire-p nil))
+      (unless (equal '(:tone :optics :noise-reduction) (kinds))
+        (return-from graph-rewire-p nil))
+      ;; Moving a node onto its own input is a no-op.
+      (when (graph-move-node-after graph (graph-node-id (kind-node :optics))
+                                   (graph-node-id (kind-node :tone)))
+        (return-from graph-rewire-p nil))
+      ;; Drag the head node back into the middle.
+      (unless (graph-move-node-after graph (graph-node-id (kind-node :tone))
+                                     (graph-node-id (kind-node :optics)))
+        (return-from graph-rewire-p nil))
+      (unless (equal '(:optics :tone :noise-reduction) (kinds))
+        (return-from graph-rewire-p nil))
+      ;; A mid-chain blend can rewire its second branch to an upstream
+      ;; node, and wiring it downstream (a cycle) rolls back untouched.
+      (let ((blend (graph-insert-node
+                    graph (graph-node-id (kind-node :optics)) :blend
+                    :opacity 0.5)))
+        (unless (graph-set-blend-input
+                 graph (graph-node-id blend)
+                 (graph-node-id (kind-node :optics)))
+          (return-from graph-rewire-p nil))
+        (let ((before (graph->sexp graph)))
+          (and (handler-case
+                   (progn (graph-set-blend-input
+                           graph (graph-node-id blend)
+                           (graph-node-id (kind-node :noise-reduction)))
+                          nil)
+                 (error () t))
+               (equal before (graph->sexp graph))
+               (progn (graph-validate graph) t)))))))
+
 (defun photo-graph-round-trip-p ()
   (let* ((original
            (make-project
@@ -993,6 +1046,8 @@
              (settings-graph-conversion-p))
       (check "graph editing inserts, reorders, deletes, and blends"
              (graph-editing-p))
+      (check "nodes splice anywhere and invalid wires roll back"
+             (graph-rewire-p))
       (check "photo graphs round trip as project version 3"
              (photo-graph-round-trip-p))
       (check "graphs serialize to the native program format"

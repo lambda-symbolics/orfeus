@@ -379,6 +379,87 @@ sides of the pair are plain single-input filters. Returns true on success."
         (graph-normalize graph)
         t))))
 
+(defun call-with-graph-rollback (graph thunk)
+  "Run THUNK; restore GRAPH's ids, inputs, order, and output on any error."
+  (let ((entries (mapcar (lambda (node)
+                           (list node (graph-node-id node)
+                                 (copy-list (graph-node-inputs node))))
+                         (processing-graph-nodes graph)))
+        (nodes (copy-list (processing-graph-nodes graph)))
+        (output (processing-graph-output graph)))
+    (handler-case (funcall thunk)
+      (error (condition)
+        (dolist (entry entries)
+          (destructuring-bind (node id inputs) entry
+            (setf (graph-node-id node) id
+                  (graph-node-inputs node) inputs)))
+        (setf (processing-graph-nodes graph) nodes
+              (processing-graph-output graph) output)
+        (error condition)))))
+
+(defun graph-move-node-after (graph id after-id)
+  "Splice node ID out of its chain and re-insert it reading AFTER-ID.
+
+Consumers of ID re-read its first input, then consumers of AFTER-ID move to
+ID, exactly like inserting a fresh node there. A blend keeps its second
+branch. Returns true when the graph changed; an invalid placement rolls the
+graph back and re-signals."
+  (let ((node (or (graph-find-node graph id)
+                  (graph-invalid graph "cannot move unknown node ~S" id))))
+    (unless (or (eql after-id *graph-source-id*)
+                (graph-find-node graph after-id))
+      (graph-invalid graph "cannot move after unknown node ~S" after-id))
+    (cond
+      ((eql id after-id) nil)
+      ((eql (first (graph-node-inputs node)) after-id) nil)
+      (t
+       (call-with-graph-rollback
+        graph
+        (lambda ()
+          (let ((replacement (first (graph-node-inputs node))))
+            (dolist (consumer (graph-consumers graph id))
+              (setf (graph-node-inputs consumer)
+                    (substitute replacement id
+                                (graph-node-inputs consumer))))
+            (when (eql (processing-graph-output graph) id)
+              (setf (processing-graph-output graph) replacement))
+            (dolist (consumer (graph-consumers graph after-id))
+              (unless (eq consumer node)
+                (setf (graph-node-inputs consumer)
+                      (substitute id after-id
+                                  (graph-node-inputs consumer)))))
+            (setf (graph-node-inputs node)
+                  (cons after-id (rest (graph-node-inputs node))))
+            (when (eql (processing-graph-output graph) after-id)
+              (setf (processing-graph-output graph) id)))
+          (graph-normalize graph)
+          t))))))
+
+(defun graph-set-blend-input (graph id source-id)
+  "Point blend node ID's second branch at SOURCE-ID (or the source).
+
+Returns true when the wiring changed; an invalid wiring (cycles included)
+rolls the graph back and re-signals."
+  (let ((node (or (graph-find-node graph id)
+                  (graph-invalid graph "cannot rewire unknown node ~S" id))))
+    (unless (graph-node-blend-p node)
+      (graph-invalid graph "node ~S is not a blend" id))
+    (unless (or (eql source-id *graph-source-id*)
+                (graph-find-node graph source-id))
+      (graph-invalid graph "cannot read unknown node ~S" source-id))
+    (cond
+      ((eql source-id id)
+       (graph-invalid graph "a blend cannot read itself"))
+      ((eql source-id (second (graph-node-inputs node))) nil)
+      (t
+       (call-with-graph-rollback
+        graph
+        (lambda ()
+          (setf (graph-node-inputs node)
+                (list (first (graph-node-inputs node)) source-id))
+          (graph-normalize graph)
+          t))))))
+
 (defun graph-tail-linear-node-id (graph)
   "Return the last node id on the output path before any film tail."
   (let ((id (processing-graph-output graph)))

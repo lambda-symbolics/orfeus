@@ -88,6 +88,9 @@
    #:graph-effective-nodes
    #:graph-find-node
    #:graph-consumers
+   #:graph-move-node-after
+   #:graph-set-blend-input
+   #:*graph-source-id*
    #:graph-insert-node
    #:graph-delete-node
    #:graph-swap-with-upstream
