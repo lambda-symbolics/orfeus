@@ -47,8 +47,32 @@
     (:blend . "Blend")
     (:color-subtract . "Subtr")
     (:crop . "Crop")
-    (:curves . "Curves"))
+    (:curves . "Curves")
+    (:node . "Node"))
   "Short node captions for the graph panel, in menu order.")
+
+(defparameter *node-kind-choices*
+  '(("None" . :node)
+    ("White Balance" . :white-balance)
+    ("Exposure" . :exposure)
+    ("Noise Reduction" . :noise-reduction)
+    ("Tone" . :tone)
+    ("Optics" . :optics)
+    ("Film" . :film)
+    ("Blend" . :blend)
+    ("Color Subtract" . :color-subtract)
+    ("Crop" . :crop)
+    ("Curves" . :curves))
+  "Correction picker entries for the Node panel, in menu order.")
+
+(defparameter *graph-node-width* 96
+  "Width of a node box on the graph editor canvas.")
+
+(defparameter *graph-node-height* 30
+  "Height of a node box on the graph editor canvas.")
+
+(defparameter *graph-row-pitch* 46
+  "Vertical distance between auto-laid-out nodes on the graph canvas.")
 
 (defun node-kind-label (kind)
   (or (rest (assoc kind *node-kind-labels*)) (string kind)))
@@ -133,9 +157,6 @@ exactly the curve the render applies."
              thereis (not (equal value
                                  (getf orfeus::*stage-identity-plist*
                                        key)))))))
-
-(defparameter *node-strip-height* 46
-  "Height of the pipeline node strip under the preview.")
 
 (defparameter *gallery-cell-width* 96
   "Width of one still cell in the gallery grid.")
@@ -326,15 +347,22 @@ exactly the curve the render applies."
            (capture-cache (make-hash-table :test #'eq))
            (thumbnail-files (make-hash-table :test #'eq))
            (lut-paths (make-hash-table :test #'equal))
-           window menu toolbar toolbar-bottom-rule main-tile left-pane center-pane
+           window menu toolbar toolbar-bottom-rule main-tile left-column
+           filmstrip-pane gallery-pane center-pane
            thumbnail-canvas thumbnail-scrollbar
            before-canvas after-canvas before-caption after-caption
-           node-strip still-button copy-grade-button paste-grade-button
-           node-opacity-slider pick-color-node crop-drag node-drag
-           (node-click (cons 0 -1))
+           still-button copy-grade-button paste-grade-button
+           right-column graph-pane graph-canvas graph-title
+           (graph-scroll-x 0)
+           (graph-scroll-y 0)
+           pick-color-node crop-drag node-drag
+           (node-click (cons 0 nil))
            grade-clipboard
-           inspector tabs basic-page optics-page effects-page export-page presets-page
-           curves-page curve-canvas curve-drag
+           inspector tabs node-page export-page
+           kind-choice
+           (node-panel-groups '())
+           blend-opacity-input crop-angle-input
+           curve-canvas curve-drag
            (curve-channel :red-points)
            curve-histogram
            status progress before-preview-file after-preview-file
@@ -342,7 +370,8 @@ exactly the curve the render applies."
            lens-name controls inspector-items tone-items lut-choice wb-choice target-choice
            export-quality export-max-width export-max-height export-metadata
            export-timestamp
-           gallery-canvas preset-name-input preset-apply-button
+           gallery-canvas gallery-title preset-name-input
+           preset-apply-button preset-save-button
            (gallery-scroll 0)
            (gallery-selected nil)
            (gallery-stills '())
@@ -1046,7 +1075,7 @@ exactly the curve the render applies."
                  (clear-previews)
                  (sync-controls)
                  (sync-node-tools)
-                 (when node-strip (cl-fltk:redraw node-strip))
+                 (when graph-canvas (cl-fltk:redraw graph-canvas))
                  (if selection
                      (schedule-initial-preview)
                      (progn
@@ -1163,210 +1192,283 @@ exactly the curve the render applies."
            (selected-photo-count ()
              (length (or (gui-model-selected-indices model)
                          (and (selected-job) '(0)))))
-           (strip-nodes ()
+           (editor-nodes ()
              (let ((graph (gui-model-display-graph model)))
                (if graph (orfeus:processing-graph-nodes graph) '())))
-           (node-strip-metrics (count)
-             (let* ((width (cl-fltk:widget-width node-strip))
-                    (wire 12)
-                    (node-width (if (plusp count)
-                                    (max 40 (min 92 (floor (- width 16
-                                                              (* (1- count)
-                                                                 wire))
-                                                           count)))
-                                    92)))
-               (values node-width wire)))
-           (node-index-at (x)
-             (let ((count (length (strip-nodes))))
-               (multiple-value-bind (node-width wire)
-                   (node-strip-metrics count)
-                 (let* ((pitch (+ node-width wire))
-                        (index (floor (- x 8) pitch))
-                        (offset (- x 8 (* index pitch))))
-                   (when (and (>= x 8) (>= index 0) (< index count)
-                              (< offset node-width))
-                     index)))))
            (crop-editing-node ()
              (let ((node (gui-model-selected-graph-node model)))
                (and node (eq :crop (orfeus:graph-node-kind node)) node)))
            (sync-node-tools ()
-             ;; One tool slider: blend opacity or crop straightening angle.
-             (let ((node (gui-model-selected-graph-node model)))
-               (cond
-                 ((and node (orfeus:graph-node-blend-p node))
-                  (cl-fltk:set-range node-opacity-slider 0 1)
-                  (cl-fltk:set-step node-opacity-slider 0.05)
-                  (cl-fltk:set-tooltip node-opacity-slider "Blend opacity")
-                  (setf (cl-fltk:value node-opacity-slider)
-                        (format nil "~,2F"
-                                (orfeus:graph-node-opacity node)))
-                  (cl-fltk:show node-opacity-slider))
-                 ((and node (eq :crop (orfeus:graph-node-kind node)))
-                  (cl-fltk:set-range node-opacity-slider -45 45)
-                  (cl-fltk:set-step node-opacity-slider 0.1)
-                  (cl-fltk:set-tooltip node-opacity-slider
-                                       "Crop angle (degrees)")
-                  (setf (cl-fltk:value node-opacity-slider)
-                        (format nil "~,1F"
-                                (getf (orfeus:graph-node-params node)
-                                      :angle 0.0)))
-                  (cl-fltk:show node-opacity-slider))
-                 (t (cl-fltk:hide node-opacity-slider)))))
-           (draw-node-strip (widget)
-             (let* ((nodes (strip-nodes))
-                    (count (length nodes)))
-               (multiple-value-bind (node-width wire)
-                   (node-strip-metrics count)
-                 (let* ((x (cl-fltk:widget-x widget))
-                        (y (cl-fltk:widget-y widget))
-                        (width (cl-fltk:widget-width widget))
-                        (height (cl-fltk:widget-height widget))
-                        (node-height 30)
-                        (top (+ y (floor (- height node-height) 2)))
-                        (middle (+ top (floor node-height 2)))
-                        (selected (gui-model-selected-graph-node model))
-                        (positions (make-hash-table)))
-                   (cl-fltk:draw-color-rgb :red 192 :green 192 :blue 192)
-                   (cl-fltk:draw-filled-rect x y width height)
-                   (when (zerop count)
-                     (cl-fltk:draw-color-rgb :red 96 :green 96 :blue 96)
-                     (cl-fltk:draw-font :size 11)
-                     (cl-fltk:draw-text
-                      (if (selected-job)
-                          "Right-click to add processing nodes"
-                          "Open a photograph to grade")
-                      (+ x 10) (+ y 27))
-                     (cl-fltk:draw-font :size 12))
-                   (setf (gethash 0 positions) (+ x 2))
-                   (loop for node in nodes
-                         for index from 0
-                         for node-x = (+ x 8 (* index (+ node-width wire)))
-                         do (let* ((kind (orfeus:graph-node-kind node))
-                                   (bypassed (orfeus:graph-node-bypassed-p
-                                              node))
-                                   (blend (orfeus:graph-node-blend-p node)))
-                              (setf (gethash (orfeus:graph-node-id node)
-                                             positions)
-                                    (+ node-x (floor node-width 2)))
-                              ;; Wire from the primary input.
-                              (let ((from (gethash
-                                           (first (orfeus:graph-node-inputs
-                                                   node))
-                                           positions)))
-                                (when from
-                                  (cl-fltk:draw-color-rgb :red 90 :green 90
-                                                          :blue 90)
-                                  (cl-fltk:draw-filled-rect
-                                   (min from node-x) middle
-                                   (max 2 (- node-x (min from node-x))) 2)))
-                              ;; Blend branch wire from the second input.
-                              (when blend
-                                (let ((from (gethash
-                                             (second
-                                              (orfeus:graph-node-inputs node))
-                                             positions)))
-                                  (when from
-                                    (cl-fltk:draw-color-rgb :red 60 :green 60
-                                                            :blue 130)
-                                    (cl-fltk:draw-line from (- top 4)
-                                                       (+ node-x
-                                                          (floor node-width 2))
-                                                       top))))
-                              (if bypassed
-                                  (cl-fltk:draw-color-rgb :red 168 :green 168
-                                                          :blue 168)
-                                  (cl-fltk:draw-color-rgb :red 210 :green 210
-                                                          :blue 210))
-                              (cl-fltk:draw-filled-rect node-x top node-width
-                                                        node-height)
-                              (cl-fltk:draw-color-rgb :red 248 :green 248
-                                                      :blue 248)
-                              (cl-fltk:draw-filled-rect node-x top node-width 1)
-                              (cl-fltk:draw-filled-rect node-x top 1
-                                                        node-height)
-                              (cl-fltk:draw-color-rgb :red 105 :green 105
-                                                      :blue 105)
-                              (cl-fltk:draw-filled-rect
-                               node-x (+ top node-height -1) node-width 1)
-                              (cl-fltk:draw-filled-rect
-                               (+ node-x node-width -1) top 1 node-height)
-                              (when (eq node selected)
-                                (cl-fltk:draw-color-rgb :red 0 :green 0
-                                                        :blue 128)
-                                (cl-fltk:draw-rect node-x top node-width
-                                                   node-height)
-                                (cl-fltk:draw-rect (1+ node-x) (1+ top)
-                                                   (- node-width 2)
-                                                   (- node-height 2)))
-                              (if (graph-node-active-p node)
-                                  (cl-fltk:draw-color-rgb :red 40 :green 150
-                                                          :blue 40)
-                                  (cl-fltk:draw-color-rgb :red 150 :green 150
-                                                          :blue 150))
-                              (cl-fltk:draw-filled-rect
-                               (+ node-x node-width -11) (+ top 4) 7 7)
-                              (if bypassed
-                                  (cl-fltk:draw-color-rgb :red 110 :green 110
-                                                          :blue 110)
-                                  (cl-fltk:draw-color-rgb :red 0 :green 0
-                                                          :blue 0))
-                              (cl-fltk:draw-font :size 11)
-                              (cl-fltk:draw-text (node-kind-label kind)
-                                                 (+ node-x 5) (+ top 20))
-                              (cl-fltk:draw-font :size 12)
-                              (when bypassed
-                                (cl-fltk:draw-color-rgb :red 165 :green 40
-                                                        :blue 40)
-                                (cl-fltk:draw-line node-x
-                                                   (+ top node-height -1)
-                                                   (+ node-x node-width -1)
-                                                   top))))
-                   ;; Rubber band and drop target while dragging a node.
-                   (when (and node-drag (getf node-drag :active-p))
-                     (let* ((dragged (getf node-drag :node))
-                            (drag-x (getf node-drag :x))
-                            (drag-y (getf node-drag :y))
-                            (source (position dragged nodes)))
-                       (when source
-                         (multiple-value-bind (kind target)
-                             (node-drop-target drag-x count)
-                           (let ((pitch (+ node-width wire)))
-                             (cl-fltk:draw-color-rgb :red 0 :green 0
-                                                     :blue 128)
-                             (case kind
-                               (:node
-                                (let ((target-x (+ x 8 (* target pitch))))
-                                  (cl-fltk:draw-rect
-                                   (1- target-x) (1- top)
-                                   (+ node-width 2) (+ node-height 2))))
-                               (:gap
-                                (let ((gap-x (+ x 8 (* target pitch)
-                                                node-width
-                                                (floor wire 2))))
-                                  (cl-fltk:draw-filled-rect
-                                   (1- gap-x) (+ top 2) 3
-                                   (- node-height 4))))
-                               (:source
-                                (cl-fltk:draw-filled-rect
-                                 (+ x 2) (+ top 2) 3
-                                 (- node-height 4))))
-                             (cl-fltk:draw-line
-                              (+ x 8 (* source pitch)
-                                 (floor node-width 2))
-                              middle (+ x drag-x)
-                              (+ y drag-y)))))))))))
+             ;; The Node panel follows the selection: the correction picker
+             ;; plus only the active kind's controls, DaVinci style.
+             (let* ((node (gui-model-selected-graph-node model))
+                    (kind (and node (orfeus:graph-node-kind node))))
+               (when kind-choice
+                 (setf (cl-fltk:value kind-choice)
+                       (or (first (find kind *node-kind-choices*
+                                        :key #'rest))
+                           "None")))
+               (dolist (entry node-panel-groups)
+                 (let ((show (case (first entry)
+                               (:picker (and node t))
+                               (:none (null node))
+                               (otherwise (eq (first entry) kind)))))
+                   (dolist (widget (rest entry))
+                     (if show
+                         (cl-fltk:show widget)
+                         (cl-fltk:hide widget)))))
+               (when (and node blend-opacity-input
+                          (orfeus:graph-node-blend-p node))
+                 (setf (cl-fltk:value blend-opacity-input)
+                       (format nil "~,2F"
+                               (orfeus:graph-node-opacity node))))
+               (when (and node crop-angle-input (eq kind :crop))
+                 (setf (cl-fltk:value crop-angle-input)
+                       (format nil "~,1F"
+                               (getf (orfeus:graph-node-params node)
+                                     :angle 0.0))))))
+           (ensure-node-positions (nodes)
+             ;; Fresh nodes stack top-down in chain order; dragged nodes
+             ;; keep wherever the user put them.
+             (loop for node in nodes
+                   for index from 1
+                   unless (orfeus:graph-node-position node)
+                     do (setf (orfeus:graph-node-position node)
+                              (list 18.0
+                                    (float (+ 6 (* index *graph-row-pitch*))
+                                           1.0))))
+             nodes)
+           (graph-node-box (node)
+             (let ((place (orfeus:graph-node-position node)))
+               (values (round (first place)) (round (second place))
+                       *graph-node-width* *graph-node-height*)))
+           (graph-output-box (nodes)
+             (let ((bottom (loop for node in nodes
+                                 maximize
+                                 (multiple-value-bind (x y) (graph-node-box
+                                                             node)
+                                   (declare (ignore x))
+                                   (+ y *graph-node-height*)))))
+               (values 18 (+ (max bottom 28) 22) *graph-node-width* 22)))
+           (graph-editor-hit (gx gy)
+             ;; What lies at graph coordinates: a node body, its output
+             ;; port, a blend's branch port, the source, or the output box.
+             (let ((nodes (ensure-node-positions (editor-nodes))))
+               (loop for node in nodes
+                     for index from 0
+                     do (multiple-value-bind (x y w h) (graph-node-box node)
+                          (let ((port-x (+ x (floor w 2)))
+                                (port-y (+ y h)))
+                            (when (and (<= (abs (- gx port-x)) 9)
+                                       (<= (abs (- gy port-y)) 7))
+                              (return-from graph-editor-hit
+                                (values :output-port index))))
+                          (when (orfeus:graph-node-blend-p node)
+                            (let ((port-x (+ x w))
+                                  (port-y (+ y (floor h 2))))
+                              (when (and (<= (abs (- gx port-x)) 8)
+                                         (<= (abs (- gy port-y)) 9))
+                                (return-from graph-editor-hit
+                                  (values :branch-port index)))))
+                          (when (and (<= x gx (+ x w)) (<= y gy (+ y h)))
+                            (return-from graph-editor-hit
+                              (values :node index)))))
+               (when (and (<= 18 gx (+ 18 *graph-node-width*))
+                          (<= 6 gy 28))
+                 (return-from graph-editor-hit
+                   (values (if (>= gy 22) :source-port :source) nil)))
+               (multiple-value-bind (x y w h) (graph-output-box nodes)
+                 (when (and (<= x gx (+ x w)) (<= y gy (+ y h)))
+                   (return-from graph-editor-hit (values :output nil))))
+               (values nil nil)))
+           (draw-editor-box (x y w h label style selected)
+             ;; STYLE :terminal draws the darker RAW/OUT wells.
+             (ecase style
+               (:terminal (cl-fltk:draw-color-rgb :red 78 :green 80 :blue 86))
+               (:bypassed (cl-fltk:draw-color-rgb :red 148 :green 148
+                                                  :blue 148))
+               (:normal (cl-fltk:draw-color-rgb :red 208 :green 208
+                                                :blue 208)))
+             (cl-fltk:draw-filled-rect x y w h)
+             (cl-fltk:draw-color-rgb :red 240 :green 240 :blue 244)
+             (cl-fltk:draw-filled-rect x y w 1)
+             (cl-fltk:draw-filled-rect x y 1 h)
+             (cl-fltk:draw-color-rgb :red 70 :green 70 :blue 74)
+             (cl-fltk:draw-filled-rect x (+ y h -1) w 1)
+             (cl-fltk:draw-filled-rect (+ x w -1) y 1 h)
+             (when selected
+               (cl-fltk:draw-color-rgb :red 0 :green 0 :blue 128)
+               (cl-fltk:draw-rect x y w h)
+               (cl-fltk:draw-rect (1+ x) (1+ y) (- w 2) (- h 2)))
+             (if (eq style :terminal)
+                 (cl-fltk:draw-color-rgb :red 225 :green 225 :blue 230)
+                 (cl-fltk:draw-color-rgb :red 10 :green 10 :blue 12))
+             (cl-fltk:draw-font :size 11)
+             (cl-fltk:draw-text label (+ x 6) (+ y (- h 9)))
+             (cl-fltk:draw-font :size 12))
+           (draw-graph-editor (widget)
+             (let* ((wx (cl-fltk:widget-x widget))
+                    (wy (cl-fltk:widget-y widget))
+                    (width (cl-fltk:widget-width widget))
+                    (height (cl-fltk:widget-height widget))
+                    (nodes (ensure-node-positions (editor-nodes)))
+                    (selected (gui-model-selected-graph-node model))
+                    (ox (- wx graph-scroll-x))
+                    (oy (- wy graph-scroll-y)))
+               (cl-fltk:draw-push-clip wx wy width height)
+               (cl-fltk:draw-color-rgb :red 52 :green 54 :blue 58)
+               (cl-fltk:draw-filled-rect wx wy width height)
+               ;; A quiet dot grid anchored to graph space.
+               (cl-fltk:draw-color-rgb :red 66 :green 68 :blue 72)
+               (loop for gy from (* 24 (ceiling graph-scroll-y 24))
+                       below (+ graph-scroll-y height) by 24
+                     do (loop for gx from (* 24 (ceiling graph-scroll-x 24))
+                                below (+ graph-scroll-x width) by 24
+                              do (cl-fltk:draw-filled-rect (+ ox gx)
+                                                           (+ oy gy) 1 1)))
+               (when (null nodes)
+                 (cl-fltk:draw-color-rgb :red 168 :green 170 :blue 174)
+                 (cl-fltk:draw-font :size 11)
+                 (cl-fltk:draw-text
+                  (if (selected-job)
+                      "Right-click for a New Node"
+                      "Open a photograph to grade")
+                  (+ wx 14) (+ wy 52))
+                 (cl-fltk:draw-font :size 12))
+               (flet ((node-center-top (node)
+                        (multiple-value-bind (x y w h) (graph-node-box node)
+                          (declare (ignore h))
+                          (values (+ ox x (floor w 2)) (+ oy y))))
+                      (node-center-bottom (node)
+                        (multiple-value-bind (x y w h) (graph-node-box node)
+                          (values (+ ox x (floor w 2)) (+ oy y h))))
+                      (node-right-middle (node)
+                        (multiple-value-bind (x y w h) (graph-node-box node)
+                          (values (+ ox x w) (+ oy y (floor h 2)))))
+                      (source-bottom ()
+                        (values (+ ox 18 (floor *graph-node-width* 2))
+                                (+ oy 28))))
+                 ;; Wires first, boxes on top.
+                 (dolist (node nodes)
+                   (let ((inputs (orfeus:graph-node-inputs node)))
+                     (multiple-value-bind (tx ty) (node-center-top node)
+                       (multiple-value-bind (fx fy)
+                           (let ((from (first inputs)))
+                             (if (eql from 0)
+                                 (source-bottom)
+                                 (node-center-bottom
+                                  (find from nodes
+                                        :key #'orfeus:graph-node-id))))
+                         (when fx
+                           (cl-fltk:draw-color-rgb :red 132 :green 134
+                                                   :blue 140)
+                           (cl-fltk:draw-line fx fy tx ty))))
+                     (when (orfeus:graph-node-blend-p node)
+                       (multiple-value-bind (tx ty) (node-right-middle node)
+                         (multiple-value-bind (fx fy)
+                             (let ((from (second inputs)))
+                               (if (eql from 0)
+                                   (source-bottom)
+                                   (node-center-bottom
+                                    (find from nodes
+                                          :key #'orfeus:graph-node-id))))
+                           (when fx
+                             (cl-fltk:draw-color-rgb :red 90 :green 110
+                                                     :blue 190)
+                             (cl-fltk:draw-line fx fy (+ tx 8) ty)
+                             (cl-fltk:draw-line (+ tx 8) ty tx ty)))))))
+                 ;; Output wire down to the OUT well.
+                 (multiple-value-bind (out-x out-y out-w out-h)
+                     (graph-output-box nodes)
+                   (declare (ignore out-h))
+                   (let* ((graph (gui-model-display-graph model))
+                          (output-id (and graph
+                                          (orfeus:processing-graph-output
+                                           graph)))
+                          (output-node
+                            (and output-id
+                                 (find output-id nodes
+                                       :key #'orfeus:graph-node-id))))
+                     (multiple-value-bind (fx fy)
+                         (if output-node
+                             (node-center-bottom output-node)
+                             (and graph (source-bottom)))
+                       (when fx
+                         (cl-fltk:draw-color-rgb :red 132 :green 134
+                                                 :blue 140)
+                         (cl-fltk:draw-line fx fy
+                                            (+ ox out-x (floor out-w 2))
+                                            (+ oy out-y)))))
+                   ;; Terminal wells.
+                   (when (selected-job)
+                     (draw-editor-box (+ ox 18) (+ oy 6)
+                                      *graph-node-width* 22
+                                      "RAW" :terminal nil)
+                     (draw-editor-box (+ ox out-x) (+ oy out-y)
+                                      out-w 22 "OUT" :terminal nil)))
+                 ;; Node boxes.
+                 (dolist (node nodes)
+                   (multiple-value-bind (x y w h) (graph-node-box node)
+                     (let ((bx (+ ox x)) (by (+ oy y))
+                           (bypassed (orfeus:graph-node-bypassed-p node)))
+                       (draw-editor-box bx by w h
+                                        (node-kind-label
+                                         (orfeus:graph-node-kind node))
+                                        (if bypassed :bypassed :normal)
+                                        (eq node selected))
+                       (if (graph-node-active-p node)
+                           (cl-fltk:draw-color-rgb :red 40 :green 150
+                                                   :blue 40)
+                           (cl-fltk:draw-color-rgb :red 150 :green 150
+                                                   :blue 150))
+                       (cl-fltk:draw-filled-rect (+ bx w -11) (+ by 4) 7 7)
+                       ;; The output port nub.
+                       (cl-fltk:draw-color-rgb :red 235 :green 235 :blue 240)
+                       (cl-fltk:draw-filled-rect (+ bx (floor w 2) -3)
+                                                 (+ by h -3) 7 6)
+                       (when (orfeus:graph-node-blend-p node)
+                         (cl-fltk:draw-color-rgb :red 90 :green 110
+                                                 :blue 190)
+                         (cl-fltk:draw-filled-rect (+ bx w -3)
+                                                   (+ by (floor h 2) -3)
+                                                   6 7))
+                       (when bypassed
+                         (cl-fltk:draw-color-rgb :red 165 :green 40 :blue 40)
+                         (cl-fltk:draw-line bx (+ by h -1)
+                                            (+ bx w -1) by)))))
+                 ;; Source port nub.
+                 (when (selected-job)
+                   (cl-fltk:draw-color-rgb :red 235 :green 235 :blue 240)
+                   (multiple-value-bind (sx sy) (source-bottom)
+                     (cl-fltk:draw-filled-rect (- sx 3) (- sy 3) 7 6)))
+                 ;; Wire rubber band.
+                 (when (and node-drag (eq (first node-drag) :wire)
+                            (getf (rest node-drag) :moved-p))
+                   (let ((from (getf (rest node-drag) :from)))
+                     (multiple-value-bind (fx fy)
+                         (if (eq from :source)
+                             (source-bottom)
+                             (let ((node (nth from nodes)))
+                               (and node (node-center-bottom node))))
+                       (when fx
+                         (cl-fltk:draw-color-rgb :red 0 :green 0 :blue 128)
+                         (cl-fltk:draw-line
+                          fx fy
+                          (+ ox (getf (rest node-drag) :x))
+                          (+ oy (getf (rest node-drag) :y))))))))
+               (cl-fltk:draw-pop-clip)))
            (after-graph-edit (message)
              (sync-controls)
              (sync-node-tools)
-             (when node-strip (cl-fltk:redraw node-strip))
+             (when graph-canvas (cl-fltk:redraw graph-canvas))
              (when curve-canvas (cl-fltk:redraw curve-canvas))
              (redraw-previews)
              (schedule-edited-preview)
              (when message (set-status message)))
-           (select-strip-node (index)
+           (select-graph-node (index)
              ;; Selecting a node upgrades flat photos to graph grading so the
-             ;; selection can drive the sidebar and later edits. Entering or
-             ;; leaving crop editing changes the preview recipe.
+             ;; selection can drive the Node panel and later edits. Entering
+             ;; or leaving crop editing changes the preview recipe.
              (when (selected-job)
                (let* ((graph (gui-model-ensure-graph model))
                       (node (nth index
@@ -1378,7 +1480,7 @@ exactly the curve the render applies."
                      (schedule-edited-preview))
                    (sync-controls)
                    (sync-node-tools)
-                   (cl-fltk:redraw node-strip)
+                   (when graph-canvas (cl-fltk:redraw graph-canvas))
                    (when curve-canvas (cl-fltk:redraw curve-canvas))
                    (set-status (format nil "Node ~D: ~A~@[ (bypassed)~]"
                                        (orfeus:graph-node-id node)
@@ -1386,6 +1488,16 @@ exactly the curve the render applies."
                                         (orfeus:graph-node-kind node))
                                        (orfeus:graph-node-bypassed-p node)))
                    node))))
+           (deselect-graph-node ()
+             (when (gui-model-selected-graph-node model)
+               (let ((was-cropping (crop-editing-node)))
+                 (setf (gui-model-selected-node model) nil)
+                 (sync-controls)
+                 (sync-node-tools)
+                 (when graph-canvas (cl-fltk:redraw graph-canvas))
+                 (when was-cropping
+                   (schedule-edited-preview))
+                 (set-status "Node deselected"))))
            (graph-node-menu-actions (node)
              (let ((kind (orfeus:graph-node-kind node)))
                (append
@@ -1438,163 +1550,245 @@ exactly the curve the render applies."
                               (gui-model-delete-node model node)
                               (after-graph-edit "Node deleted")))))))
            (add-node-menu-actions (after-node)
-             (mapcar
-              (lambda (kind)
-                (cons (format nil "Add ~A" (node-kind-label kind))
-                      (lambda ()
-                        (handler-case
-                            (progn
-                              (gui-model-add-node
-                               model kind
-                               :after (and after-node
-                                           (orfeus:graph-node-id after-node)))
-                              (after-graph-edit
-                               (format nil "Added ~A node"
-                                       (node-kind-label kind))))
-                          (error (condition)
-                            (set-status (princ-to-string condition)))))))
-              (orfeus:graph-node-kinds)))
+             ;; The Resolve flow first: New Node makes an untyped container
+             ;; the Node panel then assigns a correction to. The direct
+             ;; per-kind entries remain as shortcuts.
+             (append
+              (list (cons "New Node"
+                          (lambda ()
+                            (handler-case
+                                (progn
+                                  (gui-model-add-node
+                                   model :node
+                                   :after (and after-node
+                                               (orfeus:graph-node-id
+                                                after-node)))
+                                  (after-graph-edit
+                                   "New node: pick a correction type"))
+                              (error (condition)
+                                (set-status
+                                 (princ-to-string condition))))))
+                    (cons "-" nil))
+              (mapcar
+               (lambda (kind)
+                 (cons (format nil "Add ~A" (node-kind-label kind))
+                       (lambda ()
+                         (handler-case
+                             (progn
+                               (gui-model-add-node
+                                model kind
+                                :after (and after-node
+                                            (orfeus:graph-node-id
+                                             after-node)))
+                               (after-graph-edit
+                                (format nil "Added ~A node"
+                                        (node-kind-label kind))))
+                           (error (condition)
+                             (set-status (princ-to-string condition)))))))
+               (orfeus:graph-node-kinds))))
            (show-node-menu (actions)
              (let ((chosen (cl-fltk:popup-menu (mapcar #'first actions))))
                (when chosen
                  (let ((action (rest (nth chosen actions))))
                    (when action (funcall action))))))
-           (node-drop-target (x count)
-             ;; Where a drag at strip X lands: a node, the gap after one,
-             ;; or the source well left of the first node.
-             (when (plusp count)
-               (multiple-value-bind (node-width wire)
-                   (node-strip-metrics count)
-                 (let ((relative (- x 8)))
-                   (if (minusp relative)
-                       (values :source nil)
-                       (let* ((pitch (+ node-width wire))
-                              (index (floor relative pitch))
-                              (offset (- relative (* index pitch))))
-                         (cond ((>= index count)
-                                (values :gap (1- count)))
-                               ((< offset node-width)
-                                (values :node index))
-                               (t (values :gap index)))))))))
-           (drop-node-drag (drag)
-             (let* ((node (getf drag :node))
-                    (x (getf drag :x))
-                    (y (getf drag :y))
-                    (nodes (strip-nodes))
-                    (count (length nodes)))
-               (handler-case
-                   (multiple-value-bind (kind index)
-                       (node-drop-target x count)
-                     (cond
-                       ((eq kind :source)
-                        (if (gui-model-rewire-node
-                             model node orfeus:*graph-source-id*)
-                            (after-graph-edit
-                             (format nil "~A moved to the head"
-                                     (node-kind-label
-                                      (orfeus:graph-node-kind node))))
-                            (cl-fltk:redraw node-strip)))
-                       ((null kind) (cl-fltk:redraw node-strip))
-                       (t
-                        (let ((target (nth index nodes)))
-                          (cond
-                            ((or (null target) (eq target node))
-                             (cl-fltk:redraw node-strip))
-                            ((and (eq kind :node)
-                                  (orfeus:graph-node-blend-p target)
-                                  (< y 23))
-                             ;; Dropping on a blend's top half feeds its
-                             ;; second branch.
-                             (if (gui-model-set-blend-input model target
-                                                            node)
-                                 (after-graph-edit
-                                  (format nil "Blend branch reads ~A"
-                                          (node-kind-label
-                                           (orfeus:graph-node-kind node))))
-                                 (cl-fltk:redraw node-strip)))
-                            (t
-                             (if (gui-model-rewire-node
-                                  model node
-                                  (orfeus:graph-node-id target))
-                                 (after-graph-edit
-                                  (format nil "~A moved after ~A"
-                                          (node-kind-label
-                                           (orfeus:graph-node-kind node))
-                                          (node-kind-label
-                                           (orfeus:graph-node-kind
-                                            target))))
-                                 (cl-fltk:redraw node-strip))))))))
-                 (error (condition)
-                   (cl-fltk:redraw node-strip)
-                   (set-status (princ-to-string condition))))))
-           (handle-node-strip-mouse (widget event value)
+           (graph-content-extent ()
+             ;; (values right bottom) of everything drawn, in graph space.
+             (let ((nodes (ensure-node-positions (editor-nodes))))
+               (multiple-value-bind (out-x out-y out-w out-h)
+                   (graph-output-box nodes)
+                 (values (max (+ out-x out-w)
+                              (loop for node in nodes
+                                    maximize
+                                    (multiple-value-bind (x y w)
+                                        (graph-node-box node)
+                                      (declare (ignore y))
+                                      (+ x w))))
+                         (+ out-y out-h)))))
+           (drop-graph-wire (drag gx gy)
+             ;; Releasing a wire: onto a node feeds its primary input, onto
+             ;; a blend's right port feeds the second branch, onto OUT makes
+             ;; the source node the graph output.
+             (when (selected-job)
+               (gui-model-ensure-graph model)
+               (let* ((nodes (editor-nodes))
+                      (from (getf (rest drag) :from))
+                      (source-node (unless (eq from :source)
+                                     (nth from nodes)))
+                      (source-id (if source-node
+                                     (orfeus:graph-node-id source-node)
+                                     orfeus:*graph-source-id*)))
+                 (handler-case
+                     (multiple-value-bind (part index)
+                         (graph-editor-hit gx gy)
+                       (case part
+                         ((:node :output-port)
+                          (let ((target (nth index nodes)))
+                            (if (or (null target) (eq target source-node))
+                                (cl-fltk:redraw graph-canvas)
+                                (if (gui-model-set-primary-input
+                                     model target source-id)
+                                    (after-graph-edit
+                                     (format nil "~A reads ~A"
+                                             (node-kind-label
+                                              (orfeus:graph-node-kind
+                                               target))
+                                             (if source-node
+                                                 (node-kind-label
+                                                  (orfeus:graph-node-kind
+                                                   source-node))
+                                                 "the source")))
+                                    (cl-fltk:redraw graph-canvas)))))
+                         (:branch-port
+                          (let ((target (nth index nodes)))
+                            (if (and target
+                                     (orfeus:graph-node-blend-p target)
+                                     (not (eq target source-node)))
+                                (if (gui-model-set-blend-input
+                                     model target source-node)
+                                    (after-graph-edit
+                                     (format nil "Blend branch reads ~A"
+                                             (if source-node
+                                                 (node-kind-label
+                                                  (orfeus:graph-node-kind
+                                                   source-node))
+                                                 "the source")))
+                                    (cl-fltk:redraw graph-canvas))
+                                (cl-fltk:redraw graph-canvas))))
+                         (:output
+                          (if source-node
+                              (if (gui-model-set-output model source-node)
+                                  (after-graph-edit
+                                   (format nil "Output is now ~A"
+                                           (node-kind-label
+                                            (orfeus:graph-node-kind
+                                             source-node))))
+                                  (cl-fltk:redraw graph-canvas))
+                              (cl-fltk:redraw graph-canvas)))
+                         (t (cl-fltk:redraw graph-canvas))))
+                   (error (condition)
+                     (cl-fltk:redraw graph-canvas)
+                     (set-status (princ-to-string condition)))))))
+           (handle-graph-mouse (widget event value)
              (declare (ignore widget))
-             (multiple-value-bind (x y button) (parse-preview-event value)
+             (multiple-value-bind (x y button dx dy) (parse-preview-event
+                                                      value)
+               (declare (ignore dx))
                (when (and x (selected-job))
-                 (case event
-                   (#.cl-fltk:+event-drag+
-                    (when node-drag
-                      (setf (getf node-drag :x) x
-                            (getf node-drag :y) y)
-                      (when (and (not (getf node-drag :active-p))
-                                 (> (abs (- x (getf node-drag :start-x))) 8))
-                        (setf (getf node-drag :active-p) t))
-                      (when (getf node-drag :active-p)
-                        (cl-fltk:redraw node-strip))))
-                   (#.cl-fltk:+event-release+
-                    (when node-drag
+                 (let ((gx (+ x graph-scroll-x))
+                       (gy (+ y graph-scroll-y)))
+                   (case event
+                     (#.cl-fltk:+event-push+
+                      (multiple-value-bind (part index)
+                          (graph-editor-hit gx gy)
+                        (cond
+                          ((= button 3)
+                           (if (eq part :node)
+                               (let ((node (select-graph-node index)))
+                                 (when node
+                                   (show-node-menu
+                                    (append (graph-node-menu-actions node)
+                                            (list (cons "-" nil))
+                                            (add-node-menu-actions node)))))
+                               (progn
+                                 (gui-model-ensure-graph model)
+                                 (show-node-menu
+                                  (add-node-menu-actions
+                                   (gui-model-selected-graph-node
+                                    model))))))
+                          ((= button 1)
+                           (case part
+                             ((:output-port :source-port)
+                              (setf node-drag
+                                    (list :wire
+                                          :from (if (eq part :source-port)
+                                                    :source
+                                                    index)
+                                          :x gx :y gy :moved-p nil)))
+                             (:node
+                              (let ((node (select-graph-node index))
+                                    (now (get-internal-real-time)))
+                                (when node
+                                  (when (and (eq node (cdr node-click))
+                                             (< (- now (car node-click))
+                                                (* 0.4
+                                                   internal-time-units-per-second)))
+                                    (let ((state (gui-model-toggle-node
+                                                  model node)))
+                                      (after-graph-edit
+                                       (format nil "~A ~A"
+                                               (if (eq state :bypassed)
+                                                   "Bypassed"
+                                                   "Enabled")
+                                               (node-kind-label
+                                                (orfeus:graph-node-kind
+                                                 node))))))
+                                  (setf node-click (cons now node))
+                                  (multiple-value-bind (bx by)
+                                      (graph-node-box node)
+                                    (setf node-drag
+                                          (list :move :node node
+                                                :dx (- gx bx)
+                                                :dy (- gy by)
+                                                :moved-p nil))))))
+                             ((:source :output))
+                             (t
+                              (setf node-drag
+                                    (list :pan :x x :y y
+                                          :sx graph-scroll-x
+                                          :sy graph-scroll-y
+                                          :moved-p nil))))))))
+                     (#.cl-fltk:+event-drag+
+                      (when node-drag
+                        (let ((plist (rest node-drag)))
+                          (case (first node-drag)
+                            (:move
+                             (let ((node (getf plist :node)))
+                               (setf (getf plist :moved-p) t
+                                     (orfeus:graph-node-position node)
+                                     (list (float (max 0 (- gx
+                                                            (getf plist
+                                                                  :dx)))
+                                                  1.0)
+                                           (float (max 0 (- gy
+                                                            (getf plist
+                                                                  :dy)))
+                                                  1.0)))
+                               (cl-fltk:redraw graph-canvas)))
+                            (:wire
+                             (setf (getf plist :x) gx
+                                   (getf plist :y) gy
+                                   (getf plist :moved-p) t)
+                             (cl-fltk:redraw graph-canvas))
+                            (:pan
+                             (setf (getf plist :moved-p) t
+                                   graph-scroll-x
+                                   (max 0 (- (getf plist :sx)
+                                             (- x (getf plist :x))))
+                                   graph-scroll-y
+                                   (max 0 (- (getf plist :sy)
+                                             (- y (getf plist :y)))))
+                             (cl-fltk:redraw graph-canvas))))))
+                     (#.cl-fltk:+event-release+
                       (let ((drag node-drag))
                         (setf node-drag nil)
-                        (when (getf drag :active-p)
-                          (drop-node-drag drag)))))
-                   (#.cl-fltk:+event-push+
-                    (let ((index (node-index-at x))
-                          (now (get-internal-real-time)))
-                      (cond
-                        ((and index (= button 3))
-                         (let ((node (select-strip-node index)))
-                           (when node
-                             (show-node-menu
-                              (append (graph-node-menu-actions node)
-                                      (list (cons "-" nil))
-                                      (add-node-menu-actions node))))))
-                        ((= button 3)
-                         (gui-model-ensure-graph model)
-                         (show-node-menu (add-node-menu-actions nil)))
-                        (index
-                         (let ((node (select-strip-node index)))
-                           (when (and node
-                                      (eql index (cdr node-click))
-                                      (< (- now (car node-click))
-                                         (* 0.4
-                                            internal-time-units-per-second)))
-                             (let ((state (gui-model-toggle-node model
-                                                                 node)))
-                               (after-graph-edit
-                                (format nil "~A ~A"
-                                        (if (eq state :bypassed)
-                                            "Bypassed"
-                                            "Enabled")
-                                        (node-kind-label
-                                         (orfeus:graph-node-kind node))))))
-                           (when (and node (= button 1))
-                             (setf node-drag
-                                   (list :node node :start-x x
-                                         :active-p nil :x x :y y)))
-                           (setf node-click (cons now index))))
-                        ((and (= button 1)
-                              (gui-model-selected-graph-node model))
-                         ;; Clicking empty strip space drops the selection,
-                         ;; which also commits crop editing back into the
-                         ;; rendered preview.
-                         (let ((was-cropping (crop-editing-node)))
-                           (setf (gui-model-selected-node model) nil)
-                           (sync-controls)
-                           (sync-node-tools)
-                           (cl-fltk:redraw node-strip)
-                           (when was-cropping
-                             (schedule-edited-preview))
-                           (set-status "Node deselected"))))))))))
+                        (when drag
+                          (case (first drag)
+                            (:wire
+                             (if (getf (rest drag) :moved-p)
+                                 (drop-graph-wire drag gx gy)
+                                 (cl-fltk:redraw graph-canvas)))
+                            (:move (cl-fltk:redraw graph-canvas))
+                            (:pan
+                             (unless (getf (rest drag) :moved-p)
+                               (deselect-graph-node)))))))
+                     (#.cl-fltk:+event-wheel+
+                      (multiple-value-bind (right bottom)
+                          (graph-content-extent)
+                        (declare (ignore right))
+                        (setf graph-scroll-y
+                              (max 0 (min (max 0 (- bottom 60))
+                                          (+ graph-scroll-y (* dy 32))))))
+                      (cl-fltk:redraw graph-canvas)))))))
            (autocrop-negative (node)
              (let ((job (selected-job)))
                (when job
@@ -2105,7 +2299,7 @@ exactly the curve the render applies."
              (setf (gui-model-selected-node model) nil)
                (refresh-gallery)
              (sync-node-tools)
-             (when node-strip (cl-fltk:redraw node-strip))
+             (when graph-canvas (cl-fltk:redraw graph-canvas))
              (sync-controls)
              (if (selected-job)
                  (schedule-initial-preview)
@@ -2414,6 +2608,23 @@ exactly the curve the render applies."
                (register-inspector (cl-fltk:field-control field) 110 y
                                    :control 26 basis))
              field)
+           (build-group (kind builder)
+             ;; Collects everything BUILDER registers into one Node panel
+             ;; visibility group; SYNC-NODE-TOOLS shows exactly one of them.
+             (let ((items-before (length inspector-items))
+                   (tone-before (length tone-items)))
+               (funcall builder)
+               (push (cons kind
+                           (append
+                            (mapcar #'first
+                                    (subseq inspector-items 0
+                                            (- (length inspector-items)
+                                               items-before)))
+                            (mapcar #'first
+                                    (subseq tone-items 0
+                                            (- (length tone-items)
+                                               tone-before)))))
+                     node-panel-groups)))
            (section-frame (parent title y height)
              ;; A classic engraved group frame whose title interrupts the
              ;; frame line, drawn behind the controls it surrounds.
@@ -2457,13 +2668,13 @@ exactly the curve the render applies."
                                 (declare (ignore event value))
                                 (setting-changed key widget)))
                     (label (cl-fltk:make-label
-                            :parent basic-page :x 0 :y 306 :width 32 :height 22
+                            :parent node-page :x 0 :y 92 :width 32 :height 22
                             :label short-label))
                     (slider (cl-fltk:make-vertical-slider
-                             :parent basic-page :x 0 :y 330 :width 20 :height 120
+                             :parent node-page :x 0 :y 116 :width 20 :height 120
                              :callback callback))
                     (input (cl-fltk:make-value-input
-                            :parent basic-page :x 0 :y 454 :width 32 :height 24
+                            :parent node-page :x 0 :y 240 :width 32 :height 24
                             :callback callback)))
                (dolist (widget (list slider input))
                  (cl-fltk:set-range widget -2 2)
@@ -2475,8 +2686,8 @@ exactly the curve the render applies."
                (push (list input index :input) tone-items)))
            (layout-left-pane (&optional ignored)
              (declare (ignore ignored))
-             (let ((width (cl-fltk:widget-width left-pane))
-                   (height (cl-fltk:widget-height left-pane)))
+             (let ((width (cl-fltk:widget-width filmstrip-pane))
+                   (height (cl-fltk:widget-height filmstrip-pane)))
                (cl-fltk:resize-widget
                 thumbnail-canvas :x 0 :y 0
                 :width (max 40 (- width 16)) :height height)
@@ -2485,18 +2696,13 @@ exactly the curve the render applies."
                   thumbnail-scrollbar :x (max 40 (- width 16)) :y 0
                   :width 16 :height height)))
              (redraw-thumbnails)
-             (cl-fltk:redraw left-pane))
+             (cl-fltk:redraw filmstrip-pane))
            (layout-center-pane (&optional ignored)
              (declare (ignore ignored))
              (let* ((center (cl-fltk:widget-width center-pane))
                     (main-height (cl-fltk:widget-height center-pane))
                     (caption-height 22)
-                    (strip-height *node-strip-height*)
-                    (viewer-height (max 100 (- main-height caption-height
-                                               strip-height)))
-                    (strip-y (+ caption-height viewer-height))
-                    (button-width 52)
-                    (buttons-width (+ (* 3 button-width) 16))
+                    (viewer-height (max 100 (- main-height caption-height)))
                     (gutter 6)
                     (pane-width (floor (- center gutter) 2)))
                (if comparison-p
@@ -2522,31 +2728,55 @@ exactly the curve the render applies."
                                             :width center :height caption-height)
                      (cl-fltk:resize-widget after-canvas :x 0 :y caption-height
                                             :width center :height viewer-height)))
-               (when node-strip
-                 (let ((tools-width (+ buttons-width 118)))
-                   (cl-fltk:resize-widget node-strip :x 0 :y strip-y
-                                          :width (max 120
-                                                      (- center tools-width))
-                                          :height strip-height)
-                   (let ((button-y (+ strip-y (floor (- strip-height 24) 2))))
-                     (cl-fltk:resize-widget node-opacity-slider
-                                            :x (- center buttons-width 114)
-                                            :y (1+ button-y)
-                                            :width 110 :height 22)
-                     (cl-fltk:resize-widget still-button
-                                            :x (- center (* 3 button-width) 12)
-                                            :y button-y
-                                            :width button-width :height 24)
-                     (cl-fltk:resize-widget copy-grade-button
-                                            :x (- center (* 2 button-width) 8)
-                                            :y button-y
-                                            :width button-width :height 24)
-                     (cl-fltk:resize-widget paste-grade-button
-                                            :x (- center button-width 4)
-                                            :y button-y
-                                            :width button-width
-                                            :height 24))))
                (cl-fltk:redraw center-pane)))
+           (layout-graph-pane (&optional ignored)
+             (declare (ignore ignored))
+             (let* ((width (cl-fltk:widget-width graph-pane))
+                    (height (cl-fltk:widget-height graph-pane))
+                    (button-width (max 48 (floor (- width 32) 3))))
+               (when graph-title
+                 (cl-fltk:resize-widget graph-title :x 8 :y 4
+                                        :width (- width 16) :height 18))
+               (when still-button
+                 (cl-fltk:resize-widget still-button
+                                        :x 8 :y 24
+                                        :width button-width :height 22)
+                 (cl-fltk:resize-widget copy-grade-button
+                                        :x (+ 12 button-width) :y 24
+                                        :width button-width :height 22)
+                 (cl-fltk:resize-widget paste-grade-button
+                                        :x (+ 16 (* 2 button-width)) :y 24
+                                        :width button-width :height 22))
+               (when graph-canvas
+                 (cl-fltk:resize-widget graph-canvas :x 2 :y 52
+                                        :width (- width 4)
+                                        :height (max 60 (- height 54))))
+               (cl-fltk:redraw graph-pane)))
+           (layout-gallery-pane (&optional ignored)
+             (declare (ignore ignored))
+             (let* ((width (cl-fltk:widget-width gallery-pane))
+                    (height (cl-fltk:widget-height gallery-pane))
+                    (half (floor (- width 24) 2)))
+               (when gallery-title
+                 (cl-fltk:resize-widget gallery-title :x 8 :y 2
+                                        :width (- width 16) :height 18))
+               (when gallery-canvas
+                 (cl-fltk:resize-widget gallery-canvas :x 4 :y 22
+                                        :width (- width 8)
+                                        :height (max 60 (- height 88))))
+               (when preset-name-input
+                 (cl-fltk:resize-widget preset-name-input
+                                        :x 8 :y (- height 60)
+                                        :width (- width 16) :height 24))
+               (when preset-apply-button
+                 (cl-fltk:resize-widget preset-apply-button
+                                        :x (+ 16 half) :y (- height 32)
+                                        :width half :height 26))
+               (when preset-save-button
+                 (cl-fltk:resize-widget preset-save-button
+                                        :x 8 :y (- height 32)
+                                        :width half :height 26))
+               (cl-fltk:redraw gallery-pane)))
            (layout-inspector-pane (&optional ignored)
              (declare (ignore ignored))
              (let ((right (cl-fltk:widget-width inspector))
@@ -2554,8 +2784,7 @@ exactly the curve the render applies."
                (cl-fltk:resize-widget tabs :x 4 :y 40
                                       :width (- right 8)
                                       :height (- main-height 80))
-               (dolist (page (list basic-page optics-page effects-page
-                                    export-page presets-page curves-page))
+               (dolist (page (list node-page export-page))
                  (cl-fltk:resize-widget page :x 2 :y 24
                                         :width (- right 12)
                                         :height (- main-height 108)))
@@ -2600,7 +2829,7 @@ exactly the curve the render applies."
                                       (:label (+ column-x 4))
                                       (:slider (+ column-x (floor (- column-width 20) 2)))
                                       (:input (+ column-x 2))))
-                            (item-y (ecase role (:label 306) (:slider 330) (:input 454)))
+                            (item-y (ecase role (:label 92) (:slider 116) (:input 240)))
                             (item-height (ecase role (:label 22) (:slider 120) (:input 24))))
                        (cl-fltk:resize-widget widget :x item-x :y item-y
                                               :width item-width :height item-height)))))
@@ -2615,13 +2844,13 @@ exactly the curve the render applies."
                                420
                                (max 180
                                     (if layout-initialized-p
-                                        (cl-fltk:widget-width left-pane)
+                                        (cl-fltk:widget-width left-column)
                                         (floor width 5)))))
                     (right (min (max 280 (- width left 300))
                                 480
                                 (max 280
                                      (if layout-initialized-p
-                                         (cl-fltk:widget-width inspector)
+                                         (cl-fltk:widget-width right-column)
                                          (floor width 3)))))
                     (center (- width left right)))
                (cl-fltk:resize-widget menu :x 0 :y 0 :width width :height 24)
@@ -2634,21 +2863,53 @@ exactly the curve the render applies."
                                         :width (max 120 (- width 352)) :height 28))
                (cl-fltk:resize-widget main-tile :x 0 :y top
                                       :width width :height main-height)
-               (cl-fltk:resize-widget left-pane :x 0 :y 0
+               (cl-fltk:resize-widget left-column :x 0 :y 0
                                       :width left :height main-height)
                (cl-fltk:resize-widget center-pane :x left :y 0
                                       :width center :height main-height)
-               (cl-fltk:resize-widget inspector :x (+ left center) :y 0
+               (cl-fltk:resize-widget right-column :x (+ left center) :y 0
                                       :width right :height main-height)
+               ;; The left column splits into filmstrip and stills gallery,
+               ;; the right into the Node panel and the graph editor.
+               (let ((gallery-height
+                       (min (- main-height 200)
+                            (max 160
+                                 (if layout-initialized-p
+                                     (cl-fltk:widget-height gallery-pane)
+                                     (min 300 (floor main-height 3))))))
+                     (graph-height
+                       (min (- main-height 240)
+                            (max 160
+                                 (if layout-initialized-p
+                                     (cl-fltk:widget-height graph-pane)
+                                     (min 340
+                                          (floor (* main-height 2) 5)))))))
+                 (cl-fltk:resize-widget filmstrip-pane :x 0 :y 0
+                                        :width left
+                                        :height (- main-height
+                                                   gallery-height))
+                 (cl-fltk:resize-widget gallery-pane :x 0
+                                        :y (- main-height gallery-height)
+                                        :width left :height gallery-height)
+                 (cl-fltk:resize-widget inspector :x 0 :y 0
+                                        :width right
+                                        :height (- main-height graph-height))
+                 (cl-fltk:resize-widget graph-pane :x 0
+                                        :y (- main-height graph-height)
+                                        :width right :height graph-height))
                (cl-fltk:resize-widget progress :x 0 :y (+ top main-height)
                                       :width 180 :height bottom)
                (cl-fltk:resize-widget status :x 180 :y (+ top main-height)
                                       :width (- width 180) :height bottom)
                (layout-left-pane)
+               (layout-gallery-pane)
                (layout-center-pane)
                (layout-inspector-pane)
+               (layout-graph-pane)
                (unless layout-initialized-p
-                 (cl-fltk:init-sizes main-tile))
+                 (cl-fltk:init-sizes main-tile)
+                 (cl-fltk:init-sizes left-column)
+                 (cl-fltk:init-sizes right-column))
                (setf layout-initialized-p t)))
            (poll ()
              (dolist (event (drain-events queue))
@@ -2847,13 +3108,22 @@ exactly the curve the render applies."
         (cl-fltk:set-label-font lens-name 1)
         (setf main-tile (cl-fltk:make-tile :parent window :x 0 :y 64
                                            :width 1280 :height 708)
-              left-pane (cl-fltk:make-panel :parent main-tile :x 0 :y 0
-                                            :width 240 :height 708 :label "")
+              left-column (cl-fltk:make-tile :parent main-tile :x 0 :y 0
+                                             :width 240 :height 708)
+              filmstrip-pane (cl-fltk:make-panel :parent left-column
+                                                 :x 0 :y 0
+                                                 :width 240 :height 448
+                                                 :label "")
+              gallery-pane (cl-fltk:make-panel :parent left-column
+                                               :x 0 :y 448
+                                               :width 240 :height 260
+                                               :label "")
               center-pane (cl-fltk:make-panel :parent main-tile :x 240 :y 0
                                               :width 720 :height 708 :label ""))
+        (cl-fltk:set-box gallery-pane cl-fltk:+box-flat-box+)
         (setf thumbnail-canvas
               (cl-fltk:make-canvas
-               :parent left-pane :x 0 :y 0 :width 240 :height 708
+               :parent filmstrip-pane :x 0 :y 0 :width 240 :height 448
                :callback
                (lambda (widget event value)
                  (declare (ignore event value))
@@ -2892,7 +3162,7 @@ exactly the curve the render applies."
           (cl-fltk:on thumbnail-canvas #'handle-thumbnail-mouse :event event))
         (setf thumbnail-scrollbar
               (cl-fltk:make-scrollbar
-               :parent left-pane :x 224 :y 0 :width 16 :height 708
+               :parent filmstrip-pane :x 224 :y 0 :width 16 :height 448
                :value "0"
                :callback
                (lambda (widget event value)
@@ -2956,68 +3226,57 @@ exactly the curve the render applies."
                           (lambda (widget callback-event value)
                             (handle-preview-mouse widget callback-event value))
                           :event event))))
-        (setf node-strip
-              (cl-fltk:make-canvas
-               :parent center-pane :x 0 :y 662 :width 540 :height 46
-               :callback (lambda (widget event value)
-                           (declare (ignore event value))
-                           (draw-node-strip widget))))
-        (cl-fltk:set-box node-strip cl-fltk:+box-flat-box+)
-        (cl-fltk:set-tooltip node-strip
-                             "Pipeline nodes: click one to bypass its stage")
-        (dolist (event (list cl-fltk:+event-push+
-                             cl-fltk:+event-drag+
-                             cl-fltk:+event-release+))
-          (cl-fltk:on node-strip #'handle-node-strip-mouse :event event))
-        (flet ((grade-button (label tooltip action)
+        (setf right-column (cl-fltk:make-tile :parent main-tile
+                                              :x 960 :y 0
+                                              :width 320 :height 708)
+              inspector (cl-fltk:make-panel :parent right-column :x 0 :y 0
+                                            :width 320 :height 425
+                                            :label "")
+              graph-pane (cl-fltk:make-panel :parent right-column
+                                             :x 0 :y 425
+                                             :width 320 :height 283
+                                             :label ""))
+        (cl-fltk:set-box graph-pane cl-fltk:+box-flat-box+)
+        (setf graph-title (cl-fltk:make-label :parent graph-pane
+                                              :x 8 :y 4
+                                              :width 304 :height 18
+                                              :label "Node Graph"))
+        (cl-fltk:set-label-font graph-title cl-fltk:+font-helvetica-bold+)
+        (flet ((grade-button (x label tooltip action)
                  (let ((button (cl-fltk:make-button
-                                :parent center-pane :x 560 :y 672
-                                :width 52 :height 24 :label label
+                                :parent graph-pane :x x :y 24
+                                :width 96 :height 22 :label label
                                 :callback (lambda (&rest ignored)
                                             (declare (ignore ignored))
                                             (funcall action)))))
                    (cl-fltk:set-tooltip button tooltip)
                    button)))
           (setf still-button
-                (grade-button "Still" "Grab a still of the current grade"
+                (grade-button 8 "Still" "Grab a still of the current grade"
                               #'grab-still)
                 copy-grade-button
-                (grade-button "Copy" "Copy the current photo's node graph"
+                (grade-button 108 "Copy"
+                              "Copy the current photo's node graph"
                               #'copy-grade)
                 paste-grade-button
-                (grade-button "Paste"
+                (grade-button 208 "Paste"
                               "Paste the copied node graph to the selection"
                               #'paste-grade)))
-        (setf node-opacity-slider
-              (cl-fltk:make-slider
-               :parent center-pane :x 400 :y 672 :width 110 :height 22
-               :callback
-               (lambda (widget event value)
-                 (declare (ignore event value))
-                 (let ((node (gui-model-selected-graph-node model)))
-                   (handler-case
-                       (cond
-                         ((and node (orfeus:graph-node-blend-p node))
-                          (let ((opacity (parse-number
-                                          (cl-fltk:value widget))))
-                            (setf (orfeus:graph-node-opacity node)
-                                  (float (max 0 (min 1 opacity)) 1.0))
-                            (cl-fltk:redraw node-strip)
-                            (schedule-edited-preview)))
-                         ((and node (eq :crop (orfeus:graph-node-kind node)))
-                          (let ((angle (parse-number
-                                        (cl-fltk:value widget))))
-                            (set-crop-node-angle
-                             node (float (max -45 (min 45 angle)) 1.0)))))
-                     (error (condition)
-                       (set-status (princ-to-string condition))))))))
-        (cl-fltk:set-range node-opacity-slider 0 1)
-        (cl-fltk:set-step node-opacity-slider 0.05)
-        (cl-fltk:set-tooltip node-opacity-slider "Blend opacity")
-        (cl-fltk:hide node-opacity-slider)
-        (setf inspector (cl-fltk:make-panel :parent main-tile :x 960 :y 0
-                                            :width 320 :height 708
-                                            :label ""))
+        (setf graph-canvas
+              (cl-fltk:make-canvas
+               :parent graph-pane :x 2 :y 52 :width 316 :height 229
+               :callback (lambda (widget event value)
+                           (declare (ignore event value))
+                           (draw-graph-editor widget))))
+        (cl-fltk:set-box graph-canvas cl-fltk:+box-flat-box+)
+        (cl-fltk:set-tooltip
+         graph-canvas
+         "Drag nodes to arrange; drag a port to rewire; right-click to add")
+        (dolist (event (list cl-fltk:+event-push+
+                             cl-fltk:+event-drag+
+                             cl-fltk:+event-release+
+                             cl-fltk:+event-wheel+))
+          (cl-fltk:on graph-canvas #'handle-graph-mouse :event event))
         ;; The inspector lays its children out manually, so it must paint its
         ;; own background; a boxless group smears stale pixels during tile
         ;; drags and window resizes.
@@ -3037,25 +3296,13 @@ exactly the curve the render applies."
           (register-field scope-field 8)
           (setf target-choice (cl-fltk:field-control scope-field)))
         (setf tabs (cl-fltk:make-tabs :parent inspector :x 4 :y 40
-                                      :width 312 :height 628)
-              basic-page (cl-fltk:make-tab-page :parent tabs :x 2 :y 24
-                                                :width 308 :height 600
-                                                :label "Basic")
-              optics-page (cl-fltk:make-tab-page :parent tabs :x 2 :y 24
-                                                 :width 308 :height 600
-                                                 :label "Optics")
-              effects-page (cl-fltk:make-tab-page :parent tabs :x 2 :y 24
-                                                  :width 308 :height 600
-                                                  :label "Effects")
-               export-page (cl-fltk:make-tab-page :parent tabs :x 2 :y 24
-                                                  :width 308 :height 600
-                                                  :label "Export")
-               presets-page (cl-fltk:make-tab-page :parent tabs :x 2 :y 24
-                                                   :width 308 :height 600
-                                                   :label "Gallery")
-               curves-page (cl-fltk:make-tab-page :parent tabs :x 2 :y 24
-                                                  :width 308 :height 600
-                                                  :label "Curves"))
+                                      :width 312 :height 380)
+              node-page (cl-fltk:make-tab-page :parent tabs :x 2 :y 24
+                                               :width 308 :height 352
+                                               :label "Node")
+              export-page (cl-fltk:make-tab-page :parent tabs :x 2 :y 24
+                                                 :width 308 :height 352
+                                                 :label "Export"))
         (section-frame export-page "Output" 16 172)
         (flet ((export-integer-field (key label y)
                  (cl-fltk:field-control
@@ -3089,177 +3336,361 @@ exactly the curve the render applies."
                               (export-setting-changed :timestamp-filenames-p
                                                       widget)))
                  110 154 :control 26 :page)))
-        (section-frame presets-page "Stills Gallery" 16 244)
+        ;; The stills gallery lives on the left column, PowerGrade style.
+        (setf gallery-title (cl-fltk:make-label :parent gallery-pane
+                                                :x 8 :y 2
+                                                :width 224 :height 18
+                                                :label "Stills Gallery"))
+        (cl-fltk:set-label-font gallery-title cl-fltk:+font-helvetica-bold+)
         (setf gallery-canvas
-              (register-inspector
-               (cl-fltk:make-canvas
-                :parent presets-page :x 12 :y 28 :width 292 :height 190
-                :callback (lambda (widget event value)
-                            (declare (ignore event value))
-                            (draw-gallery widget)))
-               12 28 :fill 190 :page))
+              (cl-fltk:make-canvas
+               :parent gallery-pane :x 4 :y 22 :width 232 :height 172
+               :callback (lambda (widget event value)
+                           (declare (ignore event value))
+                           (draw-gallery widget))))
         (dolist (event (list cl-fltk:+event-push+ cl-fltk:+event-wheel+))
           (cl-fltk:on gallery-canvas #'handle-gallery-mouse :event event))
-        (let ((name-field
-                (register-field
-                 (cl-fltk:make-labeled-input
-                  :parent presets-page :x 12 :y 226 :width 292 :height 26
-                  :label "Preset name" :label-width 96)
-                 226 :page)))
-          (setf preset-name-input (cl-fltk:field-control name-field)))
-        (register-inspector
-         (cl-fltk:make-button
-          :parent presets-page :x 8 :y 270 :width 142 :height 26
-          :label "Save current"
-          :callback (lambda (&rest ignored)
-                      (declare (ignore ignored))
-                      (save-current-preset)))
-         8 270 :half-left 26 :page)
+        (setf preset-name-input
+              (cl-fltk:make-input :parent gallery-pane :x 8 :y 200
+                                  :width 224 :height 24))
+        (cl-fltk:set-tooltip preset-name-input "Still or preset name")
+        (setf preset-save-button
+              (cl-fltk:make-button
+               :parent gallery-pane :x 8 :y 228 :width 108 :height 26
+               :label "Save current"
+               :callback (lambda (&rest ignored)
+                           (declare (ignore ignored))
+                           (save-current-preset))))
         (setf preset-apply-button
-              (register-inspector
-               (cl-fltk:make-button
-                :parent presets-page :x 158 :y 270 :width 142 :height 26
-                :label "Apply to 1 photo"
-                :callback (lambda (&rest ignored)
-                            (declare (ignore ignored))
-                            (apply-current-preset)))
-               158 270 :half-right 26 :page))
-        (section-frame curves-page "Custom Curves" 16 356)
-        (let ((channel-field
-                (cl-fltk:make-labeled-choice
-                 :parent curves-page :x 12 :y 28 :width 292 :height 26
-                 :label "Channel" :label-width 88
-                 :items '("Red" "Green" "Blue")
-                 :callback (lambda (widget event value)
-                             (declare (ignore event value))
-                             (setf curve-channel
-                                   (cond ((string-equal
-                                           (cl-fltk:value widget) "Green")
-                                          :green-points)
-                                         ((string-equal
-                                           (cl-fltk:value widget) "Blue")
-                                          :blue-points)
-                                         (t :red-points)))
-                             (when curve-canvas
-                               (cl-fltk:redraw curve-canvas))))))
-          (register-field channel-field 28 :page))
-        (setf curve-canvas
-              (register-inspector
-               (cl-fltk:make-canvas
-                :parent curves-page :x 12 :y 62 :width 292 :height 264
-                :callback (lambda (widget event value)
-                            (declare (ignore event value))
-                            (draw-curve-editor widget)))
-               12 62 :fill 264 :page))
-        (cl-fltk:set-tooltip
-         curve-canvas
-         "Drag the points to shape the channel; the histogram shows occupancy")
-        (dolist (event (list cl-fltk:+event-push+
-                             cl-fltk:+event-drag+
-                             cl-fltk:+event-release+))
-          (cl-fltk:on curve-canvas #'handle-curve-mouse :event event))
-        (register-inspector
-         (cl-fltk:make-button
-          :parent curves-page :x 12 :y 334 :width 292 :height 26
-          :label "Reset Channel"
-          :callback (lambda (&rest ignored)
-                      (declare (ignore ignored))
-                      (reset-curve-channel)))
-         12 334 :fill 26 :page)
-               (refresh-gallery)
-        (section-frame basic-page "White Balance" 16 110)
-        (setf wb-choice
-              (cl-fltk:field-control
-               (register-field
-                (cl-fltk:make-labeled-choice
-                 :parent basic-page :x 12 :y 26 :width 292 :height 26
-                 :label "Mode" :label-width 96
-                 :items '("As shot" "Custom")
-                 :callback (lambda (widget event value)
-                             (declare (ignore event value))
-                             (set-wb-mode widget)))
-                26 :page)))
-        (make-number-field :white-balance-temperature "Temperature (K)"
-                           2000 15000 50 58 basic-page)
-        (make-number-field :white-balance-tint "Tint" -20 20 0.1 90 basic-page)
-        (section-frame basic-page "Exposure" 142 44)
-        (make-number-field :exposure "Exposure EV" -10 10 0.1 152 basic-page)
-        (section-frame basic-page "Noise Reduction" 202 76)
-        (make-number-field :noise-reduction "Edge-aware" 0 1 0.05 212
-                           basic-page)
-        (make-number-field :neural-noise-reduction "Neural" 0 1 0.05 244
-                           basic-page)
-        (section-frame basic-page "Tone Equalizer" 294 194)
-        (make-tone-band :tone-blacks "Blk" "Blacks" 0)
-        (make-tone-band :tone-shadows "Shd" "Shadows" 1)
-        (make-tone-band :tone-dark-mids "DkM" "Dark mids" 2)
-        (make-tone-band :tone-midtones "Mid" "Midtones" 3)
-        (make-tone-band :tone-light-mids "LtM" "Light mids" 4)
-        (make-tone-band :tone-highlights "Hi" "Highlights" 5)
-        (make-tone-band :tone-whites "Wht" "Whites" 6)
-        (section-frame optics-page "Lens Corrections" 16 110)
-        (let ((lens (register-inspector
-                     (cl-fltk:make-check-button
-                      :parent optics-page :x 12 :y 26 :width 292 :height 26
-                      :label "Apply lens distortion correction"
-                      :callback (lambda (widget event value)
-                                  (declare (ignore event value))
-                                  (gui-model-set-setting
-                                   model :lens-correction-p
-                                   (string/= "0" (cl-fltk:value widget)))
-                                  (schedule-edited-preview)))
-                     12 26 :fill 26 :page)))
-          (push (list :lens-correction-p lens) controls))
-        (make-number-field :lens-correction-strength "Strength"
-                           0 2 0.05 58 optics-page)
-        (let ((tca (register-inspector
-                    (cl-fltk:make-check-button
-                     :parent optics-page :x 12 :y 90 :width 292 :height 26
-                     :label "Remove chromatic aberration"
-                     :callback (lambda (widget event value)
-                                 (declare (ignore event value))
-                                 (gui-model-set-setting
-                                  model :chromatic-aberration-correction-p
-                                  (string/= "0" (cl-fltk:value widget)))
-                                 (schedule-edited-preview)))
-                    12 90 :fill 26 :page)))
-          (push (list :chromatic-aberration-correction-p tca) controls))
-        (section-frame effects-page "Film Emulation" 16 76)
-        (register-inspector
-         (cl-fltk:make-label :parent effects-page :x 12 :y 26
-                             :width 88 :height 26 :label "3D LUT")
-         12 26 88 26 :page)
-        (let ((items '("None")))
-          (dolist (path (gui-bundled-lut-paths))
-            (let ((name (file-namestring path)))
-              (setf (gethash name lut-paths) (namestring path)
-                    items (append items (list name)))))
-          (setf items (append items '("Browse..."))
-                lut-choice
-                (register-inspector
-                 (cl-fltk:make-choice
-                  :parent effects-page :x 110 :y 26 :width 190 :height 26
-                  :items items
-                  :callback
-                  (lambda (widget event value)
-                    (declare (ignore event value))
-                    (let ((selection (cl-fltk:value widget)))
-                      (cond ((string= selection "Browse...")
-                             (choose-lut)
-                             (sync-controls))
-                            ((string= selection "None") (clear-lut))
-                            (t
-                             (gui-model-set-setting
-                              model :lut-path (gethash selection lut-paths))
-                             (schedule-edited-preview))))))
-                 110 26 :control 26 :page)))
-        (make-number-field :lut-strength "Strength" 0 1 0.05 58
-                           effects-page)
-        (section-frame effects-page "Film Grain" 108 76)
-        (make-number-field :grain-amount "Amount" 0 1 0.05 118
-                           effects-page)
-        (make-number-field :grain-size "Size" 0.25 16 0.25 150
-                           effects-page)
+              (cl-fltk:make-button
+               :parent gallery-pane :x 124 :y 228 :width 108 :height 26
+               :label "Apply to 1 photo"
+               :callback (lambda (&rest ignored)
+                           (declare (ignore ignored))
+                           (apply-current-preset))))
+        (refresh-gallery)
+        ;; The Node panel: pick a correction, see only that category's
+        ;; controls beneath it.
+        (build-group
+         :picker
+         (lambda ()
+           (setf kind-choice
+                 (cl-fltk:field-control
+                  (register-field
+                   (cl-fltk:make-labeled-choice
+                    :parent node-page :x 12 :y 8 :width 292 :height 26
+                    :label "Correction" :label-width 88
+                    :items (mapcar #'first *node-kind-choices*)
+                    :callback
+                    (lambda (widget event value)
+                      (declare (ignore event value))
+                      (let ((node (gui-model-selected-graph-node model))
+                            (kind (rest (assoc (cl-fltk:value widget)
+                                               *node-kind-choices*
+                                               :test #'string-equal))))
+                        (when (and node kind
+                                   (not (eq kind
+                                            (orfeus:graph-node-kind
+                                             node))))
+                          (handler-case
+                              (progn
+                                (gui-model-set-node-kind model node kind)
+                                (after-graph-edit
+                                 (format nil "Correction set to ~A"
+                                         (node-kind-label kind))))
+                            (error (condition)
+                              (sync-node-tools)
+                              (set-status
+                               (princ-to-string condition))))))))
+                   8 :page)))))
+        (build-group
+         :none
+         (lambda ()
+           (register-inspector
+            (cl-fltk:make-label
+             :parent node-page :x 12 :y 44 :width 292 :height 26
+             :label "Select or create a node in the graph")
+            12 44 :fill 26 :page)))
+        (build-group
+         :node
+         (lambda ()
+           (register-inspector
+            (cl-fltk:make-label
+             :parent node-page :x 12 :y 44 :width 292 :height 26
+             :label "Pick a correction type above")
+            12 44 :fill 26 :page)))
+        (build-group
+         :white-balance
+         (lambda ()
+           (setf wb-choice
+                 (cl-fltk:field-control
+                  (register-field
+                   (cl-fltk:make-labeled-choice
+                    :parent node-page :x 12 :y 44 :width 292 :height 26
+                    :label "Mode" :label-width 88
+                    :items '("As shot" "Custom")
+                    :callback (lambda (widget event value)
+                                (declare (ignore event value))
+                                (set-wb-mode widget)))
+                   44 :page)))
+           (make-number-field :white-balance-temperature "Temperature (K)"
+                              2000 15000 50 76 node-page)
+           (make-number-field :white-balance-tint "Tint" -20 20 0.1 108
+                              node-page)))
+        (build-group
+         :exposure
+         (lambda ()
+           (make-number-field :exposure "Exposure EV" -10 10 0.1 44
+                              node-page)))
+        (build-group
+         :noise-reduction
+         (lambda ()
+           (make-number-field :noise-reduction "Edge-aware" 0 1 0.05 44
+                              node-page)
+           (make-number-field :neural-noise-reduction "Neural" 0 1 0.05 76
+                              node-page)))
+        (build-group
+         :tone
+         (lambda ()
+           (register-inspector
+            (cl-fltk:make-label :parent node-page :x 12 :y 44
+                                :width 292 :height 26
+                                :label "Tone Equalizer")
+            12 44 :fill 26 :page)
+           (make-tone-band :tone-blacks "Blk" "Blacks" 0)
+           (make-tone-band :tone-shadows "Shd" "Shadows" 1)
+           (make-tone-band :tone-dark-mids "DkM" "Dark mids" 2)
+           (make-tone-band :tone-midtones "Mid" "Midtones" 3)
+           (make-tone-band :tone-light-mids "LtM" "Light mids" 4)
+           (make-tone-band :tone-highlights "Hi" "Highlights" 5)
+           (make-tone-band :tone-whites "Wht" "Whites" 6)))
+        (build-group
+         :optics
+         (lambda ()
+           (let ((lens (register-inspector
+                        (cl-fltk:make-check-button
+                         :parent node-page :x 12 :y 44
+                         :width 292 :height 26
+                         :label "Apply lens distortion correction"
+                         :callback
+                         (lambda (widget event value)
+                           (declare (ignore event value))
+                           (gui-model-set-setting
+                            model :lens-correction-p
+                            (string/= "0" (cl-fltk:value widget)))
+                           (schedule-edited-preview)))
+                        12 44 :fill 26 :page)))
+             (push (list :lens-correction-p lens) controls))
+           (make-number-field :lens-correction-strength "Strength"
+                              0 2 0.05 76 node-page)
+           (let ((tca (register-inspector
+                       (cl-fltk:make-check-button
+                        :parent node-page :x 12 :y 108
+                        :width 292 :height 26
+                        :label "Remove chromatic aberration"
+                        :callback
+                        (lambda (widget event value)
+                          (declare (ignore event value))
+                          (gui-model-set-setting
+                           model :chromatic-aberration-correction-p
+                           (string/= "0" (cl-fltk:value widget)))
+                          (schedule-edited-preview)))
+                       12 108 :fill 26 :page)))
+             (push (list :chromatic-aberration-correction-p tca)
+                   controls))))
+        (build-group
+         :film
+         (lambda ()
+           (register-inspector
+            (cl-fltk:make-label :parent node-page :x 12 :y 44
+                                :width 88 :height 26 :label "3D LUT")
+            12 44 88 26 :page)
+           (let ((items '("None")))
+             (dolist (path (gui-bundled-lut-paths))
+               (let ((name (file-namestring path)))
+                 (setf (gethash name lut-paths) (namestring path)
+                       items (append items (list name)))))
+             (setf items (append items '("Browse..."))
+                   lut-choice
+                   (register-inspector
+                    (cl-fltk:make-choice
+                     :parent node-page :x 110 :y 44 :width 190 :height 26
+                     :items items
+                     :callback
+                     (lambda (widget event value)
+                       (declare (ignore event value))
+                       (let ((selection (cl-fltk:value widget)))
+                         (cond ((string= selection "Browse...")
+                                (choose-lut)
+                                (sync-controls))
+                               ((string= selection "None") (clear-lut))
+                               (t
+                                (gui-model-set-setting
+                                 model :lut-path
+                                 (gethash selection lut-paths))
+                                (schedule-edited-preview))))))
+                    110 44 :control 26 :page)))
+           (make-number-field :lut-strength "Strength" 0 1 0.05 76
+                              node-page)
+           (make-number-field :grain-amount "Grain amount" 0 1 0.05 108
+                              node-page)
+           (make-number-field :grain-size "Grain size" 0.25 16 0.25 140
+                              node-page)))
+        (build-group
+         :blend
+         (lambda ()
+           (register-inspector
+            (cl-fltk:make-label :parent node-page :x 12 :y 44
+                                :width 88 :height 26 :label "Opacity")
+            12 44 88 26 :page)
+           (setf blend-opacity-input
+                 (register-inspector
+                  (cl-fltk:make-spinner
+                   :parent node-page :x 110 :y 44 :width 84 :height 26
+                   :callback
+                   (lambda (widget event value)
+                     (declare (ignore event value))
+                     (let ((node (gui-model-selected-graph-node model)))
+                       (when (and node (orfeus:graph-node-blend-p node))
+                         (handler-case
+                             (let ((opacity (parse-number
+                                             (cl-fltk:value widget))))
+                               (setf (orfeus:graph-node-opacity node)
+                                     (float (max 0 (min 1 opacity)) 1.0))
+                               (when graph-canvas
+                                 (cl-fltk:redraw graph-canvas))
+                               (schedule-edited-preview))
+                           (error (condition)
+                             (set-status
+                              (princ-to-string condition))))))))
+                  110 44 84 26 :page))
+           (cl-fltk:set-range blend-opacity-input 0 1)
+           (cl-fltk:set-step blend-opacity-input 0.05)))
+        (build-group
+         :color-subtract
+         (lambda ()
+           (flet ((subtract-button (y label action)
+                    (register-inspector
+                     (cl-fltk:make-button
+                      :parent node-page :x 12 :y y :width 292 :height 26
+                      :label label
+                      :callback
+                      (lambda (&rest ignored)
+                        (declare (ignore ignored))
+                        (let ((node (gui-model-selected-graph-node
+                                     model)))
+                          (when node (funcall action node)))))
+                     12 y :fill 26 :page)))
+             (subtract-button 44 "Pick Base Color..." #'pick-base-color)
+             (subtract-button 76 "Sample Base From Photo"
+                              (lambda (node)
+                                (setf pick-color-node node)
+                                (set-status
+                                 "Click the preview to sample the film base")))
+             (subtract-button 108 "Auto Base From Border"
+                              #'auto-base-from-border))))
+        (build-group
+         :crop
+         (lambda ()
+           (register-inspector
+            (cl-fltk:make-label :parent node-page :x 12 :y 44
+                                :width 88 :height 26 :label "Angle")
+            12 44 88 26 :page)
+           (setf crop-angle-input
+                 (register-inspector
+                  (cl-fltk:make-spinner
+                   :parent node-page :x 110 :y 44 :width 84 :height 26
+                   :callback
+                   (lambda (widget event value)
+                     (declare (ignore event value))
+                     (let ((node (crop-editing-node)))
+                       (when node
+                         (handler-case
+                             (let ((angle (parse-number
+                                           (cl-fltk:value widget))))
+                               (set-crop-node-angle
+                                node
+                                (float (max -45 (min 45 angle)) 1.0)))
+                           (error (condition)
+                             (set-status
+                              (princ-to-string condition))))))))
+                  110 44 84 26 :page))
+           (cl-fltk:set-range crop-angle-input -45 45)
+           (cl-fltk:set-step crop-angle-input 0.1)
+           (register-inspector
+            (cl-fltk:make-button
+             :parent node-page :x 12 :y 76 :width 292 :height 26
+             :label "Autocrop Negative"
+             :callback (lambda (&rest ignored)
+                         (declare (ignore ignored))
+                         (let ((node (crop-editing-node)))
+                           (when node (autocrop-negative node)))))
+            12 76 :fill 26 :page)
+           (register-inspector
+            (cl-fltk:make-button
+             :parent node-page :x 12 :y 108 :width 292 :height 26
+             :label "Reset Crop"
+             :callback (lambda (&rest ignored)
+                         (declare (ignore ignored))
+                         (let ((node (crop-editing-node)))
+                           (when node
+                             (gui-model-set-node-params
+                              model node '(:left 0.0 :top 0.0
+                                           :width 1.0 :height 1.0
+                                           :angle 0.0))
+                             (after-graph-edit
+                              "Crop reset to full frame")))))
+            12 108 :fill 26 :page)
+           (register-inspector
+            (cl-fltk:make-label
+             :parent node-page :x 12 :y 140 :width 292 :height 26
+             :label "Drag the rectangle on the preview")
+            12 140 :fill 26 :page)))
+        (build-group
+         :curves
+         (lambda ()
+           (let ((channel-field
+                   (cl-fltk:make-labeled-choice
+                    :parent node-page :x 12 :y 44 :width 292 :height 26
+                    :label "Channel" :label-width 88
+                    :items '("Red" "Green" "Blue")
+                    :callback
+                    (lambda (widget event value)
+                      (declare (ignore event value))
+                      (setf curve-channel
+                            (cond ((string-equal
+                                    (cl-fltk:value widget) "Green")
+                                   :green-points)
+                                  ((string-equal
+                                    (cl-fltk:value widget) "Blue")
+                                   :blue-points)
+                                  (t :red-points)))
+                      (when curve-canvas
+                        (cl-fltk:redraw curve-canvas))))))
+             (register-field channel-field 44 :page))
+           (setf curve-canvas
+                 (register-inspector
+                  (cl-fltk:make-canvas
+                   :parent node-page :x 12 :y 76 :width 292 :height 160
+                   :callback (lambda (widget event value)
+                               (declare (ignore event value))
+                               (draw-curve-editor widget)))
+                  12 76 :fill 160 :page))
+           (cl-fltk:set-tooltip
+            curve-canvas
+            "Drag the points to shape the channel; the histogram shows occupancy")
+           (dolist (event (list cl-fltk:+event-push+
+                                cl-fltk:+event-drag+
+                                cl-fltk:+event-release+))
+             (cl-fltk:on curve-canvas #'handle-curve-mouse :event event))
+           (register-inspector
+            (cl-fltk:make-button
+             :parent node-page :x 12 :y 244 :width 292 :height 26
+             :label "Reset Channel"
+             :callback (lambda (&rest ignored)
+                         (declare (ignore ignored))
+                         (reset-curve-channel)))
+            12 244 :fill 26 :page)))
         (register-inspector
          (cl-fltk:make-button :parent inspector :x 12 :y 674
                               :width 140 :height 26 :label "Reset selected"
@@ -3281,18 +3712,25 @@ exactly the curve the render applies."
               status (cl-fltk:make-status-bar :parent window :x 180 :y 772
                                                :width 1100 :height 28
                                                :value "Ready"))
-        (cl-fltk:tile-size-range main-tile left-pane
+        (cl-fltk:tile-size-range main-tile left-column
                                  :min-width 180 :max-width 420)
         (cl-fltk:tile-size-range main-tile center-pane :min-width 300)
-        (cl-fltk:tile-size-range main-tile inspector
+        (cl-fltk:tile-size-range main-tile right-column
                                  :min-width 280 :max-width 480)
+        (cl-fltk:tile-size-range left-column filmstrip-pane :min-height 140)
+        (cl-fltk:tile-size-range left-column gallery-pane :min-height 140)
+        (cl-fltk:tile-size-range right-column inspector :min-height 220)
+        (cl-fltk:tile-size-range right-column graph-pane :min-height 140)
         (cl-fltk:on-resize window #'layout-ui)
-        (cl-fltk:on-resize left-pane #'layout-left-pane)
+        (cl-fltk:on-resize filmstrip-pane #'layout-left-pane)
+        (cl-fltk:on-resize gallery-pane #'layout-gallery-pane)
         (cl-fltk:on-resize center-pane #'layout-center-pane)
         (cl-fltk:on-resize inspector #'layout-inspector-pane)
+        (cl-fltk:on-resize graph-pane #'layout-graph-pane)
         (gui-model-set-selected-indices
          model (if (project-photos project) '(0) '()))
         (sync-controls)
+        (sync-node-tools)
         (layout-ui)
         (setf poll-id (cl-fltk:add-timeout 0.08d0 #'poll :repeat t))
         (when (selected-job)
