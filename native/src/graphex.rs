@@ -321,7 +321,7 @@ pub(crate) struct GraphContext<'a> {
 /// Maps a crop rectangle from oriented display coordinates into the
 /// unoriented sensor frame the executor works in. Rectangles are normalized
 /// (left, top, width, height); the mapping inverts `render::orient`.
-fn map_oriented_rect(orientation: u16, rect: [f32; 4]) -> [f32; 4] {
+pub(crate) fn map_oriented_rect(orientation: u16, rect: [f32; 4]) -> [f32; 4] {
     let [left, top, width, height] = rect;
     match orientation {
         2 => [1.0 - left - width, top, width, height],

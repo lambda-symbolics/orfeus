@@ -13,6 +13,7 @@ use std::ptr;
 use flate2::read::ZlibDecoder;
 use md5::{Digest, Md5};
 
+mod analyze;
 mod color;
 mod gpu;
 mod graphex;
@@ -562,6 +563,85 @@ pub unsafe extern "C" fn orfeus_raw_render_v3(
             let input = path_from_c(input_path)?;
             let output = path_from_c(output_path)?;
             graphex::render_graph(input, output, &*frame, bytes, cache_mode)
+        })
+    }
+}
+
+/// Detect the central tile and film-base color of a scanned negative.
+///
+/// Writes seven floats: the crop rectangle (left, top, width, height) in
+/// oriented normalized coordinates, then the scene-linear base color
+/// (red, green, blue) sampled from the border ring. A full-frame rectangle
+/// is reported when no plausible tile exists. Cache semantics match
+/// `orfeus_raw_render_v2`.
+///
+/// # Safety
+///
+/// `input_path` must be a readable NUL-terminated path, `results` must be
+/// writable for seven floats, and the error buffer, when non-null, writable
+/// for its stated capacity.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn orfeus_analyze_negative_frame_v1(
+    input_path: *const c_char,
+    cache_mode: u32,
+    results: *mut f32,
+    error_buffer: *mut c_char,
+    error_capacity: usize,
+) -> i32 {
+    // SAFETY: Pointer validation and dereferences remain inside the panic boundary.
+    unsafe {
+        ffi_result(error_buffer, error_capacity, || {
+            if results.is_null() {
+                return Err(Error::InvalidArgument("results pointer is null"));
+            }
+            let input = path_from_c(input_path)?;
+            let frame = analyze::analyze_negative_frame_file(input, cache_mode)?;
+            let values = [
+                frame.rect[0],
+                frame.rect[1],
+                frame.rect[2],
+                frame.rect[3],
+                frame.base[0],
+                frame.base[1],
+                frame.base[2],
+            ];
+            ptr::copy_nonoverlapping(values.as_ptr(), results, values.len());
+            Ok(())
+        })
+    }
+}
+
+/// Average the scene-linear color around an oriented normalized point.
+///
+/// Writes three floats. The radius is normalized against the shorter image
+/// edge and limited to 0.25. Cache semantics match `orfeus_raw_render_v2`.
+///
+/// # Safety
+///
+/// `input_path` must be a readable NUL-terminated path, `rgb` must be
+/// writable for three floats, and the error buffer, when non-null, writable
+/// for its stated capacity.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn orfeus_sample_linear_v1(
+    input_path: *const c_char,
+    cache_mode: u32,
+    x: f32,
+    y: f32,
+    radius: f32,
+    rgb: *mut f32,
+    error_buffer: *mut c_char,
+    error_capacity: usize,
+) -> i32 {
+    // SAFETY: Pointer validation and dereferences remain inside the panic boundary.
+    unsafe {
+        ffi_result(error_buffer, error_capacity, || {
+            if rgb.is_null() {
+                return Err(Error::InvalidArgument("rgb pointer is null"));
+            }
+            let input = path_from_c(input_path)?;
+            let color = analyze::sample_linear_file(input, cache_mode, x, y, radius)?;
+            ptr::copy_nonoverlapping(color.as_ptr(), rgb, color.len());
+            Ok(())
         })
     }
 }

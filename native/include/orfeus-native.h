@@ -150,6 +150,27 @@ int32_t orfeus_raw_render_v2(const char *input_path,
                              char *error_buffer,
                              size_t error_capacity);
 
+/* Detects a scanned negative's central tile and film-base color. Writes
+   seven floats: crop left, top, width, height in oriented normalized
+   coordinates, then the scene-linear base red, green, blue. Falls back to
+   the full frame when no tile is plausible. */
+int32_t orfeus_analyze_negative_frame_v1(const char *input_path,
+                                         uint32_t cache_mode,
+                                         float *results,
+                                         char *error_buffer,
+                                         size_t error_capacity);
+
+/* Averages scene-linear color around an oriented normalized point into
+   three floats; radius is normalized to the shorter edge, at most 0.25. */
+int32_t orfeus_sample_linear_v1(const char *input_path,
+                                uint32_t cache_mode,
+                                float x,
+                                float y,
+                                float radius,
+                                float *rgb,
+                                char *error_buffer,
+                                size_t error_capacity);
+
 int32_t orfeus_dng_original_filename(const char *dng_path,
                                      char *filename_buffer,
                                      size_t filename_capacity,

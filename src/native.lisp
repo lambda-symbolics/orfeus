@@ -258,6 +258,85 @@
         (call-with-lens-pointer (null-pointer))))
   output-pathname)
 
+(defcfun ("orfeus_analyze_negative_frame_v1" %analyze-negative-frame-v1) :int32
+  (input-path :string)
+  (cache-mode :uint32)
+  (results :pointer)
+  (error-buffer :pointer)
+  (error-capacity :size))
+
+(defcfun ("orfeus_sample_linear_v1" %sample-linear-v1) :int32
+  (input-path :string)
+  (cache-mode :uint32)
+  (x :float)
+  (y :float)
+  (radius :float)
+  (rgb :pointer)
+  (error-buffer :pointer)
+  (error-capacity :size))
+
+(defun analyze-negative-frame (input-pathname &key cache-p)
+  "Detect a scanned negative's central tile and film-base color.
+
+Returns two values: the crop rectangle (left top width height) in oriented
+normalized coordinates, and the scene-linear base color (red green blue)."
+  (native-library-load)
+  (with-foreign-pointer (results (* 7 4))
+    (with-foreign-pointer (error-buffer *native-error-buffer-size*)
+      (let ((status
+              #+sbcl
+              (sb-int:with-float-traps-masked
+                  (:invalid :divide-by-zero :overflow :underflow :inexact)
+                (%analyze-negative-frame-v1
+                 (namestring input-pathname)
+                 (if cache-p 1 0)
+                 results error-buffer *native-error-buffer-size*))
+              #-sbcl
+              (%analyze-negative-frame-v1
+               (namestring input-pathname)
+               (if cache-p 1 0)
+               results error-buffer *native-error-buffer-size*)))
+        (unless (zerop status)
+          (error 'raw-render-error
+                 :input-pathname input-pathname
+                 :output-pathname input-pathname
+                 :status status
+                 :message (native-error-message error-buffer)))
+        (values (loop for index below 4
+                      collect (mem-aref results :float index))
+                (loop for index from 4 below 7
+                      collect (mem-aref results :float index)))))))
+
+(defun sample-photo-linear-color (input-pathname x y
+                                  &key (radius 0.01) cache-p)
+  "Average the scene-linear color around oriented normalized point X, Y."
+  (native-library-load)
+  (with-foreign-pointer (rgb (* 3 4))
+    (with-foreign-pointer (error-buffer *native-error-buffer-size*)
+      (let ((status
+              #+sbcl
+              (sb-int:with-float-traps-masked
+                  (:invalid :divide-by-zero :overflow :underflow :inexact)
+                (%sample-linear-v1
+                 (namestring input-pathname)
+                 (if cache-p 1 0)
+                 (float x 0.0) (float y 0.0) (float radius 0.0)
+                 rgb error-buffer *native-error-buffer-size*))
+              #-sbcl
+              (%sample-linear-v1
+               (namestring input-pathname)
+               (if cache-p 1 0)
+               (float x 0.0) (float y 0.0) (float radius 0.0)
+               rgb error-buffer *native-error-buffer-size*)))
+        (unless (zerop status)
+          (error 'raw-render-error
+                 :input-pathname input-pathname
+                 :output-pathname input-pathname
+                 :status status
+                 :message (native-error-message error-buffer)))
+        (loop for index below 3
+              collect (mem-aref rgb :float index))))))
+
 (defparameter *graph-node-kind-codes*
   '((:white-balance . 1) (:exposure . 2) (:noise-reduction . 3)
     (:tone . 4) (:optics . 5) (:film . 6) (:blend . 7)

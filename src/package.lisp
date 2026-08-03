@@ -92,6 +92,8 @@
    #:default-processing-graph
    #:photo-job-graph
    #:processing-preset-graph
+   #:analyze-negative-frame
+   #:sample-photo-linear-color
    #:processing-preset
    #:processing-preset-disabled-stages
    #:processing-preset-name
