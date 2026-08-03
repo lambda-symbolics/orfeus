@@ -74,6 +74,9 @@
 (defparameter *graph-row-pitch* 46
   "Vertical distance between auto-laid-out nodes on the graph canvas.")
 
+(defparameter *inspector-min-height* 385
+  "Minimum inspector height that keeps the complete Curves panel accessible.")
+
 (defun node-kind-label (kind)
   (or (rest (assoc kind *node-kind-labels*)) (string kind)))
 
@@ -174,6 +177,35 @@ exactly the curve the render applies."
   "Return the cache/task key for STILL, including its provenance."
   (list (gallery-still-origin still) (gallery-still-identity still)))
 
+(defun gallery-selection-key (stills selected-index)
+  "Return the stable key selected by SELECTED-INDEX, or NIL."
+  (let ((still (and selected-index (nth selected-index stills))))
+    (and still (gallery-still-key still))))
+
+(defun gallery-selection-index (stills selected-key)
+  "Find SELECTED-KEY in STILLS without retargeting a stale numeric index."
+  (and selected-key
+       (position selected-key stills :key #'gallery-still-key :test #'equal)))
+
+(defun gallery-selected-still (stills selected-index)
+  "Return the selected gallery still, or NIL for an invalid stale index."
+  (and selected-index (nth selected-index stills)))
+
+(defun gallery-still-origin-description (still)
+  "Return a short user-visible provenance description for STILL."
+  (format nil "~(~A~) still" (gallery-still-origin still)))
+
+(defun graph-output-box-position (nodes)
+  "Return the graph-space OUT box for NODES, including an empty graph."
+  (let ((bottom
+          (loop for node in nodes
+                for place = (orfeus:graph-node-position node)
+                when place
+                  maximize (+ (round (second place)) *graph-node-height*)
+                    into maximum
+                finally (return (or maximum 28)))))
+    (values 18 (+ (max bottom 28) 22) *graph-node-width* 22)))
+
 (defun make-project-gallery-still (preset)
   (make-gallery-still :origin :project
                       :identity (orfeus:still-store-identity
@@ -237,35 +269,81 @@ exactly the curve the render applies."
             (error "Expected a number, got ~S." text))
           value))))
 
+(defconstant +preview-cache-schema-version+ 2)
+
+(defvar *active-preview-cache-files* (make-hash-table :test #'equal))
+(defvar *active-preview-cache-lock*
+  (sb-thread:make-mutex :name "Orfeus active preview cache files"))
+(defparameter *preview-lock-owner-grace-seconds* 2)
+
+(defun protect-preview-cache-path (pathname mode)
+  "Enforce MODE on PATHNAME, returning PATHNAME only when verification succeeds."
+  (handler-case
+      (progn
+        (sb-posix:chmod (namestring pathname) mode)
+        (when (= mode (logand #o777
+                              (sb-posix:stat-mode
+                               (sb-posix:stat (namestring pathname)))))
+          pathname))
+    (error () nil)))
+
+(defun make-secure-preview-directory (directory)
+  (handler-case
+      (progn
+        (ensure-directories-exist directory)
+        (or (protect-preview-cache-path directory #o700)
+            (progn
+              (ignore-errors
+                (uiop:delete-directory-tree directory :validate t
+                                                      :if-does-not-exist :ignore))
+              nil)))
+    (error () nil)))
+
 (defun gui-preview-cache-directory ()
-  "The persistent preview cache under XDG, keyed by photo content."
-  (let ((directory (uiop:xdg-cache-home "orfeus/previews/")))
-    (ensure-directories-exist directory)
-    directory))
+  "Return a private persistent cache, or a secure session cache on failure."
+  (or (make-secure-preview-directory (uiop:xdg-cache-home "orfeus/previews/"))
+      (make-secure-preview-directory
+       (merge-pathnames
+        (format nil "orfeus-preview-session-~D-~D/"
+                (sb-posix:getpid) (random most-positive-fixnum))
+        (uiop:temporary-directory)))
+      (error "Cannot create a secure preview cache directory.")))
+
+(defun file-sha256 (pathname)
+  "Return the complete SHA-256 hex digest of PATHNAME."
+  (with-open-file (stream pathname :element-type '(unsigned-byte 8))
+    (let ((digest (ironclad:make-digest :sha256))
+          (buffer (make-array 1048576 :element-type '(unsigned-byte 8))))
+      (loop for count = (read-sequence buffer stream)
+            while (plusp count)
+            do (ironclad:update-digest digest buffer :end count))
+      (ironclad:byte-array-to-hex-string (ironclad:produce-digest digest)))))
 
 (defun photo-content-key (pathname)
-  "A quick content fingerprint: size plus head and tail samples, hashed.
+  "Return a full content digest, invalidating every in-process replacement."
+  (file-sha256 pathname))
 
-Renaming or moving a photograph keeps its previews valid; editing the file
-invalidates them."
-  (with-open-file (stream pathname :element-type '(unsigned-byte 8))
-    (let* ((size (file-length stream))
-           (sample (min 65536 size))
-           (digest (ironclad:make-digest :sha256))
-           (buffer (make-array sample :element-type '(unsigned-byte 8))))
-      (read-sequence buffer stream)
-      (ironclad:update-digest digest buffer)
-      (when (> size sample)
-        (file-position stream (- size sample))
-        (let ((count (read-sequence buffer stream)))
-          (ironclad:update-digest digest buffer :end count)))
-      (let ((size-bytes (make-array 8 :element-type '(unsigned-byte 8))))
-        (dotimes (index 8)
-          (setf (aref size-bytes index) (ldb (byte 8 (* 8 index)) size)))
-        (ironclad:update-digest digest size-bytes))
-      (subseq (ironclad:byte-array-to-hex-string
-               (ironclad:produce-digest digest))
-              0 16))))
+(defun preview-cache-hit-p (pathname)
+  (when (probe-file pathname)
+    (if (protect-preview-cache-path pathname #o600)
+        t
+        (progn
+          (ignore-errors (delete-file pathname))
+          nil))))
+
+(defun preview-cache-file-active-p (pathname)
+  (sb-thread:with-mutex (*active-preview-cache-lock*)
+    (plusp (gethash (namestring pathname) *active-preview-cache-files* 0))))
+
+(defun call-with-active-preview-cache-file (pathname function)
+  (let ((key (namestring pathname)))
+    (sb-thread:with-mutex (*active-preview-cache-lock*)
+      (incf (gethash key *active-preview-cache-files* 0)))
+    (unwind-protect (funcall function)
+      (sb-thread:with-mutex (*active-preview-cache-lock*)
+        (if (= 1 (gethash key *active-preview-cache-files*))
+            (remhash key *active-preview-cache-files*)
+            (decf (gethash key *active-preview-cache-files*)))))))
 
 (defun evict-stale-previews (directory &key (max-age-days 45)
                                             (max-bytes (* 4 1024 1024 1024)))
@@ -283,15 +361,29 @@ best effort housekeeping."
                                                 '(unsigned-byte 8))
                           (file-length stream)))
                       0)))
-        (if (< date cutoff)
-            (ignore-errors (delete-file file))
+        (if (and (< date cutoff)
+                 (not (preview-cache-file-active-p file)))
+            (unless (ignore-errors
+                      (call-with-preview-key-lock
+                       file (lambda () (when (probe-file file) (delete-file file)))
+                       :timeout 0.0d0)
+                      t)
+              (push (list file date size) entries))
             (push (list file date size) entries))))
-    (let ((total (reduce #'+ entries :key #'third)))
+    (let ((total (reduce #'+ entries :key #'third :initial-value 0)))
       (dolist (entry (sort entries #'< :key #'second))
         (when (<= total max-bytes)
           (return))
-        (ignore-errors (delete-file (first entry)))
-        (decf total (third entry))))))
+        (unless (preview-cache-file-active-p (first entry))
+          (when (ignore-errors
+                  (call-with-preview-key-lock
+                   (first entry)
+                   (lambda ()
+                     (when (probe-file (first entry))
+                       (delete-file (first entry))))
+                   :timeout 0.0d0)
+                  t)
+            (decf total (third entry))))))))
 
 (defun preview-recipe-snapshot (recipe)
   "Return an immutable deep copy of a settings or graph render RECIPE."
@@ -302,32 +394,246 @@ best effort housekeeping."
      (orfeus::sexp->processing-settings
       (orfeus::processing-settings->sexp recipe)))))
 
-(defun preview-settings-key (recipe)
-  "Return a content hash covering a settings or graph render RECIPE."
-  (let* ((*print-readably* t)
-         (text (prin1-to-string
-                (etypecase recipe
-                  (orfeus:processing-graph (orfeus:graph->sexp recipe))
-                  (orfeus:processing-settings
-                   (orfeus::processing-settings->sexp recipe)))))
+(defun active-preview-lut-paths (recipe)
+  (remove-duplicates
+   (etypecase recipe
+     (orfeus:processing-settings
+      (let ((path (orfeus:processing-settings-lut-path recipe)))
+        (when (and path (plusp (orfeus:processing-settings-lut-strength recipe)))
+          (list path))))
+     (orfeus:processing-graph
+      (loop for node in (orfeus:processing-graph-nodes recipe)
+            for params = (orfeus:graph-node-params node)
+            for path = (getf params :lut-path)
+            when (and (eq :film (orfeus:graph-node-kind node))
+                      (not (orfeus:graph-node-bypassed-p node))
+                      path
+                      (plusp (getf params :lut-strength 1.0)))
+              collect path)))
+   :test #'equal))
+
+(defun preview-settings-key (recipe &key (max-width 0) (max-height 0)
+                                         (jpeg-quality 88))
+  "Return a full digest of the render recipe, output shape, and active LUTs."
+  (let* ((dependencies
+           (loop for path in (active-preview-lut-paths recipe)
+                 collect (list (namestring (pathname path))
+                               (handler-case (file-sha256 path)
+                                 (error (condition)
+                                   (list :unreadable (princ-to-string condition)))))))
+         (identity
+           (list :preview-cache-schema +preview-cache-schema-version+
+                 :max-width max-width :max-height max-height
+                 :jpeg-quality jpeg-quality
+                 :recipe (etypecase recipe
+                           (orfeus:processing-graph
+                            (orfeus:graph->render-sexp recipe))
+                           (orfeus:processing-settings
+                            (orfeus::processing-settings->sexp recipe)))
+                 :dependencies dependencies))
+         (*print-readably* t)
          (digest (ironclad:digest-sequence
                   :sha256
-                  (sb-ext:string-to-octets text :external-format :utf-8))))
-    (subseq (ironclad:byte-array-to-hex-string digest) 0 16)))
+                  (sb-ext:string-to-octets (prin1-to-string identity)
+                                           :external-format :utf-8))))
+    (ironclad:byte-array-to-hex-string digest)))
 
-(defun preview-pathname (preview-directory content-key role settings)
+(defun preview-pathname (preview-directory content-key role settings
+                         &key (max-width 0) (max-height 0) (jpeg-quality 88)
+                              settings-key)
   (merge-pathnames
    (make-pathname :name (format nil "~(~A~)-~A-~A"
                                 role content-key
-                                (preview-settings-key settings))
+                                (or settings-key
+                                    (preview-settings-key
+                                     settings :max-width max-width
+                                     :max-height max-height
+                                     :jpeg-quality jpeg-quality)))
                   :type "jpg")
    preview-directory))
 
 (defun thumbnail-pathname (preview-directory content-key)
-  (merge-pathnames
-   (make-pathname :name (format nil "thumbnail-~A" content-key)
-                  :type "jpg")
-   preview-directory))
+  (preview-pathname preview-directory content-key :thumbnail
+                    (make-processing-settings :noise-reduction 0.0
+                                              :lens-correction-p nil
+                                              :chromatic-aberration-correction-p nil
+                                              :lut-path nil :grain-amount 0.0)
+                    :max-width *thumbnail-preview-size*
+                    :max-height *thumbnail-preview-size*
+                    :jpeg-quality 82))
+
+(defun preview-lock-directory (pathname)
+  (pathname (format nil "~A.lock/" (namestring pathname))))
+
+(defun preview-lock-owner-pathname (lock)
+  (merge-pathnames "owner.sexp" lock))
+
+(defun process-alive-p (pid)
+  (handler-case
+      (progn (sb-posix:kill pid 0) t)
+    (sb-posix:syscall-error (condition)
+      ;; EPERM also proves that the process exists.
+      (= (sb-posix:syscall-errno condition) sb-posix:eperm))))
+
+(defun write-preview-lock-owner (lock token)
+  (let ((owner (preview-lock-owner-pathname lock)))
+    (with-open-file (stream owner :direction :output :if-exists :error
+                                  :if-does-not-exist :create)
+      (let ((*print-readably* t))
+        (write (list :pid (sb-posix:getpid) :created (get-universal-time)
+                     :token token)
+               :stream stream)))
+    (or (protect-preview-cache-path owner #o600)
+        (error "Cannot secure preview lock owner ~A" owner))))
+
+(defun read-preview-lock-owner (lock)
+  (handler-case
+      (with-open-file (stream (preview-lock-owner-pathname lock))
+        (let ((*read-eval* nil)) (read stream nil nil)))
+    (error () nil)))
+
+(defun preview-lock-old-enough-p (lock seconds)
+  (let ((written (ignore-errors (file-write-date lock))))
+    (and (integerp written)
+         (> (- (get-universal-time) written) seconds))))
+
+(defun stale-preview-lock-p (lock)
+  (let* ((owner (read-preview-lock-owner lock))
+         (pid (and (listp owner) (getf owner :pid)))
+         (created (and (listp owner) (getf owner :created)))
+         (token (and (listp owner) (getf owner :token)))
+         (recorded-pid-p (and (integerp pid) (plusp pid)))
+         (well-formed-p (and recorded-pid-p (integerp created) (stringp token))))
+    (cond
+      ((and recorded-pid-p (not (process-alive-p pid))) t)
+      (well-formed-p nil)
+      (t (preview-lock-old-enough-p lock *preview-lock-owner-grace-seconds*)))))
+
+(defun reclaim-stale-preview-lock (lock)
+  (when (stale-preview-lock-p lock)
+    (let ((tombstone
+            (pathname (format nil "~A.reclaimed-~D-~D/"
+                              (string-right-trim "/" (namestring lock))
+                              (sb-posix:getpid) (random most-positive-fixnum)))))
+      ;; Rename establishes exclusive ownership of exactly the stale instance.
+      (when (ignore-errors (rename-file lock tombstone) t)
+        (ignore-errors
+          (uiop:delete-directory-tree tombstone :validate t
+                                                :if-does-not-exist :ignore))
+        t))))
+
+(defun acquire-preview-lock (pathname &key (timeout 120.0d0) ignore-hit-p)
+  "Acquire a crash-recoverable cross-process per-key lock.
+
+Return NIL only when IGNORE-HIT-P is false and another process filled PATHNAME."
+  (let ((lock (preview-lock-directory pathname))
+        (deadline (+ (get-internal-real-time)
+                     (round (* timeout internal-time-units-per-second)))))
+    (loop
+      (when (and (not ignore-hit-p) (preview-cache-hit-p pathname)) (return nil))
+      (when (handler-case (progn (sb-posix:mkdir (namestring lock) #o700) t)
+              (sb-posix:syscall-error () nil))
+        (unless (protect-preview-cache-path lock #o700)
+          (ignore-errors
+            (uiop:delete-directory-tree lock :validate t
+                                             :if-does-not-exist :ignore))
+          (error "Cannot secure preview lock ~A" lock))
+        (let ((token (format nil "~D-~D" (sb-posix:getpid)
+                             (random most-positive-fixnum))))
+          (write-preview-lock-owner lock token)
+          (return (cons lock token))))
+      (reclaim-stale-preview-lock lock)
+      (when (> (get-internal-real-time) deadline)
+        (error "Timed out waiting for preview cache lock ~A" pathname))
+      (sleep 0.02d0))))
+
+(defun release-preview-lock (lock-and-token)
+  (when lock-and-token
+    (destructuring-bind (lock . token) lock-and-token
+      (let ((owner (read-preview-lock-owner lock)))
+        (when (equal token (getf owner :token))
+          (ignore-errors
+            (uiop:delete-directory-tree lock :validate t
+                                             :if-does-not-exist :ignore)))))))
+
+(defun call-with-preview-key-lock (pathname function &key (timeout 120.0d0))
+  (let ((lock (acquire-preview-lock pathname :timeout timeout :ignore-hit-p t)))
+    (unwind-protect (funcall function)
+      (release-preview-lock lock))))
+
+(defun call-with-preview-cache-fill (pathname function &key validation-function)
+  "Coalesce cache fills across processes; FUNCTION writes a secure temp file.
+
+When supplied, VALIDATION-FUNCTION must return true after the render before the
+new cache entry is published."
+  (call-with-active-preview-cache-file
+   pathname
+   (lambda ()
+     (if (preview-cache-hit-p pathname)
+         pathname
+         (let ((lock (acquire-preview-lock pathname)))
+           (if (null lock)
+               pathname
+               (let ((temporary
+                       (merge-pathnames
+                        (make-pathname
+                         :name (format nil "~A.~D-~D.tmp"
+                                       (pathname-name pathname)
+                                       (sb-posix:getpid)
+                                       (random most-positive-fixnum))
+                         :type (pathname-type pathname))
+                        (uiop:pathname-directory-pathname pathname))))
+                 (unwind-protect
+                      (progn
+                        (funcall function temporary)
+                        (when (and validation-function
+                                   (not (funcall validation-function)))
+                          (error "Preview dependencies changed during render"))
+                        (unless (protect-preview-cache-path temporary #o600)
+                          (error "Cannot secure preview cache file ~A" temporary))
+                        (rename-file temporary pathname)
+                        (unless (protect-preview-cache-path pathname #o600)
+                          (ignore-errors (delete-file pathname))
+                          (error "Cannot secure preview cache file ~A" pathname))
+                        pathname)
+                   (ignore-errors (delete-file temporary))
+                   (release-preview-lock lock)))))))))
+
+(defun materialize-preview-cache-hit (pathname session-directory
+                                      &key validation-function)
+  "Copy and validate a cache hit under its per-key lock to a secure path."
+  (let ((target (merge-pathnames
+                 (format nil "display-~D-~D.jpg" (sb-posix:getpid)
+                         (random most-positive-fixnum))
+                 session-directory)))
+    (handler-case
+        (progn
+          (call-with-preview-key-lock
+           pathname
+           (lambda ()
+             (unless (preview-cache-hit-p pathname)
+               (return-from materialize-preview-cache-hit nil))
+             (uiop:copy-file pathname target)
+             (unless (protect-preview-cache-path target #o600)
+               (error "Cannot secure materialized preview ~A" target))))
+          (when (and validation-function
+                     (not (funcall validation-function)))
+            (error "Preview dependencies changed while loading cache hit"))
+          target)
+      (error (condition)
+        (ignore-errors (delete-file target))
+        (error condition)))))
+
+(defun preview-progress-state (load total generation tracked-generation)
+  "Return percent, updated high-water TOTAL, and tracked GENERATION."
+  (when (/= generation tracked-generation)
+    (setf total 0
+          tracked-generation generation))
+  (if (zerop load)
+      (values 0 0 tracked-generation)
+      (let ((total (max total load)))
+        (values (max 2 (min 99 (round (* 100 (- total load)) total)))
+                total tracked-generation))))
 
 (defun preview-status-text (model)
   (let ((job (gui-model-selected-job model)))
@@ -366,8 +672,9 @@ best effort housekeeping."
   "Open Orfeus. PROJECT-OR-PATH may be NIL, a PROJECT, project file, ORF, or DNG."
   (multiple-value-bind (initial-project initial-path)
       (initial-gui-project project-or-path)
-    ;; Load the CFFI bridge before render workers can race to initialize it.
+    ;; Load both CFFI bridges before workers can race to initialize them.
     (orfeus:native-bridge-version)
+    (load-gui-preview-library)
     (let* ((project initial-project)
            (model (make-gui-model :project project
                                   :project-path initial-path))
@@ -378,6 +685,13 @@ best effort housekeeping."
            (histogram-queue
              (make-gui-queue :name "Orfeus histogram worker"))
            (preview-directory (gui-preview-cache-directory))
+           (preview-session-directory
+             (or (make-secure-preview-directory
+                  (merge-pathnames
+                   (format nil "orfeus-display-~D-~D/" (sb-posix:getpid)
+                           (random most-positive-fixnum))
+                   (uiop:temporary-directory)))
+                 (error "Cannot create secure preview display directory.")))
            (picker-directory
              (let ((photo (first (project-photos project))))
                (cond (initial-path
@@ -390,7 +704,9 @@ best effort housekeeping."
            (capture-cache (make-hash-table :test #'eq))
            (thumbnail-files (make-hash-table :test #'eq))
            (lut-paths (make-hash-table :test #'equal))
-           (content-keys (make-hash-table :test #'eq))
+           (content-keys (make-hash-table :test #'equal))
+            (content-keys-lock
+              (sb-thread:make-mutex :name "Orfeus preview content keys"))
            window menu toolbar toolbar-bottom-rule main-tile left-column
            filmstrip-pane gallery-pane center-pane
            thumbnail-canvas thumbnail-scrollbar
@@ -424,6 +740,7 @@ best effort housekeeping."
            (gallery-click (cons 0 -1))
            debounce-id poll-id comparison-p layout-initialized-p
            (progress-total 0)
+           (progress-generation -1)
            (thumbnail-scroll 0)
            (thumbnail-anchor 0)
            (preview-generation 0)
@@ -1087,20 +1404,15 @@ best effort housekeeping."
              (setf (cl-fltk:value status) text))
            (selected-job ()
              (gui-model-selected-job model))
-           (photo-content-key-for (job)
-             ;; Memoized per job object; the key survives renames and moves
-             ;; because it fingerprints file content, not the path.
-             (or (gethash job content-keys)
-                 (setf (gethash job content-keys)
-                       (handler-case
-                           (photo-content-key (photo-job-input-path job))
-                         (error ()
-                           (format nil "path~16,'0X"
-                                   (ldb (byte 64 0)
-                                        (sxhash
-                                         (namestring
-                                          (photo-job-input-path
-                                           job))))))))))
+           (photo-content-key-for (job generation &optional refresh-p)
+             ;; Called only by render workers. Holding the mutex through hashing
+             ;; coalesces duplicate selected/background requests in a generation.
+             (let ((key (list job generation)))
+               (sb-thread:with-mutex (content-keys-lock)
+                 (when refresh-p (remhash key content-keys))
+                 (or (gethash key content-keys)
+                     (setf (gethash key content-keys)
+                           (photo-content-key (photo-job-input-path job)))))))
            (thumbnail-row-height () 104)
            (thumbnail-scroll-limit ()
              (if thumbnail-canvas
@@ -1302,13 +1614,7 @@ best effort housekeeping."
                (values (round (first place)) (round (second place))
                        *graph-node-width* *graph-node-height*)))
            (graph-output-box (nodes)
-             (let ((bottom (loop for node in nodes
-                                 maximize
-                                 (multiple-value-bind (x y) (graph-node-box
-                                                             node)
-                                   (declare (ignore x))
-                                   (+ y *graph-node-height*)))))
-               (values 18 (+ (max bottom 28) 22) *graph-node-width* 22)))
+             (graph-output-box-position nodes))
            (graph-editor-hit (gx gy)
              ;; What lies at graph coordinates: a node body, its output
              ;; port, a blend's branch port, the source, or the output box.
@@ -1661,7 +1967,9 @@ best effort housekeeping."
                                     (multiple-value-bind (x y w)
                                         (graph-node-box node)
                                       (declare (ignore y))
-                                      (+ x w))))
+                                      (+ x w))
+                                      into right
+                                    finally (return (or right 0))))
                          (+ out-y out-h)))))
            (drop-graph-wire (drag gx gy)
              ;; Releasing a wire: onto a node feeds its primary input, onto
@@ -1957,21 +2265,23 @@ best effort housekeeping."
                       (set-status "No photograph selected"))))))
            (reload-gallery-stills ()
              ;; Local stills are view-only gallery entries, never project data.
-             (incf gallery-generation)
-             (discard-gui-tasks background-queue :still)
-             (clrhash gallery-thumbs)
-             (setf gallery-stills
-                   (append (mapcar #'make-project-gallery-still
-                                   (project-presets project))
-                           (handler-case
-                               (mapcar #'make-local-gallery-still
-                                       (orfeus:still-store-list))
-                             (error (condition)
-                               (set-status (princ-to-string condition))
-                               '()))))
-             (when (and gallery-selected
-                        (>= gallery-selected (length gallery-stills)))
-               (setf gallery-selected nil)))
+             ;; Preserve provenance, never a numeric index that can retarget.
+             (let ((selected-key
+                     (gallery-selection-key gallery-stills gallery-selected)))
+               (incf gallery-generation)
+               (discard-gui-tasks background-queue :still)
+               (clrhash gallery-thumbs)
+               (setf gallery-stills
+                     (append (mapcar #'make-project-gallery-still
+                                     (project-presets project))
+                             (handler-case
+                                 (mapcar #'make-local-gallery-still
+                                         (orfeus:still-store-list))
+                               (error (condition)
+                                 (set-status (princ-to-string condition))
+                                 '())))
+                     gallery-selected
+                     (gallery-selection-index gallery-stills selected-key))))
            (persist-still (preset)
              ;; The local gallery copy survives removable source media and
              ;; unsaved projects, but never replaces an unrelated exact name.
@@ -2034,7 +2344,7 @@ best effort housekeeping."
                            (recipe (still-recipe preset))
                            (graph-p (typep recipe
                                            'orfeus:processing-graph)))
-                      (if (probe-file output)
+                      (if (preview-cache-hit-p output)
                           (progn
                             (when (and stored (not (probe-file stored)))
                               (ignore-errors
@@ -2159,17 +2469,19 @@ best effort housekeeping."
                                              (string/= source-lens
                                                        target-lens)))))
                      " (lens differs; optics re-match per photo)")))))
-           (apply-still (preset &key bypass-kinds description)
-             (handler-case
-                 (let ((count (gui-model-apply-preset-graph
-                               model preset :bypass-kinds bypass-kinds)))
-                   (after-graph-edit
-                    (format nil "Applied ~A~@[ ~A~] to ~D photo~:P~@[~A~]"
-                            (processing-preset-name preset)
-                            description count (still-lens-note preset)))
-                   (redraw-thumbnails))
-               (error (condition)
-                 (set-status (princ-to-string condition)))))
+           (apply-still (still &key bypass-kinds description)
+             (let ((preset (gallery-still-preset still)))
+               (handler-case
+                   (let ((count (gui-model-apply-preset-graph
+                                 model preset :bypass-kinds bypass-kinds)))
+                     (after-graph-edit
+                      (format nil "Applied ~A (~A)~@[ ~A~] to ~D photo~:P~@[~A~]"
+                              (processing-preset-name preset)
+                              (gallery-still-origin-description still)
+                              description count (still-lens-note preset)))
+                     (redraw-thumbnails))
+                 (error (condition)
+                   (set-status (princ-to-string condition))))))
            (delete-still (still)
              (let ((preset (gallery-still-preset still)))
                (ecase (gallery-still-origin still)
@@ -2229,20 +2541,19 @@ best effort housekeeping."
                              (error (condition)
                                (set-status (princ-to-string condition)))))))))))
            (gallery-context-menu (still)
-             (let* ((preset (gallery-still-preset still))
-                    (actions
+             (let ((actions
                      (list (cons (format nil "Apply Graph to ~D Photo~:P"
                                          (selected-photo-count))
-                                 (lambda () (apply-still preset)))
+                                 (lambda () (apply-still still)))
                            (cons "Apply Without Optics"
                                  (lambda ()
-                                   (apply-still preset
+                                   (apply-still still
                                                 :bypass-kinds '(:optics)
                                                 :description
                                                 "without optics")))
                            (cons "Apply Without White Balance"
                                  (lambda ()
-                                   (apply-still preset
+                                   (apply-still still
                                                 :bypass-kinds
                                                 '(:white-balance)
                                                 :description
@@ -2277,7 +2588,7 @@ best effort housekeeping."
                                    (* 0.4 internal-time-units-per-second)))
                            (let ((still (nth index gallery-stills)))
                              (when still
-                               (apply-still (gallery-still-preset still)))))
+                               (apply-still still))))
                           (t (setf gallery-click (cons now index)))))))
                    (#.cl-fltk:+event-wheel+
                     (setf gallery-scroll
@@ -2308,15 +2619,11 @@ best effort housekeeping."
                (error (condition)
                  (set-status (princ-to-string condition)))))
            (apply-current-preset ()
-             (handler-case
-                 (let* ((name (cl-fltk:value preset-name-input))
-                        (count (gui-model-apply-preset model name)))
-                   (sync-controls)
-                   (schedule-edited-preview)
-                   (set-status (format nil "Applied ~A to ~D photo~:P"
-                                       name count)))
-               (error (condition)
-                 (set-status (princ-to-string condition)))))
+             (let ((still (gallery-selected-still gallery-stills
+                                                  gallery-selected)))
+               (if still
+                   (apply-still still)
+                   (set-status "Select a still in the gallery first"))))
            (sync-controls ()
              (dolist (entry controls)
                (let ((key (first entry)) (widget (second entry)))
@@ -2459,67 +2766,116 @@ best effort housekeeping."
                settings))
            (enqueue-render (target-queue role job index settings generation publish-p
                             &key front-p draft-p cache-p)
-             ;; Freeze once before deriving the cache path, then pass that same
-             ;; immutable recipe to the worker.
+             ;; Scheduling is constant-time on the FLTK thread. Content hashing,
+             ;; cache lookup, rendering, and hit materialization all run here.
              (let* ((settings (preview-recipe-snapshot settings))
                     (input (photo-job-input-path job))
                     (file-role (if draft-p :draft role))
-                    (output (preview-pathname preview-directory
-                                              (photo-content-key-for job)
-                                              file-role settings))
                     (max-width (if draft-p
                                    *gui-draft-preview-size*
                                    *gui-preview-max-width*))
                     (max-height (if draft-p
                                     *gui-draft-preview-size*
                                     *gui-preview-max-height*)))
-               (if (probe-file output)
-                   (when publish-p
-                     (queue-event queue
-                                  (list :preview generation index job role output)))
-                   (enqueue-gui-task
-                    target-queue role
-                    (lambda ()
-                      (when (or (not publish-p)
-                                (= generation preview-generation))
-                        (if (typep settings 'orfeus:processing-graph)
-                            (render-preview input output nil
-                                            :graph settings
-                                            :max-width max-width
-                                            :max-height max-height
-                                            :cache-p cache-p
-                                            :if-exists :supersede)
-                            (render-preview input output settings
-                                            :max-width max-width
-                                            :max-height max-height
-                                            :cache-p cache-p
-                                            :if-exists :supersede))
-                        (when (and publish-p
-                                   (= generation preview-generation))
-                          (queue-event queue
-                                       (list :preview generation index job role
-                                             output)))))
-                    :front-p front-p))))
-           (enqueue-thumbnail (job index generation)
-             (let ((output (thumbnail-pathname preview-directory
-                                               (photo-content-key-for job))))
-               (if (probe-file output)
-                   (queue-event queue (list :thumbnail generation job output))
-                   (enqueue-gui-task
-                    background-queue :thumbnail
-                    (lambda ()
-                      (handler-case
-                          (progn
-                            (render-preview
-                              (photo-job-input-path job) output
-                              (neutral-preview-settings)
-                              :max-width *thumbnail-preview-size*
-                              :max-height *thumbnail-preview-size*
-                              :jpeg-quality 82
-                              :if-exists :supersede)
-                            (queue-event queue
-                                         (list :thumbnail generation job output)))
-                        (error () nil)))))))
+               (enqueue-gui-task
+                target-queue role
+                (lambda ()
+                  (when (or (not publish-p) (= generation preview-generation))
+                    (loop for attempt below 3
+                          for digest = (photo-content-key-for job generation
+                                                              (plusp attempt))
+                          for settings-key = (preview-settings-key
+                                              settings :max-width max-width
+                                              :max-height max-height
+                                              :jpeg-quality 88)
+                          for output = (preview-pathname
+                                        preview-directory digest file-role settings
+                                        :max-width max-width :max-height max-height
+                                        :jpeg-quality 88 :settings-key settings-key)
+                          for dependencies-current-p =
+                            (lambda ()
+                              (string= settings-key
+                                       (preview-settings-key
+                                        settings :max-width max-width
+                                        :max-height max-height
+                                        :jpeg-quality 88)))
+                          do (handler-case
+                                 (progn
+                                   (call-with-preview-cache-fill
+                                    output
+                                    (lambda (temporary)
+                                      (if (typep settings 'orfeus:processing-graph)
+                                          (render-preview input temporary nil
+                                                          :graph settings
+                                                          :max-width max-width
+                                                          :max-height max-height
+                                                          :cache-p cache-p
+                                                          :if-exists :supersede)
+                                          (render-preview input temporary settings
+                                                          :max-width max-width
+                                                          :max-height max-height
+                                                          :cache-p cache-p
+                                                          :if-exists :supersede))
+                                      (unless (string= digest (photo-content-key input))
+                                        (error "RAW source changed during preview render")))
+                                    :validation-function dependencies-current-p)
+                                   (let ((display
+                                           (materialize-preview-cache-hit
+                                            output preview-session-directory
+                                            :validation-function
+                                            dependencies-current-p)))
+                                     (unless (string= digest (photo-content-key input))
+                                       (when display (ignore-errors (delete-file display)))
+                                       (error "RAW source changed while loading cache hit"))
+                                     (when (and display publish-p
+                                                (= generation preview-generation))
+                                       (queue-event queue
+                                                    (list :preview generation index job
+                                                          role display))))
+                                   (return))
+                               (error (condition)
+                                 (when (= attempt 2) (error condition)))))))
+                :front-p front-p :generation generation)))
+           (enqueue-thumbnail (job generation)
+             (enqueue-gui-task
+              background-queue :thumbnail
+              (lambda ()
+                (handler-case
+                    (loop for attempt below 3
+                          for digest = (photo-content-key-for job generation
+                                                              (plusp attempt))
+                          for output = (thumbnail-pathname preview-directory digest)
+                          do (handler-case
+                                 (progn
+                                   (call-with-preview-cache-fill
+                                    output
+                                    (lambda (temporary)
+                                      (render-preview
+                                       (photo-job-input-path job) temporary
+                                       (neutral-preview-settings)
+                                       :max-width *thumbnail-preview-size*
+                                       :max-height *thumbnail-preview-size*
+                                       :jpeg-quality 82 :if-exists :supersede)
+                                      (unless (string= digest
+                                                       (photo-content-key
+                                                        (photo-job-input-path job)))
+                                        (error "RAW source changed during thumbnail"))))
+                                   (let ((display
+                                           (materialize-preview-cache-hit
+                                            output preview-session-directory)))
+                                     (unless (string= digest
+                                                      (photo-content-key
+                                                       (photo-job-input-path job)))
+                                       (when display (ignore-errors (delete-file display)))
+                                       (error "RAW source changed while loading thumbnail"))
+                                     (when display
+                                       (queue-event queue
+                                                    (list :thumbnail generation job
+                                                          display))))
+                                   (return))
+                               (error (condition)
+                                 (when (= attempt 2) (error condition)))))
+                  (error () nil)))))
            (enqueue-background-previews (selected-before-p generation)
              (discard-gui-tasks background-queue :before)
              (discard-gui-tasks background-queue :after)
@@ -2535,7 +2891,7 @@ best effort housekeeping."
                                  :front-p t :cache-p t))
                (when selected-before-p
                  (dolist (index indices)
-                   (enqueue-thumbnail (nth index photos) index generation)))
+                   (enqueue-thumbnail (nth index photos) generation)))
                (dolist (index indices)
                  (unless (= index selected-index)
                    (let ((job (nth index photos)))
@@ -2549,14 +2905,8 @@ best effort housekeeping."
                  ;; A bounded draft lands quickly while the full-resolution
                  ;; preview renders behind it; both reuse the decoded RAW.
                  (let ((settings (current-settings)))
-                   (unless (probe-file
-                             (preview-pathname preview-directory
-                                               (photo-content-key-for job)
-                                               :after
-                                               (preview-recipe-snapshot
-                                                settings)))
-                     (enqueue-render queue :after job index settings generation t
-                                     :front-p t :draft-p t :cache-p t))
+                   (enqueue-render queue :after job index settings generation t
+                                   :front-p t :draft-p t :cache-p t)
                    (enqueue-render queue :after job index settings generation t
                                    :cache-p t))
                  (enqueue-background-previews initial-p generation))))
@@ -2565,11 +2915,15 @@ best effort housekeeping."
                (ignore-errors (cl-fltk:remove-timeout debounce-id))
                (setf debounce-id nil))
              (incf preview-generation)
+             (setf progress-total 0
+                   progress-generation preview-generation)
              (discard-gui-tasks queue :before)
              (discard-gui-tasks queue :after)
              (enqueue-preview t))
            (schedule-edited-preview ()
              (incf preview-generation)
+             (setf progress-total 0
+                   progress-generation preview-generation)
              (when debounce-id
                (ignore-errors (cl-fltk:remove-timeout debounce-id)))
              (setf debounce-id
@@ -2596,6 +2950,8 @@ best effort housekeeping."
                    (schedule-edited-preview))
                (error (condition) (set-status (princ-to-string condition)))))
            (render-selected ()
+             (setf progress-total 0
+                   progress-generation preview-generation)
              (let ((job (selected-job)))
                (when job
                  (let ((output (gui-photo-output-path model job)))
@@ -2614,6 +2970,8 @@ best effort housekeeping."
                                              (format nil "Export failed: ~A"
                                                      condition)))))))))))
            (render-all ()
+             (setf progress-total 0
+                   progress-generation preview-generation)
              (when (project-photos project)
                (ensure-directories-exist
                 (merge-pathnames "placeholder" (project-output-directory project)))
@@ -2944,7 +3302,7 @@ best effort housekeeping."
                                      (cl-fltk:widget-height gallery-pane)
                                      (min 300 (floor main-height 3))))))
                      (graph-height
-                       (min (- main-height 240)
+                       (min (- main-height *inspector-min-height*)
                             (max 160
                                  (if layout-initialized-p
                                      (cl-fltk:widget-height graph-pane)
@@ -3017,25 +3375,21 @@ best effort housekeeping."
                   (set-status (format nil "Exported ~A" (second event))))
                  (:error
                   (set-status (format nil "Error: ~A" (second event))))))
-             ;; Honest progress: completed over the batch's high-water
-             ;; total, across every render queue.
-             (let ((load (+ (gui-queue-load queue)
-                            (gui-queue-load background-queue)
-                            (gui-queue-load histogram-queue))))
-               (if (zerop load)
-                   (progn
-                     (setf progress-total 0)
-                     (setf (cl-fltk:value progress) "0"))
-                   (progn
-                     (setf progress-total (max progress-total load))
-                     (setf (cl-fltk:value progress)
-                           (format nil "~D"
-                                   (max 2
-                                        (min 99
-                                             (round (* 100
-                                                       (- progress-total
-                                                          load))
-                                                    progress-total))))))))))
+             ;; Progress belongs to the current preview generation or export
+             ;; batch. Histogram and eviction maintenance are deliberately
+             ;; excluded so cancellation cannot inherit an old high-water mark.
+             (let* ((export-load (gui-queue-load queue :include-kinds '(:export)))
+                    (load (if (plusp export-load)
+                              export-load
+                              (gui-queue-load queue
+                                              :exclude-kinds '(:histogram :evict :export)
+                                              :generation preview-generation))))
+               (multiple-value-bind (percent total generation)
+                   (preview-progress-state load progress-total preview-generation
+                                           progress-generation)
+                 (setf progress-total total
+                       progress-generation generation
+                       (cl-fltk:value progress) (format nil "~D" percent))))))
         (setf window (cl-fltk:make-window :width 1280 :height 800
                                           :label "Orfeus"
                                           :app-id "org.orfeus.Orfeus"))
@@ -3802,7 +4156,8 @@ best effort housekeeping."
                                  :min-width 280 :max-width 480)
         (cl-fltk:tile-size-range left-column filmstrip-pane :min-height 140)
         (cl-fltk:tile-size-range left-column gallery-pane :min-height 140)
-        (cl-fltk:tile-size-range right-column inspector :min-height 220)
+        (cl-fltk:tile-size-range right-column inspector
+                                 :min-height *inspector-min-height*)
         (cl-fltk:tile-size-range right-column graph-pane :min-height 140)
         (cl-fltk:on-resize window #'layout-ui)
         (cl-fltk:on-resize filmstrip-pane #'layout-left-pane)
@@ -3832,6 +4187,9 @@ best effort housekeeping."
           (stop-gui-queue histogram-queue)
           (orfeus::clear-render-source-cache)
           (clear-preview-cache)
+          (ignore-errors
+            (uiop:delete-directory-tree preview-session-directory :validate t
+                                                                  :if-does-not-exist :ignore))
           (when window (ignore-errors (cl-fltk:destroy window))))))))
 
 (defun main (&optional pathname)

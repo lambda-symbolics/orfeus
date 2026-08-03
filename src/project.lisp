@@ -108,7 +108,7 @@ when present, replaces the flat pipeline with an explicit node graph."
   (presets '())
   (photos '()))
 
-(declaim (ftype (function (t) t) graph->sexp sexp->graph))
+(declaim (ftype (function (t) t) graph->sexp graph->render-sexp sexp->graph))
 
 (defun project-invalid (datum control &rest arguments)
   (error 'invalid-project-data
@@ -426,7 +426,7 @@ so pasting a grade also carries which nodes were switched off."
 
 (defun project->sexp (project)
   "Convert PROJECT to its portable, versioned S-expression representation."
-  (list :orfeus-project 3
+  (list :orfeus-project 4
         :output-directory (namestring (project-output-directory project))
         :defaults (processing-settings->sexp (project-defaults project))
         :export-settings (export-settings->sexp (project-export-settings project))
@@ -437,11 +437,11 @@ so pasting a grade also carries which nodes were switched off."
   "Validate and convert a project S-expression into a PROJECT."
   (unless (and (listp sexp)
                (eq (first sexp) :orfeus-project)
-               (member (second sexp) '(1 2 3))
+               (member (second sexp) '(1 2 3 4))
                (plist-known-keys-p
                 (cddr sexp)
                 '(:output-directory :defaults :export-settings :presets :photos)))
-    (project-invalid sexp "expected (:ORFEUS-PROJECT 1|2|3 ...)"))
+    (project-invalid sexp "expected (:ORFEUS-PROJECT 1|2|3|4 ...)"))
   (let ((output-directory (getf (cddr sexp) :output-directory))
         (defaults (getf (cddr sexp) :defaults))
         (export-settings (getf (cddr sexp) :export-settings))

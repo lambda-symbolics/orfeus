@@ -2,6 +2,7 @@
 
 (defstruct gui-task
   kind
+  generation
   function)
 
 (defstruct (gui-queue (:constructor %make-gui-queue))
@@ -10,6 +11,7 @@
   (tasks '())
   (events '())
   (running 0 :type fixnum)
+  (running-kinds '())
   (workers '())
   stopping-p)
 
@@ -36,7 +38,7 @@
     (prog1 (gui-queue-events queue)
       (setf (gui-queue-events queue) '()))))
 
-(defun enqueue-gui-task (queue kind function &key replace-kind front-p)
+(defun enqueue-gui-task (queue kind function &key replace-kind front-p generation)
   "Enqueue FUNCTION on QUEUE.
 
 When REPLACE-KIND is supplied, pending tasks of that kind are discarded. This
@@ -48,7 +50,7 @@ latency-sensitive work ahead of ordinary background tasks."
         (setf (gui-queue-tasks queue)
               (delete replace-kind (gui-queue-tasks queue)
                       :key #'gui-task-kind)))
-      (let ((task (make-gui-task :kind kind :function function)))
+      (let ((task (make-gui-task :kind kind :generation generation :function function)))
         (setf (gui-queue-tasks queue)
               (if front-p
                   (cons task (gui-queue-tasks queue))
@@ -76,14 +78,19 @@ latency-sensitive work ahead of ordinary background tasks."
               (when (and (gui-queue-stopping-p queue)
                          (null (gui-queue-tasks queue)))
                 (return-from gui-queue-worker-loop nil))
-              (incf (gui-queue-running queue))
-              (pop (gui-queue-tasks queue)))))
+              (let ((task (pop (gui-queue-tasks queue))))
+                (incf (gui-queue-running queue))
+                (push task (gui-queue-running-kinds queue))
+                task))))
       (unwind-protect
            (handler-case (funcall (gui-task-function task))
              (error (condition)
                (queue-event queue (list :error (princ-to-string condition)))))
         (sb-thread:with-mutex ((gui-queue-lock queue))
-          (decf (gui-queue-running queue)))))))
+          (decf (gui-queue-running queue))
+          (setf (gui-queue-running-kinds queue)
+                (delete task (gui-queue-running-kinds queue)
+                        :count 1 :test #'eq)))))))
 
 (defun gui-queue-busy-p (queue)
   "Return true when QUEUE has running or pending work."
@@ -91,11 +98,17 @@ latency-sensitive work ahead of ordinary background tasks."
     (or (plusp (gui-queue-running queue))
         (not (null (gui-queue-tasks queue))))))
 
-(defun gui-queue-load (queue)
-  "Return the number of QUEUE's pending plus running tasks."
-  (sb-thread:with-mutex ((gui-queue-lock queue))
-    (+ (gui-queue-running queue)
-       (length (gui-queue-tasks queue)))))
+(defun gui-queue-load (queue &key exclude-kinds include-kinds generation)
+  "Return pending plus running work, optionally filtered by kind and generation."
+  (flet ((counted-p (task)
+           (and (or (null include-kinds)
+                    (member (gui-task-kind task) include-kinds))
+                (not (member (gui-task-kind task) exclude-kinds))
+                (or (null generation)
+                    (eql generation (gui-task-generation task))))))
+    (sb-thread:with-mutex ((gui-queue-lock queue))
+      (+ (count-if #'counted-p (gui-queue-running-kinds queue))
+         (count-if #'counted-p (gui-queue-tasks queue))))))
 
 (defun stop-gui-queue (queue)
   "Discard pending work, stop QUEUE's workers, and wait for active work."

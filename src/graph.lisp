@@ -44,7 +44,10 @@ POSITION, when set, is the node's (x y) spot on the graph editor canvas."
   (opacity 1.0)
   (inputs (list 0))
   (bypassed-p nil)
-  (position nil))
+  (position nil)
+  ;; Previous correction configurations survive kind switching and project
+  ;; round trips.  Entries are (KIND . STATE-PLIST).
+  (kind-states '()))
 
 (defstruct processing-graph
   "A topologically ordered processing DAG ending at OUTPUT."
@@ -133,33 +136,40 @@ POSITION, when set, is the node's (x y) spot on the graph editor canvas."
             do (graph-invalid params "key ~S does not belong to stage ~S"
                               key (graph-node-kind node)))))
 
-(defun project-resolve-graph-lut-paths (graph base-directory)
-  "Resolve relative film LUT paths in GRAPH against BASE-DIRECTORY."
+(defun graph-map-film-lut-paths (graph function)
   (when graph
     (dolist (node (processing-graph-nodes graph))
-      (when (eq :film (graph-node-kind node))
-        (let* ((params (copy-tree (graph-node-params node)))
-               (lut-path (getf params :lut-path)))
-          (when lut-path
-            (setf (getf params :lut-path)
-                  (namestring
-                   (project-resolve-pathname (pathname lut-path)
-                                             base-directory))
-                  (graph-node-params node) params))))))
+      (flet ((map-params (params)
+               (let ((copy (copy-tree params)))
+                 (when (getf copy :lut-path)
+                   (setf (getf copy :lut-path)
+                         (funcall function (getf copy :lut-path))))
+                 copy)))
+        (when (eq :film (graph-node-kind node))
+          (setf (graph-node-params node)
+                (map-params (graph-node-params node))))
+        (let ((state (assoc :film (graph-node-kind-states node))))
+          (when state
+            (let ((params-tail (member :params (rest state))))
+              (when params-tail
+                (setf (second params-tail)
+                      (map-params (second params-tail))))))))))
   graph)
 
+(defun project-resolve-graph-lut-paths (graph base-directory)
+  "Resolve active and dormant film LUT paths in GRAPH against BASE-DIRECTORY."
+  (graph-map-film-lut-paths
+   graph
+   (lambda (lut-path)
+     (namestring
+      (project-resolve-pathname (pathname lut-path) base-directory)))))
+
 (defun still-store-canonicalize-graph-lut-paths (graph)
-  "Canonicalize every film LUT path in GRAPH for durable local storage."
-  (when graph
-    (dolist (node (processing-graph-nodes graph))
-      (when (eq :film (graph-node-kind node))
-        (let* ((params (copy-tree (graph-node-params node)))
-               (lut-path (getf params :lut-path)))
-          (when lut-path
-            (setf (getf params :lut-path)
-                  (namestring (still-store-canonical-pathname lut-path))
-                  (graph-node-params node) params))))))
-  graph)
+  "Canonicalize active and dormant film LUT paths for durable local storage."
+  (graph-map-film-lut-paths
+   graph
+   (lambda (lut-path)
+     (namestring (still-store-canonical-pathname lut-path)))))
 
 (defun graph-crop-geometry (upstream node)
   "Return NODE's canonical crop history appended to UPSTREAM geometry."
@@ -170,6 +180,60 @@ POSITION, when set, is the node's (x y) spot on the graph editor canvas."
                         (getf params :width 1.0)
                         (getf params :height 1.0)
                         (getf params :angle 0.0))))))
+
+(defun graph-node-position-validate (position node)
+  (unless (or (null position)
+              (and (listp position)
+                   (ignore-errors (= 2 (list-length position)))
+                   (every (lambda (value)
+                            (and (realp value) (<= -100000 value 100000)))
+                          position)))
+    (graph-invalid node
+                   "node :position must be two coordinates within -100000..100000"))
+  position)
+
+(defun graph-kind-params-validate (kind params datum)
+  (cond
+    ((member kind '(:blend :node))
+     (when params
+       (graph-invalid datum "node kind ~S cannot carry parameters" kind)))
+    ((eq kind :color-subtract) (color-subtract-params-validate params))
+    ((eq kind :crop) (crop-params-validate params))
+    ((eq kind :curves) (curves-params-validate params))
+    ((graph-filter-kind-p kind)
+     (graph-node-params-validate
+      (make-graph-node :kind kind :params params)))
+    (t (graph-invalid datum "unknown saved node kind ~S" kind))))
+
+(defun graph-kind-states-validate (states node)
+  (unless (ignore-errors (list-length states))
+    (graph-invalid node "node kind history must be a proper list"))
+  (let ((seen '()))
+    (dolist (entry states)
+      (unless (and (consp entry)
+                   (keywordp (first entry))
+                   (ignore-errors (evenp (length (rest entry))))
+                   (plist-known-keys-p (rest entry)
+                                          '(:params :opacity :second-input)))
+        (graph-invalid node "malformed saved node kind state ~S" entry))
+      (let* ((kind (first entry))
+             (state (rest entry))
+             (opacity (getf state :opacity 1.0))
+             (second-input (getf state :second-input *graph-source-id*)))
+        (when (member kind seen)
+          (graph-invalid node "duplicate saved node kind ~S" kind))
+        (push kind seen)
+        (graph-kind-params-validate kind (getf state :params '()) entry)
+        (if (eq kind :blend)
+            (progn
+              (unless (and (realp opacity) (<= 0 opacity 1))
+                (graph-invalid entry "saved blend opacity must be within 0..1"))
+              (unless (and (integerp second-input) (not (minusp second-input)))
+                (graph-invalid entry "saved blend input must be a node id")))
+            (when (or (member :opacity state) (member :second-input state))
+              (graph-invalid entry
+                             "only saved blend state may carry blend fields"))))))
+  states)
 
 (defun graph-validate (graph)
   "Signal INVALID-PROJECT-DATA unless GRAPH is well formed; return GRAPH.
@@ -186,6 +250,8 @@ while blends stay scene-linear."
       (let ((id (graph-node-id node))
             (kind (graph-node-kind node))
             (inputs (graph-node-inputs node)))
+        (graph-node-position-validate (graph-node-position node) node)
+        (graph-kind-states-validate (graph-node-kind-states node) node)
         (unless (and (integerp id) (plusp id))
           (graph-invalid node "node id ~S must be a positive integer" id))
         (when (member id seen)
@@ -276,7 +342,7 @@ while blends stay scene-linear."
         (graph-invalid graph "graph output ~S is not a node" output)))
     graph))
 
-(defun graph-node->sexp (node)
+(defun graph-node->sexp (node &key render-only-p)
   (append (list :id (graph-node-id node)
                 :kind (graph-node-kind node)
                 :inputs (copy-list (graph-node-inputs node)))
@@ -286,34 +352,44 @@ while blends stay scene-linear."
             (list :opacity (graph-node-opacity node)))
           (when (graph-node-bypassed-p node)
             (list :bypassed-p t))
-          (when (graph-node-position node)
-            (list :position (copy-list (graph-node-position node))))))
+          (unless render-only-p
+            (append
+             (when (graph-node-position node)
+               (list :position (copy-list (graph-node-position node))))
+             (when (graph-node-kind-states node)
+               (list :kind-states
+                     (copy-tree (graph-node-kind-states node))))))))
 
 (defun graph->sexp (graph)
-  "Convert GRAPH to its portable S-expression representation."
+  "Convert validated GRAPH to its portable project S-expression."
+  (graph-validate graph)
   (list :nodes (mapcar #'graph-node->sexp (processing-graph-nodes graph))
+        :output (processing-graph-output graph)))
+
+(defun graph->render-sexp (graph)
+  "Return GRAPH's render identity, excluding editor positions and kind history."
+  (graph-validate graph)
+  (list :nodes (mapcar (lambda (node)
+                         (graph-node->sexp node :render-only-p t))
+                       (processing-graph-nodes graph))
         :output (processing-graph-output graph)))
 
 (defun sexp->graph-node (sexp)
   (unless (and (listp sexp)
                (plist-known-keys-p
                 sexp '(:id :kind :inputs :params :opacity :bypassed-p
-                       :position)))
+                       :position :kind-states)))
     (graph-invalid sexp "expected a graph node property list"))
   (let ((position (getf sexp :position)))
-    (unless (or (null position)
-                (and (listp position) (= 2 (length position))
-                     (every (lambda (value)
-                              (and (realp value) (<= -100000 value 100000)))
-                            position)))
-      (graph-invalid sexp "node :position must be two coordinates"))
+    (graph-node-position-validate position sexp)
     (make-graph-node :id (getf sexp :id 0)
                      :kind (getf sexp :kind)
                      :params (getf sexp :params '())
                      :opacity (getf sexp :opacity 1.0)
                      :inputs (getf sexp :inputs '())
                      :bypassed-p (and (getf sexp :bypassed-p) t)
-                     :position (when position (copy-list position)))))
+                     :position (when position (copy-list position))
+                     :kind-states (copy-tree (getf sexp :kind-states '())))))
 
 (defun sexp->graph (sexp)
   "Validate and convert a graph S-expression into a PROCESSING-GRAPH."
@@ -397,6 +473,16 @@ a fresh topologically ordered node list whose references remain valid."
                                nodes)
                 output)))))
 
+(defun graph-remap-kind-state-inputs (node mapping)
+  (dolist (entry (graph-node-kind-states node))
+    (when (eq :blend (first entry))
+      (let ((tail (member :second-input (rest entry))))
+        (when tail
+          (multiple-value-bind (mapped present-p)
+              (gethash (second tail) mapping)
+            (setf (second tail) (if present-p mapped *graph-source-id*)))))))
+  node)
+
 (defun graph-normalize (graph)
   "Topologically order GRAPH's nodes and renumber them 1..N.
 
@@ -427,7 +513,8 @@ edits stay visually stable. Signals INVALID-PROJECT-DATA on cycles."
       (setf (graph-node-id node) (gethash (graph-node-id node) mapping)
             (graph-node-inputs node)
             (mapcar (lambda (input) (gethash input mapping))
-                    (graph-node-inputs node))))
+                    (graph-node-inputs node)))
+      (graph-remap-kind-state-inputs node mapping))
     (setf (processing-graph-output graph)
           (gethash (processing-graph-output graph) mapping))
     (graph-validate graph)))
@@ -470,8 +557,16 @@ Returns the new node after normalizing GRAPH."
        (graph-normalize graph)
        node))))
 
+(defun graph-replace-kind-state-input (node old-id replacement)
+  (dolist (entry (graph-node-kind-states node))
+    (when (eq :blend (first entry))
+      (let ((tail (member :second-input (rest entry))))
+        (when (and tail (eql (second tail) old-id))
+          (setf (second tail) replacement)))))
+  node)
+
 (defun graph-delete-node (graph id)
-  "Remove node ID; its consumers re-read the node's first input.
+  "Remove node ID; its consumers and dormant blend states read its first input.
 
 An invalid result rolls GRAPH back and re-signals."
   (let ((node (or (graph-find-node graph id)
@@ -483,6 +578,9 @@ An invalid result rolls GRAPH back and re-signals."
          (dolist (consumer (graph-consumers graph id))
            (setf (graph-node-inputs consumer)
                  (substitute replacement id (graph-node-inputs consumer))))
+         (dolist (other (processing-graph-nodes graph))
+           (unless (eq other node)
+             (graph-replace-kind-state-input other id replacement)))
          (when (eql (processing-graph-output graph) id)
            (setf (processing-graph-output graph) replacement))
          (setf (processing-graph-nodes graph)
@@ -528,29 +626,55 @@ sides of the pair are plain single-input filters. Returns true on success."
                                  (copy-list (graph-node-inputs node))
                                  (graph-node-kind node)
                                  (copy-tree (graph-node-params node))
-                                 (graph-node-opacity node)))
+                                 (graph-node-opacity node)
+                                 (copy-tree (graph-node-kind-states node))))
                          (processing-graph-nodes graph)))
         (nodes (copy-list (processing-graph-nodes graph)))
         (output (processing-graph-output graph)))
     (handler-case (funcall thunk)
       (error (condition)
         (dolist (entry entries)
-          (destructuring-bind (node id inputs kind params opacity) entry
+          (destructuring-bind (node id inputs kind params opacity kind-states)
+              entry
             (setf (graph-node-id node) id
                   (graph-node-inputs node) inputs
                   (graph-node-kind node) kind
                   (graph-node-params node) params
-                  (graph-node-opacity node) opacity)))
+                  (graph-node-opacity node) opacity
+                  (graph-node-kind-states node) kind-states)))
         (setf (processing-graph-nodes graph) nodes
               (processing-graph-output graph) output)
         (error condition)))))
 
-(defun graph-set-node-kind (graph id kind)
-  "Change node ID's correction KIND, resetting its parameters.
+(defun graph-save-node-kind-state (node)
+  (let* ((kind (graph-node-kind node))
+         (state (append
+                 (when (graph-node-params node)
+                   (list :params (copy-tree (graph-node-params node))))
+                 (when (graph-node-blend-p node)
+                   (list :opacity (graph-node-opacity node)
+                         :second-input (second (graph-node-inputs node))))))
+         (entry (cons kind state)))
+    (setf (graph-node-kind-states node)
+          (cons entry
+                (remove kind (graph-node-kind-states node)
+                        :key #'first)))
+    entry))
 
-Turning a node into a blend feeds its second branch from the source;
-converting away keeps the primary input. Returns true when the kind
-changed; invalid results roll back and re-signal."
+(defun graph-restorable-second-input (graph node state)
+  (let ((input (getf state :second-input *graph-source-id*)))
+    (if (and (integerp input)
+             (< input (graph-node-id node))
+             (or (eql input *graph-source-id*) (graph-find-node graph input)))
+        input
+        *graph-source-id*)))
+
+(defun graph-set-node-kind (graph id kind)
+  "Change node ID's correction KIND without discarding prior kind settings.
+
+Each kind's parameters, and a blend's opacity and second input, survive later
+kind switches and portable project round trips. Converting away keeps the
+primary input. Returns true when the kind changed; invalid results roll back."
   (let ((node (or (graph-find-node graph id)
                   (graph-invalid graph "cannot retype unknown node ~S" id))))
     (unless (or (eq kind :node) (member kind (graph-node-kinds)))
@@ -560,16 +684,19 @@ changed; invalid results roll back and re-signal."
         (call-with-graph-rollback
          graph
          (lambda ()
-           (setf (graph-node-kind node) kind
-                 (graph-node-params node) '())
-           (if (eq kind :blend)
-               (setf (graph-node-inputs node)
-                     (list (first (graph-node-inputs node))
-                           *graph-source-id*)
-                     (graph-node-opacity node) 0.5)
-               (setf (graph-node-inputs node)
-                     (list (first (graph-node-inputs node)))
-                     (graph-node-opacity node) 1.0))
+           (graph-save-node-kind-state node)
+           (let ((state (rest (assoc kind (graph-node-kind-states node)))))
+             (setf (graph-node-kind node) kind
+                   (graph-node-params node)
+                   (copy-tree (getf state :params '())))
+             (if (eq kind :blend)
+                 (setf (graph-node-inputs node)
+                       (list (first (graph-node-inputs node))
+                             (graph-restorable-second-input graph node state))
+                       (graph-node-opacity node) (getf state :opacity 0.5))
+                 (setf (graph-node-inputs node)
+                       (list (first (graph-node-inputs node)))
+                       (graph-node-opacity node) 1.0)))
            (graph-normalize graph)
            t)))))
 
@@ -698,7 +825,9 @@ rolls the graph back and re-signals."
                             (graph-node-inputs copy)
                             (copy-list (graph-node-inputs node))
                             (graph-node-position copy)
-                            (copy-list (graph-node-position node)))
+                            (copy-list (graph-node-position node))
+                            (graph-node-kind-states copy)
+                            (copy-tree (graph-node-kind-states node)))
                       copy))
                   (processing-graph-nodes graph))
    :output (processing-graph-output graph)))

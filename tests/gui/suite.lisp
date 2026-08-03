@@ -223,7 +223,15 @@
              (rename-file original renamed)
              (check (string= key (orfeus/gui::photo-content-key renamed))
                     "Renaming a photo changed its content key")
-             (check (= 16 (length key)) "Content key has a wrong width"))
+             (check (= 64 (length key)) "Content key is not full SHA-256")
+             ;; A middle-only edit defeated the former head/tail sampler.
+             (with-open-file (stream renamed :direction :io
+                                             :if-exists :overwrite
+                                             :element-type '(unsigned-byte 8))
+               (file-position stream 100000)
+               (write-byte (logxor #xff (read-byte stream)) stream))
+             (check (not (string= key (orfeus/gui::photo-content-key renamed)))
+                    "Middle-byte replacement reused a stale source digest"))
            (let ((old-file (merge-pathnames "old.jpg" directory))
                  (new-file (merge-pathnames "new.jpg" directory)))
              (with-open-file (stream old-file :direction :output)
@@ -454,7 +462,225 @@
            "Before and After previews shared one cache path")
     (check (not (equal (orfeus/gui::preview-pathname directory key :after first)
                        (orfeus/gui::preview-pathname directory other :after first)))
-           "Distinct photo content shared one preview cache path")))
+           "Distinct photo content shared one preview cache path")
+    (check (not (equal (orfeus/gui::preview-pathname directory key :after first
+                                                       :max-width 1024)
+                       (orfeus/gui::preview-pathname directory key :after first
+                                                       :max-width 2048)))
+           "Distinct preview dimensions shared one cache path")
+    (check (= 64 (length (orfeus/gui::preview-settings-key first)))
+           "Preview recipe key is not full SHA-256")))
+
+(defun test-preview-cache-dependencies-and-permissions ()
+  (let* ((directory (merge-pathnames
+                     (format nil "orfeus-preview-security-~D/" (random most-positive-fixnum))
+                     (uiop:temporary-directory)))
+         (lut (merge-pathnames "look.cube" directory))
+         (output (merge-pathnames "preview.jpg" directory))
+         (coalesced (merge-pathnames "coalesced.jpg" directory))
+         (raced (merge-pathnames "raced.jpg" directory))
+         (session (merge-pathnames "session/" directory)))
+    (ensure-directories-exist directory)
+    (orfeus/gui::make-secure-preview-directory session)
+    (unwind-protect
+         (progn
+           (orfeus/gui::protect-preview-cache-path directory #o700)
+           (with-open-file (stream lut :direction :output :if-exists :supersede)
+             (write-line "first LUT" stream))
+           (let* ((settings (orfeus:make-processing-settings
+                             :lut-path lut :lut-strength 1.0))
+                  (first-key (orfeus/gui::preview-settings-key settings)))
+             (with-open-file (stream lut :direction :output :if-exists :supersede)
+               (write-line "replacement LUT" stream))
+             (check (not (string= first-key
+                                  (orfeus/gui::preview-settings-key settings)))
+                    "Same-path LUT replacement reused a stale recipe key"))
+           (let* ((node (orfeus:make-graph-node :id 1 :kind :exposure
+                                                :params '(:exposure 1.0)
+                                                :inputs '(0) :position '(10 20)))
+                  (graph (orfeus:make-processing-graph :nodes (list node) :output 1))
+                  (first-key (orfeus/gui::preview-settings-key graph)))
+             (setf (orfeus:graph-node-position node) '(900 700)
+                   (orfeus::graph-node-kind-states node)
+                   '((:film :params (:lut-path "inactive.cube"
+                                     :lut-strength 1.0))))
+             (check (string= first-key (orfeus/gui::preview-settings-key graph))
+                    "Editor-only graph state changed the render recipe key"))
+           (orfeus/gui::call-with-preview-cache-fill
+            output
+            (lambda (temporary)
+              (check (string-equal "jpg" (pathname-type temporary))
+                     "Cache fill temporary lost the renderer output type")
+              (with-open-file (stream temporary :direction :output
+                                               :if-exists :supersede)
+                (write-line "jpeg" stream))))
+           (check (= #o700 (logand #o777 (sb-posix:stat-mode
+                                          (sb-posix:stat (namestring directory)))))
+                  "Preview cache directory is not mode 0700")
+           (check (= #o600 (logand #o777 (sb-posix:stat-mode
+                                          (sb-posix:stat (namestring output)))))
+                  "Preview cache file is not mode 0600")
+           (let* ((symbol 'orfeus/gui::protect-preview-cache-path)
+                  (original (symbol-function symbol)))
+             (unwind-protect
+                  (progn
+                    (setf (symbol-function symbol)
+                          (lambda (pathname mode)
+                            (declare (ignore pathname mode))
+                            nil))
+                    (check (not (orfeus/gui::preview-cache-hit-p output))
+                           "A cache hit survived failed permission verification")
+                    (check (not (probe-file output))
+                           "An insecure cache hit was not removed"))
+               (setf (symbol-function symbol) original)))
+           (orfeus/gui::call-with-preview-cache-fill
+            output
+            (lambda (temporary)
+              (with-open-file (stream temporary :direction :output)
+                (write-line "jpeg" stream))))
+           (let ((fills 0)
+                 (lock (sb-thread:make-mutex)))
+             (flet ((fill-cache ()
+                      (orfeus/gui::call-with-preview-cache-fill
+                       coalesced
+                       (lambda (temporary)
+                         (sb-thread:with-mutex (lock) (incf fills))
+                         (sleep 0.05)
+                         (with-open-file (stream temporary :direction :output)
+                           (write-line "one fill" stream))))))
+               (let ((first (sb-thread:make-thread #'fill-cache))
+                     (second (sb-thread:make-thread #'fill-cache)))
+                 (sb-thread:join-thread first)
+                 (sb-thread:join-thread second)))
+             (check (= 1 fills) "Concurrent preview fills were not coalesced"))
+           (with-open-file (stream lut :direction :output :if-exists :supersede)
+             (write-line "stable LUT" stream))
+           (let* ((settings (orfeus:make-processing-settings
+                             :lut-path lut :lut-strength 1.0))
+                  (key (orfeus/gui::preview-settings-key settings))
+                  (current-p (lambda ()
+                               (string= key
+                                        (orfeus/gui::preview-settings-key settings))))
+                  (rejected-p nil))
+             (handler-case
+                 (orfeus/gui::call-with-preview-cache-fill
+                  raced
+                  (lambda (temporary)
+                    (with-open-file (stream temporary :direction :output)
+                      (write-line "rendered" stream))
+                    (with-open-file (stream lut :direction :output
+                                                :if-exists :supersede)
+                      (write-line "changed during render" stream)))
+                  :validation-function current-p)
+               (error () (setf rejected-p t)))
+             (check rejected-p "A LUT race published a mismatched cache entry")
+             (check (not (probe-file raced))
+                    "A cache entry survived failed post-render LUT validation")
+             (with-open-file (stream lut :direction :output :if-exists :supersede)
+               (write-line "stable again" stream))
+             (setf key (orfeus/gui::preview-settings-key settings))
+             (orfeus/gui::call-with-preview-cache-fill
+              raced
+              (lambda (temporary)
+                (with-open-file (stream temporary :direction :output)
+                  (write-line "rendered" stream))))
+             (setf rejected-p nil)
+             (handler-case
+                 (orfeus/gui::materialize-preview-cache-hit
+                  raced session
+                  :validation-function
+                  (lambda ()
+                    (with-open-file (stream lut :direction :output
+                                                :if-exists :supersede)
+                      (write-line "changed during hit" stream))
+                    (funcall current-p)))
+               (error () (setf rejected-p t)))
+             (check rejected-p "A LUT race materialized a mismatched cache hit")
+             (check (null (uiop:directory-files session))
+                    "A failed LUT hit validation retained a display copy"))
+           (sb-posix:utime (namestring output) 0 0)
+           (orfeus/gui::call-with-active-preview-cache-file
+            output (lambda () (orfeus/gui::evict-stale-previews directory)))
+           (check (probe-file output) "Eviction deleted an active cache hit"))
+      (uiop:delete-directory-tree directory :validate t
+                                           :if-does-not-exist :ignore))))
+
+(defun test-preview-cache-recovery-and-generation-load ()
+  (let* ((directory (merge-pathnames
+                     (format nil "orfeus-preview-lock-~D/" (random most-positive-fixnum))
+                     (uiop:temporary-directory)))
+         (cache (merge-pathnames "hit.jpg" directory))
+         (session (merge-pathnames "session/" directory))
+         (lock (orfeus/gui::preview-lock-directory cache)))
+    (ensure-directories-exist directory)
+    (orfeus/gui::make-secure-preview-directory session)
+    (unwind-protect
+         (progn
+           (sb-posix:mkdir (namestring lock) #o700)
+           (with-open-file (stream (orfeus/gui::preview-lock-owner-pathname lock)
+                                  :direction :output :if-exists :supersede)
+             (write (list :pid 99999999
+                          :created (get-universal-time)
+                          :token "dead")
+                    :stream stream))
+           (let ((held (orfeus/gui::acquire-preview-lock cache :ignore-hit-p t
+                                                               :timeout 1.0d0)))
+             (check held "A fresh lock owned by a dead process was not reclaimed")
+             (orfeus/gui::release-preview-lock held))
+           (flet ((check-abandoned-lock (owner description)
+                    (sb-posix:mkdir (namestring lock) #o700)
+                    (when owner
+                      (with-open-file
+                          (stream (orfeus/gui::preview-lock-owner-pathname lock)
+                                  :direction :output :if-exists :supersede)
+                        (write owner :stream stream)))
+                    (sb-posix:utime (namestring lock) 0 0)
+                    (let* ((orfeus/gui::*preview-lock-owner-grace-seconds* 0)
+                           (held (orfeus/gui::acquire-preview-lock
+                                  cache :ignore-hit-p t :timeout 1.0d0)))
+                      (check held "~A was not reclaimed after its grace" description)
+                      (orfeus/gui::release-preview-lock held))))
+             (check-abandoned-lock nil "An ownerless preview lock")
+             (check-abandoned-lock '(:pid "bad" :created nil)
+                                   "A malformed preview lock"))
+           (with-open-file (stream cache :direction :output :if-exists :supersede)
+             (write-line "jpeg" stream))
+           (orfeus/gui::protect-preview-cache-path cache #o600)
+           (let ((display (orfeus/gui::materialize-preview-cache-hit cache session)))
+             (orfeus/gui::call-with-preview-key-lock
+              cache (lambda () (delete-file cache)))
+             (check (probe-file display)
+                    "Materialized cache hit was lost during concurrent eviction")))
+      (uiop:delete-directory-tree directory :validate t
+                                            :if-does-not-exist :ignore)))
+  (let ((queue (orfeus/gui::make-gui-queue))
+        (release (sb-thread:make-semaphore)))
+    (unwind-protect
+         (progn
+           (orfeus/gui::enqueue-gui-task queue :after
+                                         (lambda () (sb-thread:wait-on-semaphore release))
+                                         :generation 10)
+           (orfeus/gui::enqueue-gui-task queue :after (lambda () nil)
+                                         :generation 11)
+           (sleep 0.02)
+           (check (= 1 (orfeus/gui::gui-queue-load queue :generation 10))
+                  "Generation progress omitted current foreground work")
+           (check (= 1 (orfeus/gui::gui-queue-load queue :generation 11))
+                  "Generation progress counted stale work"))
+      (sb-thread:signal-semaphore release)
+      (orfeus/gui::stop-gui-queue queue))))
+
+(defun test-preview-progress-cancellation ()
+  (multiple-value-bind (percent total generation)
+      (orfeus/gui::preview-progress-state 2 10 8 7)
+    (check (= 2 percent) "New preview generation inherited stale progress")
+    (check (= 2 total) "New preview generation retained the old batch total")
+    (check (= 8 generation) "New preview generation was not recorded"))
+  (multiple-value-bind (percent total generation)
+      (orfeus/gui::preview-progress-state 0 7 9 8)
+    (declare (ignore generation))
+    (check (and (zerop percent) (zerop total))
+           "Cancelled preview generation did not reset progress")))
 
 (defun test-preview-recipe-snapshot ()
   (let* ((points (list 0.0 0.0 0.33 0.25 0.66 0.75 1.0 1.0))
@@ -484,6 +710,61 @@
          "Stale cropped preview generation allowed crop interaction")
   (check (not (orfeus/gui::crop-preview-current-p 8 nil))
          "Missing bypass preview allowed crop interaction"))
+
+(defun test-gallery-selection-provenance ()
+  (let* ((project-preset (orfeus:make-processing-preset
+                          :name "Shared" :settings
+                          (orfeus:make-processing-settings :exposure 1.0)))
+         (local-preset (orfeus:make-processing-preset
+                        :name "Shared" :settings
+                        (orfeus:make-processing-settings :exposure 2.0)))
+         (project-still
+           (orfeus/gui::make-project-gallery-still project-preset))
+         (local-still (orfeus/gui::make-local-gallery-still local-preset))
+         (stills (list project-still local-still))
+         (local-key (orfeus/gui::gallery-selection-key stills 1)))
+    (check (and (eq :local (first local-key))
+                (equal (second local-key)
+                       (second (orfeus/gui::gallery-still-key project-still))))
+           "Gallery key lost same-name local provenance: ~S" local-key)
+    (check (= 0 (orfeus/gui::gallery-selection-index
+                 (list local-still project-still) local-key))
+           "Gallery refresh did not re-find the selected local still")
+    (check (null (orfeus/gui::gallery-selection-index
+                  (list project-still) local-key))
+           "Removed local still retargeted the same-name project still")
+    (check (eq local-still
+               (orfeus/gui::gallery-selected-still stills 1))
+           "Visible gallery selection did not resolve to the local still")
+    (let* ((job (orfeus:make-photo-job :input-path #P"target.orf"))
+           (project (orfeus:make-project :output-directory #P"exports/"
+                                         :photos (list job)
+                                         :presets (list project-preset)))
+           (model (orfeus/gui:make-gui-model :project project)))
+      (orfeus/gui:gui-model-apply-preset-graph
+       model (orfeus/gui::gallery-still-preset
+              (orfeus/gui::gallery-selected-still stills 1)))
+      (check (= 2.0 (orfeus/gui:gui-model-setting model :exposure))
+             "Selected local still applied the same-name project preset"))
+    (check (string= "local still"
+                    (orfeus/gui::gallery-still-origin-description local-still))
+           "Still status description lost provenance")))
+
+(defun test-empty-graph-editor-geometry ()
+  (check (>= orfeus/gui::*inspector-min-height* 378)
+         "Minimum inspector height clips the Curves reset control")
+  (multiple-value-bind (x y width height)
+      (orfeus/gui::graph-output-box-position '())
+    (check (equal (list 18 50 orfeus/gui::*graph-node-width* 22)
+                  (list x y width height))
+           "Empty graph OUT geometry failed: ~S"
+           (list x y width height)))
+  (let ((node (orfeus:make-graph-node :id 1 :kind :exposure
+                                      :position '(30.0 70.0))))
+    (multiple-value-bind (x y width height)
+        (orfeus/gui::graph-output-box-position (list node))
+      (declare (ignore x width height))
+      (check (= 122 y) "Populated graph OUT geometry was ~D" y))))
 
 (defun test-discard-pending-tasks ()
   (let ((queue (orfeus/gui::make-gui-queue))
@@ -518,6 +799,11 @@
   (test-render-queue)
   (test-parallel-render-queue)
   (test-preview-cache-key)
+  (test-preview-cache-dependencies-and-permissions)
+  (test-preview-cache-recovery-and-generation-load)
+  (test-preview-progress-cancellation)
   (test-preview-recipe-snapshot)
+  (test-gallery-selection-provenance)
+  (test-empty-graph-editor-geometry)
   (test-discard-pending-tasks)
   t)

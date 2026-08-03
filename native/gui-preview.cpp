@@ -6,9 +6,14 @@
 #include <FL/fl_draw.H>
 #include <algorithm>
 #include <cmath>
+#include <climits>
+#include <csetjmp>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <jpeglib.h>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 
@@ -28,6 +33,9 @@ struct PreviewImage {
 };
 
 std::unordered_map<std::string, PreviewImage> images;
+// Native callbacks can load, draw, inspect, or evict the same FLTK image.
+// Serialize both the ownership map and access to its image objects.
+std::mutex images_mutex;
 
 PreviewImage *find_image(const char *path) {
     if (!path || !*path) return nullptr;
@@ -46,6 +54,16 @@ PreviewImage *find_image(const char *path) {
 int scaled_dimension(int source, double scale) {
     return std::max(1, static_cast<int>(std::lround(source * scale)));
 }
+
+struct JpegErrorManager {
+    jpeg_error_mgr base;
+    std::jmp_buf jump_buffer;
+};
+
+void jpeg_error_exit(j_common_ptr info) {
+    auto *error = reinterpret_cast<JpegErrorManager *>(info->err);
+    std::longjmp(error->jump_buffer, 1);
+}
 }
 
 extern "C" int orfeus_gui_preview_draw(long long widget_id,
@@ -53,6 +71,7 @@ extern "C" int orfeus_gui_preview_draw(long long widget_id,
                                         double zoom,
                                         double center_x,
                                         double center_y) {
+    std::lock_guard<std::mutex> lock(images_mutex);
     Fl_Widget *widget = clfl_bridge::find_widget(widget_id);
     PreviewImage *image = find_image(path);
     if (!widget || !image || widget->w() <= 0 || widget->h() <= 0 ||
@@ -93,6 +112,7 @@ extern "C" int orfeus_gui_preview_draw_rect(long long widget_id,
                                                int y,
                                                int width,
                                                int height) {
+    std::lock_guard<std::mutex> lock(images_mutex);
     Fl_Widget *widget = clfl_bridge::find_widget(widget_id);
     PreviewImage *image = find_image(path);
     if (!widget || !image || width <= 0 || height <= 0) return 0;
@@ -126,28 +146,79 @@ extern "C" int orfeus_gui_preview_draw_rect(long long widget_id,
 extern "C" int orfeus_gui_preview_histogram(const char *path,
                                             int *bins,
                                             int bin_count) {
-    if (!bins || bin_count <= 0) return 0;
-    PreviewImage *image = find_image(path);
-    if (!image || !image->source) return 0;
-    Fl_JPEG_Image &source = *image->source;
-    const int depth = source.d();
-    const char *const *data = source.data();
-    if (!data || !data[0] || depth < 3) return 0;
-    std::fill(bins, bins + 3 * bin_count, 0);
-    const unsigned char *pixels =
-        reinterpret_cast<const unsigned char *>(data[0]);
-    const long count = static_cast<long>(source.w()) * source.h();
-    for (long index = 0; index < count; ++index) {
-        const unsigned char *pixel = pixels + index * depth;
-        for (int channel = 0; channel < 3; ++channel) {
-            const int bin = pixel[channel] * bin_count / 256;
-            ++bins[channel * bin_count + bin];
+    if (!path || !*path || !bins || bin_count <= 0 || bin_count > INT_MAX / 3) {
+        return 0;
+    }
+
+    FILE *file = std::fopen(path, "rb");
+    if (!file) return 0;
+    auto *decoder = static_cast<jpeg_decompress_struct *>(
+        std::calloc(1, sizeof(jpeg_decompress_struct)));
+    auto *error = static_cast<JpegErrorManager *>(
+        std::calloc(1, sizeof(JpegErrorManager)));
+    if (!decoder || !error) {
+        std::free(decoder);
+        std::free(error);
+        std::fclose(file);
+        return 0;
+    }
+
+    decoder->err = jpeg_std_error(&error->base);
+    error->base.error_exit = jpeg_error_exit;
+    if (setjmp(error->jump_buffer)) {
+        jpeg_destroy_decompress(decoder);
+        std::free(decoder);
+        std::free(error);
+        std::fclose(file);
+        return 0;
+    }
+
+    jpeg_create_decompress(decoder);
+    jpeg_stdio_src(decoder, file);
+    if (jpeg_read_header(decoder, TRUE) != JPEG_HEADER_OK) {
+        jpeg_destroy_decompress(decoder);
+        std::free(decoder);
+        std::free(error);
+        std::fclose(file);
+        return 0;
+    }
+    decoder->out_color_space = JCS_RGB;
+    jpeg_start_decompress(decoder);
+    if (decoder->output_components != 3) {
+        jpeg_destroy_decompress(decoder);
+        std::free(decoder);
+        std::free(error);
+        std::fclose(file);
+        return 0;
+    }
+
+    const JDIMENSION row_size = decoder->output_width * decoder->output_components;
+    JSAMPARRAY row = (*decoder->mem->alloc_sarray)(
+        reinterpret_cast<j_common_ptr>(decoder), JPOOL_IMAGE, row_size, 1);
+    const size_t plane_size = static_cast<size_t>(bin_count);
+    std::fill(bins, bins + 3 * plane_size, 0);
+    while (decoder->output_scanline < decoder->output_height) {
+        jpeg_read_scanlines(decoder, row, 1);
+        for (JDIMENSION x = 0; x < decoder->output_width; ++x) {
+            const unsigned char *pixel = row[0] + x * decoder->output_components;
+            for (size_t channel = 0; channel < 3; ++channel) {
+                const size_t bin = static_cast<size_t>(pixel[channel]) * plane_size / 256;
+                int &count = bins[channel * plane_size + bin];
+                if (count < INT_MAX) ++count;
+            }
         }
     }
+
+    jpeg_finish_decompress(decoder);
+    jpeg_destroy_decompress(decoder);
+    std::free(decoder);
+    std::free(error);
+    std::fclose(file);
     return 1;
 }
 
 extern "C" int orfeus_gui_preview_size(const char *path, int *width, int *height) {
+    std::lock_guard<std::mutex> lock(images_mutex);
     PreviewImage *image = find_image(path);
     if (!image || !width || !height) return 0;
     *width = image->source->w();
@@ -156,10 +227,12 @@ extern "C" int orfeus_gui_preview_size(const char *path, int *width, int *height
 }
 
 extern "C" void orfeus_gui_preview_forget(const char *path) {
+    std::lock_guard<std::mutex> lock(images_mutex);
     if (path && *path) images.erase(path);
 }
 
 extern "C" void orfeus_gui_preview_clear(void) {
+    std::lock_guard<std::mutex> lock(images_mutex);
     images.clear();
 }
 

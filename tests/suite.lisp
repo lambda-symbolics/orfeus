@@ -19,7 +19,7 @@
 (defun project-round-trip-p ()
   (let* ((original (project-test-value))
          (decoded (sexp->project (project->sexp original))))
-    (and (= 3 (second (project->sexp original)))
+    (and (= 4 (second (project->sexp original)))
          (= 0.75 (processing-settings-exposure
                   (project-defaults decoded)))
          (= 0.65 (processing-settings-lens-correction-strength
@@ -190,19 +190,23 @@
     (unwind-protect
          (let* ((lut-target (merge-pathnames "target.cube" directory))
                 (lut-link (merge-pathnames "linked.cube" directory))
+                (graph (settings->graph
+                        (make-processing-settings
+                         :lut-path (namestring lut-link)
+                         :lut-strength 1.0)))
                 (first (make-processing-preset
                         :name "A B" :source-photo #P"input/example.orf"
                         :settings (make-processing-settings :lut-path "film.cube")
-                        :graph (settings->graph
-                                (make-processing-settings
-                                 :lut-path (namestring lut-link)
-                                 :lut-strength 1.0))))
+                        :graph graph))
                 (second (make-processing-preset :name "A-B"))
                 (thumbnail-source (merge-pathnames "source.jpg" directory)))
            (with-open-file (stream lut-target :direction :output
                                               :if-exists :supersede)
              (write-line "TITLE test" stream))
            (sb-posix:symlink (namestring lut-target) (namestring lut-link))
+           (setf (orfeus::graph-node-kind-states
+                  (first (processing-graph-nodes graph)))
+                 `((:film :params (:lut-path ,(namestring lut-link)))))
            (with-open-file (stream thumbnail-source :direction :output
                                                    :element-type '(unsigned-byte 8)
                                                    :if-exists :supersede)
@@ -215,10 +219,12 @@
                   (stored-first (find "A B" loaded
                                       :key #'processing-preset-name
                                       :test #'string=))
-                  (film (find :film
-                              (processing-graph-nodes
-                               (processing-preset-graph stored-first))
-                              :key #'graph-node-kind)))
+                  (stored-nodes (processing-graph-nodes
+                                 (processing-preset-graph stored-first)))
+                  (film (find :film stored-nodes :key #'graph-node-kind))
+                  (dormant (assoc :film
+                                  (orfeus::graph-node-kind-states
+                                   (first stored-nodes)))))
              (and (= 2 (length loaded))
                   (not (string= (still-store-identity "A B")
                                 (still-store-identity "A-B")))
@@ -232,6 +238,8 @@
                    (processing-preset-source-photo stored-first))
                   (equal (namestring (truename lut-target))
                          (getf (graph-node-params film) :lut-path))
+                  (equal (namestring (truename lut-target))
+                         (getf (getf (rest dormant) :params) :lut-path))
                   (progn
                     (setf (processing-preset-name first) "Renamed")
                     (still-store-rename first "A B" :directory directory)
@@ -470,6 +478,90 @@
                     nil)
            (invalid-project-data () t)))))
 
+(defun graph-position-validation-p ()
+  (let* ((graph (default-processing-graph))
+         (node (first (processing-graph-nodes graph))))
+    (and
+     (every (lambda (position)
+              (setf (orfeus:graph-node-position node) position)
+              (handler-case (progn (graph->sexp graph) nil)
+                (invalid-project-data () t)))
+            (list '(1.0) '(1.0 2.0 3.0) '(1.0 bogus) '(100001 0)
+                   #(1.0 2.0) '(1.0 . 2.0)))
+     (progn
+       (setf (orfeus:graph-node-position node) '(12.5 -8.0))
+       (equal '(12.5 -8.0)
+              (orfeus:graph-node-position
+               (first (processing-graph-nodes
+                       (sexp->graph (graph->sexp graph))))))))))
+
+(defun graph-render-identity-p ()
+  (let* ((graph (default-processing-graph))
+         (node (first (processing-graph-nodes graph)))
+         (before (orfeus:graph->render-sexp graph)))
+    (setf (orfeus:graph-node-position node) '(200.0 -75.0)
+          (orfeus::graph-node-kind-states node)
+          '((:film :params (:lut-path "inactive.cube" :lut-strength 1.0))))
+    (and (equal before (orfeus:graph->render-sexp graph))
+         (not (equal (graph->sexp (default-processing-graph))
+                     (graph->sexp graph))))))
+
+(defun graph-kind-state-recovery-p ()
+  (let* ((graph (graph-validate
+                 (make-processing-graph
+                  :nodes (list
+                          (make-graph-node :id 1 :kind :tone
+                                           :params '(:tone-shadows 0.2)
+                                           :inputs '(0))
+                          (make-graph-node :id 2 :kind :white-balance
+                                           :params '(:white-balance-tint 2.0)
+                                           :inputs '(0))
+                          (make-graph-node :id 3 :kind :exposure
+                                           :params '(:exposure 1.25)
+                                           :inputs '(1)))
+                  :output 3)))
+         (node (graph-find-node graph 3)))
+    (and
+     (graph-set-node-kind graph 3 :blend)
+     (graph-set-blend-input graph 3 2)
+     (progn (setf (graph-node-opacity node) 0.7) t)
+     (graph-set-node-kind graph 3 :exposure)
+     (equal '(:exposure 1.25) (graph-node-params node))
+     (graph-set-node-kind graph 3 :tone)
+     (progn (setf (graph-node-params node) '(:tone-shadows 0.6)) t)
+     (graph-set-node-kind graph 3 :blend)
+     (= 0.7 (graph-node-opacity node))
+     (eql 2 (second (graph-node-inputs node)))
+     ;; Saved configurations remain portable, including across another switch.
+     (let* ((decoded (sexp->graph (graph->sexp graph)))
+            (twin (graph-find-node decoded 3)))
+       (and (graph-set-node-kind decoded 3 :tone)
+            (equal '(:tone-shadows 0.6) (graph-node-params twin))
+            (graph-set-node-kind decoded 3 :exposure)
+            (equal '(:exposure 1.25) (graph-node-params twin)))))))
+
+(defun graph-kind-state-deletion-remap-p ()
+  (let* ((graph
+           (graph-validate
+            (make-processing-graph
+             :nodes (list
+                     (make-graph-node :id 5 :kind :tone
+                                      :params '(:tone-shadows 0.2) :inputs '(0))
+                     (make-graph-node :id 10 :kind :exposure
+                                      :params '(:exposure 0.5) :inputs '(5))
+                     (make-graph-node
+                      :id 20 :kind :tone :params '(:tone-highlights 0.3)
+                      :inputs '(10)
+                      :kind-states
+                      '((:blend :opacity 0.6 :second-input 10))))
+             :output 20)))
+         (tail (graph-find-node graph 20)))
+    (graph-delete-node graph 10)
+    (let* ((renumbered (find tail (processing-graph-nodes graph)))
+           (blend (assoc :blend (orfeus::graph-node-kind-states renumbered))))
+      (and (= 2 (graph-node-id renumbered))
+           (eql 1 (getf (rest blend) :second-input))))))
+
 (defun graph-rewire-inputs-p ()
   (let* ((graph (default-processing-graph))
          (optics (first (processing-graph-nodes graph)))
@@ -659,16 +751,18 @@
          (graph (photo-job-graph (first (project-photos decoded)))))
     (and graph
          (= 3 (length (processing-graph-nodes graph)))
-         (eql 3 (second (project->sexp original)))
-         ;; Version 2 projects without graphs still read.
-         (null (photo-job-graph
-                (first (project-photos
-                        (sexp->project
-                         '(:orfeus-project 2
-                           :output-directory "exports/"
-                           :defaults (:exposure 0.0)
-                           :export-settings (:jpeg-quality 92)
-                           :photos ((:input "a.orf")))))))))))
+         (eql 4 (second (project->sexp original)))
+         ;; Versions 1 through 3 migrate without graph kind history.
+         (every (lambda (version)
+                  (null (photo-job-graph
+                         (first (project-photos
+                                 (sexp->project
+                                  `(:orfeus-project ,version
+                                    :output-directory "exports/"
+                                    :defaults (:exposure 0.0)
+                                    :export-settings (:jpeg-quality 92)
+                                    :photos ((:input "a.orf")))))))))
+                '(1 2 3)))))
 
 (defun timestamped-output-names-p ()
   (let* ((first (make-photo-job :input-path #P"one/photo.orf"))
@@ -856,7 +950,10 @@
                                          (make-graph-node
                                           :id 1 :kind :film
                                           :params '(:lut-path "preset.cube")
-                                          :inputs '(0)))
+                                          :inputs '(0)
+                                          :kind-states
+                                          '((:film :params
+                                             (:lut-path "preset-dormant.cube")))))
                                  :output 1))))
              :photos (list
                       (make-photo-job
@@ -867,27 +964,42 @@
                                         (make-graph-node
                                          :id 1 :kind :film
                                          :params '(:lut-path "photo.cube")
-                                         :inputs '(0)))
+                                         :inputs '(0)
+                                         :kind-states
+                                         '((:film :params
+                                            (:lut-path "photo-dormant.cube")))))
                                 :output 1)))))
             pathname)
            (let* ((project (project-read pathname))
                   (base (uiop:pathname-directory-pathname pathname))
                   (photo (first (project-photos project)))
-                  (preset (first (project-presets project))))
+                  (preset (first (project-presets project)))
+                  (photo-node (first (processing-graph-nodes
+                                      (photo-job-graph photo))))
+                  (preset-node (first (processing-graph-nodes
+                                       (processing-preset-graph preset)))))
              (and (equal (project-output-directory project)
                          (merge-pathnames #P"exports/" base))
                   (equal (photo-job-input-path photo)
                          (merge-pathnames #P"input.orf" base))
-                  (string= (getf (graph-node-params
-                                  (first (processing-graph-nodes
-                                          (photo-job-graph photo))))
-                                 :lut-path)
+                  (string= (getf (graph-node-params photo-node) :lut-path)
                            (namestring (merge-pathnames #P"photo.cube" base)))
-                  (string= (getf (graph-node-params
-                                  (first (processing-graph-nodes
-                                          (processing-preset-graph preset))))
+                  (string= (getf (getf (rest (assoc :film
+                                                    (orfeus::graph-node-kind-states
+                                                     photo-node)))
+                                        :params)
                                  :lut-path)
-                           (namestring (merge-pathnames #P"preset.cube" base))))))
+                           (namestring
+                            (merge-pathnames #P"photo-dormant.cube" base)))
+                  (string= (getf (graph-node-params preset-node) :lut-path)
+                           (namestring (merge-pathnames #P"preset.cube" base)))
+                  (string= (getf (getf (rest (assoc :film
+                                                    (orfeus::graph-node-kind-states
+                                                     preset-node)))
+                                        :params)
+                                 :lut-path)
+                           (namestring
+                            (merge-pathnames #P"preset-dormant.cube" base))))))
       (when (probe-file pathname)
         (delete-file pathname)))))
 
@@ -1356,6 +1468,14 @@
              (graph-rewire-p))
       (check "untyped nodes pass through until a correction is assigned"
              (graph-node-workflow-p))
+      (check "graph positions validate before portable serialization"
+             (graph-position-validation-p))
+      (check "render graph identity ignores editor-only positions"
+             (graph-render-identity-p))
+      (check "node kind switching preserves portable prior settings"
+             (graph-kind-state-recovery-p))
+      (check "deletion remaps dormant blend inputs through the replacement"
+             (graph-kind-state-deletion-remap-p))
       (check "primary inputs and the output rewire with rollback"
              (graph-rewire-inputs-p))
       (check "failed graph edits roll back and graph copies own nested params"
@@ -1364,7 +1484,7 @@
              (graph-crop-branch-compatibility-p))
       (check "curves nodes validate, serialize, and round trip"
              (graph-curves-p))
-      (check "photo graphs round trip as project version 3"
+      (check "photo graphs round trip as project version 4"
              (photo-graph-round-trip-p))
       (check "graphs serialize to the native program format"
              (graph-program-bytes-p))

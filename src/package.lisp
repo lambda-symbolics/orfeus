@@ -83,6 +83,7 @@
    #:graph-validate
    #:graph-copy
    #:graph->sexp
+   #:graph->render-sexp
    #:sexp->graph
    #:settings->graph
    #:graph-effective-nodes
