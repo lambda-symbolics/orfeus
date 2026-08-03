@@ -19,6 +19,7 @@
      (photo-job-input-path photo)
      (photo-job-render-output project photo)
      (photo-render-settings project photo)
+     :graph (photo-job-graph photo)
      :if-exists if-exists
      :jpeg-quality (export-settings-jpeg-quality export)
      :max-width (export-settings-max-width export)

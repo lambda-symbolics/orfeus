@@ -7,7 +7,7 @@
                 #:make-processing-settings #:make-project
                 #:photo-capture-description #:photo-extract-embedded-preview
                 #:photo-lens-description
-                #:photo-job-disabled-stages
+                #:photo-job-disabled-stages #:photo-job-graph
                 #:photo-job-input-path #:photo-job-output-path #:photo-job-overrides
                 #:photo-job-render-output #:processing-preset-name
                 #:processing-preset-disabled-stages

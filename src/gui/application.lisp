@@ -113,11 +113,14 @@
   (when directory
     (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore)))
 
-(defun preview-settings-key (settings)
-  "Return a content hash covering every processing setting for preview caching."
+(defun preview-settings-key (recipe)
+  "Return a content hash covering a settings or graph render RECIPE."
   (let* ((*print-readably* t)
          (text (prin1-to-string
-                (orfeus::processing-settings->sexp settings)))
+                (etypecase recipe
+                  (orfeus:processing-graph (orfeus:graph->sexp recipe))
+                  (orfeus:processing-settings
+                   (orfeus::processing-settings->sexp recipe)))))
          (digest (ironclad:digest-sequence
                   :sha256
                   (sb-ext:string-to-octets text :external-format :utf-8))))
@@ -899,9 +902,11 @@
               :lut-path nil
               :grain-amount 0.0))
            (settings-for-job (job)
-             ;; Rendering settings: overrides applied and bypassed stages
-             ;; neutralized, exactly as the CLI batch renders them.
-             (orfeus:photo-render-settings project job))
+             ;; The render recipe: the photo's node graph when it has one,
+             ;; otherwise flat settings with overrides and bypasses applied,
+             ;; exactly as the CLI batch renders them.
+             (or (orfeus:photo-job-graph job)
+                 (orfeus:photo-render-settings project job)))
            (current-settings ()
              (settings-for-job (selected-job)))
            (enqueue-render (target-queue role job index settings generation publish-p
@@ -925,11 +930,18 @@
                     (lambda ()
                       (when (or (not publish-p)
                                 (= generation preview-generation))
-                        (render-preview input output settings
-                                        :max-width max-width
-                                        :max-height max-height
-                                        :cache-p cache-p
-                                        :if-exists :supersede)
+                        (if (typep settings 'orfeus:processing-graph)
+                            (render-preview input output nil
+                                            :graph settings
+                                            :max-width max-width
+                                            :max-height max-height
+                                            :cache-p cache-p
+                                            :if-exists :supersede)
+                            (render-preview input output settings
+                                            :max-width max-width
+                                            :max-height max-height
+                                            :cache-p cache-p
+                                            :if-exists :supersede))
                         (when (and publish-p
                                    (= generation preview-generation))
                           (queue-event queue

@@ -67,6 +67,28 @@
   (error-buffer :pointer)
   (error-capacity :size))
 
+(defcstruct render-frame-v1
+  (struct-size :uint32)
+  (version :uint32)
+  (output-format :uint32)
+  (max-width :uint32)
+  (max-height :uint32)
+  (jpeg-quality :uint32)
+  (grain-seed :uint64)
+  (focal-reducer :float)
+  (lens-crop-factor :float)
+  (lens-profile-model :pointer))
+
+(defcfun ("orfeus_raw_render_v3" %raw-render-v3) :int32
+  (input-path :string)
+  (output-path :string)
+  (frame (:pointer (:struct render-frame-v1)))
+  (graph :pointer)
+  (graph-length :size)
+  (cache-mode :uint32)
+  (error-buffer :pointer)
+  (error-capacity :size))
+
 (defparameter *native-error-buffer-size* 1024
   "Bytes reserved for a diagnostic returned by the Rust bridge.")
 
@@ -234,6 +256,168 @@
                                           :encoding :utf-8)
           (call-with-lens-pointer lut-pointer))
         (call-with-lens-pointer (null-pointer))))
+  output-pathname)
+
+(defparameter *graph-node-kind-codes*
+  '((:white-balance . 1) (:exposure . 2) (:noise-reduction . 3)
+    (:tone . 4) (:optics . 5) (:film . 6) (:blend . 7))
+  "Wire codes of graph node kinds in the native program format.")
+
+(defconstant +graph-program-magic+ #x4746524F
+  "Little-endian magic of a serialized graph program, spelling ORFG.")
+
+(defun graph-boolean-parameter (value)
+  (if value 1.0 0.0))
+
+(defun graph-node-program-parameters (node)
+  "Return NODE's packed parameter list and its optional string payload."
+  (flet ((parameter (key)
+           (or (getf (graph-node-params node) key)
+               (getf *stage-identity-plist* key))))
+    (ecase (graph-node-kind node)
+      (:white-balance
+       (values (list (or (parameter :white-balance-temperature) 0.0)
+                     (parameter :white-balance-tint))
+               nil))
+      (:exposure
+       (values (list (parameter :exposure)) nil))
+      (:noise-reduction
+       (values (list (parameter :noise-reduction)
+                     (parameter :neural-noise-reduction))
+               nil))
+      (:tone
+       (values (list (parameter :tone-blacks) (parameter :tone-shadows)
+                     (parameter :tone-dark-mids) (parameter :tone-midtones)
+                     (parameter :tone-light-mids) (parameter :tone-highlights)
+                     (parameter :tone-whites))
+               nil))
+      (:optics
+       (values (list (graph-boolean-parameter (parameter :lens-correction-p))
+                     (parameter :lens-correction-strength)
+                     (graph-boolean-parameter
+                      (parameter :chromatic-aberration-correction-p)))
+               nil))
+      (:film
+       (let ((lut-path (parameter :lut-path))
+             (lut-strength (parameter :lut-strength)))
+         (values (list (if lut-path lut-strength 0.0)
+                       (parameter :grain-amount)
+                       (parameter :grain-size))
+                 (when lut-path (namestring lut-path)))))
+      (:blend
+       (values (list (graph-node-opacity node)) nil)))))
+
+(defun graph->program-bytes (graph)
+  "Serialize GRAPH's effective nodes into the native program format."
+  (let ((nodes (graph-effective-nodes graph))
+        (bytes (make-array 0 :element-type '(unsigned-byte 8)
+                             :adjustable t :fill-pointer t)))
+    (labels ((emit-u32 (value)
+               (let ((value (logand value #xFFFFFFFF)))
+                 (dotimes (shift 4)
+                   (vector-push-extend (ldb (byte 8 (* shift 8)) value) bytes))))
+             (emit-f32 (value)
+               (emit-u32 (logand (sb-kernel:single-float-bits
+                                  (float value 1.0f0))
+                                 #xFFFFFFFF)))
+             (emit-text (text)
+               (if text
+                   (let ((octets (sb-ext:string-to-octets
+                                  text :external-format :utf-8)))
+                     (emit-u32 (length octets))
+                     (loop for octet across octets
+                           do (vector-push-extend octet bytes)))
+                   (emit-u32 0))))
+      (emit-u32 +graph-program-magic+)
+      (emit-u32 1)
+      (emit-u32 (length nodes))
+      (let ((ordinals (make-hash-table)))
+        (setf (gethash 0 ordinals) 0)
+        (loop for node in nodes
+              for ordinal from 1
+              do (setf (gethash (graph-node-id node) ordinals) ordinal))
+        (dolist (node nodes)
+          (multiple-value-bind (parameters text)
+              (graph-node-program-parameters node)
+            (emit-u32 (rest (assoc (graph-node-kind node)
+                                   *graph-node-kind-codes*)))
+            (emit-u32 (gethash (first (graph-node-inputs node)) ordinals))
+            (emit-u32 (if (graph-node-blend-p node)
+                          (gethash (second (graph-node-inputs node)) ordinals)
+                          #xFFFFFFFF))
+            (emit-u32 (length parameters))
+            (mapc #'emit-f32 parameters)
+            (emit-text text)))))
+    (coerce bytes '(simple-array (unsigned-byte 8) (*)))))
+
+(defun native-raw-render-graph (input-pathname output-pathname graph
+                                &key lens-profile-model focal-reducer
+                                  lens-crop-factor (grain-seed 0)
+                                  (max-width 0) (max-height 0)
+                                  (jpeg-quality 92) output-format cache-p)
+  "Render INPUT-PATHNAME through the node GRAPH via the version 3 bridge."
+  (native-library-load)
+  (native-render-require-compatible)
+  (unless (>= (native-bridge-version) 3)
+    (error 'native-library-incompatible
+           :message "bridge ABI does not provide raw render v3"))
+  (let ((program (graph->program-bytes graph)))
+    (flet ((invoke (lens-pointer)
+             (with-foreign-object (frame '(:struct render-frame-v1))
+               (flet ((setting (name value)
+                        (setf (foreign-slot-value
+                               frame '(:struct render-frame-v1) name)
+                              value)))
+                 (setting 'struct-size
+                          (foreign-type-size '(:struct render-frame-v1)))
+                 (setting 'version 1)
+                 (setting 'output-format (ecase output-format
+                                           (:jpeg 1)
+                                           (:tiff 2)))
+                 (setting 'max-width max-width)
+                 (setting 'max-height max-height)
+                 (setting 'jpeg-quality jpeg-quality)
+                 (setting 'grain-seed grain-seed)
+                 (setting 'focal-reducer (float (or focal-reducer 1.0) 0.0))
+                 (setting 'lens-crop-factor
+                          (float (or lens-crop-factor 0.0) 0.0))
+                 (setting 'lens-profile-model lens-pointer))
+               (with-foreign-pointer (buffer (length program))
+                 (loop for octet across program
+                       for index from 0
+                       do (setf (mem-aref buffer :uint8 index) octet))
+                 (with-foreign-pointer (error-buffer
+                                        *native-error-buffer-size*)
+                   (let ((status
+                           #+sbcl
+                           (sb-int:with-float-traps-masked
+                               (:invalid :divide-by-zero :overflow
+                                :underflow :inexact)
+                             (%raw-render-v3
+                              (namestring input-pathname)
+                              (namestring output-pathname)
+                              frame buffer (length program)
+                              (if cache-p 1 0) error-buffer
+                              *native-error-buffer-size*))
+                           #-sbcl
+                           (%raw-render-v3
+                            (namestring input-pathname)
+                            (namestring output-pathname)
+                            frame buffer (length program)
+                            (if cache-p 1 0) error-buffer
+                            *native-error-buffer-size*)))
+                     (unless (zerop status)
+                       (error 'raw-render-error
+                              :input-pathname input-pathname
+                              :output-pathname output-pathname
+                              :status status
+                              :message (native-error-message
+                                        error-buffer)))))))))
+      (if lens-profile-model
+          (with-foreign-string (lens-pointer lens-profile-model
+                                             :encoding :utf-8)
+            (invoke lens-pointer))
+          (invoke (null-pointer)))))
   output-pathname)
 
 (defun dng-original-filename (pathname)

@@ -394,11 +394,58 @@ The output is published atomically and INPUT-PATHNAME is never modified."
                 (invoke fallback)))
             (error condition)))))))
 
+(defun graph-active-optics-p (graph)
+  "True when GRAPH's effective plan applies any lens correction."
+  (loop for node in (graph-effective-nodes graph)
+        thereis (and (eq :optics (graph-node-kind node))
+                     (let ((params (graph-node-params node)))
+                       (or (getf params :lens-correction-p)
+                           (getf params :chromatic-aberration-correction-p))))))
+
+(defun graph-without-optics (graph)
+  "Return a copy of GRAPH with every optics node bypassed."
+  (let ((copy (graph-copy graph)))
+    (dolist (node (processing-graph-nodes copy))
+      (when (eq :optics (graph-node-kind node))
+        (setf (graph-node-bypassed-p node) t)))
+    copy))
+
+(defun render-native-photo-graph (input-pathname output-pathname graph
+                                  &key max-width max-height jpeg-quality
+                                    grain-seed cache-p
+                                    (report-input-pathname input-pathname))
+  (multiple-value-bind (lens-profile focal-reducer lens-crop-factor)
+      (resolve-lens-profile-alias
+       (photo-lens-description report-input-pathname))
+    (flet ((invoke (effective-graph)
+             (native-raw-render-graph
+              input-pathname output-pathname effective-graph
+              :cache-p cache-p
+              :output-format (render-output-format output-pathname)
+              :lens-profile-model lens-profile
+              :focal-reducer focal-reducer
+              :lens-crop-factor lens-crop-factor
+              :grain-seed grain-seed
+              :max-width max-width
+              :max-height max-height
+              :jpeg-quality jpeg-quality)))
+      (handler-case
+          (invoke graph)
+        (raw-render-error (condition)
+          (if (and (= 9 (raw-render-error-status condition))
+                   (graph-active-optics-p graph))
+              (progn
+                (warn 'lens-profile-unavailable
+                      :input-pathname report-input-pathname
+                      :message (raw-render-error-message condition))
+                (invoke (graph-without-optics graph)))
+              (error condition)))))))
+
 (defun render-photo (input-pathname output-pathname settings
                      &key (if-exists :error)
                        (max-width 0) (max-height 0)
                        (jpeg-quality 92) (grain-seed 0)
-                       (preserve-metadata-p t) cache-p)
+                       (preserve-metadata-p t) cache-p graph)
   "Render INPUT-PATHNAME to JPEG or TIFF using PROCESSING-SETTINGS.
 
 This frontend-independent operation is shared by the CLI and GUI. It renders
@@ -406,8 +453,17 @@ through the Rust bridge, optionally copies source metadata with ExifTool, and
 publishes the completed file atomically. MAX-WIDTH and MAX-HEIGHT bound preview
 output dimensions; zero leaves a dimension unconstrained. CACHE-P asks the
 bridge to reuse decoded scene data across renders of the same unchanged input;
-interactive frontends enable it for the photograph under adjustment."
-  (check-type settings processing-settings)
+interactive frontends enable it for the photograph under adjustment. GRAPH,
+when supplied, renders through the processing node graph instead of SETTINGS,
+which may then be NIL."
+  (check-type settings (or null processing-settings))
+  (check-type graph (or null processing-graph))
+  (unless (or settings graph)
+    (error 'raw-render-error
+           :input-pathname input-pathname
+           :output-pathname output-pathname
+           :status 1
+           :message "a render needs processing settings or a node graph"))
   (when (pathname-same-file-p input-pathname output-pathname)
     (error 'raw-render-error
            :input-pathname input-pathname
@@ -431,14 +487,23 @@ interactive frontends enable it for the photograph under adjustment."
              (call-with-render-source
               input-pathname
               (lambda (render-input-pathname)
-                (render-native-photo
-                 render-input-pathname temporary settings
-                 :report-input-pathname input-pathname
-                 :grain-seed grain-seed
-                 :max-width (or max-width 0)
-                 :max-height (or max-height 0)
-                 :jpeg-quality jpeg-quality
-                 :cache-p cache-p)))
+                (if graph
+                    (render-native-photo-graph
+                     render-input-pathname temporary graph
+                     :report-input-pathname input-pathname
+                     :grain-seed grain-seed
+                     :max-width (or max-width 0)
+                     :max-height (or max-height 0)
+                     :jpeg-quality jpeg-quality
+                     :cache-p cache-p)
+                    (render-native-photo
+                     render-input-pathname temporary settings
+                     :report-input-pathname input-pathname
+                     :grain-seed grain-seed
+                     :max-width (or max-width 0)
+                     :max-height (or max-height 0)
+                     :jpeg-quality jpeg-quality
+                     :cache-p cache-p))))
              (when preserve-metadata-p
                (render-copy-metadata input-pathname temporary))
              (render-publish temporary output-pathname publish-policy)
@@ -449,7 +514,7 @@ interactive frontends enable it for the photograph under adjustment."
 (defun render-preview (input-pathname output-pathname settings
                        &key (if-exists :error)
                          (max-width 1600) (max-height 1200)
-                         (jpeg-quality 88) (grain-seed 0) cache-p)
+                         (jpeg-quality 88) (grain-seed 0) cache-p graph)
   "Render a bounded JPEG preview without metadata-copy overhead."
   (render-photo input-pathname output-pathname settings
                 :max-width max-width
@@ -458,4 +523,5 @@ interactive frontends enable it for the photograph under adjustment."
                 :grain-seed grain-seed
                 :preserve-metadata-p nil
                 :if-exists if-exists
-                :cache-p cache-p))
+                :cache-p cache-p
+                :graph graph))

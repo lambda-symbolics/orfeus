@@ -7,6 +7,7 @@
                 #:foreign-string-to-lisp
                 #:foreign-type-size
                 #:load-foreign-library
+                #:mem-aref
                 #:null-pointer
                 #:with-foreign-object
                 #:with-foreign-pointer

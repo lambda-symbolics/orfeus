@@ -493,6 +493,60 @@
          (equal (photo-job-render-output project absolute)
                 #P"/tmp/custom-output.jpg"))))
 
+(defun graph-program-bytes-p ()
+  (let* ((graph (make-processing-graph
+                 :nodes (list (make-graph-node :id 1 :kind :exposure
+                                               :params '(:exposure 0.5)
+                                               :inputs '(0)))
+                 :output 1))
+         (bytes (orfeus::graph->program-bytes graph)))
+    (equalp bytes
+            ;; magic "ORFG", version 1, one node: exposure(2), input 0,
+            ;; no second input, one parameter 0.5f0, no string.
+            (coerce #(#x4F #x52 #x46 #x47  1 0 0 0  1 0 0 0
+                      2 0 0 0  0 0 0 0  #xFF #xFF #xFF #xFF
+                      1 0 0 0  0 0 0 #x3F  0 0 0 0)
+                    '(simple-array (unsigned-byte 8) (*))))))
+
+(defun graph-program-prunes-bypassed-nodes-p ()
+  (let* ((graph (make-processing-graph
+                 :nodes (list (make-graph-node :id 1 :kind :exposure
+                                               :params '(:exposure 0.5)
+                                               :inputs '(0)
+                                               :bypassed-p t)
+                              (make-graph-node :id 2 :kind :tone
+                                               :params '(:tone-whites 0.3)
+                                               :inputs '(1)))
+                 :output 2))
+         (bytes (orfeus::graph->program-bytes graph)))
+    ;; Only the tone node survives, reading straight from the source.
+    (and (= 1 (elt bytes 8))
+         (= 4 (elt bytes 12))
+         (= 0 (elt bytes 16)))))
+
+(defun graph-render-rejects-input-as-output-p ()
+  (let ((pathname (test-temporary-pathname "orf"))
+        (contents "source pixels must survive"))
+    (unwind-protect
+         (progn
+           (with-open-file (stream pathname
+                                   :direction :output
+                                   :if-exists :supersede)
+             (write-string contents stream))
+           (let ((rejected
+                   (handler-case
+                       (progn
+                         (render-photo pathname pathname nil
+                                       :graph (default-processing-graph)
+                                       :if-exists :supersede)
+                         nil)
+                     (raw-render-error () t))))
+             (and rejected
+                  (string= contents
+                           (uiop:read-file-string pathname)))))
+      (when (probe-file pathname)
+        (delete-file pathname)))))
+
 (defun render-rejects-input-as-output-p ()
   (let ((pathname (test-temporary-pathname "orf"))
         (contents "source pixels must survive"))
@@ -834,6 +888,12 @@
              (graph-editing-p))
       (check "photo graphs round trip as project version 3"
              (photo-graph-round-trip-p))
+      (check "graphs serialize to the native program format"
+             (graph-program-bytes-p))
+      (check "bypassed nodes drop out of serialized programs"
+             (graph-program-prunes-bypassed-nodes-p))
+      (check "graph rendering never replaces its input"
+             (graph-render-rejects-input-as-output-p))
       (check "old projects receive export defaults" (old-project-export-defaults-p))
       (check "project-relative paths resolve beside the project"
              (project-relative-paths-p))

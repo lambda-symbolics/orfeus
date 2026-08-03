@@ -632,6 +632,35 @@ mod tests {
     }
 
     #[test]
+    fn repeated_nodes_of_one_kind_compose() {
+        // Two consecutive +2 EV exposure nodes must equal one +4 EV node.
+        let stacked = execute_graph(
+            &parse_graph(
+                &GraphBuilder::new()
+                    .node(NODE_EXPOSURE, 0, -1, &[2.0], None)
+                    .node(NODE_EXPOSURE, 1, -1, &[2.0], None)
+                    .build(),
+            )
+            .unwrap(),
+            gradient_image(),
+            &context(7),
+        )
+        .unwrap();
+        let single = execute_graph(
+            &parse_graph(
+                &GraphBuilder::new()
+                    .node(NODE_EXPOSURE, 0, -1, &[4.0], None)
+                    .build(),
+            )
+            .unwrap(),
+            gradient_image(),
+            &context(7),
+        )
+        .unwrap();
+        assert!(max_difference(&stacked, &single) < 1.0e-6);
+    }
+
+    #[test]
     fn blend_mixes_branches_by_opacity() {
         let ops = parse_graph(
             &GraphBuilder::new()
