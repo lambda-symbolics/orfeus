@@ -12,6 +12,18 @@
 (defparameter *graph-source-id* 0
   "The reserved node id of the decoded RAW source image.")
 
+(defparameter *graph-only-node-kinds* '(:blend :color-subtract :crop)
+  "Node kinds that exist only in graphs, beyond the flat pipeline stages.
+
+:COLOR-SUBTRACT computes picked-color minus pixel per channel in scene-linear
+space, the film-negative inversion primitive. :CROP keeps a normalized
+rectangle given in display (oriented) coordinates, so one graph fits both
+previews and full-resolution exports.")
+
+(defparameter *color-subtract-keys* '(:red :green :blue))
+
+(defparameter *crop-keys* '(:left :top :width :height))
+
 (defstruct graph-node
   "One processing node: a stage filter, or a blend of two branches."
   (id 1 :type (integer 1))
@@ -34,6 +46,36 @@
 
 (defun graph-node-blend-p (node)
   (eq (graph-node-kind node) :blend))
+
+(defun graph-node-kinds ()
+  "Every node kind a graph may contain, in menu order."
+  (append (grade-stages) *graph-only-node-kinds*))
+
+(defun color-subtract-params-validate (params)
+  (unless (and (listp params)
+               (plist-known-keys-p params *color-subtract-keys*))
+    (graph-invalid params "expected :red :green :blue color parameters"))
+  (loop for (key value) on params by #'cddr
+        unless (and (realp value) (<= 0 value 4))
+          do (graph-invalid params "color component ~S must be within 0..4"
+                            key))
+  params)
+
+(defun crop-params-validate (params)
+  (unless (and (listp params)
+               (plist-known-keys-p params *crop-keys*))
+    (graph-invalid params "expected :left :top :width :height parameters"))
+  (let ((left (getf params :left 0.0))
+        (top (getf params :top 0.0))
+        (width (getf params :width 1.0))
+        (height (getf params :height 1.0)))
+    (unless (and (realp left) (realp top) (realp width) (realp height)
+                 (<= 0 left 1) (<= 0 top 1)
+                 (<= 0.05 width 1) (<= 0.05 height 1)
+                 (<= (+ left width) 1.0001)
+                 (<= (+ top height) 1.0001))
+      (graph-invalid params "crop rectangle must stay inside the frame")))
+  params)
 
 (defun graph-find-node (graph id)
   "Return the node of GRAPH with ID, or NIL for the source id."
@@ -86,18 +128,28 @@ nodes may consume film output while blends stay scene-linear."
              (when (member input display)
                (graph-invalid node
                               "blend node ~S cannot consume film output" id))))
+          ((eq kind :color-subtract)
+           (unless (= 1 (length inputs))
+             (graph-invalid node "filter node ~S needs exactly one input" id))
+           (color-subtract-params-validate (graph-node-params node))
+           (when (member (first inputs) display)
+             (graph-invalid node "node ~S cannot process film output" id)))
+          ((eq kind :crop)
+           (unless (= 1 (length inputs))
+             (graph-invalid node "filter node ~S needs exactly one input" id))
+           (crop-params-validate (graph-node-params node))
+           ;; Crops keep their branch's domain.
+           (when (member (first inputs) display)
+             (push id display)))
           ((graph-filter-kind-p kind)
            (unless (= 1 (length inputs))
              (graph-invalid node "filter node ~S needs exactly one input" id))
            (graph-node-params-validate node)
            (if (eq kind :film)
-               (when (member (first inputs) display)
-                 (push id display))
+               (pushnew id display)
                (when (member (first inputs) display)
                  (graph-invalid node
-                                "node ~S cannot process film output" id)))
-           (when (eq kind :film)
-             (pushnew id display)))
+                                "node ~S cannot process film output" id))))
           (t (graph-invalid node "unknown node kind ~S" kind)))
         (push id seen)))
     (let ((output (processing-graph-output graph)))
@@ -295,8 +347,8 @@ sides of the pair are plain single-input filters. Returns true on success."
          (upstream-id (and node (first (graph-node-inputs node))))
          (upstream (and upstream-id (graph-find-node graph upstream-id))))
     (when (and node upstream
-               (graph-node-filter-p node)
-               (graph-node-filter-p upstream)
+               (not (graph-node-blend-p node))
+               (not (graph-node-blend-p upstream))
                (= 1 (length (graph-consumers graph upstream-id))))
       (let ((below (first (graph-node-inputs upstream))))
         (dolist (consumer (graph-consumers graph id))

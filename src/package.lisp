@@ -72,6 +72,7 @@
    #:graph-node-bypassed-p
    #:graph-node-blend-p
    #:graph-node-filter-p
+   #:graph-node-kinds
    #:processing-graph
    #:make-processing-graph
    #:copy-processing-graph

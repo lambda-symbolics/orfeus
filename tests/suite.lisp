@@ -493,6 +493,58 @@
          (equal (photo-job-render-output project absolute)
                 #P"/tmp/custom-output.jpg"))))
 
+(defun negative-workflow-graph-p ()
+  (let* ((graph (graph-validate
+                 (make-processing-graph
+                  :nodes (list (make-graph-node
+                                :id 1 :kind :crop
+                                :params '(:left 0.1 :top 0.1
+                                          :width 0.8 :height 0.8)
+                                :inputs '(0))
+                               (make-graph-node
+                                :id 2 :kind :color-subtract
+                                :params '(:red 0.9 :green 0.62 :blue 0.5)
+                                :inputs '(1))
+                               (make-graph-node
+                                :id 3 :kind :white-balance
+                                :params '(:white-balance-temperature 5500.0
+                                          :white-balance-tint 0.0)
+                                :inputs '(2)))
+                  :output 3)))
+         (decoded (sexp->graph (graph->sexp graph)))
+         (bytes (orfeus::graph->program-bytes decoded)))
+    (and (= 3 (length (processing-graph-nodes decoded)))
+         (equal '(:red 0.9 :green 0.62 :blue 0.5)
+                (graph-node-params (graph-find-node decoded 2)))
+         ;; Wire codes 9 (crop) and 8 (color subtract) in program order.
+         (= 9 (elt bytes 12))
+         (plusp (length bytes))
+         (flet ((rejected-p (nodes)
+                  (handler-case
+                      (progn (graph-validate (make-processing-graph
+                                              :nodes nodes
+                                              :output (graph-node-id
+                                                       (first (last nodes)))))
+                             nil)
+                    (invalid-project-data () t))))
+           (and
+            ;; Color components outside 0..4 are rejected.
+            (rejected-p (list (make-graph-node
+                               :id 1 :kind :color-subtract
+                               :params '(:red 5.0) :inputs '(0))))
+            ;; Crops cannot leave the frame.
+            (rejected-p (list (make-graph-node
+                               :id 1 :kind :crop
+                               :params '(:left 0.8 :width 0.5)
+                               :inputs '(0))))
+            ;; Color subtraction stays scene-linear.
+            (rejected-p (list (make-graph-node
+                               :id 1 :kind :film
+                               :params '(:grain-amount 0.2) :inputs '(0))
+                              (make-graph-node
+                               :id 2 :kind :color-subtract
+                               :params '(:red 1.0) :inputs '(1)))))))))
+
 (defun graph-program-bytes-p ()
   (let* ((graph (make-processing-graph
                  :nodes (list (make-graph-node :id 1 :kind :exposure
@@ -894,6 +946,8 @@
              (graph-program-prunes-bypassed-nodes-p))
       (check "graph rendering never replaces its input"
              (graph-render-rejects-input-as-output-p))
+      (check "negative-inversion graphs validate and serialize"
+             (negative-workflow-graph-p))
       (check "old projects receive export defaults" (old-project-export-defaults-p))
       (check "project-relative paths resolve beside the project"
              (project-relative-paths-p))

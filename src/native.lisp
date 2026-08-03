@@ -260,7 +260,8 @@
 
 (defparameter *graph-node-kind-codes*
   '((:white-balance . 1) (:exposure . 2) (:noise-reduction . 3)
-    (:tone . 4) (:optics . 5) (:film . 6) (:blend . 7))
+    (:tone . 4) (:optics . 5) (:film . 6) (:blend . 7)
+    (:color-subtract . 8) (:crop . 9))
   "Wire codes of graph node kinds in the native program format.")
 
 (defconstant +graph-program-magic+ #x4746524F
@@ -305,7 +306,20 @@
                        (parameter :grain-size))
                  (when lut-path (namestring lut-path)))))
       (:blend
-       (values (list (graph-node-opacity node)) nil)))))
+       (values (list (graph-node-opacity node)) nil))
+      (:color-subtract
+       (let ((params (graph-node-params node)))
+         (values (list (getf params :red 1.0)
+                       (getf params :green 1.0)
+                       (getf params :blue 1.0))
+                 nil)))
+      (:crop
+       (let ((params (graph-node-params node)))
+         (values (list (getf params :left 0.0)
+                       (getf params :top 0.0)
+                       (getf params :width 1.0)
+                       (getf params :height 1.0))
+                 nil))))))
 
 (defun graph->program-bytes (graph)
   "Serialize GRAPH's effective nodes into the native program format."

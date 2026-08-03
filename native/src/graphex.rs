@@ -32,6 +32,8 @@ pub const NODE_TONE: u32 = 4;
 pub const NODE_OPTICS: u32 = 5;
 pub const NODE_FILM: u32 = 6;
 pub const NODE_BLEND: u32 = 7;
+pub const NODE_COLOR_SUBTRACT: u32 = 8;
+pub const NODE_CROP: u32 = 9;
 
 /// Frame-level settings shared by every node of one graph render.
 #[repr(C)]
@@ -141,6 +143,8 @@ fn expected_param_count(kind: u32) -> Result<usize, Error> {
         NODE_OPTICS => 3,        // distortion?, strength, tca?
         NODE_FILM => 3,          // lut strength, grain amount, grain size
         NODE_BLEND => 1,         // opacity toward input B
+        NODE_COLOR_SUBTRACT => 3, // picked color, subtracted per channel
+        NODE_CROP => 4,          // left, top, width, height (oriented, 0..1)
         _ => return Err(Error::InvalidArgument("unknown graph node kind")),
     })
 }
@@ -161,6 +165,9 @@ fn validate_param(kind: u32, index: usize, value: f32) -> Result<(), Error> {
         (NODE_FILM, 1) => (0.0..=1.0).contains(&value),
         (NODE_FILM, 2) => (0.25..=16.0).contains(&value),
         (NODE_BLEND, 0) => (0.0..=1.0).contains(&value),
+        (NODE_COLOR_SUBTRACT, _) => (0.0..=4.0).contains(&value),
+        (NODE_CROP, 0) | (NODE_CROP, 1) => (0.0..=1.0).contains(&value),
+        (NODE_CROP, 2) | (NODE_CROP, 3) => (0.05..=1.0).contains(&value),
         _ => false,
     };
     if ok {
@@ -239,6 +246,17 @@ pub(crate) fn parse_graph(bytes: &[u8]) -> Result<Vec<GraphOp>, Error> {
             NODE_FILM => {
                 display[index] = true;
             }
+            NODE_CROP => {
+                // Crops keep their branch's domain.
+                display[index] = display[input_a];
+                let (left, top, width, height) =
+                    (params[0], params[1], params[2], params[3]);
+                if left + width > 1.0001 || top + height > 1.0001 {
+                    return Err(Error::InvalidArgument(
+                        "crop rectangle leaves the frame",
+                    ));
+                }
+            }
             _ => {
                 if display[input_a] {
                     return Err(Error::InvalidArgument(
@@ -246,9 +264,6 @@ pub(crate) fn parse_graph(bytes: &[u8]) -> Result<Vec<GraphOp>, Error> {
                     ));
                 }
             }
-        }
-        if kind == NODE_FILM && display[input_a] {
-            display[index] = true;
         }
         ops.push(GraphOp {
             kind,
@@ -300,6 +315,44 @@ pub(crate) struct GraphContext<'a> {
     pub(crate) focal_reducer: f32,
     pub(crate) crop_factor: f32,
     pub(crate) grain_seed: u64,
+    pub(crate) orientation: u16,
+}
+
+/// Maps a crop rectangle from oriented display coordinates into the
+/// unoriented sensor frame the executor works in. Rectangles are normalized
+/// (left, top, width, height); the mapping inverts `render::orient`.
+fn map_oriented_rect(orientation: u16, rect: [f32; 4]) -> [f32; 4] {
+    let [left, top, width, height] = rect;
+    match orientation {
+        2 => [1.0 - left - width, top, width, height],
+        3 => [1.0 - left - width, 1.0 - top - height, width, height],
+        4 => [left, 1.0 - top - height, width, height],
+        5 => [top, left, height, width],
+        6 => [top, 1.0 - left - width, height, width],
+        7 => [1.0 - top - height, 1.0 - left - width, height, width],
+        8 => [1.0 - top - height, left, height, width],
+        _ => rect,
+    }
+}
+
+fn crop_image(image: &RgbImage, rect: [f32; 4]) -> Result<RgbImage, Error> {
+    let [left, top, width, height] = rect;
+    let x0 = ((left * image.width as f32).round() as usize).min(image.width - 1);
+    let y0 = ((top * image.height as f32).round() as usize).min(image.height - 1);
+    let target_width = (((width) * image.width as f32).round() as usize)
+        .clamp(1, image.width - x0);
+    let target_height = (((height) * image.height as f32).round() as usize)
+        .clamp(1, image.height - y0);
+    let mut data = Vec::with_capacity(target_width * target_height * 3);
+    for row in 0..target_height {
+        let start = ((y0 + row) * image.width + x0) * 3;
+        data.extend_from_slice(&image.data[start..start + target_width * 3]);
+    }
+    Ok(RgbImage {
+        width: target_width,
+        height: target_height,
+        data,
+    })
 }
 
 /// Executes OPS over SOURCE, returning the final display-domain image.
@@ -419,6 +472,23 @@ pub(crate) fn execute_graph(
                 let other = take(&mut registers, &mut uses, op.input_b)?;
                 image = blend_images(&image, &other, op.params[0])?;
             }
+            NODE_COLOR_SUBTRACT => {
+                // Picked color minus pixel, per channel, deliberately
+                // unclamped: this is the scene-linear negative inversion.
+                let color = [op.params[0], op.params[1], op.params[2]];
+                image.data.par_chunks_exact_mut(3).for_each(|pixel| {
+                    for (value, base) in pixel.iter_mut().zip(color) {
+                        *value = base - *value;
+                    }
+                });
+            }
+            NODE_CROP => {
+                let rect = map_oriented_rect(
+                    context.orientation,
+                    [op.params[0], op.params[1], op.params[2], op.params[3]],
+                );
+                image = crop_image(&image, rect)?;
+            }
             _ => unreachable!("kinds were validated during parsing"),
         }
         registers[slot] = Some(image);
@@ -501,6 +571,7 @@ pub fn render_graph(
         focal_reducer: frame.focal_reducer,
         crop_factor: frame.lens_crop_factor,
         grain_seed: frame.grain_seed,
+        orientation: decoded.orientation,
     };
     let image = execute_graph(&ops, source, &context)?;
     let image = render::orient(image, decoded.orientation);
@@ -578,6 +649,7 @@ mod tests {
             focal_reducer: 1.0,
             crop_factor: 0.0,
             grain_seed: seed,
+            orientation: 1,
         }
     }
 
@@ -756,6 +828,90 @@ mod tests {
             .build();
         program.push(0);
         assert!(parse_graph(&program).is_err());
+    }
+
+    #[test]
+    fn color_subtract_inverts_against_the_picked_base() {
+        let ops = parse_graph(
+            &GraphBuilder::new()
+                .node(NODE_COLOR_SUBTRACT, 0, -1, &[0.9, 0.8, 0.7], None)
+                .build(),
+        )
+        .unwrap();
+        let source = gradient_image();
+        let inverted = execute_graph(&ops, source.clone(), &context(7)).unwrap();
+        // Verify in linear space by comparing against a manual inversion.
+        let mut reference = source;
+        for pixel in reference.data.as_chunks_mut::<3>().0 {
+            pixel[0] = 0.9 - pixel[0];
+            pixel[1] = 0.8 - pixel[1];
+            pixel[2] = 0.7 - pixel[2];
+        }
+        apply_default_display_tone(&mut reference.data);
+        render::srgb_transfer(&mut reference);
+        assert!(max_difference(&inverted, &reference) < 1.0e-6);
+    }
+
+    #[test]
+    fn crop_extracts_the_oriented_rectangle() {
+        let ops = parse_graph(
+            &GraphBuilder::new()
+                .node(NODE_CROP, 0, -1, &[0.25, 0.25, 0.5, 0.5], None)
+                .build(),
+        )
+        .unwrap();
+        let cropped = execute_graph(&ops, gradient_image(), &context(7)).unwrap();
+        assert_eq!((cropped.width, cropped.height), (12, 8));
+
+        // Under orientation 6 the displayed frame is the transposed sensor,
+        // so a display-left crop must come from the sensor's bottom band.
+        let rect = map_oriented_rect(6, [0.0, 0.0, 0.5, 1.0]);
+        assert_eq!(rect, [0.0, 0.5, 1.0, 0.5]);
+        let rect = map_oriented_rect(8, [0.0, 0.0, 0.5, 1.0]);
+        assert_eq!(rect, [0.0, 0.0, 1.0, 0.5]);
+        let rect = map_oriented_rect(3, [0.1, 0.2, 0.3, 0.4]);
+        assert!((rect[0] - 0.6).abs() < 1.0e-6 && (rect[1] - 0.4).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn crop_keeps_film_domain_and_blend_rejects_mismatched_sizes() {
+        // film -> crop -> film stays legal.
+        assert!(parse_graph(
+            &GraphBuilder::new()
+                .node(NODE_FILM, 0, -1, &[0.0, 0.2, 1.0], None)
+                .node(NODE_CROP, 1, -1, &[0.0, 0.0, 0.5, 0.5], None)
+                .node(NODE_FILM, 2, -1, &[0.0, 0.1, 1.0], None)
+                .build(),
+        )
+        .is_ok());
+        // film -> crop -> tone must stay illegal.
+        assert!(parse_graph(
+            &GraphBuilder::new()
+                .node(NODE_FILM, 0, -1, &[0.0, 0.2, 1.0], None)
+                .node(NODE_CROP, 1, -1, &[0.0, 0.0, 0.5, 0.5], None)
+                .node(NODE_TONE, 2, -1, &[0.0; 7], None)
+                .build(),
+        )
+        .is_err());
+        // A crop leaving the frame is rejected at parse time.
+        assert!(parse_graph(
+            &GraphBuilder::new()
+                .node(NODE_CROP, 0, -1, &[0.75, 0.0, 0.5, 1.0], None)
+                .build(),
+        )
+        .is_err());
+        // Blending a cropped branch against the full frame errors clearly.
+        let ops = parse_graph(
+            &GraphBuilder::new()
+                .node(NODE_CROP, 0, -1, &[0.0, 0.0, 0.5, 0.5], None)
+                .node(NODE_BLEND, 0, 1, &[0.5], None)
+                .build(),
+        )
+        .unwrap();
+        assert!(matches!(
+            execute_graph(&ops, gradient_image(), &context(7)),
+            Err(Error::Render(_))
+        ));
     }
 
     #[test]
