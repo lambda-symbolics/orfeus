@@ -109,6 +109,59 @@
     (check (null (orfeus:photo-job-disabled-stages (second jobs)))
            "Reset kept the stage bypass")))
 
+(defun test-node-graph-model ()
+  (let* ((jobs (list (orfeus:make-photo-job :input-path #P"one.orf"
+                                            :overrides '(:exposure 1.0))
+                     (orfeus:make-photo-job :input-path #P"two.orf")))
+         (project (orfeus:make-project :output-directory #P"exports/"
+                                       :photos jobs))
+         (model (orfeus/gui:make-gui-model :project project)))
+    (orfeus/gui:gui-model-ensure-graph model)
+    (check (orfeus:photo-job-graph (first jobs))
+           "Conversion did not store a graph")
+    (check (null (orfeus:photo-job-overrides (first jobs)))
+           "Conversion kept flat overrides")
+    (check (= 1.0 (orfeus/gui:gui-model-setting model :exposure))
+           "Converted graph lost the exposure value")
+    ;; Editing a stage without a node creates one at the chain end.
+    (orfeus/gui:gui-model-set-setting model :tone-shadows 0.4)
+    (check (= 0.4 (orfeus/gui:gui-model-setting model :tone-shadows))
+           "Tone edit did not round trip through its node")
+    ;; Duplicate kinds: a second exposure node edited through selection.
+    (let ((node (orfeus/gui:gui-model-add-node model :exposure)))
+      (orfeus/gui:gui-model-set-node-params model node '(:exposure 2.0))
+      (check (= 2.0 (orfeus/gui:gui-model-setting model :exposure))
+             "Selected node did not win key routing")
+      (check (= 2 (count :exposure
+                         (mapcar #'orfeus:graph-node-kind
+                                 (orfeus:processing-graph-nodes
+                                  (orfeus:photo-job-graph (first jobs))))))
+             "Stacked exposure node is missing"))
+    ;; Paste the graph across the selection.
+    (orfeus/gui:gui-model-set-selected-indices model '(0 1))
+    (let ((graph (orfeus/gui:gui-model-copy-graph model)))
+      (check (= 2 (orfeus/gui:gui-model-paste-graph model graph))
+             "Graph paste did not cover the selection"))
+    (check (orfeus:photo-job-graph (second jobs))
+           "Graph paste skipped the second photo")
+    ;; Stills carry graphs; smart apply bypasses chosen kinds.
+    (orfeus/gui:gui-model-set-selected-indices model '(0))
+    (let ((preset (orfeus/gui:gui-model-grab-still model)))
+      (check (orfeus:processing-preset-graph preset)
+             "Grabbed still lost its node graph")
+      (orfeus/gui:gui-model-set-selected-indices model '(1))
+      (check (= 1 (orfeus/gui:gui-model-apply-preset-graph
+                   model preset :bypass-kinds (list :optics)))
+             "Smart apply did not report the selection")
+      (let* ((applied (orfeus:photo-job-graph (second jobs)))
+             (optics (find :optics (orfeus:processing-graph-nodes applied)
+                           :key #'orfeus:graph-node-kind)))
+        (check (or (null optics) (orfeus:graph-node-bypassed-p optics))
+               "Smart apply left optics active")))
+    (orfeus/gui:gui-model-reset-selected model)
+    (check (null (orfeus:photo-job-graph (second jobs)))
+           "Reset kept the node graph")))
+
 (defun test-output-path-semantics ()
   (let* ((relative (orfeus:make-photo-job :input-path #P"one.orf" :output-path #P"nested/one.jpg"))
          (automatic (orfeus:make-photo-job :input-path #P"two.orf"))
@@ -396,6 +449,7 @@
   (test-model-settings)
   (test-preset-bulk-application)
   (test-grade-workflow)
+  (test-node-graph-model)
   (test-output-path-semantics)
   (test-preview-job-identity)
   (test-preview-directory)
