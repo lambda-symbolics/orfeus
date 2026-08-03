@@ -14,10 +14,12 @@ const MINIMUM_FRAME_FRACTION: f32 = 0.2;
 const FRAME_INSET_FRACTION: f32 = 0.015;
 
 /// A detected negative frame: the crop rectangle in oriented normalized
-/// coordinates and the film-base color in scene-linear values.
+/// coordinates, the film-base color in scene-linear values, and the gentle
+/// tilt (degrees, display convention) that straightens the frame.
 pub(crate) struct NegativeFrame {
     pub(crate) rect: [f32; 4],
     pub(crate) base: [f32; 3],
+    pub(crate) angle: f32,
 }
 
 /// Maps a normalized rectangle from the unoriented sensor frame into display
@@ -95,30 +97,110 @@ fn base_like(pixel: &[f32], base: &[f32; 3]) -> bool {
     })
 }
 
-/// Returns the longest run of content (non-border) lines, or None.
+/// Returns the content (non-border) run to treat as the frame, or None.
+///
+/// Film carriers like the JJC set expose extra windows near an edge (a strip
+/// of film edge with sprockets), so the run containing the axis midpoint wins
+/// over a longer run elsewhere; the longest run is only a fallback.
 fn content_span(border_flags: &[bool]) -> Option<(usize, usize)> {
-    let mut best: Option<(usize, usize)> = None;
+    let mut runs: Vec<(usize, usize)> = Vec::new();
     let mut start = None;
     for (index, border) in border_flags.iter().enumerate() {
         match (border, start) {
             (false, None) => start = Some(index),
             (true, Some(begin)) => {
-                let length = index - begin;
-                if best.map_or(true, |(_, best_length)| length > best_length) {
-                    best = Some((begin, length));
-                }
+                runs.push((begin, index - begin));
                 start = None;
             }
             _ => {}
         }
     }
     if let Some(begin) = start {
-        let length = border_flags.len() - begin;
-        if best.map_or(true, |(_, best_length)| length > best_length) {
-            best = Some((begin, length));
+        runs.push((begin, border_flags.len() - begin));
+    }
+    let midpoint = border_flags.len() / 2;
+    runs.iter()
+        .copied()
+        .find(|(begin, length)| *begin <= midpoint && midpoint < begin + length)
+        .or_else(|| runs.into_iter().max_by_key(|(_, length)| *length))
+}
+
+/// Estimates the frame tilt from the left and right content edges.
+///
+/// Fits the first and last base-to-content transitions across the frame's
+/// inner rows and converts the mean slope into the display-space angle that
+/// straightens the frame through a crop node. Returns 0 when the evidence is
+/// weak, keeping flimsy-carrier detection conservative.
+fn estimate_frame_angle(
+    image: &RgbImage,
+    base: &[f32; 3],
+    rows: (usize, usize),
+    columns: (usize, usize),
+) -> f32 {
+    let (row_start, row_length) = rows;
+    let (column_start, column_length) = columns;
+    let inset = (row_length / 10).max(2);
+    let probe_start = row_start + inset;
+    let probe_end = (row_start + row_length).saturating_sub(inset);
+    if probe_end <= probe_start + 8 {
+        return 0.0;
+    }
+    let margin = (column_length / 4).max(4);
+    let mut points_left: Vec<(f32, f32)> = Vec::new();
+    let mut points_right: Vec<(f32, f32)> = Vec::new();
+    for y in probe_start..probe_end {
+        let row = &image.data[y * image.width * 3..(y + 1) * image.width * 3];
+        let scan_from = column_start.saturating_sub(margin);
+        let scan_to = (column_start + margin).min(image.width);
+        for x in scan_from..scan_to {
+            if !base_like(&row[x * 3..x * 3 + 3], base) {
+                points_left.push((y as f32, x as f32));
+                break;
+            }
+        }
+        let right_edge = column_start + column_length;
+        let scan_from = right_edge.saturating_sub(margin);
+        let scan_to = (right_edge + margin).min(image.width);
+        for x in (scan_from..scan_to).rev() {
+            if !base_like(&row[x * 3..x * 3 + 3], base) {
+                points_right.push((y as f32, x as f32));
+                break;
+            }
         }
     }
-    best
+    let slope = |points: &[(f32, f32)]| -> Option<f32> {
+        if points.len() < 8 {
+            return None;
+        }
+        let count = points.len() as f32;
+        let mean_y = points.iter().map(|(y, _)| y).sum::<f32>() / count;
+        let mean_x = points.iter().map(|(_, x)| x).sum::<f32>() / count;
+        let mut numerator = 0.0;
+        let mut denominator = 0.0;
+        for (y, x) in points {
+            numerator += (y - mean_y) * (x - mean_x);
+            denominator += (y - mean_y) * (y - mean_y);
+        }
+        if denominator < 1.0 {
+            None
+        } else {
+            Some(numerator / denominator)
+        }
+    };
+    let slopes: Vec<f32> = [slope(&points_left), slope(&points_right)]
+        .into_iter()
+        .flatten()
+        .collect();
+    if slopes.is_empty() {
+        return 0.0;
+    }
+    // Edges of one rigid frame must agree; disagreement means bad evidence.
+    if slopes.len() == 2 && (slopes[0] - slopes[1]).abs() > 0.03 {
+        return 0.0;
+    }
+    let mean = slopes.iter().sum::<f32>() / slopes.len() as f32;
+    let angle = mean.atan().to_degrees().clamp(-7.0, 7.0);
+    if angle.abs() < 0.3 { 0.0 } else { angle }
 }
 
 /// Detects the central exposed tile of a scanned or photographed negative.
@@ -154,12 +236,18 @@ pub(crate) fn analyze_negative_frame(decoded: &DecodedRaw) -> NegativeFrame {
         .collect();
     let rows = content_span(&row_border);
     let columns = content_span(&column_border);
-    let rect = match (rows, columns) {
+    let (rect, sensor_angle) = match (rows, columns) {
         (Some((row_start, row_length)), Some((column_start, column_length)))
             if row_length as f32 / image.height as f32 > MINIMUM_FRAME_FRACTION
                 && column_length as f32 / image.width as f32
                     > MINIMUM_FRAME_FRACTION =>
         {
+            let angle = estimate_frame_angle(
+                &image,
+                &base,
+                (row_start, row_length),
+                (column_start, column_length),
+            );
             let inset_x = FRAME_INSET_FRACTION;
             let inset_y = FRAME_INSET_FRACTION;
             let left = column_start as f32 / image.width as f32 + inset_x;
@@ -170,18 +258,28 @@ pub(crate) fn analyze_negative_frame(decoded: &DecodedRaw) -> NegativeFrame {
             let height = (row_length as f32 / image.height as f32
                 - 2.0 * inset_y)
                 .max(0.05);
-            [
-                left.clamp(0.0, 0.95),
-                top.clamp(0.0, 0.95),
-                width.min(1.0 - left.clamp(0.0, 0.95)),
-                height.min(1.0 - top.clamp(0.0, 0.95)),
-            ]
+            (
+                [
+                    left.clamp(0.0, 0.95),
+                    top.clamp(0.0, 0.95),
+                    width.min(1.0 - left.clamp(0.0, 0.95)),
+                    height.min(1.0 - top.clamp(0.0, 0.95)),
+                ],
+                angle,
+            )
         }
-        _ => [0.0, 0.0, 1.0, 1.0],
+        _ => ([0.0, 0.0, 1.0, 1.0], 0.0),
+    };
+    // Mirrored orientations flip the visual rotation direction.
+    let display_angle = if matches!(decoded.orientation, 2 | 4 | 5 | 7) {
+        -sensor_angle
+    } else {
+        sensor_angle
     };
     NegativeFrame {
         rect: map_unoriented_rect(decoded.orientation, rect),
         base,
+        angle: display_angle,
     }
 }
 
@@ -310,6 +408,110 @@ mod tests {
         assert!((height - 0.50).abs() < 0.08, "height {height}");
         assert!((top - 0.25).abs() < 0.05, "top {top}");
         let _ = left;
+    }
+
+    fn jjc_carrier_negative() -> DecodedRaw {
+        // The JJC-style holder: the main tile centered, plus a thin film-edge
+        // window near the top that must not confuse frame detection.
+        let mut negative = synthetic_negative(1);
+        let width = negative.width;
+        for y in 4..14 {
+            for x in 30..170 {
+                let offset = (y * width + x) * 3;
+                negative.data[offset] = 0.2;
+                negative.data[offset + 1] = 0.28;
+                negative.data[offset + 2] = 0.3;
+            }
+        }
+        negative
+    }
+
+    #[test]
+    fn film_edge_window_does_not_hijack_the_frame() {
+        let frame = analyze_negative_frame(&jjc_carrier_negative());
+        let [left, top, width, height] = frame.rect;
+        assert!(top > 0.2, "detection latched onto the top window: {top}");
+        assert!((left - 0.25).abs() < 0.05, "left {left}");
+        assert!((width - 0.50).abs() < 0.08, "width {width}");
+        assert!((height - 0.50).abs() < 0.09, "height {height}");
+        assert_eq!(frame.angle, 0.0);
+    }
+
+    fn tilted_negative(degrees: f32) -> DecodedRaw {
+        let width = 400;
+        let height = 240;
+        let (sin, cos) = degrees.to_radians().sin_cos();
+        let (center_x, center_y) = (width as f32 / 2.0, height as f32 / 2.0);
+        let (half_width, half_height) = (100.0_f32, 60.0_f32);
+        let mut data = Vec::with_capacity(width * height * 3);
+        for y in 0..height {
+            for x in 0..width {
+                // Rotate the point back by the tilt; inside the upright
+                // rectangle means inside the tilted frame.
+                let dx = x as f32 - center_x;
+                let dy = y as f32 - center_y;
+                let local_x = cos * dx + sin * dy;
+                let local_y = -sin * dx + cos * dy;
+                let inside =
+                    local_x.abs() < half_width && local_y.abs() < half_height;
+                if inside {
+                    data.extend_from_slice(&[0.12, 0.2, 0.25]);
+                } else {
+                    data.extend_from_slice(&[0.82, 0.51, 0.33]);
+                }
+            }
+        }
+        DecodedRaw {
+            width,
+            height,
+            data,
+            orientation: 1,
+            make: String::new(),
+            model: String::new(),
+            lens_name: String::new(),
+            focal: 0.0,
+        }
+    }
+
+    #[test]
+    fn gentle_tilt_is_detected_and_straightens_the_crop() {
+        let tilt = 3.0_f32;
+        let negative = tilted_negative(tilt);
+        let frame = analyze_negative_frame(&negative);
+        assert!(
+            frame.angle.abs() > 1.0,
+            "no tilt detected: {}",
+            frame.angle
+        );
+        // Applying the crop with the reported angle must straighten the
+        // frame: probe points just inside each mid-edge must be tile-colored.
+        let image = RgbImage {
+            width: negative.width,
+            height: negative.height,
+            data: negative.data.clone(),
+        };
+        let cropped = super::super::graphex::rotate_crop_for_tests(
+            &image,
+            frame.rect,
+            frame.angle,
+        );
+        let probe = |x: usize, y: usize| -> f32 {
+            cropped.data[(y * cropped.width + x) * 3]
+        };
+        let inset = 6;
+        let tile = 0.12_f32;
+        for (x, y) in [
+            (cropped.width / 2, inset),
+            (cropped.width / 2, cropped.height - 1 - inset),
+            (inset, cropped.height / 2),
+            (cropped.width - 1 - inset, cropped.height / 2),
+        ] {
+            assert!(
+                (probe(x, y) - tile).abs() < 0.05,
+                "edge probe at {x},{y} saw {}, frame is still tilted",
+                probe(x, y)
+            );
+        }
     }
 
     #[test]

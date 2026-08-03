@@ -151,9 +151,10 @@ int32_t orfeus_raw_render_v2(const char *input_path,
                              size_t error_capacity);
 
 /* Detects a scanned negative's central tile and film-base color. Writes
-   seven floats: crop left, top, width, height in oriented normalized
-   coordinates, then the scene-linear base red, green, blue. Falls back to
-   the full frame when no tile is plausible. */
+   eight floats: crop left, top, width, height in oriented normalized
+   coordinates, the scene-linear base red, green, blue, and the display-space
+   straightening angle in degrees. Falls back to the full frame with angle
+   zero when no tile is plausible. */
 int32_t orfeus_analyze_negative_frame_v1(const char *input_path,
                                          uint32_t cache_mode,
                                          float *results,

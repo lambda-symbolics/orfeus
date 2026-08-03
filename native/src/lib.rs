@@ -569,16 +569,16 @@ pub unsafe extern "C" fn orfeus_raw_render_v3(
 
 /// Detect the central tile and film-base color of a scanned negative.
 ///
-/// Writes seven floats: the crop rectangle (left, top, width, height) in
-/// oriented normalized coordinates, then the scene-linear base color
-/// (red, green, blue) sampled from the border ring. A full-frame rectangle
-/// is reported when no plausible tile exists. Cache semantics match
-/// `orfeus_raw_render_v2`.
+/// Writes eight floats: the crop rectangle (left, top, width, height) in
+/// oriented normalized coordinates, the scene-linear base color (red, green,
+/// blue) sampled from the border ring, and the straightening angle in
+/// degrees. A full-frame rectangle with angle zero is reported when no
+/// plausible tile exists. Cache semantics match `orfeus_raw_render_v2`.
 ///
 /// # Safety
 ///
 /// `input_path` must be a readable NUL-terminated path, `results` must be
-/// writable for seven floats, and the error buffer, when non-null, writable
+/// writable for eight floats, and the error buffer, when non-null, writable
 /// for its stated capacity.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn orfeus_analyze_negative_frame_v1(
@@ -604,6 +604,7 @@ pub unsafe extern "C" fn orfeus_analyze_negative_frame_v1(
                 frame.base[0],
                 frame.base[1],
                 frame.base[2],
+                frame.angle,
             ];
             ptr::copy_nonoverlapping(values.as_ptr(), results, values.len());
             Ok(())

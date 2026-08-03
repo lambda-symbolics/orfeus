@@ -276,12 +276,13 @@
   (error-capacity :size))
 
 (defun analyze-negative-frame (input-pathname &key cache-p)
-  "Detect a scanned negative's central tile and film-base color.
+  "Detect a scanned negative's central tile, film-base color, and tilt.
 
-Returns two values: the crop rectangle (left top width height) in oriented
-normalized coordinates, and the scene-linear base color (red green blue)."
+Returns three values: the crop rectangle (left top width height) in oriented
+normalized coordinates, the scene-linear base color (red green blue), and
+the straightening angle in degrees for a crop node."
   (native-library-load)
-  (with-foreign-pointer (results (* 7 4))
+  (with-foreign-pointer (results (* 8 4))
     (with-foreign-pointer (error-buffer *native-error-buffer-size*)
       (let ((status
               #+sbcl
@@ -305,7 +306,8 @@ normalized coordinates, and the scene-linear base color (red green blue)."
         (values (loop for index below 4
                       collect (mem-aref results :float index))
                 (loop for index from 4 below 7
-                      collect (mem-aref results :float index)))))))
+                      collect (mem-aref results :float index))
+                (mem-aref results :float 7))))))
 
 (defun sample-photo-linear-color (input-pathname x y
                                   &key (radius 0.01) cache-p)
