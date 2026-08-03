@@ -123,6 +123,30 @@ extern "C" int orfeus_gui_preview_draw_rect(long long widget_id,
     return 1;
 }
 
+extern "C" int orfeus_gui_preview_histogram(const char *path,
+                                            int *bins,
+                                            int bin_count) {
+    if (!bins || bin_count <= 0) return 0;
+    PreviewImage *image = find_image(path);
+    if (!image || !image->source) return 0;
+    Fl_JPEG_Image &source = *image->source;
+    const int depth = source.d();
+    const char *const *data = source.data();
+    if (!data || !data[0] || depth < 3) return 0;
+    std::fill(bins, bins + 3 * bin_count, 0);
+    const unsigned char *pixels =
+        reinterpret_cast<const unsigned char *>(data[0]);
+    const long count = static_cast<long>(source.w()) * source.h();
+    for (long index = 0; index < count; ++index) {
+        const unsigned char *pixel = pixels + index * depth;
+        for (int channel = 0; channel < 3; ++channel) {
+            const int bin = pixel[channel] * bin_count / 256;
+            ++bins[channel * bin_count + bin];
+        }
+    }
+    return 1;
+}
+
 extern "C" int orfeus_gui_preview_size(const char *path, int *width, int *height) {
     PreviewImage *image = find_image(path);
     if (!image || !width || !height) return 0;

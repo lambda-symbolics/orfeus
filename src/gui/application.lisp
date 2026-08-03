@@ -46,11 +46,64 @@
     (:film . "Film")
     (:blend . "Blend")
     (:color-subtract . "Subtr")
-    (:crop . "Crop"))
+    (:crop . "Crop")
+    (:curves . "Curves"))
   "Short node captions for the graph panel, in menu order.")
 
 (defun node-kind-label (kind)
   (or (rest (assoc kind *node-kind-labels*)) (string kind)))
+
+(defun curve-spline-value (points x)
+  "Evaluate the monotone cubic through POINTS (four x y pairs) at X.
+
+Mirrors the native executor's Fritsch-Carlson spline so the editor draws
+exactly the curve the render applies."
+  (let ((xs (make-array 4)) (ys (make-array 4)))
+    (dotimes (index 4)
+      (setf (aref xs index) (float (nth (* index 2) points) 1d0)
+            (aref ys index) (float (nth (1+ (* index 2)) points) 1d0)))
+    (cond
+      ((<= x (aref xs 0)) (aref ys 0))
+      ((>= x (aref xs 3)) (aref ys 3))
+      (t
+       (let ((slopes (make-array 3))
+             (tangents (make-array 4)))
+         (dotimes (segment 3)
+           (setf (aref slopes segment)
+                 (/ (- (aref ys (1+ segment)) (aref ys segment))
+                    (max 1.0d-4 (- (aref xs (1+ segment))
+                                   (aref xs segment))))))
+         (setf (aref tangents 0) (aref slopes 0)
+               (aref tangents 3) (aref slopes 2))
+         (loop for point from 1 to 2
+               do (setf (aref tangents point)
+                        (let ((before (aref slopes (1- point)))
+                              (after (aref slopes point)))
+                          (if (<= (* before after) 0)
+                              0d0
+                              (let ((left (- (aref xs point)
+                                             (aref xs (1- point))))
+                                    (right (- (aref xs (1+ point))
+                                              (aref xs point))))
+                                (/ (* 3 (+ left right))
+                                   (+ (/ (+ (* 2 right) left) before)
+                                      (/ (+ right (* 2 left)) after))))))))
+         (let* ((segment (cond ((< x (aref xs 1)) 0)
+                               ((< x (aref xs 2)) 1)
+                               (t 2)))
+                (width (max 1.0d-4 (- (aref xs (1+ segment))
+                                      (aref xs segment))))
+                (v (/ (- x (aref xs segment)) width))
+                (v2 (* v v))
+                (v3 (* v2 v)))
+           (max 0d0
+                (min 1d0
+                     (+ (* (+ (* 2 v3) (* -3 v2) 1) (aref ys segment))
+                        (* (+ v3 (* -2 v2) v) width
+                           (aref tangents segment))
+                        (* (+ (* -2 v3) (* 3 v2)) (aref ys (1+ segment)))
+                        (* (- v3 v2) width
+                           (aref tangents (1+ segment))))))))))))
 
 (defun srgb-encode-component (value)
   "Encode one scene-linear component for a display color dialog."
@@ -243,6 +296,9 @@
            (node-click (cons 0 -1))
            grade-clipboard
            inspector tabs basic-page optics-page effects-page export-page presets-page
+           curves-page curve-canvas curve-drag
+           (curve-channel :red-points)
+           curve-histogram curve-histogram-file
            status progress before-preview-file after-preview-file
            lens-name controls inspector-items tone-items lut-choice wb-choice target-choice
            export-quality export-max-width export-max-height export-metadata
@@ -621,6 +677,253 @@
                                                     :blue 240)
                             (cl-fltk:draw-filled-circle px py 4))
                    (cl-fltk:draw-pop-clip)))))
+           (curves-editing-node ()
+             ;; The editor drives the selected curves node, else the most
+             ;; downstream curves node on the photo's real graph.
+             (let* ((job (selected-job))
+                    (graph (and job (orfeus:photo-job-graph job)))
+                    (selected (gui-model-selected-graph-node model)))
+               (cond
+                 ((and selected (eq :curves (orfeus:graph-node-kind selected)))
+                  selected)
+                 (graph
+                  (find :curves
+                        (reverse (orfeus:processing-graph-nodes graph))
+                        :key #'orfeus:graph-node-kind)))))
+           (curve-node-points (node key)
+             (or (getf (orfeus:graph-node-params node) key)
+                 orfeus:*identity-curve-points*))
+           (curve-channel-color (key active)
+             (ecase key
+               (:red-points (if active
+                                (values 235 90 90)
+                                (values 120 55 55)))
+               (:green-points (if active
+                                  (values 95 220 95)
+                                  (values 55 110 55)))
+               (:blue-points (if active
+                                 (values 110 150 255)
+                                 (values 60 75 125)))))
+           (curve-channel-label (key)
+             (ecase key
+               (:red-points "Red")
+               (:green-points "Green")
+               (:blue-points "Blue")))
+           (refresh-curve-histogram ()
+             (when (and after-preview-file
+                        (not (equal after-preview-file
+                                    curve-histogram-file)))
+               (setf curve-histogram-file after-preview-file
+                     curve-histogram
+                     (multiple-value-bind (red green blue)
+                         (ignore-errors
+                           (preview-histogram after-preview-file))
+                       (when red (list red green blue))))))
+           (curve-chart-geometry ()
+             ;; The chart rectangle, widget-relative.
+             (values 12 8
+                     (- (cl-fltk:widget-width curve-canvas) 24)
+                     (- (cl-fltk:widget-height curve-canvas) 16)))
+           (draw-curve-editor (widget)
+             (let* ((x (cl-fltk:widget-x widget))
+                    (y (cl-fltk:widget-y widget))
+                    (width (cl-fltk:widget-width widget))
+                    (height (cl-fltk:widget-height widget))
+                    (node (curves-editing-node)))
+               (cl-fltk:draw-color-rgb :red 44 :green 44 :blue 48)
+               (cl-fltk:draw-filled-rect x y width height)
+               (multiple-value-bind (chart-x chart-y chart-w chart-h)
+                   (curve-chart-geometry)
+                 (let ((left (+ x chart-x))
+                       (top (+ y chart-y)))
+                   (cl-fltk:draw-color-rgb :red 16 :green 16 :blue 18)
+                   (cl-fltk:draw-filled-rect left top chart-w chart-h)
+                   ;; Channel occupancy: dim RGB histogram bars behind the
+                   ;; grid, the waveform check for stretched negatives.
+                   (refresh-curve-histogram)
+                   (when curve-histogram
+                     (loop for plane in curve-histogram
+                           for (red green blue) in '((120 50 50)
+                                                     (50 105 50)
+                                                     (60 75 140))
+                           do (let* ((bins (length plane))
+                                     (peak (max 1 (loop for index from 1
+                                                          below (1- bins)
+                                                        maximize
+                                                        (aref plane index)))))
+                                (cl-fltk:draw-color-rgb :red red :green green
+                                                        :blue blue)
+                                (loop for index from 0 below bins
+                                      for value = (min 1.0
+                                                       (/ (aref plane index)
+                                                          (float peak)))
+                                      for bar = (round (* value
+                                                          (- chart-h 2)))
+                                      for bar-x = (+ left
+                                                     (floor (* index chart-w)
+                                                            bins))
+                                      for bar-w = (max 1
+                                                       (- (floor (* (1+ index)
+                                                                    chart-w)
+                                                                 bins)
+                                                          (floor (* index
+                                                                    chart-w)
+                                                                 bins)))
+                                      do (when (plusp bar)
+                                           (cl-fltk:draw-filled-rect
+                                            bar-x (+ top chart-h (- bar))
+                                            bar-w bar))))))
+                   (cl-fltk:draw-color-rgb :red 58 :green 58 :blue 64)
+                   (dotimes (line 2)
+                     (let ((grid-x (+ left (floor (* (1+ line) chart-w) 3)))
+                           (grid-y (+ top (floor (* (1+ line) chart-h) 3))))
+                       (cl-fltk:draw-line grid-x top grid-x (+ top chart-h))
+                       (cl-fltk:draw-line left grid-y (+ left chart-w)
+                                          grid-y)))
+                   (cl-fltk:draw-color-rgb :red 84 :green 84 :blue 92)
+                   (cl-fltk:draw-line left (+ top chart-h) (+ left chart-w)
+                                      top)
+                   (if (null node)
+                       (progn
+                         (cl-fltk:draw-color-rgb :red 205 :green 205
+                                                 :blue 210)
+                         (cl-fltk:draw-font :size 11)
+                         (cl-fltk:draw-text "Right-click the node strip"
+                                            (+ left 14) (+ top 26))
+                         (cl-fltk:draw-text "and add a Curves node"
+                                            (+ left 14) (+ top 42))
+                         (cl-fltk:draw-font :size 12))
+                       (progn
+                         ;; Draw the two inactive curves, then the active
+                         ;; channel on top with its control points.
+                         (dolist (key (append (remove curve-channel
+                                                      orfeus:*curve-channel-keys*)
+                                              (list curve-channel)))
+                           (let ((points (curve-node-points node key)))
+                             (multiple-value-bind (red green blue)
+                                 (curve-channel-color
+                                  key (eq key curve-channel))
+                               (cl-fltk:draw-color-rgb :red red :green green
+                                                       :blue blue))
+                             (loop with steps = 48
+                                   for step from 0 below steps
+                                   for x0 = (/ step (float steps))
+                                   for x1 = (/ (1+ step) (float steps))
+                                   for y0 = (curve-spline-value points x0)
+                                   for y1 = (curve-spline-value points x1)
+                                   do (cl-fltk:draw-line
+                                       (+ left (round (* x0 (1- chart-w))))
+                                       (+ top (round (* (- 1 y0)
+                                                        (1- chart-h))))
+                                       (+ left (round (* x1 (1- chart-w))))
+                                       (+ top (round (* (- 1 y1)
+                                                        (1- chart-h))))))))
+                         (let ((points (curve-node-points node
+                                                          curve-channel)))
+                           (dotimes (index 4)
+                             (let ((point-x
+                                     (+ left
+                                        (round (* (nth (* index 2) points)
+                                                  (1- chart-w)))))
+                                   (point-y
+                                     (+ top
+                                        (round (* (- 1 (nth (1+ (* index 2))
+                                                            points))
+                                                  (1- chart-h))))))
+                               (cl-fltk:draw-color-rgb :red 20 :green 20
+                                                       :blue 24)
+                               (cl-fltk:draw-filled-circle point-x point-y 5)
+                               (multiple-value-bind (red green blue)
+                                   (curve-channel-color curve-channel t)
+                                 (cl-fltk:draw-color-rgb :red red
+                                                         :green green
+                                                         :blue blue))
+                               (cl-fltk:draw-filled-circle point-x point-y
+                                                           4))))))))))
+           (update-curve-drag (node x y)
+             (multiple-value-bind (chart-x chart-y chart-w chart-h)
+                 (curve-chart-geometry)
+               (let* ((points (copy-list (curve-node-points node
+                                                            curve-channel)))
+                      (index curve-drag)
+                      (raw-x (/ (- x chart-x) (float (1- chart-w))))
+                      (raw-y (- 1 (/ (- y chart-y) (float (1- chart-h)))))
+                      (new-y (max 0.0 (min 1.0 raw-y)))
+                      (new-x (cond ((= index 0) 0.0)
+                                   ((= index 3) 1.0)
+                                   (t (max (+ (nth (* 2 (1- index)) points)
+                                              0.02)
+                                          (min (- (nth (* 2 (1+ index))
+                                                       points)
+                                                  0.02)
+                                               raw-x))))))
+                 (setf (nth (* index 2) points) (float new-x 1.0)
+                       (nth (1+ (* index 2)) points) (float new-y 1.0))
+                 (handler-case
+                     (progn
+                       (gui-model-set-node-params
+                        model node (list curve-channel points))
+                       (cl-fltk:redraw curve-canvas)
+                       (schedule-edited-preview)
+                       (set-status
+                        (format nil "~A point ~D: ~,2F ~,2F"
+                                (curve-channel-label curve-channel)
+                                (1+ index) new-x new-y)))
+                   (error (condition)
+                     (set-status (princ-to-string condition)))))))
+           (handle-curve-mouse (widget event value)
+             (declare (ignore widget))
+             (multiple-value-bind (x y) (parse-preview-event value)
+               (when x
+                 (let ((node (curves-editing-node)))
+                   (when node
+                     (case event
+                       (#.cl-fltk:+event-push+
+                        (multiple-value-bind (chart-x chart-y chart-w
+                                              chart-h)
+                            (curve-chart-geometry)
+                          (let ((points (curve-node-points node
+                                                           curve-channel)))
+                            (setf curve-drag nil)
+                            (dotimes (index 4)
+                              (let ((point-x
+                                      (+ chart-x
+                                         (round (* (nth (* index 2) points)
+                                                   (1- chart-w)))))
+                                    (point-y
+                                      (+ chart-y
+                                         (round (* (- 1
+                                                      (nth (1+ (* index 2))
+                                                           points))
+                                                   (1- chart-h))))))
+                                (when (and (<= (abs (- x point-x)) 8)
+                                           (<= (abs (- y point-y)) 8))
+                                  (setf curve-drag index)))))))
+                       (#.cl-fltk:+event-drag+
+                        (when curve-drag
+                          (update-curve-drag node x y)))
+                       (#.cl-fltk:+event-release+
+                        (when curve-drag
+                          (setf curve-drag nil)
+                          (set-status
+                           (format nil "~A curve updated"
+                                   (curve-channel-label
+                                    curve-channel)))))))))))
+           (reset-curve-channel ()
+             (let ((node (curves-editing-node)))
+               (if node
+                   (handler-case
+                       (progn
+                         (gui-model-set-node-params
+                          model node
+                          (list curve-channel
+                                (copy-list orfeus:*identity-curve-points*)))
+                         (after-graph-edit
+                          (format nil "~A curve reset"
+                                  (curve-channel-label curve-channel))))
+                     (error (condition)
+                       (set-status (princ-to-string condition))))
+                   (set-status "Add a Curves node first"))))
            (handle-preview-mouse (canvas event value)
              (multiple-value-bind (x y button dx dy state)
                  (parse-preview-event value)
@@ -739,6 +1042,8 @@
                  (:after (setf after-preview-file path
                                (gethash (selected-job) thumbnail-files) path)
                          (cl-fltk:redraw after-canvas)
+                         (when curve-canvas
+                           (cl-fltk:redraw curve-canvas))
                          (redraw-thumbnails)))))
            (sync-export-controls ()
              (when export-quality
@@ -993,6 +1298,7 @@
              (sync-controls)
              (sync-node-tools)
              (when node-strip (cl-fltk:redraw node-strip))
+             (when curve-canvas (cl-fltk:redraw curve-canvas))
              (redraw-previews)
              (schedule-edited-preview)
              (when message (set-status message)))
@@ -1012,6 +1318,7 @@
                    (sync-controls)
                    (sync-node-tools)
                    (cl-fltk:redraw node-strip)
+                   (when curve-canvas (cl-fltk:redraw curve-canvas))
                    (set-status (format nil "Node ~D: ~A~@[ (bypassed)~]"
                                        (orfeus:graph-node-id node)
                                        (node-kind-label
@@ -2146,7 +2453,7 @@
                                       :width (- right 8)
                                       :height (- main-height 80))
                (dolist (page (list basic-page optics-page effects-page
-                                    export-page presets-page))
+                                    export-page presets-page curves-page))
                  (cl-fltk:resize-widget page :x 2 :y 24
                                         :width (- right 12)
                                         :height (- main-height 108)))
@@ -2632,7 +2939,10 @@
                                                   :label "Export")
                presets-page (cl-fltk:make-tab-page :parent tabs :x 2 :y 24
                                                    :width 308 :height 600
-                                                   :label "Gallery"))
+                                                   :label "Gallery")
+               curves-page (cl-fltk:make-tab-page :parent tabs :x 2 :y 24
+                                                  :width 308 :height 600
+                                                  :label "Curves"))
         (section-frame export-page "Output" 16 172)
         (flet ((export-integer-field (key label y)
                  (cl-fltk:field-control
@@ -2701,6 +3011,48 @@
                             (declare (ignore ignored))
                             (apply-current-preset)))
                158 270 :half-right 26 :page))
+        (section-frame curves-page "Custom Curves" 16 356)
+        (let ((channel-field
+                (cl-fltk:make-labeled-choice
+                 :parent curves-page :x 12 :y 28 :width 292 :height 26
+                 :label "Channel" :label-width 88
+                 :items '("Red" "Green" "Blue")
+                 :callback (lambda (widget event value)
+                             (declare (ignore event value))
+                             (setf curve-channel
+                                   (cond ((string-equal
+                                           (cl-fltk:value widget) "Green")
+                                          :green-points)
+                                         ((string-equal
+                                           (cl-fltk:value widget) "Blue")
+                                          :blue-points)
+                                         (t :red-points)))
+                             (when curve-canvas
+                               (cl-fltk:redraw curve-canvas))))))
+          (register-field channel-field 28 :page))
+        (setf curve-canvas
+              (register-inspector
+               (cl-fltk:make-canvas
+                :parent curves-page :x 12 :y 62 :width 292 :height 264
+                :callback (lambda (widget event value)
+                            (declare (ignore event value))
+                            (draw-curve-editor widget)))
+               12 62 :fill 264 :page))
+        (cl-fltk:set-tooltip
+         curve-canvas
+         "Drag the points to shape the channel; the histogram shows occupancy")
+        (dolist (event (list cl-fltk:+event-push+
+                             cl-fltk:+event-drag+
+                             cl-fltk:+event-release+))
+          (cl-fltk:on curve-canvas #'handle-curve-mouse :event event))
+        (register-inspector
+         (cl-fltk:make-button
+          :parent curves-page :x 12 :y 334 :width 292 :height 26
+          :label "Reset Channel"
+          :callback (lambda (&rest ignored)
+                      (declare (ignore ignored))
+                      (reset-curve-channel)))
+         12 334 :fill 26 :page)
         (merge-local-stills)
         (refresh-gallery)
         (section-frame basic-page "White Balance" 16 110)

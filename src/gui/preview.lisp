@@ -29,6 +29,8 @@
   (x :int) (y :int) (width :int) (height :int))
 (cffi:defcfun ("orfeus_gui_preview_size" %gui-preview-size) :int
   (path :string) (width :pointer) (height :pointer))
+(cffi:defcfun ("orfeus_gui_preview_histogram" %gui-preview-histogram) :int
+  (path :string) (bins :pointer) (bin-count :int))
 (cffi:defcfun ("orfeus_gui_preview_forget" %gui-preview-forget) :void
   (path :string))
 (cffi:defcfun ("orfeus_gui_preview_clear" %gui-preview-clear) :void)
@@ -50,6 +52,19 @@
   "Release all decoded images held by the native preview adapter."
   (when *gui-preview-library-loaded-p*
     (%gui-preview-clear)))
+
+(defun preview-histogram (pathname &key (bins 64))
+  "Return three vectors of BINS counts (red, green, blue) for PATHNAME."
+  (load-gui-preview-library)
+  (cffi:with-foreign-object (buffer :int (* 3 bins))
+    (when (plusp (%gui-preview-histogram (namestring pathname) buffer bins))
+      (flet ((plane (channel)
+               (let ((vector (make-array bins)))
+                 (dotimes (index bins vector)
+                   (setf (aref vector index)
+                         (cffi:mem-aref buffer :int
+                                        (+ (* channel bins) index)))))))
+        (values (plane 0) (plane 1) (plane 2))))))
 
 (defun preview-file-size (pathname)
   "Return the decoded width and height of preview PATHNAME."
