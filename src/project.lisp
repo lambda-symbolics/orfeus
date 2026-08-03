@@ -74,7 +74,8 @@ DISABLED-STAGES preserves pipeline bypass state without discarding its settings.
   (name "" :type string)
   (settings (make-processing-settings) :type processing-settings)
   (source-photo nil)
-  (disabled-stages '()))
+  (disabled-stages '())
+  (graph nil))
 
 (defstruct export-settings
   "Frontend-independent options for encoded photo exports."
@@ -87,11 +88,13 @@ DISABLED-STAGES preserves pipeline bypass state without discarding its settings.
   "One input photograph and its optional per-photo setting overrides.
 
 DISABLED-STAGES lists pipeline stages bypassed for this photograph; their
-settings are remembered but render as identity, like a disabled node."
+settings are remembered but render as identity, like a disabled node. GRAPH,
+when present, replaces the flat pipeline with an explicit node graph."
   input-path
   output-path
   (overrides '())
-  (disabled-stages '()))
+  (disabled-stages '())
+  (graph nil))
 
 (defstruct project
   "A batch of photographs sharing processing defaults and an output directory."
@@ -100,6 +103,8 @@ settings are remembered but render as identity, like a disabled node."
   (export-settings (make-export-settings))
   (presets '())
   (photos '()))
+
+(declaim (ftype (function (t) t) graph->sexp sexp->graph))
 
 (defun project-invalid (datum control &rest arguments)
   (error 'invalid-project-data
@@ -180,18 +185,21 @@ settings are remembered but render as identity, like a disabled node."
        (list :source-photo (namestring source))))
    (when (processing-preset-disabled-stages preset)
      (list :disabled-stages
-           (copy-list (processing-preset-disabled-stages preset))))))
+           (copy-list (processing-preset-disabled-stages preset))))
+   (when (processing-preset-graph preset)
+     (list :graph (graph->sexp (processing-preset-graph preset))))))
 
 (defun sexp->processing-preset (sexp)
   (unless (and (listp sexp)
                (plist-known-keys-p sexp
                                    '(:name :settings :source-photo
-                                     :disabled-stages)))
+                                     :disabled-stages :graph)))
     (project-invalid sexp "expected a preset property list"))
   (let ((name (getf sexp :name))
         (settings (getf sexp :settings))
         (source-photo (getf sexp :source-photo))
-        (disabled-stages (getf sexp :disabled-stages '())))
+        (disabled-stages (getf sexp :disabled-stages '()))
+        (graph (getf sexp :graph)))
     (unless (and (stringp name)
                  (plusp (length (string-trim '(#\Space #\Tab) name))))
       (project-invalid sexp "preset :name must be a nonempty string"))
@@ -202,7 +210,8 @@ settings are remembered but render as identity, like a disabled node."
                             :settings (sexp->processing-settings settings)
                             :source-photo (when source-photo
                                             (pathname source-photo))
-                            :disabled-stages disabled-stages)))
+                            :disabled-stages disabled-stages
+                            :graph (when graph (sexp->graph graph)))))
 
 (defun sexp->processing-presets (sexp)
   (unless (listp sexp)
@@ -260,17 +269,20 @@ settings are remembered but render as identity, like a disabled node."
          :overrides (copy-list (photo-job-overrides photo)))
    (when (photo-job-disabled-stages photo)
      (list :disabled-stages
-           (copy-list (photo-job-disabled-stages photo))))))
+           (copy-list (photo-job-disabled-stages photo))))
+   (when (photo-job-graph photo)
+     (list :graph (graph->sexp (photo-job-graph photo))))))
 
 (defun sexp->photo-job (sexp)
   (unless (and (listp sexp)
                (plist-known-keys-p
-                sexp '(:input :output :overrides :disabled-stages)))
+                sexp '(:input :output :overrides :disabled-stages :graph)))
     (project-invalid sexp "expected a photo property list"))
   (let ((input (getf sexp :input))
         (output (getf sexp :output))
         (overrides (getf sexp :overrides '()))
-        (disabled-stages (getf sexp :disabled-stages '())))
+        (disabled-stages (getf sexp :disabled-stages '()))
+        (graph (getf sexp :graph)))
     (unless (stringp input)
       (project-invalid sexp ":input must be a pathname string"))
     (unless (or (null output) (stringp output))
@@ -280,7 +292,8 @@ settings are remembered but render as identity, like a disabled node."
     (make-photo-job :input-path (pathname input)
                     :output-path (when output (pathname output))
                     :overrides overrides
-                    :disabled-stages disabled-stages)))
+                    :disabled-stages disabled-stages
+                    :graph (when graph (sexp->graph graph)))))
 
 (defun processing-settings-with-overrides (settings overrides)
   "Return a copy of SETTINGS with validated OVERRIDES applied."
@@ -393,7 +406,7 @@ so pasting a grade also carries which nodes were switched off."
 
 (defun project->sexp (project)
   "Convert PROJECT to its portable, versioned S-expression representation."
-  (list :orfeus-project 2
+  (list :orfeus-project 3
         :output-directory (namestring (project-output-directory project))
         :defaults (processing-settings->sexp (project-defaults project))
         :export-settings (export-settings->sexp (project-export-settings project))
@@ -404,11 +417,11 @@ so pasting a grade also carries which nodes were switched off."
   "Validate and convert a project S-expression into a PROJECT."
   (unless (and (listp sexp)
                (eq (first sexp) :orfeus-project)
-               (member (second sexp) '(1 2))
+               (member (second sexp) '(1 2 3))
                (plist-known-keys-p
                 (cddr sexp)
                 '(:output-directory :defaults :export-settings :presets :photos)))
-    (project-invalid sexp "expected (:ORFEUS-PROJECT 1|2 ...)"))
+    (project-invalid sexp "expected (:ORFEUS-PROJECT 1|2|3 ...)"))
   (let ((output-directory (getf (cddr sexp) :output-directory))
         (defaults (getf (cddr sexp) :defaults))
         (export-settings (getf (cddr sexp) :export-settings))

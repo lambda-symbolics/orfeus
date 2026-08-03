@@ -19,7 +19,7 @@
 (defun project-round-trip-p ()
   (let* ((original (project-test-value))
          (decoded (sexp->project (project->sexp original))))
-    (and (= 2 (second (project->sexp original)))
+    (and (= 3 (second (project->sexp original)))
          (= 0.75 (processing-settings-exposure
                   (project-defaults decoded)))
          (= 0.65 (processing-settings-lens-correction-strength
@@ -189,6 +189,159 @@
                                    :name "Still 001 (example)")))))
     (string= "Still 002 (example)"
              (next-still-preset-name project photo))))
+
+(defun branched-test-graph ()
+  "Source -> exposure -> (tone branch) blended back over the exposure result."
+  (make-processing-graph
+   :nodes (list (make-graph-node :id 1 :kind :exposure
+                                 :params '(:exposure 1.0) :inputs '(0))
+                (make-graph-node :id 2 :kind :tone
+                                 :params '(:tone-shadows 0.5) :inputs '(1))
+                (make-graph-node :id 3 :kind :blend
+                                 :opacity 0.25 :inputs '(1 2)))
+   :output 3))
+
+(defun graph-round-trip-p ()
+  (let* ((graph (graph-validate (branched-test-graph)))
+         (decoded (sexp->graph (graph->sexp graph)))
+         (blend (graph-find-node decoded 3)))
+    (and (= 3 (length (processing-graph-nodes decoded)))
+         (equal '(1 2) (graph-node-inputs blend))
+         (= 0.25 (graph-node-opacity blend))
+         (equal '(:exposure 1.0)
+                (graph-node-params (graph-find-node decoded 1)))
+         (= 3 (processing-graph-output decoded)))))
+
+(defun graph-validation-rejects-p ()
+  (flet ((rejected-p (graph)
+           (handler-case (progn (graph-validate graph) nil)
+             (invalid-project-data () t))))
+    (and
+     ;; Forward reference.
+     (rejected-p (make-processing-graph
+                  :nodes (list (make-graph-node :id 1 :kind :exposure
+                                                :params '() :inputs '(2)))
+                  :output 1))
+     ;; Key from a foreign stage.
+     (rejected-p (make-processing-graph
+                  :nodes (list (make-graph-node :id 1 :kind :exposure
+                                                :params '(:tone-whites 1.0)
+                                                :inputs '(0)))
+                  :output 1))
+     ;; Filter consuming film output.
+     (rejected-p (make-processing-graph
+                  :nodes (list (make-graph-node :id 1 :kind :film
+                                                :params '(:grain-amount 0.5)
+                                                :inputs '(0))
+                               (make-graph-node :id 2 :kind :tone
+                                                :params '() :inputs '(1)))
+                  :output 2))
+     ;; Blend consuming film output.
+     (rejected-p (make-processing-graph
+                  :nodes (list (make-graph-node :id 1 :kind :film
+                                                :params '(:grain-amount 0.5)
+                                                :inputs '(0))
+                               (make-graph-node :id 2 :kind :blend
+                                                :opacity 0.5 :inputs '(0 1)))
+                  :output 2))
+     ;; Out-of-range blend opacity.
+     (rejected-p (make-processing-graph
+                  :nodes (list (make-graph-node :id 1 :kind :blend
+                                                :opacity 1.5 :inputs '(0 0)))
+                  :output 1))
+     ;; Film chained after film stays legal.
+     (not (rejected-p (make-processing-graph
+                       :nodes (list (make-graph-node :id 1 :kind :film
+                                                     :params '(:grain-amount 0.2)
+                                                     :inputs '(0))
+                                    (make-graph-node :id 2 :kind :film
+                                                     :params '(:grain-amount 0.1)
+                                                     :inputs '(1)))
+                       :output 2))))))
+
+(defun settings-graph-conversion-p ()
+  (let* ((settings (make-processing-settings :exposure 0.5
+                                             :noise-reduction 0.4
+                                             :lens-correction-p nil
+                                             :chromatic-aberration-correction-p nil
+                                             :lut-strength 0.0))
+         (graph (settings->graph settings '(:noise-reduction)))
+         (nodes (processing-graph-nodes graph)))
+    (and (= 2 (length nodes))
+         (eq :exposure (graph-node-kind (first nodes)))
+         (eq :noise-reduction (graph-node-kind (second nodes)))
+         (graph-node-bypassed-p (second nodes))
+         (not (graph-node-bypassed-p (first nodes)))
+         ;; The bypassed node drops out of the effective plan.
+         (= 1 (length (graph-effective-nodes graph))))))
+
+(defun graph-editing-p ()
+  (let ((graph (graph-validate
+                (make-processing-graph
+                 :nodes (list (make-graph-node :id 1 :kind :exposure
+                                               :params '(:exposure 1.0)
+                                               :inputs '(0))
+                              (make-graph-node :id 2 :kind :tone
+                                               :params '(:tone-shadows 0.5)
+                                               :inputs '(1)))
+                 :output 2))))
+    ;; Insert white balance right after the source.
+    (graph-insert-node graph 0 :white-balance
+                       :params '(:white-balance-tint 3.0))
+    (unless (equal '(:white-balance :exposure :tone)
+                   (mapcar #'graph-node-kind (processing-graph-nodes graph)))
+      (return-from graph-editing-p nil))
+    ;; Reorder: pull tone above exposure.
+    (let ((tone (find :tone (processing-graph-nodes graph)
+                      :key #'graph-node-kind)))
+      (unless (graph-swap-with-upstream graph (graph-node-id tone))
+        (return-from graph-editing-p nil)))
+    (unless (equal '(:white-balance :tone :exposure)
+                   (mapcar #'graph-node-kind (processing-graph-nodes graph)))
+      (return-from graph-editing-p nil))
+    ;; Drop the white balance again; tone must inherit the source input.
+    (let ((wb (find :white-balance (processing-graph-nodes graph)
+                    :key #'graph-node-kind)))
+      (graph-delete-node graph (graph-node-id wb)))
+    (unless (and (equal '(:tone :exposure)
+                        (mapcar #'graph-node-kind
+                                (processing-graph-nodes graph)))
+                 (equal '(0) (graph-node-inputs
+                              (first (processing-graph-nodes graph)))))
+      (return-from graph-editing-p nil))
+    ;; Blend the graded result against the untouched source.
+    (let ((exposure (find :exposure (processing-graph-nodes graph)
+                          :key #'graph-node-kind)))
+      (graph-insert-node graph (graph-node-id exposure) :blend
+                         :opacity 0.5))
+    (let ((blend (find :blend (processing-graph-nodes graph)
+                       :key #'graph-node-kind)))
+      (and blend
+           (eql (processing-graph-output graph) (graph-node-id blend))
+           (= 3 (length (graph-effective-nodes graph)))
+           (progn (graph-validate graph) t)))))
+
+(defun photo-graph-round-trip-p ()
+  (let* ((original
+           (make-project
+            :output-directory #P"exports/"
+            :photos (list (make-photo-job
+                           :input-path #P"input/example.orf"
+                           :graph (branched-test-graph)))))
+         (decoded (sexp->project (project->sexp original)))
+         (graph (photo-job-graph (first (project-photos decoded)))))
+    (and graph
+         (= 3 (length (processing-graph-nodes graph)))
+         (eql 3 (second (project->sexp original)))
+         ;; Version 2 projects without graphs still read.
+         (null (photo-job-graph
+                (first (project-photos
+                        (sexp->project
+                         '(:orfeus-project 2
+                           :output-directory "exports/"
+                           :defaults (:exposure 0.0)
+                           :export-settings (:jpeg-quality 92)
+                           :photos ((:input "a.orf")))))))))))
 
 (defun old-project-export-defaults-p ()
   (let* ((decoded
@@ -671,6 +824,16 @@
              (still-preset-source-photo-round-trip-p))
       (check "still names increment past taken gallery names"
              (still-names-increment-p))
+      (check "graphs round trip through S-expressions"
+             (graph-round-trip-p))
+      (check "graph validation rejects malformed graphs"
+             (graph-validation-rejects-p))
+      (check "settings convert to equivalent linear graphs"
+             (settings-graph-conversion-p))
+      (check "graph editing inserts, reorders, deletes, and blends"
+             (graph-editing-p))
+      (check "photo graphs round trip as project version 3"
+             (photo-graph-round-trip-p))
       (check "old projects receive export defaults" (old-project-export-defaults-p))
       (check "project-relative paths resolve beside the project"
              (project-relative-paths-p))

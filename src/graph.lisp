@@ -1,0 +1,347 @@
+(in-package #:orfeus)
+
+;;; Processing graphs: an ordered DAG of piped filter nodes and blend nodes.
+;;;
+;;; Node id 0 always denotes the decoded RAW source. Filter nodes carry the
+;;; parameters of exactly one pipeline stage and one input; blend nodes mix
+;;; two upstream results by opacity in scene-linear space. Film nodes work in
+;;; display space, so they may only sit on the tail of the graph: nothing but
+;;; further film nodes may consume them, and no blend may. Photographs without
+;;; a graph keep the flat settings pipeline unchanged.
+
+(defparameter *graph-source-id* 0
+  "The reserved node id of the decoded RAW source image.")
+
+(defstruct graph-node
+  "One processing node: a stage filter, or a blend of two branches."
+  (id 1 :type (integer 1))
+  (kind :exposure)
+  (params '())
+  (opacity 1.0)
+  (inputs (list 0))
+  (bypassed-p nil))
+
+(defstruct processing-graph
+  "A topologically ordered processing DAG ending at OUTPUT."
+  (nodes '())
+  (output 0))
+
+(defun graph-filter-kind-p (kind)
+  (and (assoc kind *grade-stages*) t))
+
+(defun graph-node-filter-p (node)
+  (graph-filter-kind-p (graph-node-kind node)))
+
+(defun graph-node-blend-p (node)
+  (eq (graph-node-kind node) :blend))
+
+(defun graph-find-node (graph id)
+  "Return the node of GRAPH with ID, or NIL for the source id."
+  (find id (processing-graph-nodes graph) :key #'graph-node-id))
+
+(defun graph-invalid (datum control &rest arguments)
+  (error 'invalid-project-data
+         :datum datum
+         :reason (apply #'format nil control arguments)))
+
+(defun graph-node-params-validate (node)
+  (let ((params (graph-node-params node))
+        (keys (grade-stage-keys (graph-node-kind node))))
+    (processing-plist-validate params)
+    (loop for (key nil) on params by #'cddr
+          unless (member key keys)
+            do (graph-invalid params "key ~S does not belong to stage ~S"
+                              key (graph-node-kind node)))))
+
+(defun graph-validate (graph)
+  "Signal INVALID-PROJECT-DATA unless GRAPH is well formed; return GRAPH.
+
+Checks topological id order, input arity and reference validity, per-stage
+parameter keys, blend opacities, and the display-domain rule that only film
+nodes may consume film output while blends stay scene-linear."
+  (let ((seen (list *graph-source-id*))
+        (display '()))
+    (dolist (node (processing-graph-nodes graph))
+      (let ((id (graph-node-id node))
+            (kind (graph-node-kind node))
+            (inputs (graph-node-inputs node)))
+        (unless (and (integerp id) (plusp id))
+          (graph-invalid node "node id ~S must be a positive integer" id))
+        (when (member id seen)
+          (graph-invalid node "node id ~S is not strictly increasing" id))
+        (unless (> id (first seen))
+          (graph-invalid node "node id ~S is not strictly increasing" id))
+        (dolist (input inputs)
+          (unless (member input seen)
+            (graph-invalid node "node ~S input ~S is not upstream" id input)))
+        (cond
+          ((graph-node-blend-p node)
+           (unless (= 2 (length inputs))
+             (graph-invalid node "blend node ~S needs exactly two inputs" id))
+           (let ((opacity (graph-node-opacity node)))
+             (unless (and (realp opacity) (<= 0 opacity 1))
+               (graph-invalid node "blend opacity ~S must be within 0..1"
+                              opacity)))
+           (dolist (input inputs)
+             (when (member input display)
+               (graph-invalid node
+                              "blend node ~S cannot consume film output" id))))
+          ((graph-filter-kind-p kind)
+           (unless (= 1 (length inputs))
+             (graph-invalid node "filter node ~S needs exactly one input" id))
+           (graph-node-params-validate node)
+           (if (eq kind :film)
+               (when (member (first inputs) display)
+                 (push id display))
+               (when (member (first inputs) display)
+                 (graph-invalid node
+                                "node ~S cannot process film output" id)))
+           (when (eq kind :film)
+             (pushnew id display)))
+          (t (graph-invalid node "unknown node kind ~S" kind)))
+        (push id seen)))
+    (let ((output (processing-graph-output graph)))
+      (unless (member output seen)
+        (graph-invalid graph "graph output ~S is not a node" output)))
+    graph))
+
+(defun graph-node->sexp (node)
+  (append (list :id (graph-node-id node)
+                :kind (graph-node-kind node)
+                :inputs (copy-list (graph-node-inputs node)))
+          (when (graph-node-params node)
+            (list :params (copy-list (graph-node-params node))))
+          (when (graph-node-blend-p node)
+            (list :opacity (graph-node-opacity node)))
+          (when (graph-node-bypassed-p node)
+            (list :bypassed-p t))))
+
+(defun graph->sexp (graph)
+  "Convert GRAPH to its portable S-expression representation."
+  (list :nodes (mapcar #'graph-node->sexp (processing-graph-nodes graph))
+        :output (processing-graph-output graph)))
+
+(defun sexp->graph-node (sexp)
+  (unless (and (listp sexp)
+               (plist-known-keys-p
+                sexp '(:id :kind :inputs :params :opacity :bypassed-p)))
+    (graph-invalid sexp "expected a graph node property list"))
+  (make-graph-node :id (getf sexp :id 0)
+                   :kind (getf sexp :kind)
+                   :params (getf sexp :params '())
+                   :opacity (getf sexp :opacity 1.0)
+                   :inputs (getf sexp :inputs '())
+                   :bypassed-p (and (getf sexp :bypassed-p) t)))
+
+(defun sexp->graph (sexp)
+  "Validate and convert a graph S-expression into a PROCESSING-GRAPH."
+  (unless (and (listp sexp)
+               (plist-known-keys-p sexp '(:nodes :output)))
+    (graph-invalid sexp "expected a graph property list"))
+  (graph-validate
+   (make-processing-graph
+    :nodes (mapcar #'sexp->graph-node (getf sexp :nodes '()))
+    :output (getf sexp :output *graph-source-id*))))
+
+(defun settings->graph (settings &optional disabled-stages)
+  "Chain the non-identity stages of SETTINGS as a linear graph.
+
+Stages listed in DISABLED-STAGES become bypassed nodes so their grades stay
+editable. The result renders identically to the flat pipeline."
+  (disabled-stages-validate disabled-stages)
+  (let ((nodes '())
+        (next-id 1)
+        (previous *graph-source-id*))
+    (dolist (stage (grade-stages))
+      (let* ((params (settings-grade-plist settings (list stage)))
+             (bypassed (and (member stage disabled-stages) t))
+             (active (loop for (key value) on params by #'cddr
+                             thereis (not (equal value
+                                                 (getf *stage-identity-plist*
+                                                       key))))))
+        (when (or active bypassed)
+          (push (make-graph-node :id next-id
+                                 :kind stage
+                                 :params params
+                                 :inputs (list previous)
+                                 :bypassed-p bypassed)
+                nodes)
+          (setf previous next-id)
+          (incf next-id))))
+    (make-processing-graph :nodes (nreverse nodes) :output previous)))
+
+(defun graph-effective-nodes (graph)
+  "Return GRAPH's reachable, non-bypassed nodes with inputs resolved.
+
+Bypassed filters pass their input through; bypassed blends pass their first
+input. Nodes that do not contribute to the output are dropped. The result is
+a fresh topologically ordered node list whose references remain valid."
+  (graph-validate graph)
+  (let ((forward (make-hash-table)))
+    (setf (gethash *graph-source-id* forward) *graph-source-id*)
+    (let ((kept '()))
+      (dolist (node (processing-graph-nodes graph))
+        (let ((resolved (mapcar (lambda (input) (gethash input forward))
+                                (graph-node-inputs node))))
+          (if (graph-node-bypassed-p node)
+              (setf (gethash (graph-node-id node) forward) (first resolved))
+              (progn
+                (setf (gethash (graph-node-id node) forward)
+                      (graph-node-id node))
+                (push (let ((copy (copy-graph-node node)))
+                        (setf (graph-node-inputs copy) resolved)
+                        copy)
+                      kept)))))
+      (let* ((nodes (nreverse kept))
+             (output (gethash (processing-graph-output graph) forward))
+             (needed (list output)))
+        (dolist (node (reverse nodes))
+          (when (member (graph-node-id node) needed)
+            (dolist (input (graph-node-inputs node))
+              (pushnew input needed))))
+        (values (remove-if-not (lambda (node)
+                                 (member (graph-node-id node) needed))
+                               nodes)
+                output)))))
+
+(defun graph-normalize (graph)
+  "Topologically order GRAPH's nodes and renumber them 1..N.
+
+Relative order between independent nodes follows their current listing, so
+edits stay visually stable. Signals INVALID-PROJECT-DATA on cycles."
+  (let ((remaining (copy-list (processing-graph-nodes graph)))
+        (placed (list *graph-source-id*))
+        (ordered '()))
+    (loop while remaining
+          do (let ((ready (find-if (lambda (node)
+                                     (every (lambda (input)
+                                              (member input placed))
+                                            (graph-node-inputs node)))
+                                   remaining)))
+               (unless ready
+                 (graph-invalid graph "graph contains a cycle"))
+               (push (graph-node-id ready) placed)
+               (push ready ordered)
+               (setf remaining (remove ready remaining))))
+    (setf (processing-graph-nodes graph) (nreverse ordered)))
+  (let ((mapping (make-hash-table))
+        (next-id 1))
+    (setf (gethash *graph-source-id* mapping) *graph-source-id*)
+    (dolist (node (processing-graph-nodes graph))
+      (setf (gethash (graph-node-id node) mapping) next-id)
+      (incf next-id))
+    (dolist (node (processing-graph-nodes graph))
+      (setf (graph-node-id node) (gethash (graph-node-id node) mapping)
+            (graph-node-inputs node)
+            (mapcar (lambda (input) (gethash input mapping))
+                    (graph-node-inputs node))))
+    (setf (processing-graph-output graph)
+          (gethash (processing-graph-output graph) mapping))
+    (graph-validate graph)))
+
+(defun graph-consumers (graph id)
+  "Return the nodes of GRAPH that read node ID directly."
+  (remove-if-not (lambda (node) (member id (graph-node-inputs node)))
+                 (processing-graph-nodes graph)))
+
+(defun graph-insert-node (graph after-id kind &key params (opacity 0.5)
+                                                second-input)
+  "Insert a new node reading AFTER-ID; every consumer of AFTER-ID moves to it.
+
+For KIND :blend, SECOND-INPUT names the other branch (default: the source).
+Returns the new node after normalizing GRAPH."
+  (unless (or (eql after-id *graph-source-id*) (graph-find-node graph after-id))
+    (graph-invalid graph "cannot insert after unknown node ~S" after-id))
+  (let* ((blend (eq kind :blend))
+         (node (make-graph-node
+                :id (1+ (reduce #'max (processing-graph-nodes graph)
+                                :key #'graph-node-id
+                                :initial-value *graph-source-id*))
+                :kind kind
+                :params (and (not blend) (copy-list params))
+                :opacity (if blend opacity 1.0)
+                :inputs (if blend
+                            (list after-id (or second-input *graph-source-id*))
+                            (list after-id)))))
+    (dolist (consumer (graph-consumers graph after-id))
+      (setf (graph-node-inputs consumer)
+            (substitute (graph-node-id node) after-id
+                        (graph-node-inputs consumer))))
+    (when (eql (processing-graph-output graph) after-id)
+      (setf (processing-graph-output graph) (graph-node-id node)))
+    (setf (processing-graph-nodes graph)
+          (append (processing-graph-nodes graph) (list node)))
+    (graph-normalize graph)
+    node))
+
+(defun graph-delete-node (graph id)
+  "Remove node ID; its consumers re-read the node's first input."
+  (let ((node (or (graph-find-node graph id)
+                  (graph-invalid graph "cannot delete unknown node ~S" id))))
+    (let ((replacement (first (graph-node-inputs node))))
+      (dolist (consumer (graph-consumers graph id))
+        (setf (graph-node-inputs consumer)
+              (substitute replacement id (graph-node-inputs consumer))))
+      (when (eql (processing-graph-output graph) id)
+        (setf (processing-graph-output graph) replacement))
+      (setf (processing-graph-nodes graph)
+            (remove node (processing-graph-nodes graph)))
+      (graph-normalize graph))))
+
+(defun graph-swap-with-upstream (graph id)
+  "Swap filter node ID with its single upstream filter neighbor, when both
+sides of the pair are plain single-input filters. Returns true on success."
+  (let* ((node (graph-find-node graph id))
+         (upstream-id (and node (first (graph-node-inputs node))))
+         (upstream (and upstream-id (graph-find-node graph upstream-id))))
+    (when (and node upstream
+               (graph-node-filter-p node)
+               (graph-node-filter-p upstream)
+               (= 1 (length (graph-consumers graph upstream-id))))
+      (let ((below (first (graph-node-inputs upstream))))
+        (dolist (consumer (graph-consumers graph id))
+          (setf (graph-node-inputs consumer)
+                (substitute upstream-id id (graph-node-inputs consumer))))
+        (when (eql (processing-graph-output graph) id)
+          (setf (processing-graph-output graph) upstream-id))
+        (setf (graph-node-inputs node) (list below)
+              (graph-node-inputs upstream) (list id))
+        (setf (processing-graph-nodes graph)
+              (let ((nodes (remove node (processing-graph-nodes graph))))
+                (let ((position (position upstream nodes)))
+                  (append (subseq nodes 0 position)
+                          (list node)
+                          (subseq nodes position)))))
+        (graph-normalize graph)
+        t))))
+
+(defun graph-copy (graph)
+  "Return a structurally independent copy of GRAPH."
+  (make-processing-graph
+   :nodes (mapcar (lambda (node)
+                    (let ((copy (copy-graph-node node)))
+                      (setf (graph-node-params copy)
+                            (copy-list (graph-node-params node))
+                            (graph-node-inputs copy)
+                            (copy-list (graph-node-inputs node)))
+                      copy))
+                  (processing-graph-nodes graph))
+   :output (processing-graph-output graph)))
+
+(defun default-processing-graph ()
+  "Return the default graph: lens corrections piped into noise reduction."
+  (make-processing-graph
+   :nodes (list (make-graph-node
+                 :id 1
+                 :kind :optics
+                 :params (list :lens-correction-p t
+                               :lens-correction-strength 1.0
+                               :chromatic-aberration-correction-p t)
+                 :inputs (list *graph-source-id*))
+                (make-graph-node
+                 :id 2
+                 :kind :noise-reduction
+                 :params (list :noise-reduction 0.35
+                               :neural-noise-reduction 0.0)
+                 :inputs (list 1)))
+   :output 2))

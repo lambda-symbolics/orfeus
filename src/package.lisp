@@ -61,6 +61,35 @@
    #:settings-apply-stage-bypass
    #:settings-grade-plist
    #:next-still-preset-name
+   #:graph-node
+   #:make-graph-node
+   #:graph-node-id
+   #:graph-node-kind
+   #:graph-node-params
+   #:graph-node-opacity
+   #:graph-node-inputs
+   #:graph-node-bypassed-p
+   #:graph-node-blend-p
+   #:graph-node-filter-p
+   #:processing-graph
+   #:make-processing-graph
+   #:copy-processing-graph
+   #:processing-graph-nodes
+   #:processing-graph-output
+   #:graph-validate
+   #:graph-copy
+   #:graph->sexp
+   #:sexp->graph
+   #:settings->graph
+   #:graph-effective-nodes
+   #:graph-find-node
+   #:graph-consumers
+   #:graph-insert-node
+   #:graph-delete-node
+   #:graph-swap-with-upstream
+   #:default-processing-graph
+   #:photo-job-graph
+   #:processing-preset-graph
    #:processing-preset
    #:processing-preset-disabled-stages
    #:processing-preset-name

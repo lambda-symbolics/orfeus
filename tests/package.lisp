@@ -22,8 +22,30 @@
                 #:photo-job-render-output
                 #:processing-preset-name
                 #:processing-preset-settings
+                #:default-processing-graph
                 #:grade-stage-keys
                 #:grade-stages
+                #:graph->sexp
+                #:graph-consumers
+                #:graph-delete-node
+                #:graph-effective-nodes
+                #:graph-find-node
+                #:graph-insert-node
+                #:graph-node-bypassed-p
+                #:graph-node-inputs
+                #:graph-node-kind
+                #:graph-node-opacity
+                #:graph-node-params
+                #:graph-node-id
+                #:graph-swap-with-upstream
+                #:graph-validate
+                #:make-graph-node
+                #:make-processing-graph
+                #:photo-job-graph
+                #:processing-graph-nodes
+                #:processing-graph-output
+                #:sexp->graph
+                #:settings->graph
                 #:next-still-preset-name
                 #:photo-job-apply-grade
                 #:photo-job-disabled-stages
