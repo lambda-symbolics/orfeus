@@ -1726,6 +1726,82 @@ pub(crate) fn neural_render_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
+type ScaledSourceKey = (String, usize, usize, u32, u32, usize);
+
+fn scaled_source_cache() -> &'static Mutex<Vec<(ScaledSourceKey, Arc<RgbImage>)>> {
+    static CACHE: OnceLock<Mutex<Vec<(ScaledSourceKey, Arc<RgbImage>)>>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+const SCALED_SOURCE_CAPACITY: usize = 4;
+
+/// Return the decoded source bounded to the render dimensions, caching the
+/// downscale for interactive re-renders of the same photo and size.
+pub(crate) fn scaled_source_for_render(
+    decoded: &Arc<DecodedRaw>,
+    input: &Path,
+    max_width: u32,
+    max_height: u32,
+    cache_mode: u32,
+) -> RgbImage {
+    let full = |decoded: &DecodedRaw| RgbImage {
+        width: decoded.width,
+        height: decoded.height,
+        data: decoded.data.clone(),
+    };
+    let bounded = max_width > 0 || max_height > 0;
+    if cache_mode != CACHE_USE || !bounded {
+        return match downscale_from(
+            &decoded.data,
+            decoded.width,
+            decoded.height,
+            max_width,
+            max_height,
+        ) {
+            Some(scaled) => scaled,
+            None => full(decoded),
+        };
+    }
+    let key: ScaledSourceKey = (
+        input.to_string_lossy().into_owned(),
+        decoded.width,
+        decoded.height,
+        max_width,
+        max_height,
+        // A re-decoded file gets a fresh Arc, invalidating stale entries.
+        Arc::as_ptr(decoded) as usize,
+    );
+    {
+        let mut cache = scaled_source_cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(position) = cache.iter().position(|(held, _)| *held == key) {
+            let entry = cache.remove(position);
+            let image = (*entry.1).clone();
+            cache.insert(0, entry);
+            return image;
+        }
+    }
+    let scaled = match downscale_from(
+        &decoded.data,
+        decoded.width,
+        decoded.height,
+        max_width,
+        max_height,
+    ) {
+        Some(scaled) => scaled,
+        None => full(decoded),
+    };
+    let mut cache = scaled_source_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cache.retain(|(held, _)| *held != key);
+    cache.insert(0, (key, Arc::new(scaled.clone())));
+    cache.truncate(SCALED_SOURCE_CAPACITY);
+    scaled
+}
+
 fn decode_cache_key(input: &Path) -> Result<DecodeCacheKey, Error> {
     let mut file = File::open(input)?;
     let mut hasher = Sha256::new();
@@ -1936,22 +2012,14 @@ pub fn render(
     let (native_max_width, native_max_height) =
         native_downscale_bounds(orientation, settings.max_width, settings.max_height);
     // Downscaling first commutes with the linear white adaptation and exposure
-    // gains, and bounded renders then read the shared decode cache directly
-    // instead of copying the full-resolution image.
-    let mut image = match downscale_from(
-        &decoded.data,
-        decoded.width,
-        decoded.height,
+    // gains; interactive re-renders reuse the cached bounded source.
+    let mut image = scaled_source_for_render(
+        &decoded,
+        input,
         native_max_width,
         native_max_height,
-    ) {
-        Some(scaled) => scaled,
-        None => RgbImage {
-            width: decoded.width,
-            height: decoded.height,
-            data: decoded.data.clone(),
-        },
-    };
+        cache_mode,
+    );
     profile_stage!("downscale");
     apply_white_adaptation(&mut image, settings.kelvin, settings.tint);
     apply_exposure(&mut image, settings.exposure_ev);

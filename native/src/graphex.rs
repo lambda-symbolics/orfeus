@@ -11,7 +11,7 @@
 
 use std::ffi::{CStr, c_char};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use rayon::prelude::*;
 
@@ -75,7 +75,7 @@ impl RenderFrameV1 {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct GraphOp {
     kind: u32,
     input_a: usize,
@@ -526,33 +526,168 @@ fn rotate_crop_image(
 ///
 /// The source and every intermediate stays scene-linear until either a film
 /// node or the end of the graph converts its branch for display.
+/// A saved register entering one op boundary, for interactive resumes.
+struct PrefixSnapshot {
+    register: usize,
+    image: RgbImage,
+    domain: Domain,
+    oriented: bool,
+}
+
+/// The live registers captured at op boundaries of the last interactive
+/// program: dragging one node re-executes only the ops downstream of it.
+/// Two checkpoints are kept: the divergence point of the latest edit, and
+/// the boundary after the last expensive stage, so switching from editing
+/// an expensive node to a cheap downstream one stays instant too.
+struct PrefixEntry {
+    ops: Vec<GraphOp>,
+    checkpoints: Vec<(usize, Vec<PrefixSnapshot>)>,
+}
+
+/// Cache key: input path, decoded dimensions, bounded render dimensions.
+pub(crate) type PrefixKey = (String, usize, usize, u32, u32, usize);
+
+const PREFIX_CACHE_CAPACITY: usize = 2;
+const PREFIX_SNAPSHOT_LIMIT: usize = 3;
+
+fn prefix_cache() -> &'static Mutex<Vec<(PrefixKey, PrefixEntry)>> {
+    static CACHE: OnceLock<Mutex<Vec<(PrefixKey, PrefixEntry)>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn common_prefix_length(previous: &[GraphOp], current: &[GraphOp]) -> usize {
+    previous
+        .iter()
+        .zip(current)
+        .take_while(|(before, after)| before == after)
+        .count()
+}
+
+/// The default checkpoint: right after the last expensive stage, so edits
+/// to the cheap grading tail never pay for optics or noise reduction again.
+fn default_snapshot_boundary(ops: &[GraphOp]) -> usize {
+    ops.iter()
+        .rposition(|op| {
+            matches!(op.kind, NODE_OPTICS | NODE_NOISE_REDUCTION)
+        })
+        .map(|index| index + 1)
+        .unwrap_or(0)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn execute_graph(
     ops: &[GraphOp],
     source: RgbImage,
     context: &GraphContext<'_>,
 ) -> Result<RgbImage, Error> {
+    execute_graph_cached(ops, source, context, None)
+}
+
+pub(crate) fn execute_graph_cached(
+    ops: &[GraphOp],
+    source: RgbImage,
+    context: &GraphContext<'_>,
+    cache_key: Option<PrefixKey>,
+) -> Result<RgbImage, Error> {
     let count = ops.len();
-    // Each register's remaining reader count, so images move instead of
-    // cloning whenever an input is consumed for the last time.
+    if count == 0 {
+        let mut image = render::orient(source, context.orientation);
+        to_display(&mut image);
+        return Ok(image);
+    }
+    // Interactive resume: reuse the deepest checkpoint of the previous
+    // program that still lies on this program's unchanged prefix.
+    let mut resume: Option<(usize, Vec<PrefixSnapshot>)> = None;
+    let mut capture_points: Vec<usize> = Vec::new();
+    if let Some(key) = &cache_key {
+        let mut cache = prefix_cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let common = if let Some(position) =
+            cache.iter().position(|(held, _)| held == key)
+        {
+            let entry = &cache[position].1;
+            let common = common_prefix_length(&entry.ops, ops);
+            if let Some((boundary, snapshots)) = entry
+                .checkpoints
+                .iter()
+                .filter(|(boundary, _)| *boundary > 0 && *boundary <= common)
+                .max_by_key(|(boundary, _)| *boundary)
+            {
+                resume = Some((
+                    *boundary,
+                    snapshots
+                        .iter()
+                        .map(|snapshot| PrefixSnapshot {
+                            register: snapshot.register,
+                            image: snapshot.image.clone(),
+                            domain: snapshot.domain,
+                            oriented: snapshot.oriented,
+                        })
+                        .collect(),
+                ));
+            }
+            let held = cache.remove(position);
+            cache.insert(0, held);
+            Some(common)
+        } else {
+            None
+        };
+        // Checkpoint at the edit's divergence point for same-node drags,
+        // and after the last expensive stage for downstream edits.
+        match common {
+            Some(common) if common < count => capture_points.push(common),
+            _ => {}
+        }
+        capture_points.push(default_snapshot_boundary(ops));
+        capture_points.retain(|point| *point > 0);
+        capture_points.sort_unstable();
+        capture_points.dedup();
+    }
+    let boundary = resume.as_ref().map(|(boundary, _)| *boundary).unwrap_or(0);
+    capture_points.retain(|point| *point >= boundary);
+    // Remaining reader counts cover only the ops actually executed, so
+    // images still move instead of cloning on their last read.
     let mut uses = vec![0_usize; count + 1];
-    for op in ops {
+    for op in &ops[boundary..] {
         uses[op.input_a] += 1;
         if op.kind == NODE_BLEND {
             uses[op.input_b] += 1;
         }
     }
     uses[count] += 1; // The final node feeds the output.
-    if count == 0 {
-        let mut image = render::orient(source, context.orientation);
-        to_display(&mut image);
-        return Ok(image);
-    }
     let mut registers: Vec<Option<RgbImage>> = (0..=count).map(|_| None).collect();
     let mut domains = vec![Domain::Linear; count + 1];
     let mut oriented = vec![false; count + 1];
     let mut film_ordinal = 0_u64;
-    registers[0] = Some(source);
-    for (index, op) in ops.iter().enumerate() {
+    match resume {
+        Some((_, snapshots)) => {
+            for snapshot in snapshots {
+                if uses[snapshot.register] > 0 {
+                    registers[snapshot.register] = Some(snapshot.image);
+                    domains[snapshot.register] = snapshot.domain;
+                    oriented[snapshot.register] = snapshot.oriented;
+                }
+            }
+            if uses[0] > 0 && registers[0].is_none() {
+                registers[0] = Some(source);
+            }
+            film_ordinal = ops[..boundary]
+                .iter()
+                .filter(|op| op.kind == NODE_FILM)
+                .count() as u64;
+        }
+        None => registers[0] = Some(source),
+    }
+    let mut captured: Vec<(usize, Vec<PrefixSnapshot>)> = Vec::new();
+    for (index, op) in ops.iter().enumerate().skip(boundary) {
+        if capture_points.contains(&index) {
+            if let Some(snapshots) =
+                collect_snapshots(&registers, &domains, &oriented)
+            {
+                captured.push((index, snapshots));
+            }
+        }
         let slot = index + 1;
         let take = |registers: &mut Vec<Option<RgbImage>>,
                     uses: &mut Vec<usize>,
@@ -706,6 +841,25 @@ pub(crate) fn execute_graph(
         }
         registers[slot] = Some(image);
     }
+    if capture_points.contains(&count) {
+        if let Some(snapshots) =
+            collect_snapshots(&registers, &domains, &oriented)
+        {
+            captured.push((count, snapshots));
+        }
+    }
+    if let (Some(key), false) = (&cache_key, captured.is_empty()) {
+        let entry = PrefixEntry {
+            ops: ops.to_vec(),
+            checkpoints: captured,
+        };
+        let mut cache = prefix_cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        cache.retain(|(held, _)| held != key);
+        cache.insert(0, (key.clone(), entry));
+        cache.truncate(PREFIX_CACHE_CAPACITY);
+    }
     let mut image = registers[count]
         .take()
         .ok_or(Error::Render("graph produced no output".into()))?;
@@ -716,6 +870,29 @@ pub(crate) fn execute_graph(
         to_display(&mut image);
     }
     Ok(image)
+}
+
+/// Clones every live register: one checkpoint's worth of resume state.
+fn collect_snapshots(
+    registers: &[Option<RgbImage>],
+    domains: &[Domain],
+    oriented: &[bool],
+) -> Option<Vec<PrefixSnapshot>> {
+    let mut snapshots = Vec::new();
+    for (register, image) in registers.iter().enumerate() {
+        if let Some(image) = image {
+            snapshots.push(PrefixSnapshot {
+                register,
+                image: image.clone(),
+                domain: domains[register],
+                oriented: oriented[register],
+            });
+            if snapshots.len() > PREFIX_SNAPSHOT_LIMIT {
+                return None; // Degenerate fan-outs are not worth the memory.
+            }
+        }
+    }
+    if snapshots.is_empty() { None } else { Some(snapshots) }
 }
 
 /// Test hook: rotate-crop with display-convention angle at orientation 1.
@@ -762,20 +939,13 @@ pub fn render_graph(
     let decoded: Arc<DecodedRaw> = render::decoded_for_render(input, cache_mode, profiling)?;
     let (native_max_width, native_max_height) =
         render::native_downscale_bounds(decoded.orientation, frame.max_width, frame.max_height);
-    let source = match render::downscale_from(
-        &decoded.data,
-        decoded.width,
-        decoded.height,
+    let source = render::scaled_source_for_render(
+        &decoded,
+        input,
         native_max_width,
         native_max_height,
-    ) {
-        Some(scaled) => scaled,
-        None => RgbImage {
-            width: decoded.width,
-            height: decoded.height,
-            data: decoded.data.clone(),
-        },
-    };
+        cache_mode,
+    );
     let explicit_profile = if frame.lens_profile_model.is_null() {
         None
     } else {
@@ -796,7 +966,19 @@ pub fn render_graph(
         grain_seed: frame.grain_seed,
         orientation: decoded.orientation,
     };
-    let image = execute_graph(&ops, source, &context)?;
+    let bounded = native_max_width > 0 || native_max_height > 0;
+    let prefix_key = (cache_mode == render::CACHE_USE && bounded).then(|| {
+        (
+            input.to_string_lossy().into_owned(),
+            decoded.width,
+            decoded.height,
+            native_max_width,
+            native_max_height,
+            // A re-decoded file gets a fresh Arc, invalidating stale entries.
+            Arc::as_ptr(&decoded) as usize,
+        )
+    });
+    let image = execute_graph_cached(&ops, source, &context, prefix_key)?;
     render::atomic_encode(
         input,
         output,
@@ -1286,6 +1468,73 @@ mod tests {
         // Out-of-range values ride through continuously.
         assert!(apply_curve_value(&identity_lut, -0.25) < 0.0);
         assert!(apply_curve_value(&identity_lut, 1.5) > 1.4);
+    }
+
+    fn tone_program(shadows: f32) -> Vec<u8> {
+        GraphBuilder::new()
+            .node(NODE_EXPOSURE, 0, -1, &[0.4], None)
+            .node(NODE_TONE, 1, -1, &[0.0, shadows, 0.0, 0.0, 0.0, 0.0, 0.0], None)
+            .node(NODE_BLEND, 2, 0, &[0.6], None)
+            .build()
+    }
+
+    #[test]
+    fn prefix_resume_matches_a_cold_render_exactly() {
+        let key: PrefixKey = ("prefix-test".into(), 24, 16, 24, 16, 1);
+        {
+            let mut cache = prefix_cache()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            cache.retain(|(held, _)| held.0 != "prefix-test");
+        }
+        // First render primes the checkpoint; the tone edit then resumes
+        // mid-program, with the blend pulling the source across the
+        // boundary. The result must be identical to an uncached render.
+        let first = parse_graph(&tone_program(0.3)).unwrap();
+        let second = parse_graph(&tone_program(0.7)).unwrap();
+        let source = gradient_image();
+        execute_graph_cached(&first, source.clone(), &context(7),
+                             Some(key.clone()))
+            .unwrap();
+        let resumed = execute_graph_cached(&second, source.clone(),
+                                           &context(7), Some(key.clone()))
+            .unwrap();
+        let cold = execute_graph(&second, source.clone(), &context(7))
+            .unwrap();
+        assert_eq!(resumed.width, cold.width);
+        assert_eq!(resumed.height, cold.height);
+        assert!(max_difference(&resumed, &cold) == 0.0);
+        // A third tweak resumes from the refreshed checkpoint.
+        let third = parse_graph(&tone_program(0.9)).unwrap();
+        let resumed = execute_graph_cached(&third, source.clone(),
+                                           &context(7), Some(key))
+            .unwrap();
+        let cold = execute_graph(&third, source, &context(7)).unwrap();
+        assert!(max_difference(&resumed, &cold) == 0.0);
+    }
+
+    #[test]
+    fn prefix_cache_keys_do_not_leak_across_photos() {
+        let key_a: PrefixKey = ("photo-a".into(), 24, 16, 24, 16, 1);
+        let key_b: PrefixKey = ("photo-b".into(), 24, 16, 24, 16, 1);
+        let ops = parse_graph(&tone_program(0.5)).unwrap();
+        let bright = {
+            let mut image = gradient_image();
+            for value in &mut image.data {
+                *value *= 2.0;
+            }
+            image
+        };
+        execute_graph_cached(&ops, gradient_image(), &context(7),
+                             Some(key_a))
+            .unwrap();
+        // Rendering photo B with its own key must not reuse A's registers.
+        let edited = parse_graph(&tone_program(0.8)).unwrap();
+        let via_cache = execute_graph_cached(&edited, bright.clone(),
+                                             &context(7), Some(key_b))
+            .unwrap();
+        let cold = execute_graph(&edited, bright, &context(7)).unwrap();
+        assert!(max_difference(&via_cache, &cold) == 0.0);
     }
 
     #[test]
