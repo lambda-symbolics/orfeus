@@ -503,6 +503,31 @@ placement breaks the film-domain rules."
                (orfeus:graph-swap-with-upstream
                 graph (orfeus:graph-node-id (first consumers)))))))))))
 
+(defun gui-model-set-node-kind (model node kind)
+  "Assign a correction KIND to NODE on the selected photo's graph."
+  (let* ((job (gui-model-selected-job model))
+         (graph (and job (photo-job-graph job))))
+    (when (and graph
+               (member node (orfeus:processing-graph-nodes graph)))
+      (orfeus:graph-set-node-kind graph (orfeus:graph-node-id node) kind))))
+
+(defun gui-model-set-primary-input (model node input-id)
+  "Point NODE's primary input at INPUT-ID on the selected photo's graph."
+  (let* ((job (gui-model-selected-job model))
+         (graph (and job (photo-job-graph job))))
+    (when (and graph
+               (member node (orfeus:processing-graph-nodes graph)))
+      (orfeus:graph-set-primary-input graph (orfeus:graph-node-id node)
+                                      input-id))))
+
+(defun gui-model-set-output (model node)
+  "Make NODE the selected photo's graph output."
+  (let* ((job (gui-model-selected-job model))
+         (graph (and job (photo-job-graph job))))
+    (when (and graph
+               (member node (orfeus:processing-graph-nodes graph)))
+      (orfeus:graph-set-output graph (orfeus:graph-node-id node)))))
+
 (defun gui-model-rewire-node (model node after-id)
   "Splice NODE to read AFTER-ID on the selected photo's graph.
 

@@ -33,13 +33,18 @@ negatives.")
   "Four (x y) control points along the diagonal: the do-nothing curve.")
 
 (defstruct graph-node
-  "One processing node: a stage filter, or a blend of two branches."
+  "One processing node: a stage filter, or a blend of two branches.
+
+KIND :NODE is an untyped container fresh from \"New Node\": it passes its
+branch through unchanged until the user assigns a correction type.
+POSITION, when set, is the node's (x y) spot on the graph editor canvas."
   (id 1 :type (integer 1))
-  (kind :exposure)
+  (kind :node)
   (params '())
   (opacity 1.0)
   (inputs (list 0))
-  (bypassed-p nil))
+  (bypassed-p nil)
+  (position nil))
 
 (defstruct processing-graph
   "A topologically ordered processing DAG ending at OUTPUT."
@@ -221,6 +226,16 @@ while blends stay scene-linear."
            (curves-params-validate (graph-node-params node))
            (when (member (first inputs) display)
              (graph-invalid node "node ~S cannot process film output" id)))
+          ((eq kind :node)
+           ;; An untyped container: passes its branch through unchanged,
+           ;; in either domain, until a correction type is assigned.
+           (unless (= 1 (length inputs))
+             (graph-invalid node "filter node ~S needs exactly one input" id))
+           (when (graph-node-params node)
+             (graph-invalid node "untyped node ~S cannot carry parameters"
+                            id))
+           (when (member (first inputs) display)
+             (push id display)))
           ((graph-filter-kind-p kind)
            (unless (= 1 (length inputs))
              (graph-invalid node "filter node ~S needs exactly one input" id))
@@ -270,7 +285,9 @@ while blends stay scene-linear."
           (when (graph-node-blend-p node)
             (list :opacity (graph-node-opacity node)))
           (when (graph-node-bypassed-p node)
-            (list :bypassed-p t))))
+            (list :bypassed-p t))
+          (when (graph-node-position node)
+            (list :position (copy-list (graph-node-position node))))))
 
 (defun graph->sexp (graph)
   "Convert GRAPH to its portable S-expression representation."
@@ -280,14 +297,23 @@ while blends stay scene-linear."
 (defun sexp->graph-node (sexp)
   (unless (and (listp sexp)
                (plist-known-keys-p
-                sexp '(:id :kind :inputs :params :opacity :bypassed-p)))
+                sexp '(:id :kind :inputs :params :opacity :bypassed-p
+                       :position)))
     (graph-invalid sexp "expected a graph node property list"))
-  (make-graph-node :id (getf sexp :id 0)
-                   :kind (getf sexp :kind)
-                   :params (getf sexp :params '())
-                   :opacity (getf sexp :opacity 1.0)
-                   :inputs (getf sexp :inputs '())
-                   :bypassed-p (and (getf sexp :bypassed-p) t)))
+  (let ((position (getf sexp :position)))
+    (unless (or (null position)
+                (and (listp position) (= 2 (length position))
+                     (every (lambda (value)
+                              (and (realp value) (<= -100000 value 100000)))
+                            position)))
+      (graph-invalid sexp "node :position must be two coordinates"))
+    (make-graph-node :id (getf sexp :id 0)
+                     :kind (getf sexp :kind)
+                     :params (getf sexp :params '())
+                     :opacity (getf sexp :opacity 1.0)
+                     :inputs (getf sexp :inputs '())
+                     :bypassed-p (and (getf sexp :bypassed-p) t)
+                     :position (when position (copy-list position)))))
 
 (defun sexp->graph (sexp)
   "Validate and convert a graph S-expression into a PROCESSING-GRAPH."
@@ -348,7 +374,9 @@ a fresh topologically ordered node list whose references remain valid."
       (dolist (node (processing-graph-nodes graph))
         (let ((resolved (mapcar (lambda (input) (gethash input forward))
                                 (graph-node-inputs node))))
-          (if (graph-node-bypassed-p node)
+          (if (or (graph-node-bypassed-p node)
+                  ;; Untyped containers render as passthrough.
+                  (eq :node (graph-node-kind node)))
               (setf (gethash (graph-node-id node) forward) (first resolved))
               (progn
                 (setf (gethash (graph-node-id node) forward)
@@ -494,22 +522,92 @@ sides of the pair are plain single-input filters. Returns true on success."
            t))))))
 
 (defun call-with-graph-rollback (graph thunk)
-  "Run THUNK; restore GRAPH's ids, inputs, order, and output on any error."
+  "Run THUNK; restore GRAPH's node state, order, and output on any error."
   (let ((entries (mapcar (lambda (node)
                            (list node (graph-node-id node)
-                                 (copy-list (graph-node-inputs node))))
+                                 (copy-list (graph-node-inputs node))
+                                 (graph-node-kind node)
+                                 (copy-tree (graph-node-params node))
+                                 (graph-node-opacity node)))
                          (processing-graph-nodes graph)))
         (nodes (copy-list (processing-graph-nodes graph)))
         (output (processing-graph-output graph)))
     (handler-case (funcall thunk)
       (error (condition)
         (dolist (entry entries)
-          (destructuring-bind (node id inputs) entry
+          (destructuring-bind (node id inputs kind params opacity) entry
             (setf (graph-node-id node) id
-                  (graph-node-inputs node) inputs)))
+                  (graph-node-inputs node) inputs
+                  (graph-node-kind node) kind
+                  (graph-node-params node) params
+                  (graph-node-opacity node) opacity)))
         (setf (processing-graph-nodes graph) nodes
               (processing-graph-output graph) output)
         (error condition)))))
+
+(defun graph-set-node-kind (graph id kind)
+  "Change node ID's correction KIND, resetting its parameters.
+
+Turning a node into a blend feeds its second branch from the source;
+converting away keeps the primary input. Returns true when the kind
+changed; invalid results roll back and re-signal."
+  (let ((node (or (graph-find-node graph id)
+                  (graph-invalid graph "cannot retype unknown node ~S" id))))
+    (unless (or (eq kind :node) (member kind (graph-node-kinds)))
+      (graph-invalid graph "unknown node kind ~S" kind))
+    (if (eq kind (graph-node-kind node))
+        nil
+        (call-with-graph-rollback
+         graph
+         (lambda ()
+           (setf (graph-node-kind node) kind
+                 (graph-node-params node) '())
+           (if (eq kind :blend)
+               (setf (graph-node-inputs node)
+                     (list (first (graph-node-inputs node))
+                           *graph-source-id*)
+                     (graph-node-opacity node) 0.5)
+               (setf (graph-node-inputs node)
+                     (list (first (graph-node-inputs node)))
+                     (graph-node-opacity node) 1.0))
+           (graph-normalize graph)
+           t)))))
+
+(defun graph-set-primary-input (graph id input-id)
+  "Point node ID's primary input at INPUT-ID (or the source).
+
+Returns true when the wiring changed; invalid wiring (cycles included)
+rolls the graph back and re-signals."
+  (let ((node (or (graph-find-node graph id)
+                  (graph-invalid graph "cannot rewire unknown node ~S" id))))
+    (unless (or (eql input-id *graph-source-id*)
+                (graph-find-node graph input-id))
+      (graph-invalid graph "cannot read unknown node ~S" input-id))
+    (cond
+      ((eql input-id id)
+       (graph-invalid graph "a node cannot read itself"))
+      ((eql input-id (first (graph-node-inputs node))) nil)
+      (t
+       (call-with-graph-rollback
+        graph
+        (lambda ()
+          (setf (graph-node-inputs node)
+                (cons input-id (rest (graph-node-inputs node))))
+          (graph-normalize graph)
+          t))))))
+
+(defun graph-set-output (graph id)
+  "Make node ID the graph output; invalid choices roll back and re-signal."
+  (unless (graph-find-node graph id)
+    (graph-invalid graph "cannot output unknown node ~S" id))
+  (if (eql (processing-graph-output graph) id)
+      nil
+      (call-with-graph-rollback
+       graph
+       (lambda ()
+         (setf (processing-graph-output graph) id)
+         (graph-normalize graph)
+         t))))
 
 (defun graph-move-node-after (graph id after-id)
   "Splice node ID out of its chain and re-insert it reading AFTER-ID.
@@ -598,7 +696,9 @@ rolls the graph back and re-signals."
                       (setf (graph-node-params copy)
                             (copy-tree (graph-node-params node))
                             (graph-node-inputs copy)
-                            (copy-list (graph-node-inputs node)))
+                            (copy-list (graph-node-inputs node))
+                            (graph-node-position copy)
+                            (copy-list (graph-node-position node)))
                       copy))
                   (processing-graph-nodes graph))
    :output (processing-graph-output graph)))

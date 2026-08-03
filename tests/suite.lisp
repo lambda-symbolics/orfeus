@@ -443,6 +443,56 @@
                nil)
            (invalid-project-data () t)))))
 
+(defun graph-node-workflow-p ()
+  ;; The Resolve-style flow: New Node (untyped) -> assign a correction.
+  (let* ((graph (default-processing-graph))
+         (node (graph-insert-node graph (processing-graph-output graph)
+                                  :node)))
+    (and (graph-validate graph)
+         ;; Untyped nodes are invisible to the render program.
+         (= 2 (length (graph-effective-nodes graph)))
+         (graph-set-node-kind graph (graph-node-id node) :exposure)
+         (eq :exposure (graph-node-kind node))
+         (= 3 (length (graph-effective-nodes graph)))
+         ;; Retyping into a blend gains a source-fed second branch.
+         (graph-set-node-kind graph (graph-node-id node) :blend)
+         (= 2 (length (graph-node-inputs node)))
+         (eql 0 (second (graph-node-inputs node)))
+         ;; Positions ride through S-expression round trips.
+         (progn (setf (orfeus:graph-node-position node) (list 40.0 96.0))
+                (let* ((decoded (sexp->graph (graph->sexp graph)))
+                       (twin (find :blend (processing-graph-nodes decoded)
+                                   :key #'graph-node-kind)))
+                  (equal '(40.0 96.0) (orfeus:graph-node-position twin))))
+         ;; Unknown kinds are rejected.
+         (handler-case
+             (progn (graph-set-node-kind graph (graph-node-id node) :bogus)
+                    nil)
+           (invalid-project-data () t)))))
+
+(defun graph-rewire-inputs-p ()
+  (let* ((graph (default-processing-graph))
+         (optics (first (processing-graph-nodes graph)))
+         (nr (second (processing-graph-nodes graph))))
+    (and ;; NR reads the source directly; optics hangs as a side branch.
+         (graph-set-primary-input graph (graph-node-id nr)
+                                  *graph-source-id*)
+         (eql 0 (first (graph-node-inputs nr)))
+         ;; The output can move to any node.
+         (graph-set-output graph (graph-node-id optics))
+         (eql (graph-node-id optics) (processing-graph-output graph))
+         ;; Wiring a genuine cycle rolls back untouched.
+         (graph-set-primary-input graph (graph-node-id optics)
+                                  (graph-node-id nr))
+         (let ((before (graph->sexp graph)))
+           (and (handler-case
+                    (progn (graph-set-primary-input
+                            graph (graph-node-id nr)
+                            (graph-node-id optics))
+                           nil)
+                  (invalid-project-data () t))
+                (equal before (graph->sexp graph)))))))
+
 (defun graph-rewire-p ()
   (let ((graph (graph-validate
                 (make-processing-graph
@@ -1304,6 +1354,10 @@
              (graph-editing-p))
       (check "nodes splice anywhere and invalid wires roll back"
              (graph-rewire-p))
+      (check "untyped nodes pass through until a correction is assigned"
+             (graph-node-workflow-p))
+      (check "primary inputs and the output rewire with rollback"
+             (graph-rewire-inputs-p))
       (check "failed graph edits roll back and graph copies own nested params"
              (graph-edit-rollback-and-copy-p))
       (check "blends require compatible crop geometry on both branches"

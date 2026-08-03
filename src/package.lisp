@@ -90,6 +90,10 @@
    #:graph-consumers
    #:graph-move-node-after
    #:graph-set-blend-input
+   #:graph-set-node-kind
+   #:graph-set-primary-input
+   #:graph-set-output
+   #:graph-node-position
    #:*graph-source-id*
    #:*curve-channel-keys*
    #:*identity-curve-points*

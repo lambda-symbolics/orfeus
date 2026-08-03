@@ -48,6 +48,9 @@
                 #:graph-swap-with-upstream
                 #:graph-move-node-after
                 #:graph-set-blend-input
+                #:graph-set-node-kind
+                #:graph-set-primary-input
+                #:graph-set-output
                 #:*graph-source-id*
                 #:graph-validate
                 #:make-graph-node
