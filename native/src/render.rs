@@ -207,14 +207,14 @@ impl RenderSettingsV1 {
 }
 
 #[derive(Clone, Debug)]
-struct RgbImage {
-    width: usize,
-    height: usize,
-    data: Vec<f32>,
+pub(crate) struct RgbImage {
+    pub(crate) width: usize,
+    pub(crate) height: usize,
+    pub(crate) data: Vec<f32>,
 }
 
 #[derive(Debug)]
-struct CubeLut {
+pub(crate) struct CubeLut {
     size: usize,
     domain_min: [f32; 3],
     domain_max: [f32; 3],
@@ -222,7 +222,7 @@ struct CubeLut {
 }
 
 impl CubeLut {
-    fn read(path: &Path) -> Result<Self, Error> {
+    pub(crate) fn read(path: &Path) -> Result<Self, Error> {
         let file = File::open(path)?;
         if file.metadata()?.len() > MAX_LUT_BYTES {
             return Err(Error::Render(".cube file exceeds 32 MiB limit".into()));
@@ -395,7 +395,7 @@ fn parse_triplet_iter<'a>(
     Ok(out)
 }
 
-fn apply_exposure(image: &mut RgbImage, ev: f32) {
+pub(crate) fn apply_exposure(image: &mut RgbImage, ev: f32) {
     if ev == 0.0 {
         return;
     }
@@ -441,7 +441,7 @@ fn mat_mul(left: [[f32; 3]; 3], right: [[f32; 3]; 3]) -> [[f32; 3]; 3] {
 /// Camera WB remains rawler's camera-aware default when Kelvin is zero; tint is
 /// then a small working-space green/magenta adaptation around D65. A nonzero
 /// Kelvin deliberately disables camera WB and adapts the camera-matrix result.
-fn apply_white_adaptation(image: &mut RgbImage, kelvin: f32, tint: f32) {
+pub(crate) fn apply_white_adaptation(image: &mut RgbImage, kelvin: f32, tint: f32) {
     if kelvin == 0.0 && tint == 0.0 {
         return;
     }
@@ -504,7 +504,7 @@ fn tone_adjustment_ev(luminance: f32, adjustments: &[f32; 7]) -> f32 {
     adjustments[interval] * (1.0 - smooth) + adjustments[interval + 1] * smooth
 }
 
-fn apply_tonal_equalizer(image: &mut RgbImage, adjustments: [f32; 7]) {
+pub(crate) fn apply_tonal_equalizer(image: &mut RgbImage, adjustments: [f32; 7]) {
     if adjustments.iter().all(|adjustment| *adjustment == 0.0) {
         return;
     }
@@ -650,7 +650,7 @@ fn soft_threshold(value: f32, threshold: f32) -> f32 {
     value.signum() * (value.abs() - threshold).max(0.0)
 }
 
-fn apply_noise_reduction(image: &mut RgbImage, luma: f32, chroma: f32) {
+pub(crate) fn apply_noise_reduction(image: &mut RgbImage, luma: f32, chroma: f32) {
     if (luma == 0.0 && chroma == 0.0) || image.width < 3 || image.height < 3 {
         return;
     }
@@ -930,19 +930,19 @@ fn zoom_center(image: &mut RgbImage, scale: f32) {
         });
 }
 
-struct LensCorrectionOptions<'a> {
-    make: &'a str,
-    model: &'a str,
-    lens_name: &'a str,
-    focal: f32,
-    flags: u32,
-    strength: f32,
-    explicit_profile: Option<&'a str>,
-    focal_reducer: f32,
-    crop_factor: f32,
+pub(crate) struct LensCorrectionOptions<'a> {
+    pub(crate) make: &'a str,
+    pub(crate) model: &'a str,
+    pub(crate) lens_name: &'a str,
+    pub(crate) focal: f32,
+    pub(crate) flags: u32,
+    pub(crate) strength: f32,
+    pub(crate) explicit_profile: Option<&'a str>,
+    pub(crate) focal_reducer: f32,
+    pub(crate) crop_factor: f32,
 }
 
-fn apply_lens(image: &mut RgbImage, options: &LensCorrectionOptions<'_>) -> Result<(), Error> {
+pub(crate) fn apply_lens(image: &mut RgbImage, options: &LensCorrectionOptions<'_>) -> Result<(), Error> {
     let make = options.make;
     let model = options.model;
     let lens_name = options.lens_name;
@@ -1098,7 +1098,7 @@ fn apply_lens(image: &mut RgbImage, options: &LensCorrectionOptions<'_>) -> Resu
     Ok(())
 }
 
-fn orient(image: RgbImage, orientation: u16) -> RgbImage {
+pub(crate) fn orient(image: RgbImage, orientation: u16) -> RgbImage {
     if orientation <= 1 || orientation > 8 {
         return image;
     }
@@ -1136,7 +1136,7 @@ fn orient(image: RgbImage, orientation: u16) -> RgbImage {
     output
 }
 
-fn native_downscale_bounds(orientation: u16, max_width: u32, max_height: u32) -> (u32, u32) {
+pub(crate) fn native_downscale_bounds(orientation: u16, max_width: u32, max_height: u32) -> (u32, u32) {
     if (5..=8).contains(&orientation) {
         (max_height, max_width)
     } else {
@@ -1147,7 +1147,7 @@ fn native_downscale_bounds(orientation: u16, max_width: u32, max_height: u32) ->
 /// Area-averages SOURCE into the bounded size, or returns None when the
 /// bounds do not require shrinking. Reading borrowed pixels lets bounded
 /// renders start straight from the shared decode cache without copying it.
-fn downscale_from(
+pub(crate) fn downscale_from(
     source: &[f32],
     source_width: usize,
     source_height: usize,
@@ -1247,7 +1247,7 @@ fn area_coverage(source: usize, target: usize) -> Vec<(usize, Vec<f32>)> {
         .collect()
 }
 
-fn srgb_transfer(image: &mut RgbImage) {
+pub(crate) fn srgb_transfer(image: &mut RgbImage) {
     image.data.par_iter_mut().for_each(|value| {
         *value = if *value <= 0.003_130_8 {
             12.92 * *value
@@ -1257,7 +1257,7 @@ fn srgb_transfer(image: &mut RgbImage) {
     });
 }
 
-fn apply_lut(image: &mut RgbImage, lut: &CubeLut, strength: f32) {
+pub(crate) fn apply_lut(image: &mut RgbImage, lut: &CubeLut, strength: f32) {
     image.data.par_chunks_exact_mut(3).for_each(|pixel| {
         let transformed = lut.sample([pixel[0], pixel[1], pixel[2]]);
         for channel in 0..3 {
@@ -1274,7 +1274,7 @@ fn splitmix64(mut value: u64) -> u64 {
     value ^ (value >> 31)
 }
 
-fn apply_grain(image: &mut RgbImage, amount: f32, size: f32, seed: u64) {
+pub(crate) fn apply_grain(image: &mut RgbImage, amount: f32, size: f32, seed: u64) {
     if amount == 0.0 {
         return;
     }
@@ -1364,7 +1364,7 @@ fn encode_to<W: Write + Seek>(
     .map_err(|e| Error::Render(format!("image encoding failed: {e}")))
 }
 
-fn same_file(input: &Path, output: &Path) -> Result<bool, Error> {
+pub(crate) fn same_file(input: &Path, output: &Path) -> Result<bool, Error> {
     let input_meta = fs::metadata(input)?;
     match fs::metadata(output) {
         Ok(output_meta) => {
@@ -1391,7 +1391,7 @@ fn temporary_path(output: &Path, attempt: u32) -> Result<PathBuf, Error> {
     )))
 }
 
-fn atomic_encode(
+pub(crate) fn atomic_encode(
     input: &Path,
     output: &Path,
     image: &RgbImage,
@@ -1438,15 +1438,15 @@ fn atomic_encode(
 }
 
 /// Scene-linear sRGB pixels and the source description needed to render them.
-struct DecodedRaw {
-    width: usize,
-    height: usize,
-    data: Vec<f32>,
-    orientation: u16,
-    make: String,
-    model: String,
-    lens_name: String,
-    focal: f32,
+pub(crate) struct DecodedRaw {
+    pub(crate) width: usize,
+    pub(crate) height: usize,
+    pub(crate) data: Vec<f32>,
+    pub(crate) orientation: u16,
+    pub(crate) make: String,
+    pub(crate) model: String,
+    pub(crate) lens_name: String,
+    pub(crate) focal: f32,
 }
 
 type DecodeCacheKey = [u8; 32];
@@ -1463,7 +1463,7 @@ fn decode_cache() -> &'static (Mutex<DecodeCacheState>, Condvar) {
     CACHE.get_or_init(|| (Mutex::new(DecodeCacheState::default()), Condvar::new()))
 }
 
-fn neural_render_lock() -> &'static Mutex<()> {
+pub(crate) fn neural_render_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
 }
@@ -1622,7 +1622,7 @@ where
     result
 }
 
-fn decoded_for_render(
+pub(crate) fn decoded_for_render(
     input: &Path,
     cache_mode: u32,
     profiling: bool,

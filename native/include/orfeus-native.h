@@ -97,6 +97,48 @@ enum orfeus_render_cache_mode {
     ORFEUS_RENDER_CACHE_USE = 1
 };
 
+enum orfeus_graph_node_kind {
+    ORFEUS_NODE_WHITE_BALANCE = 1,
+    ORFEUS_NODE_EXPOSURE = 2,
+    ORFEUS_NODE_NOISE_REDUCTION = 3,
+    ORFEUS_NODE_TONE = 4,
+    ORFEUS_NODE_OPTICS = 5,
+    ORFEUS_NODE_FILM = 6,
+    ORFEUS_NODE_BLEND = 7
+};
+
+struct orfeus_render_frame_v1 {
+    uint32_t struct_size;
+    uint32_t version; /* 1 */
+    uint32_t output_format;
+    uint32_t max_width;
+    uint32_t max_height;
+    uint32_t jpeg_quality;
+    uint64_t grain_seed;
+    float focal_reducer;
+    float lens_crop_factor;
+    /* NULL for automatic camera/mount matching; must stay readable for the
+       complete call. */
+    const char *lens_profile_model;
+};
+
+/* Renders through a little-endian node program: magic "ORFG" (0x4746524F),
+   format version 1, node count, then per node: kind u32, input_a i32,
+   input_b i32 (-1 unless blend), param count u32, params f32[], string
+   length u32 + UTF-8 bytes (film LUT path only). Inputs reference earlier
+   node ordinals; 0 is the decoded source. Blend nodes mix scene-linear
+   branches; film nodes convert their branch to display space and only film
+   nodes may consume them. Orientation, ICC, and atomic publish semantics
+   match orfeus_raw_render_v1; cache semantics match orfeus_raw_render_v2. */
+int32_t orfeus_raw_render_v3(const char *input_path,
+                             const char *output_path,
+                             const struct orfeus_render_frame_v1 *frame,
+                             const uint8_t *graph,
+                             size_t graph_length,
+                             uint32_t cache_mode,
+                             char *error_buffer,
+                             size_t error_capacity);
+
 /* Renders like orfeus_raw_render_v1. Cache mode ORFEUS_RENDER_CACHE_USE keeps
    a small in-process cache of decoded scene-linear images keyed by input path,
    size, and modification time so interactive setting changes skip RAW

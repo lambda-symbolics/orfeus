@@ -15,6 +15,7 @@ use md5::{Digest, Md5};
 
 mod color;
 mod gpu;
+mod graphex;
 mod nn;
 mod render;
 mod tone;
@@ -411,11 +412,12 @@ where
 
 /// Return the C ABI version implemented by this library.
 ///
-/// Version 2 adds `orfeus_raw_render_v2` with an opt-in decode cache while
-/// keeping every version 1 entry point unchanged.
+/// Version 2 added `orfeus_raw_render_v2` with an opt-in decode cache.
+/// Version 3 adds `orfeus_raw_render_v3`, which executes a serialized
+/// processing node graph. Every earlier entry point is unchanged.
 #[unsafe(no_mangle)]
 pub extern "C" fn orfeus_bridge_abi_version() -> u32 {
-    2
+    3
 }
 
 /// Read `OriginalRawFileName` from a classic TIFF/DNG into a caller buffer.
@@ -518,6 +520,49 @@ pub unsafe extern "C" fn orfeus_raw_render_v1(
             error_buffer,
             error_capacity,
         )
+    }
+}
+
+/// Render INPUT through a serialized processing node graph.
+///
+/// `frame` carries the output and lens-alias parameters shared by the whole
+/// graph; `graph`/`graph_length` reference the little-endian node program
+/// produced by the Orfeus core (magic "ORFG"). Cache semantics match
+/// `orfeus_raw_render_v2`. Export behavior (orientation, ICC, atomic
+/// publish) matches `orfeus_raw_render_v1`.
+///
+/// # Safety
+///
+/// Path pointers and a non-null `frame.lens_profile_model` must be readable
+/// NUL-terminated strings, `frame` must point to a readable
+/// `orfeus_render_frame_v1`, and `graph` must be readable for
+/// `graph_length` bytes, all for the duration of this call. The error
+/// buffer, when non-null, must be writable for its stated capacity.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn orfeus_raw_render_v3(
+    input_path: *const c_char,
+    output_path: *const c_char,
+    frame: *const graphex::RenderFrameV1,
+    graph: *const u8,
+    graph_length: usize,
+    cache_mode: u32,
+    error_buffer: *mut c_char,
+    error_capacity: usize,
+) -> i32 {
+    // SAFETY: Pointer validation and dereferences remain inside the panic boundary.
+    unsafe {
+        ffi_result(error_buffer, error_capacity, || {
+            if frame.is_null() {
+                return Err(Error::InvalidArgument("render frame pointer is null"));
+            }
+            if graph.is_null() {
+                return Err(Error::InvalidArgument("graph pointer is null"));
+            }
+            let bytes = std::slice::from_raw_parts(graph, graph_length);
+            let input = path_from_c(input_path)?;
+            let output = path_from_c(output_path)?;
+            graphex::render_graph(input, output, &*frame, bytes, cache_mode)
+        })
     }
 }
 
@@ -627,7 +672,7 @@ mod tests {
 
     #[test]
     fn reports_current_abi_version() {
-        assert_eq!(orfeus_bridge_abi_version(), 2);
+        assert_eq!(orfeus_bridge_abi_version(), 3);
         assert_eq!(orfeus_raw_render_capabilities_v1(), 1 | 2 | 4 | 16);
     }
 
