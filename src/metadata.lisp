@@ -40,6 +40,38 @@ otherwise the slowest step of an interactive preview.")
               (read-photo-lens-description pathname))
         cached)))
 
+(defvar *photo-capture-timestamp-cache*
+  (make-hash-table :test #'equal #+sbcl :synchronized #+sbcl t)
+  "Capture timestamps keyed by path and write date.")
+
+(defun timestamp-token (raw)
+  "Normalize an EXIF date like \"2026:08:02 18:35:12\" to 20260802-183512."
+  (let ((digits (remove-if-not #'digit-char-p raw)))
+    (when (>= (length digits) 14)
+      (format nil "~A-~A" (subseq digits 0 8) (subseq digits 8 14)))))
+
+(defun read-photo-capture-timestamp (pathname)
+  (multiple-value-bind (output error-output status)
+      (uiop:run-program
+       (list "exiftool" "-s3" "-DateTimeOriginal" "-CreateDate"
+             (namestring (pathname pathname)))
+       :output :string :error-output :string :ignore-error-status t)
+    (declare (ignore error-output))
+    (when (zerop status)
+      (loop for line in (uiop:split-string output :separator '(#\Newline))
+            for token = (timestamp-token line)
+            when token return token))))
+
+(defun photo-capture-timestamp (pathname)
+  "Return PATHNAME's capture time as a 20260802-183512 token, or NIL."
+  (let* ((key (cons (namestring (pathname pathname))
+                    (ignore-errors (file-write-date pathname))))
+         (cached (gethash key *photo-capture-timestamp-cache* :missing)))
+    (if (eq cached :missing)
+        (setf (gethash key *photo-capture-timestamp-cache*)
+              (read-photo-capture-timestamp pathname))
+        cached)))
+
 (defun capture-description (model iso aperture shutter)
   (let ((parts
           (remove nil

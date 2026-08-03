@@ -6,6 +6,7 @@
                 #:export-settings-max-height
                 #:export-settings-max-width
                 #:export-settings-preserve-metadata-p
+                #:export-settings-timestamp-filenames-p
                 #:invalid-project-data
                 #:lens-profile-aliases-read
                 #:resolve-lens-profile-alias

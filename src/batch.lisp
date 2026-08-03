@@ -1,16 +1,27 @@
 (in-package #:orfeus)
 
 (defun photo-job-render-output (project photo)
-  "Return PHOTO's output pathname using PROJECT's output-directory semantics."
+  "Return PHOTO's output pathname using PROJECT's output-directory semantics.
+
+Automatic names keep the original filename; with the project's
+TIMESTAMP-FILENAMES-P export option they gain a capture-time prefix like
+20260802-183512-PB020123.jpg. Explicit :output paths are never rewritten."
   (let ((specified (photo-job-output-path photo)))
     (if specified
         (if (uiop:absolute-pathname-p specified)
             specified
             (merge-pathnames specified (project-output-directory project)))
-        (merge-pathnames
-         (make-pathname :name (pathname-name (photo-job-input-path photo))
-                        :type "jpg")
-         (project-output-directory project)))))
+        (let* ((base (pathname-name (photo-job-input-path photo)))
+               (timestamp (and (export-settings-timestamp-filenames-p
+                                (project-export-settings project))
+                               (photo-capture-timestamp
+                                (photo-job-input-path photo)))))
+          (merge-pathnames
+           (make-pathname :name (if timestamp
+                                    (format nil "~A-~A" timestamp base)
+                                    base)
+                          :type "jpg")
+           (project-output-directory project))))))
 
 (defun render-photo-job (project photo &key (if-exists :error))
   "Render PHOTO using PROJECT's processing and export settings."

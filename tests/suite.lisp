@@ -343,6 +343,24 @@
                            :export-settings (:jpeg-quality 92)
                            :photos ((:input "a.orf")))))))))))
 
+(defun timestamped-output-names-p ()
+  (let* ((project (make-project
+                   :output-directory #P"/tmp/orfeus-exports/"
+                   :export-settings (make-export-settings
+                                     :timestamp-filenames-p t)
+                   :photos (list (make-photo-job
+                                  :input-path #P"source/photo.orf"))))
+         (photo (first (project-photos project))))
+    (and (string= "20260802-183512"
+                  (orfeus::timestamp-token "2026:08:02 18:35:12"))
+         (null (orfeus::timestamp-token "no digits here"))
+         ;; Without readable EXIF the original name survives untouched.
+         (equal #P"/tmp/orfeus-exports/photo.jpg"
+                (photo-job-render-output project photo))
+         (let ((decoded (sexp->project (project->sexp project))))
+           (export-settings-timestamp-filenames-p
+            (project-export-settings decoded))))))
+
 (defun old-project-export-defaults-p ()
   (let* ((decoded
            (sexp->project
@@ -948,6 +966,8 @@
              (graph-render-rejects-input-as-output-p))
       (check "negative-inversion graphs validate and serialize"
              (negative-workflow-graph-p))
+      (check "timestamped output names format and round trip"
+             (timestamped-output-names-p))
       (check "old projects receive export defaults" (old-project-export-defaults-p))
       (check "project-relative paths resolve beside the project"
              (project-relative-paths-p))
