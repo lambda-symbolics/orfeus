@@ -960,7 +960,7 @@ pub(crate) fn apply_noise_reduction(image: &mut RgbImage, luma: f32, chroma: f32
         });
 }
 
-fn bilinear(image: &RgbImage, x: f32, y: f32, channel: usize) -> f32 {
+pub(crate) fn bilinear(image: &RgbImage, x: f32, y: f32, channel: usize) -> f32 {
     if x < 0.0 || y < 0.0 || x > (image.width - 1) as f32 || y > (image.height - 1) as f32 {
         return 0.0;
     }

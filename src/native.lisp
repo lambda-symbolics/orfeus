@@ -397,7 +397,8 @@ normalized coordinates, and the scene-linear base color (red green blue)."
          (values (list (getf params :left 0.0)
                        (getf params :top 0.0)
                        (getf params :width 1.0)
-                       (getf params :height 1.0))
+                       (getf params :height 1.0)
+                       (getf params :angle 0.0))
                  nil))))))
 
 (defun graph->program-bytes (graph)

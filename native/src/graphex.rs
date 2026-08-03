@@ -143,7 +143,7 @@ fn expected_param_count(kind: u32) -> Result<usize, Error> {
         NODE_FILM => 3,          // lut strength, grain amount, grain size
         NODE_BLEND => 1,         // opacity toward input B
         NODE_COLOR_SUBTRACT => 3, // picked color, subtracted per channel
-        NODE_CROP => 4,          // left, top, width, height (oriented, 0..1)
+        NODE_CROP => 5,          // left, top, width, height, angle (degrees)
         _ => return Err(Error::InvalidArgument("unknown graph node kind")),
     })
 }
@@ -167,6 +167,7 @@ fn validate_param(kind: u32, index: usize, value: f32) -> Result<(), Error> {
         (NODE_COLOR_SUBTRACT, _) => (0.0..=4.0).contains(&value),
         (NODE_CROP, 0) | (NODE_CROP, 1) => (0.0..=1.0).contains(&value),
         (NODE_CROP, 2) | (NODE_CROP, 3) => (0.05..=1.0).contains(&value),
+        (NODE_CROP, 4) => (-45.0..=45.0).contains(&value),
         _ => false,
     };
     if ok {
@@ -353,6 +354,55 @@ fn crop_image(image: &RgbImage, rect: [f32; 4]) -> Result<RgbImage, Error> {
     })
 }
 
+/// Rotates the image by SENSOR-ANGLE degrees about the rectangle's center,
+/// then extracts the rectangle — one bilinear sampling pass.
+fn rotate_crop_image(
+    image: &RgbImage,
+    rect: [f32; 4],
+    sensor_angle: f32,
+) -> Result<RgbImage, Error> {
+    let [left, top, width, height] = rect;
+    let x0 = (left * image.width as f32).round().max(0.0);
+    let y0 = (top * image.height as f32).round().max(0.0);
+    let target_width = ((width * image.width as f32).round() as usize)
+        .clamp(1, image.width);
+    let target_height = ((height * image.height as f32).round() as usize)
+        .clamp(1, image.height);
+    let center_x = x0 + target_width as f32 * 0.5;
+    let center_y = y0 + target_height as f32 * 0.5;
+    let radians = sensor_angle.to_radians();
+    let (sin, cos) = radians.sin_cos();
+    let mut output = RgbImage {
+        width: target_width,
+        height: target_height,
+        data: vec![0.0; target_width * target_height * 3],
+    };
+    output
+        .data
+        .par_chunks_mut(target_width * 3)
+        .enumerate()
+        .for_each(|(row, output_row)| {
+            let offset_y = y0 + row as f32 + 0.5 - center_y;
+            for (column, pixel) in
+                output_row.as_chunks_mut::<3>().0.iter_mut().enumerate()
+            {
+                let offset_x = x0 + column as f32 + 0.5 - center_x;
+                // Rotating the image by theta samples the source rotated the
+                // other way around the crop center.
+                let source_x =
+                    center_x + cos * offset_x + sin * offset_y - 0.5;
+                let source_y =
+                    center_y - sin * offset_x + cos * offset_y - 0.5;
+                for (channel, value) in pixel.iter_mut().enumerate() {
+                    *value = render::bilinear(
+                        image, source_x, source_y, channel,
+                    );
+                }
+            }
+        });
+    Ok(output)
+}
+
 /// Executes OPS over SOURCE, returning the final display-domain image.
 ///
 /// The source and every intermediate stays scene-linear until either a film
@@ -485,7 +535,20 @@ pub(crate) fn execute_graph(
                     context.orientation,
                     [op.params[0], op.params[1], op.params[2], op.params[3]],
                 );
-                image = crop_image(&image, rect)?;
+                let angle = op.params[4];
+                if angle.abs() < 0.01 {
+                    image = crop_image(&image, rect)?;
+                } else {
+                    // Mirrored orientations conjugate the rotation, flipping
+                    // its direction in sensor space.
+                    let sensor_angle =
+                        if matches!(context.orientation, 2 | 4 | 5 | 7) {
+                            -angle
+                        } else {
+                            angle
+                        };
+                    image = rotate_crop_image(&image, rect, sensor_angle)?;
+                }
             }
             _ => unreachable!("kinds were validated during parsing"),
         }
@@ -498,6 +561,20 @@ pub(crate) fn execute_graph(
         to_display(&mut image);
     }
     Ok(image)
+}
+
+/// Test hook: rotate-crop with display-convention angle at orientation 1.
+#[cfg(test)]
+pub(crate) fn rotate_crop_for_tests(
+    image: &RgbImage,
+    rect: [f32; 4],
+    angle: f32,
+) -> RgbImage {
+    if angle.abs() < 0.01 {
+        crop_image(image, rect).expect("test crop")
+    } else {
+        rotate_crop_image(image, rect, angle).expect("test rotate crop")
+    }
 }
 
 /// Renders INPUT through a serialized graph program to OUTPUT.
@@ -850,7 +927,7 @@ mod tests {
     fn crop_extracts_the_oriented_rectangle() {
         let ops = parse_graph(
             &GraphBuilder::new()
-                .node(NODE_CROP, 0, -1, &[0.25, 0.25, 0.5, 0.5], None)
+                .node(NODE_CROP, 0, -1, &[0.25, 0.25, 0.5, 0.5, 0.0], None)
                 .build(),
         )
         .unwrap();
@@ -868,12 +945,31 @@ mod tests {
     }
 
     #[test]
+    fn crop_rotation_straightens_and_zero_angle_matches_the_fast_path() {
+        let source = gradient_image();
+        let rect = [0.25_f32, 0.25, 0.5, 0.5];
+        let fast = crop_image(&source, rect).unwrap();
+        let rotated_zero = rotate_crop_image(&source, rect, 0.0).unwrap();
+        assert_eq!(fast.width, rotated_zero.width);
+        assert_eq!(fast.height, rotated_zero.height);
+        assert!(max_difference(&fast, &rotated_zero) < 1.0e-6);
+
+        let tilted = rotate_crop_image(&source, rect, 10.0).unwrap();
+        assert_eq!((tilted.width, tilted.height), (fast.width, fast.height));
+        assert!(max_difference(&fast, &tilted) > 1.0e-3);
+        assert!(tilted.data.iter().all(|value| value.is_finite()));
+        // Opposite angles differ from each other too.
+        let counter = rotate_crop_image(&source, rect, -10.0).unwrap();
+        assert!(max_difference(&tilted, &counter) > 1.0e-3);
+    }
+
+    #[test]
     fn crop_keeps_film_domain_and_blend_rejects_mismatched_sizes() {
         // film -> crop -> film stays legal.
         assert!(parse_graph(
             &GraphBuilder::new()
                 .node(NODE_FILM, 0, -1, &[0.0, 0.2, 1.0], None)
-                .node(NODE_CROP, 1, -1, &[0.0, 0.0, 0.5, 0.5], None)
+                .node(NODE_CROP, 1, -1, &[0.0, 0.0, 0.5, 0.5, 0.0], None)
                 .node(NODE_FILM, 2, -1, &[0.0, 0.1, 1.0], None)
                 .build(),
         )
@@ -882,7 +978,7 @@ mod tests {
         assert!(parse_graph(
             &GraphBuilder::new()
                 .node(NODE_FILM, 0, -1, &[0.0, 0.2, 1.0], None)
-                .node(NODE_CROP, 1, -1, &[0.0, 0.0, 0.5, 0.5], None)
+                .node(NODE_CROP, 1, -1, &[0.0, 0.0, 0.5, 0.5, 0.0], None)
                 .node(NODE_TONE, 2, -1, &[0.0; 7], None)
                 .build(),
         )
@@ -890,14 +986,14 @@ mod tests {
         // A crop leaving the frame is rejected at parse time.
         assert!(parse_graph(
             &GraphBuilder::new()
-                .node(NODE_CROP, 0, -1, &[0.75, 0.0, 0.5, 1.0], None)
+                .node(NODE_CROP, 0, -1, &[0.75, 0.0, 0.5, 1.0, 0.0], None)
                 .build(),
         )
         .is_err());
         // Blending a cropped branch against the full frame errors clearly.
         let ops = parse_graph(
             &GraphBuilder::new()
-                .node(NODE_CROP, 0, -1, &[0.0, 0.0, 0.5, 0.5], None)
+                .node(NODE_CROP, 0, -1, &[0.0, 0.0, 0.5, 0.5, 0.0], None)
                 .node(NODE_BLEND, 0, 1, &[0.5], None)
                 .build(),
         )

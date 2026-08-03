@@ -22,7 +22,7 @@ previews and full-resolution exports.")
 
 (defparameter *color-subtract-keys* '(:red :green :blue))
 
-(defparameter *crop-keys* '(:left :top :width :height))
+(defparameter *crop-keys* '(:left :top :width :height :angle))
 
 (defstruct graph-node
   "One processing node: a stage filter, or a blend of two branches."
@@ -68,13 +68,16 @@ previews and full-resolution exports.")
   (let ((left (getf params :left 0.0))
         (top (getf params :top 0.0))
         (width (getf params :width 1.0))
-        (height (getf params :height 1.0)))
+        (height (getf params :height 1.0))
+        (angle (getf params :angle 0.0)))
     (unless (and (realp left) (realp top) (realp width) (realp height)
                  (<= 0 left 1) (<= 0 top 1)
                  (<= 0.05 width 1) (<= 0.05 height 1)
                  (<= (+ left width) 1.0001)
                  (<= (+ top height) 1.0001))
-      (graph-invalid params "crop rectangle must stay inside the frame")))
+      (graph-invalid params "crop rectangle must stay inside the frame"))
+    (unless (and (realp angle) (<= -45 angle 45))
+      (graph-invalid params "crop angle must be within -45..45 degrees")))
   params)
 
 (defun graph-find-node (graph id)
