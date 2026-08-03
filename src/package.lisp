@@ -30,6 +30,7 @@
    #:export-settings-max-height
    #:export-settings-max-width
    #:export-settings-preserve-metadata-p
+   #:export-settings-timestamp-filenames-p
    #:invalid-project-data
    #:lens-profile-aliases-pathname
    #:lens-profile-aliases-read
@@ -61,6 +62,7 @@
    #:grade-stage-keys
    #:settings-apply-stage-bypass
    #:settings-grade-plist
+   #:grade-key-inert-p
    #:next-still-preset-name
    #:graph-node
    #:make-graph-node
@@ -89,6 +91,9 @@
    #:graph-insert-node
    #:graph-delete-node
    #:graph-swap-with-upstream
+   #:graph-tail-linear-node-id
+   #:graph-last-node-covering-key
+   #:photo-capture-timestamp
    #:default-processing-graph
    #:photo-job-graph
    #:processing-preset-graph

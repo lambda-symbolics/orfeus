@@ -78,11 +78,15 @@ DISABLED-STAGES preserves pipeline bypass state without discarding its settings.
   (graph nil))
 
 (defstruct export-settings
-  "Frontend-independent options for encoded photo exports."
+  "Frontend-independent options for encoded photo exports.
+
+TIMESTAMP-FILENAMES-P prefixes automatic output names with the capture time,
+as in 20260802-183512-PB020123.jpg, keeping the original name intact."
   (jpeg-quality 92 :type (integer 1 100))
   (max-width nil :type (or null (integer 1)))
   (max-height nil :type (or null (integer 1)))
-  (preserve-metadata-p t :type boolean))
+  (preserve-metadata-p t :type boolean)
+  (timestamp-filenames-p nil :type boolean))
 
 (defstruct photo-job
   "One input photograph and its optional per-photo setting overrides.
@@ -227,16 +231,20 @@ when present, replaces the flat pipeline with an explicit node graph."
   (list :jpeg-quality (export-settings-jpeg-quality settings)
         :max-width (export-settings-max-width settings)
         :max-height (export-settings-max-height settings)
-        :preserve-metadata-p (export-settings-preserve-metadata-p settings)))
+        :preserve-metadata-p (export-settings-preserve-metadata-p settings)
+        :timestamp-filenames-p
+        (export-settings-timestamp-filenames-p settings)))
 
 (defun sexp->export-settings (sexp)
   (unless (and (listp sexp)
                (plist-known-keys-p
-                sexp '(:jpeg-quality :max-width :max-height :preserve-metadata-p)))
+                sexp '(:jpeg-quality :max-width :max-height :preserve-metadata-p
+                       :timestamp-filenames-p)))
     (project-invalid sexp "expected a property list of export settings"))
   (let ((quality (getf sexp :jpeg-quality 92))
         (max-width (getf sexp :max-width))
         (max-height (getf sexp :max-height))
+        (timestamp-filenames-p (getf sexp :timestamp-filenames-p))
         (preserve-metadata-p (getf sexp :preserve-metadata-p t)))
     (unless (and (integerp quality) (<= 1 quality 100))
       (project-invalid sexp ":jpeg-quality must be an integer from 1 to 100"))
@@ -247,10 +255,13 @@ when present, replaces the flat pipeline with an explicit node graph."
         (project-invalid sexp "~S must be NIL or a positive integer" (first entry))))
     (unless (typep preserve-metadata-p 'boolean)
       (project-invalid sexp ":preserve-metadata-p must be a boolean"))
+    (unless (typep timestamp-filenames-p 'boolean)
+      (project-invalid sexp ":timestamp-filenames-p must be a boolean"))
     (make-export-settings :jpeg-quality quality
                           :max-width max-width
                           :max-height max-height
-                          :preserve-metadata-p preserve-metadata-p)))
+                          :preserve-metadata-p preserve-metadata-p
+                          :timestamp-filenames-p timestamp-filenames-p)))
 
 (defun disabled-stages-validate (stages)
   (unless (and (listp stages)
@@ -363,6 +374,15 @@ when present, replaces the flat pipeline with an explicit node graph."
    (processing-settings-with-overrides (project-defaults project)
                                        (photo-job-overrides photo))
    (photo-job-disabled-stages photo)))
+
+(defun grade-key-inert-p (key plist)
+  "True when KEY cannot affect rendering given the other values in PLIST."
+  (case key
+    (:lut-strength (null (getf plist :lut-path)))
+    (:grain-size (let ((amount (getf plist :grain-amount)))
+                   (or (null amount) (not (plusp amount)))))
+    (:lens-correction-strength (not (getf plist :lens-correction-p)))
+    (t nil)))
 
 (defun settings-grade-plist (settings &optional (stages (grade-stages)))
   "Return the grade of SETTINGS as a plist restricted to STAGES."

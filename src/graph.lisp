@@ -195,22 +195,31 @@ nodes may consume film output while blends stay scene-linear."
     :nodes (mapcar #'sexp->graph-node (getf sexp :nodes '()))
     :output (getf sexp :output *graph-source-id*))))
 
+(defparameter *flat-pipeline-stage-order*
+  '(:white-balance :exposure :optics :noise-reduction :tone :film)
+  "The order the flat pipeline actually executes its stages in.
+Graph conversion must chain nodes this way — notably optics before noise
+reduction — so a converted photograph renders identically.")
+
 (defun settings->graph (settings &optional disabled-stages)
   "Chain the non-identity stages of SETTINGS as a linear graph.
 
 Stages listed in DISABLED-STAGES become bypassed nodes so their grades stay
-editable. The result renders identically to the flat pipeline."
+editable. Nodes follow the flat pipeline's execution order, so the result
+renders identically to the flat pipeline."
   (disabled-stages-validate disabled-stages)
   (let ((nodes '())
         (next-id 1)
         (previous *graph-source-id*))
-    (dolist (stage (grade-stages))
+    (dolist (stage *flat-pipeline-stage-order*)
       (let* ((params (settings-grade-plist settings (list stage)))
              (bypassed (and (member stage disabled-stages) t))
              (active (loop for (key value) on params by #'cddr
-                             thereis (not (equal value
-                                                 (getf *stage-identity-plist*
-                                                       key))))))
+                             thereis (and (not (grade-key-inert-p key params))
+                                          (not (equal value
+                                                      (getf
+                                                       *stage-identity-plist*
+                                                       key)))))))
         (when (or active bypassed)
           (push (make-graph-node :id next-id
                                  :kind stage
@@ -366,6 +375,22 @@ sides of the pair are plain single-input filters. Returns true on success."
                           (subseq nodes position)))))
         (graph-normalize graph)
         t))))
+
+(defun graph-tail-linear-node-id (graph)
+  "Return the last node id on the output path before any film tail."
+  (let ((id (processing-graph-output graph)))
+    (loop for node = (graph-find-node graph id)
+          while (and node (eq :film (graph-node-kind node)))
+          do (setf id (first (graph-node-inputs node))))
+    id))
+
+(defun graph-last-node-covering-key (graph key)
+  "Return the most downstream node whose kind's stage covers setting KEY."
+  (let ((stage (loop for (name keys) in *grade-stages*
+                     when (member key keys) return name)))
+    (when stage
+      (find stage (reverse (processing-graph-nodes graph))
+            :key #'graph-node-kind))))
 
 (defun graph-copy (graph)
   "Return a structurally independent copy of GRAPH."
