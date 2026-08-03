@@ -91,6 +91,8 @@
    #:graph-move-node-after
    #:graph-set-blend-input
    #:*graph-source-id*
+   #:*curve-channel-keys*
+   #:*identity-curve-points*
    #:graph-insert-node
    #:graph-delete-node
    #:graph-swap-with-upstream

@@ -356,6 +356,35 @@
            (= 3 (length (graph-effective-nodes graph)))
            (progn (graph-validate graph) t)))))
 
+(defun graph-curves-p ()
+  (let* ((graph (default-processing-graph))
+         (points (list 0.0 0.05 0.3 0.5 0.7 0.9 1.0 1.0))
+         (node (graph-insert-node graph (processing-graph-output graph)
+                                  :curves
+                                  :params (list :red-points points))))
+    (and (graph-validate graph)
+         ;; The wire format flattens all three channels, filling unset
+         ;; ones with the identity diagonal.
+         (let ((params (orfeus::graph-node-program-parameters node)))
+           (and (= 24 (length params))
+                (= 0.05 (second params))
+                (= 0.33 (nth 10 params))))
+         (eql 10 (rest (assoc :curves orfeus::*graph-node-kind-codes*)))
+         ;; Points survive the project S-expression round trip.
+         (let* ((decoded (sexp->graph (graph->sexp graph)))
+                (twin (find :curves (processing-graph-nodes decoded)
+                            :key #'graph-node-kind)))
+           (equal points (getf (graph-node-params twin) :red-points)))
+         ;; Descending positions are rejected.
+         (handler-case
+             (progn
+               (graph-insert-node
+                (default-processing-graph) 2 :curves
+                :params '(:green-points
+                          (0.0 0.0 0.6 0.5 0.3 0.7 1.0 1.0)))
+               nil)
+           (invalid-project-data () t)))))
+
 (defun graph-rewire-p ()
   (let ((graph (graph-validate
                 (make-processing-graph
@@ -1048,6 +1077,8 @@
              (graph-editing-p))
       (check "nodes splice anywhere and invalid wires roll back"
              (graph-rewire-p))
+      (check "curves nodes validate, serialize, and round trip"
+             (graph-curves-p))
       (check "photo graphs round trip as project version 3"
              (photo-graph-round-trip-p))
       (check "graphs serialize to the native program format"

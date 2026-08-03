@@ -12,17 +12,25 @@
 (defparameter *graph-source-id* 0
   "The reserved node id of the decoded RAW source image.")
 
-(defparameter *graph-only-node-kinds* '(:blend :color-subtract :crop)
+(defparameter *graph-only-node-kinds* '(:blend :color-subtract :crop :curves)
   "Node kinds that exist only in graphs, beyond the flat pipeline stages.
 
 :COLOR-SUBTRACT computes picked-color minus pixel per channel in scene-linear
 space, the film-negative inversion primitive. :CROP keeps a normalized
 rectangle given in display (oriented) coordinates, so one graph fits both
-previews and full-resolution exports.")
+previews and full-resolution exports. :CURVES applies a monotone spline per
+channel on the encoded signal, the per-stock decompression for inverted
+negatives.")
 
 (defparameter *color-subtract-keys* '(:red :green :blue))
 
 (defparameter *crop-keys* '(:left :top :width :height :angle))
+
+(defparameter *curve-channel-keys* '(:red-points :green-points :blue-points))
+
+(defparameter *identity-curve-points*
+  '(0.0 0.0 0.33 0.33 0.67 0.67 1.0 1.0)
+  "Four (x y) control points along the diagonal: the do-nothing curve.")
 
 (defstruct graph-node
   "One processing node: a stage filter, or a blend of two branches."
@@ -59,6 +67,28 @@ previews and full-resolution exports.")
         unless (and (realp value) (<= 0 value 4))
           do (graph-invalid params "color component ~S must be within 0..4"
                             key))
+  params)
+
+(defun curve-points-validate (points key)
+  (unless (and (listp points) (= 8 (length points))
+               (every (lambda (value) (and (realp value) (<= 0 value 1)))
+                      points))
+    (graph-invalid points "~S must hold four (x y) points within 0..1" key))
+  (loop for (x nil next-x) on points by #'cddr
+        while next-x
+        unless (< (+ x 0.001) next-x)
+          do (graph-invalid points "~S positions must ascend" key))
+  points)
+
+(defun curves-params-validate (params)
+  (unless (and (listp params)
+               (plist-known-keys-p params *curve-channel-keys*))
+    (graph-invalid params
+                   "expected :red-points :green-points :blue-points"))
+  (dolist (key *curve-channel-keys*)
+    (let ((points (getf params key)))
+      (when points
+        (curve-points-validate points key))))
   params)
 
 (defun crop-params-validate (params)
@@ -144,6 +174,12 @@ nodes may consume film output while blends stay scene-linear."
            ;; Crops keep their branch's domain.
            (when (member (first inputs) display)
              (push id display)))
+          ((eq kind :curves)
+           (unless (= 1 (length inputs))
+             (graph-invalid node "filter node ~S needs exactly one input" id))
+           (curves-params-validate (graph-node-params node))
+           (when (member (first inputs) display)
+             (graph-invalid node "node ~S cannot process film output" id)))
           ((graph-filter-kind-p kind)
            (unless (= 1 (length inputs))
              (graph-invalid node "filter node ~S needs exactly one input" id))

@@ -342,7 +342,7 @@ the straightening angle in degrees for a crop node."
 (defparameter *graph-node-kind-codes*
   '((:white-balance . 1) (:exposure . 2) (:noise-reduction . 3)
     (:tone . 4) (:optics . 5) (:film . 6) (:blend . 7)
-    (:color-subtract . 8) (:crop . 9))
+    (:color-subtract . 8) (:crop . 9) (:curves . 10))
   "Wire codes of graph node kinds in the native program format.")
 
 (defconstant +graph-program-magic+ #x4746524F
@@ -401,6 +401,13 @@ the straightening angle in degrees for a crop node."
                        (getf params :width 1.0)
                        (getf params :height 1.0)
                        (getf params :angle 0.0))
+                 nil)))
+      (:curves
+       (let ((params (graph-node-params node)))
+         (values (loop for key in *curve-channel-keys*
+                       append (copy-list
+                               (or (getf params key)
+                                   *identity-curve-points*)))
                  nil))))))
 
 (defun graph->program-bytes (graph)
