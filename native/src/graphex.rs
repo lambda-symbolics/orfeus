@@ -578,18 +578,19 @@ pub(crate) fn execute_graph(
     source: RgbImage,
     context: &GraphContext<'_>,
 ) -> Result<RgbImage, Error> {
-    execute_graph_cached(ops, source, context, None)
+    execute_graph_cached(ops, Arc::new(source), context, None)
 }
 
 pub(crate) fn execute_graph_cached(
     ops: &[GraphOp],
-    source: RgbImage,
+    source: Arc<RgbImage>,
     context: &GraphContext<'_>,
     cache_key: Option<PrefixKey>,
 ) -> Result<RgbImage, Error> {
     let count = ops.len();
     if count == 0 {
-        let mut image = render::orient(source, context.orientation);
+        let mut image =
+            render::orient(render::own_source(source), context.orientation);
         to_display(&mut image);
         return Ok(image);
     }
@@ -666,14 +667,14 @@ pub(crate) fn execute_graph_cached(
                 }
             }
             if uses[0] > 0 && registers[0].is_none() {
-                registers[0] = Some(source);
+                registers[0] = Some(render::own_source(source));
             }
             film_ordinal = ops[..boundary]
                 .iter()
                 .filter(|op| op.kind == NODE_FILM)
                 .count() as u64;
         }
-        None => registers[0] = Some(source),
+        None => registers[0] = Some(render::own_source(source)),
     }
     let profiling = std::env::var_os("ORFEUS_PROFILE").is_some();
     let mut captured: Vec<(usize, Vec<PrefixSnapshot>)> = Vec::new();
@@ -1548,16 +1549,16 @@ mod tests {
         let first = parse_graph(&tone_program(0.3)).unwrap();
         let second = parse_graph(&tone_program(0.7)).unwrap();
         let source = gradient_image();
-        execute_graph_cached(&first, source.clone(), &context(7), Some(key.clone())).unwrap();
+        execute_graph_cached(&first, Arc::new(source.clone()), &context(7), Some(key.clone())).unwrap();
         let resumed =
-            execute_graph_cached(&second, source.clone(), &context(7), Some(key.clone())).unwrap();
+            execute_graph_cached(&second, Arc::new(source.clone()), &context(7), Some(key.clone())).unwrap();
         let cold = execute_graph(&second, source.clone(), &context(7)).unwrap();
         assert_eq!(resumed.width, cold.width);
         assert_eq!(resumed.height, cold.height);
         assert!(max_difference(&resumed, &cold) == 0.0);
         // A third tweak resumes from the refreshed checkpoint.
         let third = parse_graph(&tone_program(0.9)).unwrap();
-        let resumed = execute_graph_cached(&third, source.clone(), &context(7), Some(key)).unwrap();
+        let resumed = execute_graph_cached(&third, Arc::new(source.clone()), &context(7), Some(key)).unwrap();
         let cold = execute_graph(&third, source, &context(7)).unwrap();
         assert!(max_difference(&resumed, &cold) == 0.0);
     }
@@ -1574,11 +1575,11 @@ mod tests {
             }
             image
         };
-        execute_graph_cached(&ops, gradient_image(), &context(7), Some(key_a)).unwrap();
+        execute_graph_cached(&ops, Arc::new(gradient_image()), &context(7), Some(key_a)).unwrap();
         // Rendering photo B with its own key must not reuse A's registers.
         let edited = parse_graph(&tone_program(0.8)).unwrap();
         let via_cache =
-            execute_graph_cached(&edited, bright.clone(), &context(7), Some(key_b)).unwrap();
+            execute_graph_cached(&edited, Arc::new(bright.clone()), &context(7), Some(key_b)).unwrap();
         let cold = execute_graph(&edited, bright, &context(7)).unwrap();
         assert!(max_difference(&via_cache, &cold) == 0.0);
     }

@@ -1802,13 +1802,18 @@ const SCALED_SOURCE_CAPACITY: usize = 4;
 
 /// Return the decoded source bounded to the render dimensions, caching the
 /// downscale for interactive re-renders of the same photo and size.
+/// The bounded source for one render, shared rather than copied.
+///
+/// Interactive frames that resume from a graph checkpoint never touch this
+/// image at all, so handing back a handle keeps a 20 MB copy off the hot
+/// path; callers that mutate it in place own it with `own_source`.
 pub(crate) fn scaled_source_for_render(
     decoded: &Arc<DecodedRaw>,
     input: &Path,
     max_width: u32,
     max_height: u32,
     cache_mode: u32,
-) -> RgbImage {
+) -> Arc<RgbImage> {
     let full = |decoded: &DecodedRaw| RgbImage {
         width: decoded.width,
         height: decoded.height,
@@ -1816,7 +1821,7 @@ pub(crate) fn scaled_source_for_render(
     };
     let bounded = max_width > 0 || max_height > 0;
     if cache_mode != CACHE_USE || !bounded {
-        return match downscale_from(
+        return Arc::new(match downscale_from(
             &decoded.data,
             decoded.width,
             decoded.height,
@@ -1825,7 +1830,7 @@ pub(crate) fn scaled_source_for_render(
         ) {
             Some(scaled) => scaled,
             None => full(decoded),
-        };
+        });
     }
     let key: ScaledSourceKey = (
         input.to_string_lossy().into_owned(),
@@ -1842,7 +1847,7 @@ pub(crate) fn scaled_source_for_render(
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(position) = cache.iter().position(|(held, _)| *held == key) {
             let entry = cache.remove(position);
-            let image = (*entry.1).clone();
+            let image = Arc::clone(&entry.1);
             cache.insert(0, entry);
             return image;
         }
@@ -1857,16 +1862,75 @@ pub(crate) fn scaled_source_for_render(
         Some(scaled) => scaled,
         None => full(decoded),
     };
+    let shared = Arc::new(scaled);
     let mut cache = scaled_source_cache()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     cache.retain(|(held, _)| *held != key);
-    cache.insert(0, (key, Arc::new(scaled.clone())));
+    cache.insert(0, (key, Arc::clone(&shared)));
     cache.truncate(SCALED_SOURCE_CAPACITY);
-    scaled
+    shared
 }
 
+/// Take ownership of a shared source, copying only when it is still shared.
+pub(crate) fn own_source(source: Arc<RgbImage>) -> RgbImage {
+    Arc::try_unwrap(source).unwrap_or_else(|shared| (*shared).clone())
+}
+
+/// A file's identity as the filesystem reports it, cheap to obtain.
+type StatIdentity = (u64, u64, u64, i64, i64);
+
+fn stat_identity(input: &Path) -> Result<StatIdentity, Error> {
+    let metadata = std::fs::metadata(input)?;
+    Ok((
+        metadata.dev(),
+        metadata.ino(),
+        metadata.size(),
+        metadata.mtime(),
+        metadata.mtime_nsec(),
+    ))
+}
+
+const KEY_MEMO_CAPACITY: usize = 16;
+
+fn key_memo() -> &'static Mutex<Vec<(StatIdentity, DecodeCacheKey)>> {
+    static MEMO: OnceLock<Mutex<Vec<(StatIdentity, DecodeCacheKey)>>> = OnceLock::new();
+    MEMO.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// The content hash of INPUT, memoized on its stat identity.
+///
+/// Hashing 20 MB of RAW is far more expensive than the render it guards
+/// when the decode cache already holds the image, so an unchanged inode,
+/// size, and modification time reuse the previous hash. Anything that
+/// rewrites the file changes at least one of those, and callers that must
+/// be certain use `decode_cache_key_uncached`.
 fn decode_cache_key(input: &Path) -> Result<DecodeCacheKey, Error> {
+    let identity = stat_identity(input)?;
+    {
+        let mut memo = key_memo()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(position) = memo.iter().position(|(held, _)| *held == identity) {
+            let entry = memo.remove(position);
+            let key = entry.1;
+            memo.push(entry);
+            return Ok(key);
+        }
+    }
+    let key = decode_cache_key_uncached(input)?;
+    let mut memo = key_memo()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    memo.retain(|(held, _)| *held != identity);
+    if memo.len() >= KEY_MEMO_CAPACITY {
+        memo.remove(0);
+    }
+    memo.push((identity, key));
+    Ok(key)
+}
+
+fn decode_cache_key_uncached(input: &Path) -> Result<DecodeCacheKey, Error> {
     let mut file = File::open(input)?;
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];
@@ -1988,7 +2052,7 @@ where
     let decode_result = catch_unwind(AssertUnwindSafe(decode));
     let result = match decode_result {
         Ok(result) => result.and_then(|decoded| {
-            if decode_cache_key(input)? != key {
+            if decode_cache_key_uncached(input)? != key {
                 return Err(Error::Render(
                     "RAW source changed while it was being decoded".into(),
                 ));
@@ -2077,13 +2141,13 @@ pub fn render(
         native_downscale_bounds(orientation, settings.max_width, settings.max_height);
     // Downscaling first commutes with the linear white adaptation and exposure
     // gains; interactive re-renders reuse the cached bounded source.
-    let mut image = scaled_source_for_render(
+    let mut image = own_source(scaled_source_for_render(
         &decoded,
         input,
         native_max_width,
         native_max_height,
         cache_mode,
-    );
+    ));
     profile_stage!("downscale");
     apply_white_adaptation(&mut image, settings.kelvin, settings.tint);
     apply_exposure(&mut image, settings.exposure_ev);
@@ -2251,6 +2315,24 @@ mod tests {
         assert_ne!(original, decode_cache_key(&first).unwrap());
         fs::remove_file(first).unwrap();
         fs::remove_file(second).unwrap();
+    }
+
+    #[test]
+    fn decode_cache_keys_are_memoized_without_rereading_the_file() {
+        // The memo must not outlive a rewrite: a changed size or
+        // modification time has to produce a fresh hash, or interactive
+        // renders would keep grading a stale image.
+        let path = temp("cache-key-memo.raw");
+        fs::write(&path, [1, 2, 3, 4]).unwrap();
+        let first = decode_cache_key(&path).unwrap();
+        assert_eq!(first, decode_cache_key(&path).unwrap());
+        assert_eq!(first, decode_cache_key_uncached(&path).unwrap());
+        // A rewrite of a different length changes the stat identity.
+        fs::write(&path, [4, 3, 2, 1, 0]).unwrap();
+        let second = decode_cache_key(&path).unwrap();
+        assert_ne!(first, second);
+        assert_eq!(second, decode_cache_key_uncached(&path).unwrap());
+        fs::remove_file(path).unwrap();
     }
 
     #[test]
