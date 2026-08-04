@@ -1464,15 +1464,70 @@ fn area_coverage(source: usize, target: usize) -> Vec<(usize, Vec<f32>)> {
         .collect()
 }
 
+/// The GPU status line a process prints once, so a silent CPU fallback is
+/// never mistaken for hardware acceleration.
+pub(crate) fn gpu_status_message(status: GpuStatus<'_>) -> String {
+    match status {
+        GpuStatus::Disabled => "orfeus: Vulkan tone transfer is disabled; \
+             using the CPU path (set ORFEUS_GPU=1 to enable it)"
+            .to_string(),
+        GpuStatus::Unavailable(reason) => format!(
+            "orfeus: WARNING Vulkan tone transfer is unavailable, \
+             falling back to the CPU path: {reason}"
+        ),
+        GpuStatus::Active(adapter) => {
+            format!("orfeus: Vulkan tone transfer active on {adapter}")
+        }
+    }
+}
+
+pub(crate) enum GpuStatus<'a> {
+    Disabled,
+    Unavailable(&'a str),
+    Active(&'a str),
+}
+
+/// Reports STATUS on stderr the first time the process reaches it. Returns
+/// true when it printed, so callers and tests can tell the once-only
+/// behaviour apart from repeated frames.
+fn report_gpu_status_once(cell: &OnceLock<()>, status: GpuStatus<'_>) -> bool {
+    if cell.set(()).is_ok() {
+        eprintln!("{}", gpu_status_message(status));
+        true
+    } else {
+        false
+    }
+}
+
+fn gpu_disabled_notice() -> &'static OnceLock<()> {
+    static CELL: OnceLock<OnceLock<()>> = OnceLock::new();
+    CELL.get_or_init(OnceLock::new)
+}
+
+fn gpu_fallback_notice() -> &'static OnceLock<()> {
+    static CELL: OnceLock<OnceLock<()>> = OnceLock::new();
+    CELL.get_or_init(OnceLock::new)
+}
+
+fn gpu_active_notice() -> &'static OnceLock<()> {
+    static CELL: OnceLock<OnceLock<()>> = OnceLock::new();
+    CELL.get_or_init(OnceLock::new)
+}
+
 /// Applies the default display tone and sRGB transfer, on the GPU when
 /// explicitly enabled with `ORFEUS_GPU=1` and on the CPU otherwise. Failures
-/// leave the input intact and fall back.
+/// leave the input intact and fall back, complaining once on stderr so a
+/// missing driver never degrades performance silently.
 pub(crate) fn apply_display_transform(image: &mut RgbImage, profiling: bool) {
     let gpu_completed = if super::gpu::requested() {
         match catch_unwind(AssertUnwindSafe(|| {
             super::gpu::tone_and_transfer(&mut image.data)
         })) {
             Ok(Ok(dispatch)) => {
+                report_gpu_status_once(
+                    gpu_active_notice(),
+                    GpuStatus::Active(&dispatch.adapter_name),
+                );
                 if profiling {
                     eprintln!(
                         "orfeus-profile gpu-stage=tone-transfer adapter={:?} milliseconds={:.3}",
@@ -1482,6 +1537,10 @@ pub(crate) fn apply_display_transform(image: &mut RgbImage, profiling: bool) {
                 true
             }
             Ok(Err(error)) => {
+                report_gpu_status_once(
+                    gpu_fallback_notice(),
+                    GpuStatus::Unavailable(&error),
+                );
                 if profiling {
                     eprintln!(
                         "orfeus-profile gpu-stage=tone-transfer fallback=cpu error={error:?}"
@@ -1490,6 +1549,10 @@ pub(crate) fn apply_display_transform(image: &mut RgbImage, profiling: bool) {
                 false
             }
             Err(_) => {
+                report_gpu_status_once(
+                    gpu_fallback_notice(),
+                    GpuStatus::Unavailable("the Vulkan backend panicked"),
+                );
                 if profiling {
                     eprintln!("orfeus-profile gpu-stage=tone-transfer fallback=cpu error=panic");
                 }
@@ -1497,6 +1560,7 @@ pub(crate) fn apply_display_transform(image: &mut RgbImage, profiling: bool) {
             }
         }
     } else {
+        report_gpu_status_once(gpu_disabled_notice(), GpuStatus::Disabled);
         false
     };
     if !gpu_completed {
@@ -2128,6 +2192,28 @@ mod tests {
             "LUT_3D_SIZE 2\n0 0 0\n1 0 0\n0 1 0\n1 1 0\n0 0 1\n1 0 1\n0 1 1\n1 1 1\n",
         ))
         .unwrap()
+    }
+
+    #[test]
+    fn gpu_fallback_complains_once_and_names_the_reason() {
+        let message = gpu_status_message(GpuStatus::Unavailable(
+            "ERROR_INCOMPATIBLE_DRIVER",
+        ));
+        assert!(message.contains("WARNING"), "{message}");
+        assert!(message.contains("ERROR_INCOMPATIBLE_DRIVER"), "{message}");
+        assert!(message.contains("CPU"), "{message}");
+        // The disabled notice tells the reader how to turn Vulkan on.
+        let disabled = gpu_status_message(GpuStatus::Disabled);
+        assert!(disabled.contains("ORFEUS_GPU=1"), "{disabled}");
+        assert!(!disabled.contains("WARNING"), "{disabled}");
+        assert!(
+            gpu_status_message(GpuStatus::Active("llvmpipe")).contains("llvmpipe")
+        );
+        // One line per process, however many frames render.
+        let cell = OnceLock::new();
+        assert!(report_gpu_status_once(&cell, GpuStatus::Disabled));
+        assert!(!report_gpu_status_once(&cell, GpuStatus::Disabled));
+        assert!(!report_gpu_status_once(&cell, GpuStatus::Disabled));
     }
     fn image() -> RgbImage {
         RgbImage {
