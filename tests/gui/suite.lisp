@@ -292,6 +292,8 @@
          "Visible photo checkbox was not clickable")
   (check (not (orfeus/gui::thumbnail-toggle-hit-p 180 240))
          "Photo row body was mistaken for its checkbox")
+  (check (= 218 (orfeus/gui::thumbnail-checkbox-x 0 240))
+         "Photo checkbox geometry did not remain numeric and right-aligned")
   (multiple-value-bind (selection anchor)
       (orfeus/gui::thumbnail-selection-after-click '(1 4) 2 1 0)
     (check (equal '(2) selection) "Plain thumbnail click did not replace selection")

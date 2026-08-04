@@ -256,6 +256,10 @@ Existing positions are preserved so dragged nodes remain where the user put them
   (and event-x canvas-width
        (>= event-x (- canvas-width *thumbnail-selection-gutter*))))
 
+(defun thumbnail-checkbox-x (canvas-x canvas-width)
+  "Return the left edge of a photo row's selection checkbox."
+  (- (+ canvas-x canvas-width) 22))
+
 (defun preview-priority-indices (count selected)
   "Return every photo index ordered from SELECTED outward."
   (when (and (plusp count) (<= 0 selected) (< selected count))
@@ -3645,7 +3649,7 @@ new cache entry is published."
                               (cl-fltk:draw-text
                                (file-namestring (photo-job-input-path job))
                                (+ x 102) (+ row-y 30))
-                              (let ((check-x (+ x width - 22))
+                              (let ((check-x (thumbnail-checkbox-x x width))
                                     (check-y (+ row-y 10)))
                                 (cl-fltk:draw-color-rgb :red 225 :green 225 :blue 225)
                                 (cl-fltk:draw-filled-rect check-x check-y 14 14)
