@@ -874,10 +874,17 @@ new cache entry is published."
                    preview-center-y .5d0)
              (redraw-previews)
              (set-status "Preview fitted to window"))
+           (live-view-p (&optional canvas)
+             ;; The live buffer is bounded, so its zoom ceiling is lower
+             ;; than the full-resolution preview's. Showing it only at fit
+             ;; keeps framing identical across the swap; zoomed in, the
+             ;; file preview stays on screen and stays sharp.
+             (and after-live-p after-live-front (plusp after-live-width)
+                  (<= preview-zoom 1.0001d0)
+                  (or (null canvas) (eq canvas after-canvas))))
            (preview-scaled-size (canvas path zoom)
              (multiple-value-bind (source-width source-height)
-                 (if (and (eq canvas after-canvas) after-live-p
-                          (plusp after-live-width))
+                 (if (live-view-p canvas)
                      (values after-live-width after-live-height)
                      (preview-file-size path))
                (when source-width
@@ -919,6 +926,15 @@ new cache entry is published."
                              preview-center-y
                              (- source-y (* (- source-y preview-center-y) ratio)))))))
                (setf preview-zoom new-zoom)
+               ;; Leaving fit hands the canvas back to the file preview, so
+               ;; a pending live edit must be settled now instead of after
+               ;; the drag timer, or the sharp image would lag behind.
+               (when (and after-live-p (> new-zoom 1.0001d0))
+                 (when live-settle-id
+                   (ignore-errors (cl-fltk:remove-timeout live-settle-id))
+                   (setf live-settle-id nil))
+                 (discard-gui-tasks queue :after)
+                 (enqueue-preview nil))
                (redraw-previews)
                (set-status (format nil "Preview zoom: ~,0F%" (* 100 new-zoom)))))
            (preview-one-to-one ()
@@ -2988,7 +3004,7 @@ new cache entry is published."
                  ;; Once checkpointed re-renders come back fast enough, the
                  ;; draft layer only adds churn, so it is skipped.
                  (let ((settings (current-settings)))
-                   (when (and (>= last-render-ms 300) (not after-live-p))
+                   (when (and (>= last-render-ms 300) (not (live-view-p)))
                      (enqueue-render queue :after job index settings
                                      generation t
                                      :front-p t :draft-p t :cache-p t))
@@ -3832,9 +3848,8 @@ new cache entry is published."
                     (let ((path (ecase role
                                   (:before before-preview-file)
                                   (:after after-preview-file)))
-                          (live-p (and (eq role :after) after-live-p
-                                       after-live-front
-                                       (plusp after-live-width))))
+                          (live-p (and (eq role :after)
+                                       (live-view-p widget))))
                       (cond
                         (live-p
                          (draw-preview-buffer widget after-live-front
