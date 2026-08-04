@@ -299,15 +299,18 @@
     (check (equal '(2) selection) "Plain thumbnail click did not replace selection")
     (check (= 2 anchor) "Plain thumbnail click did not move the anchor"))
   (multiple-value-bind (selection anchor)
-      (orfeus/gui::thumbnail-selection-after-click '(1 4) 2 1 4)
+      (orfeus/gui::thumbnail-selection-after-click
+       '(1 4) 2 1 orfeus/gui::+thumbnail-control-mask+)
     (check (equal '(2 1 4) selection) "Control-click did not add a thumbnail")
     (check (= 2 anchor) "Control-click did not move the anchor"))
   (multiple-value-bind (selection anchor)
-      (orfeus/gui::thumbnail-selection-after-click '(1 2 4) 2 1 4)
+      (orfeus/gui::thumbnail-selection-after-click
+       '(1 2 4) 2 1 orfeus/gui::+thumbnail-control-mask+)
     (check (equal '(1 4) selection) "Control-click did not remove a thumbnail")
     (check (= 2 anchor) "Control-click removal did not move the anchor"))
   (multiple-value-bind (selection anchor)
-      (orfeus/gui::thumbnail-selection-after-click '(1 4) 5 2 1)
+      (orfeus/gui::thumbnail-selection-after-click
+       '(1 4) 5 2 orfeus/gui::+thumbnail-shift-mask+)
     (check (equal '(2 3 4 5) selection) "Shift-click did not select an inclusive range")
     (check (= 2 anchor) "Shift-click did not preserve the anchor")))
 

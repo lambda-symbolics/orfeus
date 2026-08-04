@@ -31,8 +31,10 @@ buffer, with no JPEG or file on the path.")
 (defparameter *background-preview-workers* (available-processor-count)
   "Concurrent thumbnail and full-project preview workers, one per CPU.")
 
-(defconstant +thumbnail-shift-mask+ 1)
-(defconstant +thumbnail-control-mask+ 4)
+(defconstant +thumbnail-shift-mask+ #x00010000
+  "FLTK's FL_SHIFT bit in the raw event state the bridge forwards.")
+(defconstant +thumbnail-control-mask+ #x00040000
+  "FLTK's FL_CTRL bit in the raw event state the bridge forwards.")
 
 (defparameter *left-sidebar-min-width* 240
   "Minimum width of the photo and stills sidebar.")
@@ -271,12 +273,18 @@ Existing positions are preserved so dragged nodes remain where the user put them
                  #'< :key (lambda (index) (abs (- index selected))))))
 
 (defun thumbnail-selection-after-click (selected row anchor state)
-  "Return the selection and anchor produced by clicking ROW with modifier STATE."
+  "Return the selection and anchor produced by clicking ROW with modifier STATE.
+
+Plain clicks select one photo, control toggles, shift selects the range
+from the anchor, and control-shift adds that range to the selection."
   (cond
     ((logtest +thumbnail-shift-mask+ state)
-     (values (loop for index from (min anchor row) to (max anchor row)
-                   collect index)
-             anchor))
+     (let ((range (loop for index from (min anchor row) to (max anchor row)
+                        collect index)))
+       (values (if (logtest +thumbnail-control-mask+ state)
+                   (remove-duplicates (append selected range) :from-end t)
+                   range)
+               anchor)))
     ((logtest +thumbnail-control-mask+ state)
      (values (if (member row selected)
                  (remove row selected)
