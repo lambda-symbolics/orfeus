@@ -292,6 +292,17 @@ from the anchor, and control-shift adds that range to the selection."
              row))
     (t (values (list row) row))))
 
+(defun graph-view-signature (job graph selected-node)
+  "Return a cheap identity of what the node graph editor should display.
+
+Comparing this between poll ticks repaints the editor after any path that
+changes the graph without invalidating the canvas itself, so an added,
+removed, or replaced photograph can never leave a stale graph on screen."
+  (list job graph
+        (and graph (length (orfeus:processing-graph-nodes graph)))
+        (and graph (orfeus:processing-graph-output graph))
+        selected-node))
+
 (defun crop-preview-current-p (preview-generation published-generation)
   "True when the displayed preview uses the current crop-edit generation."
   (and published-generation
@@ -790,6 +801,7 @@ new cache entry is published."
            (gallery-click (cons 0 -1))
            debounce-id poll-id comparison-p layout-initialized-p
            (progress-total 0)
+           (graph-view-state :unset)
            (last-render-ms 10000)
            (live-render-ms 10000)
            after-live-front after-live-back after-live-capacity
@@ -2749,6 +2761,9 @@ new cache entry is published."
                          (incf preview-generation)
                          (clear-previews)
                          (sync-controls)
+                         (sync-node-tools)
+                         (when graph-canvas (cl-fltk:redraw graph-canvas))
+                         (redraw-thumbnails)
                          (schedule-initial-preview)
                          (set-status (format nil "Added ~D photograph~:P" count)))
                        (set-status "All selected photographs are already in the project"))))))
@@ -2762,6 +2777,9 @@ new cache entry is published."
                    (remhash job thumbnail-files))
                  (clear-previews)
                  (sync-controls)
+                 (sync-node-tools)
+                 (when graph-canvas (cl-fltk:redraw graph-canvas))
+                 (redraw-thumbnails)
                  (if (selected-job)
                      (progn
                        (schedule-initial-preview)
@@ -2995,6 +3013,7 @@ new cache entry is published."
                     (generation preview-generation)
                     (recipe (and job (current-settings))))
                (if (and job after-live-back
+                        (<= preview-zoom 1.0001d0)
                         (typep recipe 'orfeus:processing-graph))
                    (let ((snapshot (preview-recipe-snapshot recipe))
                          (input (photo-job-input-path job)))
@@ -3072,6 +3091,7 @@ new cache entry is published."
                    (when (member key '(:white-balance-temperature
                                        :white-balance-tint))
                      (setf (cl-fltk:value wb-choice) "Custom"))
+                   (when graph-canvas (cl-fltk:redraw graph-canvas))
                    (schedule-edited-preview))
                (error (condition) (set-status (princ-to-string condition)))))
            (render-selected ()
@@ -3515,6 +3535,18 @@ new cache entry is published."
                   (set-status (format nil "Exported ~A" (second event))))
                  (:error
                   (set-status (format nil "Error: ~A" (second event))))))
+             ;; The node graph repaints whenever what it should show
+             ;; changes, so no edit path can leave a stale graph on screen.
+             (let* ((graph-job (selected-job))
+                    (signature (graph-view-signature
+                                graph-job
+                                (and graph-job
+                                     (orfeus:photo-job-graph graph-job))
+                                (gui-model-selected-graph-node model))))
+               (unless (equal signature graph-view-state)
+                 (setf graph-view-state signature)
+                 (sync-node-tools)
+                 (when graph-canvas (cl-fltk:redraw graph-canvas))))
              ;; Progress belongs to the current preview generation or export
              ;; batch. Histogram and eviction maintenance are deliberately
              ;; excluded so cancellation cannot inherit an old high-water mark.

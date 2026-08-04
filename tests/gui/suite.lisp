@@ -810,6 +810,38 @@
            (check (not ran-p) "Discarded background task still ran"))
       (orfeus/gui::stop-gui-queue queue))))
 
+(defun test-graph-view-signature ()
+  ;; The signature drives the poll repaint, so it must change whenever the
+  ;; editor should show something different: the reported bug was an added
+  ;; photograph leaving "Open a photograph to grade" on screen.
+  (let* ((first-job (orfeus:make-photo-job :input-path #P"one.orf"))
+         (second-job (orfeus:make-photo-job :input-path #P"two.orf"))
+         (graph (orfeus:default-processing-graph))
+         (node (first (orfeus:processing-graph-nodes graph)))
+         (empty (orfeus/gui::graph-view-signature nil nil nil))
+         (opened (orfeus/gui::graph-view-signature first-job nil nil)))
+    (check (not (equal empty opened))
+           "Opening a photograph did not change the graph view signature")
+    (check (equal opened (orfeus/gui::graph-view-signature first-job nil nil))
+           "An unchanged graph view produced a different signature")
+    (check (not (equal opened
+                       (orfeus/gui::graph-view-signature second-job nil nil)))
+           "Switching photographs did not change the signature")
+    (let ((flat (orfeus/gui::graph-view-signature first-job nil nil))
+          (graded (orfeus/gui::graph-view-signature first-job graph nil)))
+      (check (not (equal flat graded))
+             "Converting a photograph to a graph did not change the signature")
+      (check (not (equal graded
+                         (orfeus/gui::graph-view-signature first-job graph
+                                                           node)))
+             "Selecting a node did not change the signature")
+      (orfeus:graph-insert-node graph (orfeus:processing-graph-output graph)
+                                :exposure :params '(:exposure 1.0))
+      (check (not (equal graded
+                         (orfeus/gui::graph-view-signature first-job graph
+                                                           nil)))
+             "Adding a node did not change the signature"))))
+
 (defun run-tests ()
   (test-model-settings)
   (test-preset-bulk-application)
@@ -822,6 +854,7 @@
   (test-preview-priority-order)
   (test-thumbnail-hit-testing)
   (test-thumbnail-multi-selection)
+  (test-graph-view-signature)
   (test-bundled-film-lut-menu)
   (test-file-filter-syntax)
   (test-direct-open-workflow)
