@@ -909,15 +909,56 @@ pub fn render_graph(
     graph_bytes: &[u8],
     cache_mode: u32,
 ) -> Result<(), Error> {
-    frame.validate()?;
-    let ops = parse_graph(graph_bytes)?;
-    if !matches!(cache_mode, render::CACHE_NONE | render::CACHE_USE) {
-        return Err(Error::InvalidArgument("unsupported decode cache mode"));
-    }
     if render::same_file(input, output)? {
         return Err(Error::InvalidArgument(
             "input and output refer to the same file",
         ));
+    }
+    let image = render_graph_image(input, frame, graph_bytes, cache_mode)?;
+    render::atomic_encode(
+        input,
+        output,
+        &image,
+        frame.output_format,
+        frame.jpeg_quality,
+    )
+}
+
+/// Renders straight into a caller-provided RGB8 buffer: the zero-copy hot
+/// path for live previews, with no JPEG or file round trip.
+pub fn render_graph_rgb(
+    input: &Path,
+    frame: &RenderFrameV1,
+    graph_bytes: &[u8],
+    buffer: &mut [u8],
+    cache_mode: u32,
+) -> Result<(usize, usize), Error> {
+    let image = render_graph_image(input, frame, graph_bytes, cache_mode)?;
+    let needed = image.width * image.height * 3;
+    if buffer.len() < needed {
+        return Err(Error::InvalidArgument("preview buffer is too small"));
+    }
+    buffer[..needed]
+        .par_chunks_mut(1 << 16)
+        .zip(image.data.par_chunks(1 << 16))
+        .for_each(|(bytes, values)| {
+            for (byte, value) in bytes.iter_mut().zip(values) {
+                *byte = (value.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+            }
+        });
+    Ok((image.width, image.height))
+}
+
+fn render_graph_image(
+    input: &Path,
+    frame: &RenderFrameV1,
+    graph_bytes: &[u8],
+    cache_mode: u32,
+) -> Result<RgbImage, Error> {
+    frame.validate()?;
+    let ops = parse_graph(graph_bytes)?;
+    if !matches!(cache_mode, render::CACHE_NONE | render::CACHE_USE) {
+        return Err(Error::InvalidArgument("unsupported decode cache mode"));
     }
     let profiling = std::env::var_os("ORFEUS_PROFILE").is_some();
     let needs_neural = ops
@@ -974,14 +1015,7 @@ pub fn render_graph(
             Arc::as_ptr(&decoded) as usize,
         )
     });
-    let image = execute_graph_cached(&ops, source, &context, prefix_key)?;
-    render::atomic_encode(
-        input,
-        output,
-        &image,
-        frame.output_format,
-        frame.jpeg_quality,
-    )
+    execute_graph_cached(&ops, source, &context, prefix_key)
 }
 
 #[cfg(test)]

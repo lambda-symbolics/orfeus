@@ -154,6 +154,23 @@ int32_t orfeus_raw_render_v2(const char *input_path,
                              char *error_buffer,
                              size_t error_capacity);
 
+/* Renders a node graph into a caller-provided row-major RGB8 buffer, the
+   live-preview hot path: identical processing to orfeus_raw_render_v3 but
+   no JPEG encode or file write. Writes the oriented image dimensions to
+   out_width/out_height; the frame's output format and JPEG quality are
+   ignored. */
+int32_t orfeus_raw_render_rgb_v1(const char *input_path,
+                                 const struct orfeus_render_frame_v1 *frame,
+                                 const uint8_t *graph,
+                                 size_t graph_length,
+                                 uint8_t *buffer,
+                                 size_t capacity,
+                                 uint32_t *out_width,
+                                 uint32_t *out_height,
+                                 uint32_t cache_mode,
+                                 char *error_buffer,
+                                 size_t error_capacity);
+
 /* Detects a scanned negative's central tile and film-base color. Writes
    eight floats: crop left, top, width, height in oriented normalized
    coordinates, the scene-linear base red, green, blue, and the display-space

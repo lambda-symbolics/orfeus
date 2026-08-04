@@ -567,6 +567,58 @@ pub unsafe extern "C" fn orfeus_raw_render_v3(
     }
 }
 
+/// Render a node graph into a caller-provided RGB8 buffer.
+///
+/// The live-preview hot path: identical processing to
+/// `orfeus_raw_render_v3`, but the oriented display image lands directly in
+/// `buffer` (row-major RGB, one byte per channel) with no JPEG encode or
+/// file write. Writes the image dimensions to `out_width`/`out_height`.
+/// The frame's output format and JPEG quality fields are ignored.
+///
+/// # Safety
+///
+/// `input_path` must be a readable NUL-terminated path, `frame` and `graph`
+/// valid for their stated sizes, `buffer` writable for `capacity` bytes,
+/// `out_width`/`out_height` writable, and the error buffer, when non-null,
+/// writable for its stated capacity.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn orfeus_raw_render_rgb_v1(
+    input_path: *const c_char,
+    frame: *const graphex::RenderFrameV1,
+    graph: *const u8,
+    graph_length: usize,
+    buffer: *mut u8,
+    capacity: usize,
+    out_width: *mut u32,
+    out_height: *mut u32,
+    cache_mode: u32,
+    error_buffer: *mut c_char,
+    error_capacity: usize,
+) -> i32 {
+    // SAFETY: Pointer validation and dereferences remain inside the panic boundary.
+    unsafe {
+        ffi_result(error_buffer, error_capacity, || {
+            if frame.is_null() {
+                return Err(Error::InvalidArgument("render frame pointer is null"));
+            }
+            if graph.is_null() {
+                return Err(Error::InvalidArgument("graph pointer is null"));
+            }
+            if buffer.is_null() || out_width.is_null() || out_height.is_null() {
+                return Err(Error::InvalidArgument("output pointer is null"));
+            }
+            let bytes = std::slice::from_raw_parts(graph, graph_length);
+            let destination = std::slice::from_raw_parts_mut(buffer, capacity);
+            let input = path_from_c(input_path)?;
+            let (width, height) =
+                graphex::render_graph_rgb(input, &*frame, bytes, destination, cache_mode)?;
+            *out_width = width as u32;
+            *out_height = height as u32;
+            Ok(())
+        })
+    }
+}
+
 /// Detect the central tile and film-base color of a scanned negative.
 ///
 /// Writes eight floats: the crop rectangle (left, top, width, height) in
