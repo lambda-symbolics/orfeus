@@ -12,6 +12,10 @@
 (defparameter *gui-draft-preview-size* 2048
   "Bounding size of the fast draft preview rendered before the full one.")
 
+(defparameter *gui-live-preview-size* 1600
+  "Bounding size of live drag previews rendered straight into the canvas
+buffer, with no JPEG or file on the path.")
+
 (defparameter *thumbnail-preview-size* 320
   "Maximum width and height for orientation-correct thumbnail renders.")
 
@@ -779,6 +783,12 @@ new cache entry is published."
            debounce-id poll-id comparison-p layout-initialized-p
            (progress-total 0)
            (last-render-ms 10000)
+           (live-render-ms 10000)
+           after-live-front after-live-back after-live-capacity
+           (after-live-width 0)
+           (after-live-height 0)
+           (after-live-generation 0)
+           after-live-p live-settle-id
            (progress-generation -1)
            (thumbnail-scroll 0)
            (thumbnail-anchor 0)
@@ -846,7 +856,10 @@ new cache entry is published."
              (set-status "Preview fitted to window"))
            (preview-scaled-size (canvas path zoom)
              (multiple-value-bind (source-width source-height)
-                 (preview-file-size path)
+                 (if (and (eq canvas after-canvas) after-live-p
+                          (plusp after-live-width))
+                     (values after-live-width after-live-height)
+                     (preview-file-size path))
                (when source-width
                  (let ((fit (min (/ (cl-fltk:widget-width canvas)
                                     (float source-width 1d0))
@@ -1523,7 +1536,8 @@ new cache entry is published."
              (setf preview-zoom 1d0
                    preview-center-x .5d0
                    preview-center-y .5d0
-                   preview-drag-p nil)
+                   preview-drag-p nil
+                   after-live-p nil)
              (dolist (path (list before-preview-file after-preview-file))
                (when path (forget-preview-file path)))
              (setf before-preview-file nil
@@ -1542,6 +1556,7 @@ new cache entry is published."
                           (cl-fltk:redraw before-canvas))
                  (:after (setf after-preview-file path
                                after-preview-generation generation
+                               after-live-p nil
                                (gethash (selected-job) thumbnail-files) path)
                          (schedule-curve-histogram path generation)
                          (cl-fltk:redraw after-canvas)
@@ -2947,7 +2962,7 @@ new cache entry is published."
                  ;; Once checkpointed re-renders come back fast enough, the
                  ;; draft layer only adds churn, so it is skipped.
                  (let ((settings (current-settings)))
-                   (when (>= last-render-ms 300)
+                   (when (and (>= last-render-ms 300) (not after-live-p))
                      (enqueue-render queue :after job index settings
                                      generation t
                                      :front-p t :draft-p t :cache-p t))
@@ -2964,6 +2979,60 @@ new cache entry is published."
              (discard-gui-tasks queue :before)
              (discard-gui-tasks queue :after)
              (enqueue-preview t))
+           (enqueue-live-preview ()
+             ;; The drag hot path: bounded render straight into the back
+             ;; buffer, swapped onto the canvas by the poll loop. Falls
+             ;; back to the file path for photos still on flat settings.
+             (let* ((job (selected-job))
+                    (generation preview-generation)
+                    (recipe (and job (current-settings))))
+               (if (and job after-live-back
+                        (typep recipe 'orfeus:processing-graph))
+                   (let ((snapshot (preview-recipe-snapshot recipe))
+                         (input (photo-job-input-path job)))
+                     (enqueue-gui-task
+                      queue :live
+                      (lambda ()
+                        (when (= generation preview-generation)
+                          (let ((started (get-internal-real-time)))
+                            (handler-case
+                                (multiple-value-bind (width height)
+                                    (orfeus:render-preview-rgb
+                                     input snapshot
+                                     after-live-back after-live-capacity
+                                     :max-width *gui-live-preview-size*
+                                     :max-height *gui-live-preview-size*
+                                     :cache-p t)
+                                  (setf live-render-ms
+                                        (/ (* 1000.0
+                                              (- (get-internal-real-time)
+                                                 started))
+                                           internal-time-units-per-second))
+                                  (when (= generation preview-generation)
+                                    (queue-event
+                                     queue
+                                     (list :live-preview generation job
+                                           width height))))
+                              (error (condition)
+                                (queue-event
+                                 queue
+                                 (list :error
+                                       (princ-to-string condition))))))))
+                      :replace-kind :live :front-p t))
+                   (enqueue-preview nil))))
+           (schedule-live-settle ()
+             ;; Once the drag quiets down, one file render persists the
+             ;; result: the content-keyed cache, histogram, thumbnails,
+             ;; and background previews all refresh from it.
+             (when live-settle-id
+               (ignore-errors (cl-fltk:remove-timeout live-settle-id)))
+             (setf live-settle-id
+                   (cl-fltk:add-timeout
+                    0.5d0
+                    (lambda ()
+                      (setf live-settle-id nil)
+                      (discard-gui-tasks queue :after)
+                      (enqueue-preview nil)))))
            (schedule-edited-preview ()
              (incf preview-generation)
              (setf progress-total 0
@@ -2972,14 +3041,15 @@ new cache entry is published."
                (ignore-errors (cl-fltk:remove-timeout debounce-id)))
              (setf debounce-id
                    (cl-fltk:add-timeout
-                    ;; When the executor resumes from its checkpoint the
-                    ;; re-render is near instant, so track drags tightly.
-                    (if (< last-render-ms 250) 0.04d0
+                    ;; Checkpointed live renders come back in tens of
+                    ;; milliseconds, so track drags tightly.
+                    (if (< live-render-ms 250) 0.04d0
                         *preview-debounce-seconds*)
                     (lambda ()
                       (setf debounce-id nil)
                       (discard-gui-tasks queue :after)
-                      (enqueue-preview nil)))))
+                      (enqueue-live-preview)
+                      (schedule-live-settle)))))
            (setting-changed (key widget &optional allow-empty)
              (handler-case
                  (let ((new-value (parse-number (cl-fltk:value widget)
@@ -3398,6 +3468,15 @@ new cache entry is published."
                   (when (gui-preview-event-current-p model event preview-generation)
                     (publish-preview (fifth event) (sixth event) (second event))
                     (set-status (preview-status-text model))))
+                 (:live-preview
+                  (when (and (= (second event) preview-generation)
+                             (eq (third event) (selected-job)))
+                    (rotatef after-live-front after-live-back)
+                    (setf after-live-width (fourth event)
+                          after-live-height (fifth event)
+                          after-live-p t)
+                    (incf after-live-generation)
+                    (when after-canvas (cl-fltk:redraw after-canvas))))
                  (:histogram
                   (when (and (= (second event) preview-generation)
                              (equal (third event) after-preview-file))
@@ -3442,6 +3521,12 @@ new cache entry is published."
                  (setf progress-total total
                        progress-generation generation
                        (cl-fltk:value progress) (format nil "~D" percent))))))
+        (setf after-live-capacity
+              (* *gui-live-preview-size* *gui-live-preview-size* 3)
+              after-live-front (cffi:foreign-alloc
+                                :uint8 :count after-live-capacity)
+              after-live-back (cffi:foreign-alloc
+                               :uint8 :count after-live-capacity))
         (setf window (cl-fltk:make-window :width 1280 :height 800
                                           :label "Orfeus"
                                           :app-id "org.orfeus.Orfeus"))
@@ -3705,20 +3790,32 @@ new cache entry is published."
                      (cl-fltk:widget-width widget) (cl-fltk:widget-height widget))
                     (let ((path (ecase role
                                   (:before before-preview-file)
-                                  (:after after-preview-file))))
-                      (if path
-                          (progn
-                            (draw-preview-file widget path
-                                               :zoom preview-zoom
-                                               :center-x preview-center-x
-                                               :center-y preview-center-y)
-                            (when (eq role :after)
-                              (draw-crop-overlay widget)))
-                          (progn
-                            (cl-fltk:draw-color-rgb :red 205 :green 208 :blue 210)
-                            (cl-fltk:draw-text "Developing RAW preview..."
-                                               (+ (cl-fltk:widget-x widget) 20)
-                                               (+ (cl-fltk:widget-y widget) 36)))))))))
+                                  (:after after-preview-file)))
+                          (live-p (and (eq role :after) after-live-p
+                                       after-live-front
+                                       (plusp after-live-width))))
+                      (cond
+                        (live-p
+                         (draw-preview-buffer widget after-live-front
+                                              after-live-width
+                                              after-live-height
+                                              after-live-generation
+                                              :zoom preview-zoom
+                                              :center-x preview-center-x
+                                              :center-y preview-center-y)
+                         (draw-crop-overlay widget))
+                        (path
+                         (draw-preview-file widget path
+                                            :zoom preview-zoom
+                                            :center-x preview-center-x
+                                            :center-y preview-center-y)
+                         (when (eq role :after)
+                           (draw-crop-overlay widget)))
+                        (t
+                         (cl-fltk:draw-color-rgb :red 205 :green 208 :blue 210)
+                         (cl-fltk:draw-text "Developing RAW preview..."
+                                            (+ (cl-fltk:widget-x widget) 20)
+                                            (+ (cl-fltk:widget-y widget) 36)))))))))
           (setf before-canvas (make-preview-canvas :before 0)
                 after-canvas (make-preview-canvas :after 363))
           (dolist (canvas (list before-canvas after-canvas))
@@ -4252,6 +4349,9 @@ new cache entry is published."
           (stop-gui-queue queue)
           (stop-gui-queue background-queue)
           (stop-gui-queue histogram-queue)
+          (when after-live-front (cffi:foreign-free after-live-front))
+          (when after-live-back (cffi:foreign-free after-live-back))
+          (setf after-live-front nil after-live-back nil)
           (orfeus::clear-render-source-cache)
           (clear-preview-cache)
           (ignore-errors

@@ -106,6 +106,69 @@ extern "C" int orfeus_gui_preview_draw(long long widget_id,
     return 1;
 }
 
+namespace {
+// The live preview: one borrowed RGB8 buffer drawn without any JPEG or
+// file round trip. The scaled copy is cached per generation and size.
+struct LiveView {
+    std::unique_ptr<Fl_Image> scaled;
+    int generation = -1;
+    int scaled_width = 0;
+    int scaled_height = 0;
+};
+LiveView live_view;
+}
+
+extern "C" int orfeus_gui_preview_draw_buffer(long long widget_id,
+                                              const unsigned char *rgb,
+                                              int width,
+                                              int height,
+                                              int generation,
+                                              double zoom,
+                                              double center_x,
+                                              double center_y) {
+    std::lock_guard<std::mutex> lock(images_mutex);
+    Fl_Widget *widget = clfl_bridge::find_widget(widget_id);
+    if (!widget || !rgb || width <= 0 || height <= 0 ||
+        widget->w() <= 0 || widget->h() <= 0 ||
+        !std::isfinite(zoom) || !std::isfinite(center_x) ||
+        !std::isfinite(center_y)) {
+        return 0;
+    }
+
+    const double fit_scale = std::min(static_cast<double>(widget->w()) / width,
+                                      static_cast<double>(widget->h()) / height);
+    const double maximum_scale = std::max(fit_scale, 2.0);
+    const double effective_scale = std::clamp(fit_scale * std::max(1.0, zoom),
+                                              fit_scale, maximum_scale);
+    const int scaled_width = scaled_dimension(width, effective_scale);
+    const int scaled_height = scaled_dimension(height, effective_scale);
+    if (!live_view.scaled || live_view.generation != generation ||
+        live_view.scaled_width != scaled_width ||
+        live_view.scaled_height != scaled_height) {
+        Fl_RGB_Image source(rgb, width, height, 3, 0);
+        live_view.scaled.reset(source.copy(scaled_width, scaled_height));
+        if (!live_view.scaled) return 0;
+        live_view.generation = generation;
+        live_view.scaled_width = scaled_width;
+        live_view.scaled_height = scaled_height;
+    }
+
+    const double visible_x =
+        std::min(1.0, static_cast<double>(widget->w()) / scaled_width);
+    const double visible_y =
+        std::min(1.0, static_cast<double>(widget->h()) / scaled_height);
+    const double clamped_x =
+        std::clamp(center_x, visible_x / 2.0, 1.0 - visible_x / 2.0);
+    const double clamped_y =
+        std::clamp(center_y, visible_y / 2.0, 1.0 - visible_y / 2.0);
+    const int x = widget->x() + widget->w() / 2 -
+                  static_cast<int>(std::lround(clamped_x * scaled_width));
+    const int y = widget->y() + widget->h() / 2 -
+                  static_cast<int>(std::lround(clamped_y * scaled_height));
+    live_view.scaled->draw(x, y);
+    return 1;
+}
+
 extern "C" int orfeus_gui_preview_draw_rect(long long widget_id,
                                                const char *path,
                                                int x,

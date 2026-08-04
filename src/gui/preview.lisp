@@ -31,6 +31,9 @@
   (path :string) (width :pointer) (height :pointer))
 (cffi:defcfun ("orfeus_gui_preview_histogram" %gui-preview-histogram) :int
   (path :string) (bins :pointer) (bin-count :int))
+(cffi:defcfun ("orfeus_gui_preview_draw_buffer" %gui-preview-draw-buffer) :int
+  (widget-id :long-long) (rgb :pointer) (width :int) (height :int)
+  (generation :int) (zoom :double) (center-x :double) (center-y :double))
 (cffi:defcfun ("orfeus_gui_preview_forget" %gui-preview-forget) :void
   (path :string))
 (cffi:defcfun ("orfeus_gui_preview_clear" %gui-preview-clear) :void)
@@ -81,6 +84,17 @@
   (load-gui-preview-library)
   (plusp (%gui-preview-draw (cl-fltk:widget-id canvas) (namestring pathname)
                             zoom center-x center-y)))
+
+(defun draw-preview-buffer (canvas pointer width height generation
+                            &key (zoom 1d0) (center-x .5d0) (center-y .5d0))
+  "Draw the borrowed live RGB8 buffer in CANVAS with fit, zoom, and pan.
+
+GENERATION keys the cached scaled copy; bump it whenever the buffer's
+contents change."
+  (load-gui-preview-library)
+  (plusp (%gui-preview-draw-buffer (cl-fltk:widget-id canvas) pointer
+                                   width height generation
+                                   zoom center-x center-y)))
 
 (defun draw-thumbnail-file (canvas pathname x y width height)
   "Draw PATHNAME fitted inside the absolute rectangle in CANVAS."
