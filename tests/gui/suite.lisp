@@ -753,6 +753,26 @@
 (defun test-empty-graph-editor-geometry ()
   (check (>= orfeus/gui::*inspector-min-height* 378)
          "Minimum inspector height clips the Curves reset control")
+  (let ((unplaced (orfeus:make-graph-node :id 1 :kind :optics))
+        (placed (orfeus:make-graph-node :id 2 :kind :exposure
+                                        :position '(31.0 97.0))))
+    (orfeus/gui::ensure-graph-node-positions (list unplaced placed))
+    (check (equal '(18.0 52.0) (orfeus:graph-node-position unplaced))
+           "Default graph node position was not assigned before dragging")
+    (check (equal '(31.0 97.0) (orfeus:graph-node-position placed))
+           "Existing dragged graph node position was replaced"))
+  (let* ((job (orfeus:make-photo-job :input-path #P"legacy-flat.orf"))
+         (project (orfeus:make-project :output-directory #P"exports/"
+                                       :photos (list job)))
+         (model (orfeus/gui:make-gui-model :project project))
+         (node (orfeus/gui::graph-node-for-edit model 0)))
+    (check node "Flat photo did not materialize a graph node for dragging")
+    (check (orfeus:graph-node-position node)
+           "Materialized graph node still had no drag position")
+    (check (member node
+                   (orfeus:processing-graph-nodes
+                    (orfeus:photo-job-graph job)))
+           "Positioned drag node did not belong to the stored graph"))
   (multiple-value-bind (x y width height)
       (orfeus/gui::graph-output-box-position '())
     (check (equal (list 18 50 orfeus/gui::*graph-node-width* 22)

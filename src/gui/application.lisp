@@ -195,6 +195,26 @@ exactly the curve the render applies."
   "Return a short user-visible provenance description for STILL."
   (format nil "~(~A~) still" (gallery-still-origin still)))
 
+(defun ensure-graph-node-positions (nodes)
+  "Assign default editor positions to unplaced NODES and return NODES.
+
+Existing positions are preserved so dragged nodes remain where the user put them."
+  (loop for node in nodes
+        for index from 1
+        unless (orfeus:graph-node-position node)
+          do (setf (orfeus:graph-node-position node)
+                   (list 18.0
+                         (float (+ 6 (* index *graph-row-pitch*)) 1.0))))
+  nodes)
+
+(defun graph-node-for-edit (model index)
+  "Return the positioned node at INDEX after materializing MODEL's graph."
+  (let ((graph (gui-model-ensure-graph model)))
+    (when graph
+      (nth index
+           (ensure-graph-node-positions
+            (orfeus:processing-graph-nodes graph))))))
+
 (defun graph-output-box-position (nodes)
   "Return the graph-space OUT box for NODES, including an empty graph."
   (let ((bottom
@@ -1599,17 +1619,6 @@ new cache entry is published."
                        (format nil "~,1F"
                                (getf (orfeus:graph-node-params node)
                                      :angle 0.0))))))
-           (ensure-node-positions (nodes)
-             ;; Fresh nodes stack top-down in chain order; dragged nodes
-             ;; keep wherever the user put them.
-             (loop for node in nodes
-                   for index from 1
-                   unless (orfeus:graph-node-position node)
-                     do (setf (orfeus:graph-node-position node)
-                              (list 18.0
-                                    (float (+ 6 (* index *graph-row-pitch*))
-                                           1.0))))
-             nodes)
            (graph-node-box (node)
              (let ((place (orfeus:graph-node-position node)))
                (values (round (first place)) (round (second place))
@@ -1619,7 +1628,7 @@ new cache entry is published."
            (graph-editor-hit (gx gy)
              ;; What lies at graph coordinates: a node body, its output
              ;; port, a blend's branch port, the source, or the output box.
-             (let ((nodes (ensure-node-positions (editor-nodes))))
+             (let ((nodes (ensure-graph-node-positions (editor-nodes))))
                (loop for node in nodes
                      for index from 0
                      do (multiple-value-bind (x y w h) (graph-node-box node)
@@ -1677,7 +1686,7 @@ new cache entry is published."
                     (wy (cl-fltk:widget-y widget))
                     (width (cl-fltk:widget-width widget))
                     (height (cl-fltk:widget-height widget))
-                    (nodes (ensure-node-positions (editor-nodes)))
+                    (nodes (ensure-graph-node-positions (editor-nodes)))
                     (selected (gui-model-selected-graph-node model))
                     (ox (- wx graph-scroll-x))
                     (oy (- wy graph-scroll-y)))
@@ -1836,9 +1845,7 @@ new cache entry is published."
              ;; selection can drive the Node panel and later edits. Entering
              ;; or leaving crop editing changes the preview recipe.
              (when (selected-job)
-               (let* ((graph (gui-model-ensure-graph model))
-                      (node (nth index
-                                 (orfeus:processing-graph-nodes graph)))
+               (let* ((node (graph-node-for-edit model index))
                       (was-cropping (crop-editing-node)))
                  (when node
                    (setf (gui-model-selected-node model) node)
@@ -1959,7 +1966,7 @@ new cache entry is published."
                    (when action (funcall action))))))
            (graph-content-extent ()
              ;; (values right bottom) of everything drawn, in graph space.
-             (let ((nodes (ensure-node-positions (editor-nodes))))
+             (let ((nodes (ensure-graph-node-positions (editor-nodes))))
                (multiple-value-bind (out-x out-y out-w out-h)
                    (graph-output-box nodes)
                  (values (max (+ out-x out-w)
