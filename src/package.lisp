@@ -158,6 +158,7 @@
    #:render-photo
    #:render-photo-job
    #:render-preview
+   #:render-preview-rgb
    #:sexp->project))
 
 (in-package #:orfeus)

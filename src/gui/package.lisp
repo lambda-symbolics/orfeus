@@ -17,7 +17,8 @@
                 #:project #:project-defaults #:project-export-settings
                 #:project-output-directory #:project-photos #:project-presets
                 #:project-read #:project-render #:project-write
-                #:render-photo-job #:render-preview)
+                #:render-photo-job #:render-preview
+                #:render-preview-rgb)
   (:export #:gui-model #:gui-model-add-photos #:gui-model-add-node
            #:gui-model-apply-preset #:gui-model-apply-preset-graph
            #:gui-model-copy-grade #:gui-model-copy-graph

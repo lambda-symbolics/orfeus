@@ -89,6 +89,19 @@
   (error-buffer :pointer)
   (error-capacity :size))
 
+(defcfun ("orfeus_raw_render_rgb_v1" %raw-render-rgb-v1) :int32
+  (input-path :string)
+  (frame (:pointer (:struct render-frame-v1)))
+  (graph :pointer)
+  (graph-length :size)
+  (buffer :pointer)
+  (capacity :size)
+  (out-width :pointer)
+  (out-height :pointer)
+  (cache-mode :uint32)
+  (error-buffer :pointer)
+  (error-capacity :size))
+
 (defparameter *native-error-buffer-size* 1024
   "Bytes reserved for a diagnostic returned by the Rust bridge.")
 
@@ -522,6 +535,82 @@ the straightening angle in degrees for a crop node."
             (invoke lens-pointer))
           (invoke (null-pointer)))))
   output-pathname)
+
+(defun native-raw-render-graph-rgb (input-pathname graph rgb-buffer capacity
+                                    &key lens-profile-model focal-reducer
+                                      lens-crop-factor (grain-seed 0)
+                                      (max-width 0) (max-height 0) cache-p)
+  "Render INPUT-PATHNAME through GRAPH into the foreign RGB-BUFFER.
+
+The live-preview hot path: no JPEG encode and no file. Returns the oriented
+image width and height as two values."
+  (native-library-load)
+  (native-render-require-compatible)
+  (unless (>= (native-bridge-version) 3)
+    (error 'native-library-incompatible
+           :message "bridge ABI does not provide raw render v3"))
+  (let ((program (graph->program-bytes graph)))
+    (flet ((invoke (lens-pointer)
+             (with-foreign-object (frame '(:struct render-frame-v1))
+               (flet ((setting (name value)
+                        (setf (foreign-slot-value
+                               frame '(:struct render-frame-v1) name)
+                              value)))
+                 (setting 'struct-size
+                          (foreign-type-size '(:struct render-frame-v1)))
+                 (setting 'version 1)
+                 (setting 'output-format 1)
+                 (setting 'max-width max-width)
+                 (setting 'max-height max-height)
+                 (setting 'jpeg-quality 92)
+                 (setting 'grain-seed grain-seed)
+                 (setting 'focal-reducer (float (or focal-reducer 1.0) 0.0))
+                 (setting 'lens-crop-factor
+                          (float (or lens-crop-factor 0.0) 0.0))
+                 (setting 'lens-profile-model lens-pointer))
+               (with-foreign-pointer (program-buffer (length program))
+                 (loop for octet across program
+                       for index from 0
+                       do (setf (mem-aref program-buffer :uint8 index) octet))
+                 (with-foreign-object (out-width :uint32)
+                   (with-foreign-object (out-height :uint32)
+                     (with-foreign-pointer (error-buffer
+                                            *native-error-buffer-size*)
+                       (let ((status
+                               #+sbcl
+                               (sb-int:with-float-traps-masked
+                                   (:invalid :divide-by-zero :overflow
+                                    :underflow :inexact)
+                                 (%raw-render-rgb-v1
+                                  (namestring input-pathname)
+                                  frame program-buffer (length program)
+                                  rgb-buffer capacity
+                                  out-width out-height
+                                  (if cache-p 1 0) error-buffer
+                                  *native-error-buffer-size*))
+                               #-sbcl
+                               (%raw-render-rgb-v1
+                                (namestring input-pathname)
+                                frame program-buffer (length program)
+                                rgb-buffer capacity
+                                out-width out-height
+                                (if cache-p 1 0) error-buffer
+                                *native-error-buffer-size*)))
+                         (unless (zerop status)
+                           (error 'raw-render-error
+                                  :input-pathname input-pathname
+                                  :output-pathname nil
+                                  :status status
+                                  :message (native-error-message
+                                            error-buffer)))
+                         (values
+                          (cffi:mem-ref out-width :uint32)
+                          (cffi:mem-ref out-height :uint32))))))))))
+      (if lens-profile-model
+          (with-foreign-string (lens-pointer lens-profile-model
+                                             :encoding :utf-8)
+            (invoke lens-pointer))
+          (invoke (null-pointer))))))
 
 (defun dng-original-filename (pathname)
   "Return the embedded original filename recorded by DNG PATHNAME."

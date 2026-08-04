@@ -525,3 +525,38 @@ which may then be NIL."
                 :if-exists if-exists
                 :cache-p cache-p
                 :graph graph))
+
+(defun render-preview-rgb (input-pathname graph rgb-buffer capacity
+                           &key (max-width 2048) (max-height 2048)
+                             (grain-seed 0) (cache-p t))
+  "Render a bounded live preview through GRAPH into the foreign RGB-BUFFER.
+
+The interactive hot path: no JPEG encode, no file, no metadata copy.
+Returns the oriented image width and height as two values."
+  (check-type graph processing-graph)
+  (multiple-value-bind (lens-profile focal-reducer lens-crop-factor)
+      (resolve-lens-profile-alias (photo-lens-description input-pathname))
+    (call-with-render-source
+     input-pathname
+     (lambda (render-input-pathname)
+       (flet ((invoke (effective-graph)
+                (native-raw-render-graph-rgb
+                 render-input-pathname effective-graph rgb-buffer capacity
+                 :cache-p cache-p
+                 :lens-profile-model lens-profile
+                 :focal-reducer focal-reducer
+                 :lens-crop-factor lens-crop-factor
+                 :grain-seed grain-seed
+                 :max-width max-width
+                 :max-height max-height)))
+         (handler-case
+             (invoke graph)
+           (raw-render-error (condition)
+             (if (and (= 9 (raw-render-error-status condition))
+                      (graph-active-optics-p graph))
+                 (progn
+                   (warn 'lens-profile-unavailable
+                         :input-pathname input-pathname
+                         :message (raw-render-error-message condition))
+                   (invoke (graph-without-optics graph)))
+                 (error condition)))))))))
