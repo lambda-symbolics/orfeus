@@ -30,6 +30,15 @@
 (defconstant +thumbnail-shift-mask+ 1)
 (defconstant +thumbnail-control-mask+ 4)
 
+(defparameter *left-sidebar-min-width* 240
+  "Minimum width of the photo and stills sidebar.")
+
+(defparameter *left-sidebar-initial-width* 260
+  "Preferred initial width of the photo and stills sidebar.")
+
+(defparameter *thumbnail-selection-gutter* 28
+  "Width reserved for the visible multi-selection checkbox in each photo row.")
+
 (defconstant +menu-shift+ #x00010000
   "FLTK FL_SHIFT modifier for menu shortcuts.")
 (defconstant +menu-ctrl+ #x00040000
@@ -241,6 +250,11 @@ Existing positions are preserved so dragged nodes remain where the user put them
 (defun thumbnail-row-at (event-y scroll row-height)
   "Return the zero-based thumbnail row at local EVENT-Y."
   (floor (+ event-y scroll) row-height))
+
+(defun thumbnail-toggle-hit-p (event-x canvas-width)
+  "Return true when EVENT-X hits a photo row's selection checkbox."
+  (and event-x canvas-width
+       (>= event-x (- canvas-width *thumbnail-selection-gutter*))))
 
 (defun preview-priority-indices (count selected)
   "Return every photo index ordered from SELECTED outward."
@@ -729,7 +743,7 @@ new cache entry is published."
               (sb-thread:make-mutex :name "Orfeus preview content keys"))
            window menu toolbar toolbar-bottom-rule main-tile left-column
            filmstrip-pane gallery-pane center-pane
-           thumbnail-canvas thumbnail-scrollbar
+           thumbnail-canvas thumbnail-scrollbar photo-selection-label
            before-canvas after-canvas before-caption after-caption
            still-button copy-grade-button paste-grade-button
            right-column graph-pane graph-canvas graph-title
@@ -1484,17 +1498,20 @@ new cache entry is published."
                              curve-histogram nil)))
                  (redraw-thumbnails))))
            (handle-thumbnail-mouse (canvas event value)
-             (declare (ignore canvas))
+
              (multiple-value-bind (x y button dx dy state)
                  (parse-preview-event value)
-               (declare (ignore x button dx))
+               (declare (ignore button dx))
                (when y
                  (case event
                    (#.cl-fltk:+event-push+
                     (select-thumbnail-row
                      (thumbnail-row-at y thumbnail-scroll
                                        (thumbnail-row-height))
-                     state))
+                     (if (thumbnail-toggle-hit-p
+                          x (cl-fltk:widget-width canvas))
+                         (logior state +thumbnail-control-mask+)
+                         state)))
                    (#.cl-fltk:+event-wheel+
                     (incf thumbnail-scroll (* dy 36))
                     (redraw-thumbnails))))))
@@ -2604,10 +2621,13 @@ new cache entry is published."
                                (max 0 (+ gallery-scroll (* dy 32)))))
                     (cl-fltk:redraw gallery-canvas))))))
            (sync-preset-action-label ()
-             (when preset-apply-button
-               (setf (cl-fltk:label preset-apply-button)
-                     (format nil "Apply to ~D photo~:P"
-                             (selected-photo-count)))))
+             (let ((count (selected-photo-count)))
+               (when preset-apply-button
+                 (setf (cl-fltk:label preset-apply-button)
+                       (format nil "Apply to ~D photo~:P" count)))
+               (when photo-selection-label
+                 (setf (cl-fltk:label photo-selection-label)
+                       (format nil "Photos · ~D selected · boxes toggle" count)))))
            (save-current-preset ()
              (handler-case
                  (let ((preset (gui-model-save-preset
@@ -3134,14 +3154,18 @@ new cache entry is published."
            (layout-left-pane (&optional ignored)
              (declare (ignore ignored))
              (let ((width (cl-fltk:widget-width filmstrip-pane))
-                   (height (cl-fltk:widget-height filmstrip-pane)))
+                   (height (cl-fltk:widget-height filmstrip-pane))
+                   (header-height 28))
+               (when photo-selection-label
+                 (cl-fltk:resize-widget photo-selection-label :x 8 :y 2
+                                        :width (- width 16) :height 24))
                (cl-fltk:resize-widget
-                thumbnail-canvas :x 0 :y 0
-                :width (max 40 (- width 16)) :height height)
+                thumbnail-canvas :x 0 :y header-height
+                :width (max 40 (- width 16)) :height (- height header-height))
                (when thumbnail-scrollbar
                  (cl-fltk:resize-widget
-                  thumbnail-scrollbar :x (max 40 (- width 16)) :y 0
-                  :width 16 :height height)))
+                  thumbnail-scrollbar :x (max 40 (- width 16)) :y header-height
+                  :width 16 :height (- height header-height))))
              (redraw-thumbnails)
              (cl-fltk:redraw filmstrip-pane))
            (layout-center-pane (&optional ignored)
@@ -3203,7 +3227,8 @@ new cache entry is published."
              (declare (ignore ignored))
              (let* ((width (cl-fltk:widget-width gallery-pane))
                     (height (cl-fltk:widget-height gallery-pane))
-                    (half (floor (- width 24) 2)))
+                    (save-width 88)
+                    (apply-width (max 120 (- width save-width 24))))
                (when gallery-title
                  (cl-fltk:resize-widget gallery-title :x 8 :y 2
                                         :width (- width 16) :height 18))
@@ -3217,12 +3242,12 @@ new cache entry is published."
                                         :width (- width 16) :height 24))
                (when preset-apply-button
                  (cl-fltk:resize-widget preset-apply-button
-                                        :x (+ 16 half) :y (- height 32)
-                                        :width half :height 26))
+                                        :x (+ 16 save-width) :y (- height 32)
+                                        :width apply-width :height 26))
                (when preset-save-button
                  (cl-fltk:resize-widget preset-save-button
                                         :x 8 :y (- height 32)
-                                        :width half :height 26))
+                                        :width save-width :height 26))
                (cl-fltk:redraw gallery-pane)))
            (layout-inspector-pane (&optional ignored)
              (declare (ignore ignored))
@@ -3287,12 +3312,12 @@ new cache entry is published."
                     (height (cl-fltk:widget-height window))
                     (top 64) (bottom 28)
                     (main-height (max 200 (- height top bottom)))
-                    (left (min (max 180 (- width 580))
-                               420
-                               (max 180
+                    (left (min (max *left-sidebar-min-width* (- width 580))
+                               480
+                               (max *left-sidebar-min-width*
                                     (if layout-initialized-p
                                         (cl-fltk:widget-width left-column)
-                                        (floor width 5)))))
+                                        *left-sidebar-initial-width*))))
                     (right (min (max 280 (- width left 300))
                                 480
                                 (max 280
@@ -3581,9 +3606,14 @@ new cache entry is published."
               center-pane (cl-fltk:make-panel :parent main-tile :x 240 :y 0
                                               :width 720 :height 708 :label ""))
         (cl-fltk:set-box gallery-pane cl-fltk:+box-flat-box+)
+        (setf photo-selection-label
+              (cl-fltk:make-label
+               :parent filmstrip-pane :x 8 :y 2 :width 224 :height 24
+               :label "Photos · 1 selected · boxes toggle"))
+        (cl-fltk:set-label-font photo-selection-label cl-fltk:+font-helvetica-bold+)
         (setf thumbnail-canvas
               (cl-fltk:make-canvas
-               :parent filmstrip-pane :x 0 :y 0 :width 240 :height 448
+               :parent filmstrip-pane :x 0 :y 28 :width 240 :height 420
                :callback
                (lambda (widget event value)
                  (declare (ignore event value))
@@ -3615,14 +3645,24 @@ new cache entry is published."
                               (cl-fltk:draw-text
                                (file-namestring (photo-job-input-path job))
                                (+ x 102) (+ row-y 30))
+                              (let ((check-x (+ x width - 22))
+                                    (check-y (+ row-y 10)))
+                                (cl-fltk:draw-color-rgb :red 225 :green 225 :blue 225)
+                                (cl-fltk:draw-filled-rect check-x check-y 14 14)
+                                (when (member row (gui-model-selected-indices model))
+                                  (cl-fltk:draw-color-rgb :red 0 :green 0 :blue 128)
+                                  (cl-fltk:draw-filled-rect (+ check-x 3) (+ check-y 3) 8 8)))
                               (cl-fltk:draw-color-rgb :red 125 :green 127 :blue 129)
                               (cl-fltk:draw-filled-rect x (+ row-y row-height -1)
                                                        width 1))))))
+        (cl-fltk:set-tooltip
+         thumbnail-canvas
+         "Click a box to add or remove a photo; Shift-click selects a range")
         (dolist (event (list cl-fltk:+event-push+ cl-fltk:+event-wheel+))
           (cl-fltk:on thumbnail-canvas #'handle-thumbnail-mouse :event event))
         (setf thumbnail-scrollbar
               (cl-fltk:make-scrollbar
-               :parent filmstrip-pane :x 224 :y 0 :width 16 :height 448
+               :parent filmstrip-pane :x 224 :y 28 :width 16 :height 420
                :value "0"
                :callback
                (lambda (widget event value)

@@ -286,6 +286,12 @@
              "Thumbnail hit test selected the wrong row for ~S" case))))
 
 (defun test-thumbnail-multi-selection ()
+  (check (>= orfeus/gui::*left-sidebar-min-width* 240)
+         "Photo sidebar is too narrow for selection controls")
+  (check (orfeus/gui::thumbnail-toggle-hit-p 220 240)
+         "Visible photo checkbox was not clickable")
+  (check (not (orfeus/gui::thumbnail-toggle-hit-p 180 240))
+         "Photo row body was mistaken for its checkbox")
   (multiple-value-bind (selection anchor)
       (orfeus/gui::thumbnail-selection-after-click '(1 4) 2 1 0)
     (check (equal '(2) selection) "Plain thumbnail click did not replace selection")
