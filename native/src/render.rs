@@ -1468,8 +1468,8 @@ fn area_coverage(source: usize, target: usize) -> Vec<(usize, Vec<f32>)> {
 /// never mistaken for hardware acceleration.
 pub(crate) fn gpu_status_message(status: GpuStatus<'_>) -> String {
     match status {
-        GpuStatus::Disabled => "orfeus: Vulkan tone transfer is disabled; \
-             using the CPU path (set ORFEUS_GPU=1 to enable it)"
+        GpuStatus::Disabled => "orfeus: Vulkan tone transfer is disabled by \
+             ORFEUS_GPU=0; using the CPU path"
             .to_string(),
         GpuStatus::Unavailable(reason) => format!(
             "orfeus: WARNING Vulkan tone transfer is unavailable, \
@@ -1514,8 +1514,8 @@ fn gpu_active_notice() -> &'static OnceLock<()> {
     CELL.get_or_init(OnceLock::new)
 }
 
-/// Applies the default display tone and sRGB transfer, on the GPU when
-/// explicitly enabled with `ORFEUS_GPU=1` and on the CPU otherwise. Failures
+/// Applies the default display tone and sRGB transfer, on the GPU unless
+/// `ORFEUS_GPU=0` forces the CPU path. Failures
 /// leave the input intact and fall back, complaining once on stderr so a
 /// missing driver never degrades performance silently.
 pub(crate) fn apply_display_transform(image: &mut RgbImage, profiling: bool) {
@@ -2204,7 +2204,7 @@ mod tests {
         assert!(message.contains("CPU"), "{message}");
         // The disabled notice tells the reader how to turn Vulkan on.
         let disabled = gpu_status_message(GpuStatus::Disabled);
-        assert!(disabled.contains("ORFEUS_GPU=1"), "{disabled}");
+        assert!(disabled.contains("ORFEUS_GPU=0"), "{disabled}");
         assert!(!disabled.contains("WARNING"), "{disabled}");
         assert!(
             gpu_status_message(GpuStatus::Active("llvmpipe")).contains("llvmpipe")

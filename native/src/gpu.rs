@@ -1,6 +1,6 @@
 //! Direct-Vulkan compute for the fused display-tone and sRGB-transfer stage.
 //!
-//! The backend is opt-in; set `ORFEUS_GPU=1` to enable it.
+//! The backend is on by default; set `ORFEUS_GPU=0` to force the CPU path.
 //! Any initialization, allocation, submission, or readback failure leaves the
 //! input untouched so the renderer can run the CPU implementation, and a
 //! failed initialization is remembered so later renders skip the attempt.
@@ -53,7 +53,7 @@ pub(crate) fn requested() -> bool {
 }
 
 fn requested_value(value: Option<&std::ffi::OsStr>) -> bool {
-    value.is_some_and(|value| value == "1")
+    !value.is_some_and(|value| value == "0")
 }
 
 fn context() -> Result<&'static Mutex<Context>, String> {
@@ -615,10 +615,10 @@ mod tests {
     }
 
     #[test]
-    fn gpu_requires_explicit_numeric_opt_in() {
-        assert!(!requested_value(None));
+    fn gpu_is_default_with_an_explicit_numeric_opt_out() {
+        assert!(requested_value(None));
         assert!(!requested_value(Some(std::ffi::OsStr::new("0"))));
-        assert!(!requested_value(Some(std::ffi::OsStr::new("true"))));
+        assert!(requested_value(Some(std::ffi::OsStr::new("true"))));
         assert!(requested_value(Some(std::ffi::OsStr::new("1"))));
     }
 
