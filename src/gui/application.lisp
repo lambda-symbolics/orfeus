@@ -3428,8 +3428,9 @@ new cache entry is published."
                             (max 160
                                  (if layout-initialized-p
                                      (cl-fltk:widget-height graph-pane)
-                                     (min 340
-                                          (floor (* main-height 2) 5)))))))
+                                     (min 480
+                                          (floor (* main-height 11)
+                                                 20)))))))
                  (cl-fltk:resize-widget filmstrip-pane :x 0 :y 0
                                         :width left
                                         :height (- main-height
