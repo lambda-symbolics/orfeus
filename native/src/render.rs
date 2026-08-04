@@ -1727,10 +1727,10 @@ pub(crate) fn neural_render_lock() -> &'static Mutex<()> {
 }
 
 type ScaledSourceKey = (String, usize, usize, u32, u32, usize);
+type ScaledSourceCache = Mutex<Vec<(ScaledSourceKey, Arc<RgbImage>)>>;
 
-fn scaled_source_cache() -> &'static Mutex<Vec<(ScaledSourceKey, Arc<RgbImage>)>> {
-    static CACHE: OnceLock<Mutex<Vec<(ScaledSourceKey, Arc<RgbImage>)>>> =
-        OnceLock::new();
+fn scaled_source_cache() -> &'static ScaledSourceCache {
+    static CACHE: OnceLock<ScaledSourceCache> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(Vec::new()))
 }
 

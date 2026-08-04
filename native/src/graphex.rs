@@ -567,9 +567,7 @@ fn common_prefix_length(previous: &[GraphOp], current: &[GraphOp]) -> usize {
 /// to the cheap grading tail never pay for optics or noise reduction again.
 fn default_snapshot_boundary(ops: &[GraphOp]) -> usize {
     ops.iter()
-        .rposition(|op| {
-            matches!(op.kind, NODE_OPTICS | NODE_NOISE_REDUCTION)
-        })
+        .rposition(|op| matches!(op.kind, NODE_OPTICS | NODE_NOISE_REDUCTION))
         .map(|index| index + 1)
         .unwrap_or(0)
 }
@@ -603,9 +601,7 @@ pub(crate) fn execute_graph_cached(
         let mut cache = prefix_cache()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let common = if let Some(position) =
-            cache.iter().position(|(held, _)| held == key)
-        {
+        let common = if let Some(position) = cache.iter().position(|(held, _)| held == key) {
             let entry = &cache[position].1;
             let common = common_prefix_length(&entry.ops, ops);
             if let Some((boundary, snapshots)) = entry
@@ -681,12 +677,10 @@ pub(crate) fn execute_graph_cached(
     }
     let mut captured: Vec<(usize, Vec<PrefixSnapshot>)> = Vec::new();
     for (index, op) in ops.iter().enumerate().skip(boundary) {
-        if capture_points.contains(&index) {
-            if let Some(snapshots) =
-                collect_snapshots(&registers, &domains, &oriented)
-            {
-                captured.push((index, snapshots));
-            }
+        if capture_points.contains(&index)
+            && let Some(snapshots) = collect_snapshots(&registers, &domains, &oriented)
+        {
+            captured.push((index, snapshots));
         }
         let slot = index + 1;
         let take = |registers: &mut Vec<Option<RgbImage>>,
@@ -841,12 +835,10 @@ pub(crate) fn execute_graph_cached(
         }
         registers[slot] = Some(image);
     }
-    if capture_points.contains(&count) {
-        if let Some(snapshots) =
-            collect_snapshots(&registers, &domains, &oriented)
-        {
-            captured.push((count, snapshots));
-        }
+    if capture_points.contains(&count)
+        && let Some(snapshots) = collect_snapshots(&registers, &domains, &oriented)
+    {
+        captured.push((count, snapshots));
     }
     if let (Some(key), false) = (&cache_key, captured.is_empty()) {
         let entry = PrefixEntry {
@@ -892,7 +884,11 @@ fn collect_snapshots(
             }
         }
     }
-    if snapshots.is_empty() { None } else { Some(snapshots) }
+    if snapshots.is_empty() {
+        None
+    } else {
+        Some(snapshots)
+    }
 }
 
 /// Test hook: rotate-crop with display-convention angle at orientation 1.
@@ -1473,7 +1469,13 @@ mod tests {
     fn tone_program(shadows: f32) -> Vec<u8> {
         GraphBuilder::new()
             .node(NODE_EXPOSURE, 0, -1, &[0.4], None)
-            .node(NODE_TONE, 1, -1, &[0.0, shadows, 0.0, 0.0, 0.0, 0.0, 0.0], None)
+            .node(
+                NODE_TONE,
+                1,
+                -1,
+                &[0.0, shadows, 0.0, 0.0, 0.0, 0.0, 0.0],
+                None,
+            )
             .node(NODE_BLEND, 2, 0, &[0.6], None)
             .build()
     }
@@ -1493,22 +1495,16 @@ mod tests {
         let first = parse_graph(&tone_program(0.3)).unwrap();
         let second = parse_graph(&tone_program(0.7)).unwrap();
         let source = gradient_image();
-        execute_graph_cached(&first, source.clone(), &context(7),
-                             Some(key.clone()))
-            .unwrap();
-        let resumed = execute_graph_cached(&second, source.clone(),
-                                           &context(7), Some(key.clone()))
-            .unwrap();
-        let cold = execute_graph(&second, source.clone(), &context(7))
-            .unwrap();
+        execute_graph_cached(&first, source.clone(), &context(7), Some(key.clone())).unwrap();
+        let resumed =
+            execute_graph_cached(&second, source.clone(), &context(7), Some(key.clone())).unwrap();
+        let cold = execute_graph(&second, source.clone(), &context(7)).unwrap();
         assert_eq!(resumed.width, cold.width);
         assert_eq!(resumed.height, cold.height);
         assert!(max_difference(&resumed, &cold) == 0.0);
         // A third tweak resumes from the refreshed checkpoint.
         let third = parse_graph(&tone_program(0.9)).unwrap();
-        let resumed = execute_graph_cached(&third, source.clone(),
-                                           &context(7), Some(key))
-            .unwrap();
+        let resumed = execute_graph_cached(&third, source.clone(), &context(7), Some(key)).unwrap();
         let cold = execute_graph(&third, source, &context(7)).unwrap();
         assert!(max_difference(&resumed, &cold) == 0.0);
     }
@@ -1525,14 +1521,11 @@ mod tests {
             }
             image
         };
-        execute_graph_cached(&ops, gradient_image(), &context(7),
-                             Some(key_a))
-            .unwrap();
+        execute_graph_cached(&ops, gradient_image(), &context(7), Some(key_a)).unwrap();
         // Rendering photo B with its own key must not reuse A's registers.
         let edited = parse_graph(&tone_program(0.8)).unwrap();
-        let via_cache = execute_graph_cached(&edited, bright.clone(),
-                                             &context(7), Some(key_b))
-            .unwrap();
+        let via_cache =
+            execute_graph_cached(&edited, bright.clone(), &context(7), Some(key_b)).unwrap();
         let cold = execute_graph(&edited, bright, &context(7)).unwrap();
         assert!(max_difference(&via_cache, &cold) == 0.0);
     }
