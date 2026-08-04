@@ -675,8 +675,10 @@ pub(crate) fn execute_graph_cached(
         }
         None => registers[0] = Some(source),
     }
+    let profiling = std::env::var_os("ORFEUS_PROFILE").is_some();
     let mut captured: Vec<(usize, Vec<PrefixSnapshot>)> = Vec::new();
     for (index, op) in ops.iter().enumerate().skip(boundary) {
+        let node_started = profiling.then(std::time::Instant::now);
         if capture_points.contains(&index)
             && let Some(snapshots) = collect_snapshots(&registers, &domains, &oriented)
         {
@@ -833,6 +835,15 @@ pub(crate) fn execute_graph_cached(
             }
             _ => unreachable!("kinds were validated during parsing"),
         }
+        if let Some(started) = node_started {
+            eprintln!(
+                "orfeus-profile node={} kind={} pixels={} milliseconds={:.3}",
+                slot,
+                op.kind,
+                image.width * image.height,
+                started.elapsed().as_secs_f64() * 1000.0
+            );
+        }
         registers[slot] = Some(image);
     }
     if capture_points.contains(&count)
@@ -852,6 +863,7 @@ pub(crate) fn execute_graph_cached(
         cache.insert(0, (key.clone(), entry));
         cache.truncate(PREFIX_CACHE_CAPACITY);
     }
+    let tail_started = profiling.then(std::time::Instant::now);
     let mut image = registers[count]
         .take()
         .ok_or(Error::Render("graph produced no output".into()))?;
@@ -860,6 +872,13 @@ pub(crate) fn execute_graph_cached(
     }
     if domains[count] == Domain::Linear {
         to_display(&mut image);
+    }
+    if let Some(started) = tail_started {
+        eprintln!(
+            "orfeus-profile graph-tail resumed-from={} milliseconds={:.3}",
+            boundary,
+            started.elapsed().as_secs_f64() * 1000.0
+        );
     }
     Ok(image)
 }
