@@ -1,5 +1,15 @@
 //! Native acceleration boundary for Orfeus.
 
+/// Swap the system allocator for mimalloc with `--features mimalloc-allocator`.
+///
+/// Left off by default: measured on a 13700H it moved a full-resolution export
+/// by less than the run-to-run variance, and the render's allocations are a
+/// handful of whole-image buffers rather than the many small ones a faster
+/// allocator would help with.
+#[cfg(feature = "mimalloc-allocator")]
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::collections::HashSet;
 use std::ffi::{CStr, c_char};
 use std::fmt;

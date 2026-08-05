@@ -15,9 +15,14 @@ image = { version = "=0.25.10", default-features = false, features = ["jpeg", "t
 jpeg-encoder = { version = "=0.7.1", features = ["simd"] }
 lensfun = "=0.7.0"
 md-5 = "=0.10.6"
+mimalloc = { version = "=0.1.48", default-features = false, optional = true }
 rawler = "=0.7.2"
 rayon = "=1.12.0"
 sha2 = "=0.10.9"
+
+[features]
+# Measured on a 13700H: no effect outside run-to-run noise, kept as a switch.
+mimalloc-allocator = ["mimalloc"]
 
 [profile.release]
 lto = "thin"
