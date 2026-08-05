@@ -361,6 +361,9 @@ the straightening angle in degrees for a crop node."
 (defconstant +graph-program-magic+ #x4746524F
   "Little-endian magic of a serialized graph program, spelling ORFG.")
 
+(defconstant +graph-program-version+ 2
+  "Serialized graph program version; 2 added the curves node's luma channel.")
+
 (defun graph-boolean-parameter (value)
   (if value 1.0 0.0))
 
@@ -445,7 +448,7 @@ the straightening angle in degrees for a crop node."
                            do (vector-push-extend octet bytes)))
                    (emit-u32 0))))
       (emit-u32 +graph-program-magic+)
-      (emit-u32 1)
+      (emit-u32 +graph-program-version+)
       (emit-u32 (length nodes))
       (let ((ordinals (make-hash-table)))
         (setf (gethash 0 ordinals) 0)

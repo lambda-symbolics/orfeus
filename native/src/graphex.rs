@@ -19,7 +19,7 @@ use super::Error;
 use super::render::{self, DecodedRaw, LensCorrectionOptions, RgbImage};
 
 const GRAPH_MAGIC: u32 = 0x4746_524F; // "ORFG" little-endian
-const GRAPH_VERSION: u32 = 1;
+const GRAPH_VERSION: u32 = 2;
 const MAX_GRAPH_NODES: usize = 64;
 
 pub const NODE_WHITE_BALANCE: u32 = 1;
@@ -144,13 +144,13 @@ fn expected_param_count(kind: u32) -> Result<usize, Error> {
         NODE_BLEND => 1,           // opacity toward input B
         NODE_COLOR_SUBTRACT => 3,  // picked color, subtracted per channel
         NODE_CROP => 5,            // left, top, width, height, angle (degrees)
-        NODE_CURVES => 24,         // three channels x four (x, y) points
+        NODE_CURVES => 32,         // red, green, blue, luma x four (x, y) points
         _ => return Err(Error::InvalidArgument("unknown graph node kind")),
     })
 }
 
 fn validate_curve_points(params: &[f32]) -> Result<(), Error> {
-    for channel in 0..3 {
+    for channel in 0..4 {
         let points = &params[channel * 8..channel * 8 + 8];
         for segment in 0..3 {
             if points[segment * 2] + 1.0e-3 > points[segment * 2 + 2] {
@@ -248,6 +248,27 @@ fn curve_lut(points: &[f32]) -> Vec<f32> {
             srgb_decode_value(eval_curve(&xs, &ys, &tangents, encoded))
         })
         .collect()
+}
+
+/// The do-nothing curve: every control point sits on the diagonal.
+fn is_identity_curve(points: &[f32]) -> bool {
+    points
+        .chunks_exact(2)
+        .all(|point| (point[0] - point[1]).abs() < 1.0e-6)
+}
+
+/// One channel's LUT with the luma curve, when it is not the identity, folded
+/// in after it. Composing costs a few thousand lookups once per render instead
+/// of a second curve evaluation per pixel.
+fn channel_lut(points: &[f32], luma: Option<&[f32]>) -> Vec<f32> {
+    let channel = curve_lut(points);
+    match luma {
+        None => channel,
+        Some(luma) => channel
+            .iter()
+            .map(|value| apply_curve_value(luma, *value))
+            .collect(),
+    }
 }
 
 fn apply_curve_value(lut: &[f32], value: f32) -> f32 {
@@ -812,12 +833,15 @@ pub(crate) fn execute_graph_cached(
                 });
             }
             NODE_CURVES => {
-                // Per-channel monotone curves on the encoded signal: the
-                // film-stock "decompression" for inverted negatives.
+                // Per-channel monotone curves on the encoded signal, then the
+                // luma curve over all three: the film-stock "decompression"
+                // for inverted negatives.
+                let luma = (!is_identity_curve(&op.params[24..32]))
+                    .then(|| curve_lut(&op.params[24..32]));
                 let luts = [
-                    curve_lut(&op.params[0..8]),
-                    curve_lut(&op.params[8..16]),
-                    curve_lut(&op.params[16..24]),
+                    channel_lut(&op.params[0..8], luma.as_deref()),
+                    channel_lut(&op.params[8..16], luma.as_deref()),
+                    channel_lut(&op.params[16..24], luma.as_deref()),
                 ];
                 image.data.par_chunks_exact_mut(3).for_each(|pixel| {
                     for (value, lut) in pixel.iter_mut().zip(&luts) {
@@ -1470,10 +1494,19 @@ mod tests {
     ];
 
     fn curves_params(red: &[f32; 8], green: &[f32; 8], blue: &[f32; 8]) -> Vec<f32> {
-        let mut params = Vec::with_capacity(24);
-        params.extend_from_slice(red);
-        params.extend_from_slice(green);
-        params.extend_from_slice(blue);
+        luma_curves_params(red, green, blue, &IDENTITY_CURVE)
+    }
+
+    fn luma_curves_params(
+        red: &[f32; 8],
+        green: &[f32; 8],
+        blue: &[f32; 8],
+        luma: &[f32; 8],
+    ) -> Vec<f32> {
+        let mut params = Vec::with_capacity(32);
+        for channel in [red, green, blue, luma] {
+            params.extend_from_slice(channel);
+        }
         params
     }
 
@@ -1518,6 +1551,64 @@ mod tests {
         // Out-of-range values ride through continuously.
         assert!(apply_curve_value(&identity_lut, -0.25) < 0.0);
         assert!(apply_curve_value(&identity_lut, 1.5) > 1.4);
+    }
+
+    #[test]
+    fn the_luma_curve_composes_over_every_channel() {
+        // A luma lift raises all three channels; folding it into the channel
+        // LUTs must match evaluating the two curves in sequence.
+        let lift = [0.0, 0.0, 1.0 / 3.0, 0.5, 2.0 / 3.0, 0.8, 1.0, 1.0];
+        let red = [0.0, 0.0, 1.0 / 3.0, 0.25, 2.0 / 3.0, 0.6, 1.0, 1.0];
+        let luma_lut = curve_lut(&lift);
+        let composed = channel_lut(&red, Some(&luma_lut));
+        let plain = channel_lut(&red, None);
+        for step in 1..20 {
+            let value = step as f32 / 20.0;
+            let sequential = apply_curve_value(&luma_lut, apply_curve_value(&plain, value));
+            let folded = apply_curve_value(&composed, value);
+            assert!(
+                (folded - sequential).abs() < 3.0e-3,
+                "composition drift at {value}: {folded} vs {sequential}"
+            );
+            assert!(
+                folded > apply_curve_value(&plain, value),
+                "luma lift missing at {value}"
+            );
+        }
+        assert!(is_identity_curve(&IDENTITY_CURVE));
+        assert!(!is_identity_curve(&lift));
+    }
+
+    #[test]
+    fn a_white_point_pulled_left_gains_the_channel_and_clips_above_it() {
+        // The negative-scan move: drag the top-right point in, so everything
+        // above it reaches full output.
+        let gained = [0.0, 0.0, 0.25, 0.4, 0.5, 0.8, 0.7, 1.0];
+        let ops = parse_graph(
+            &GraphBuilder::new()
+                .node(
+                    NODE_CURVES,
+                    0,
+                    -1,
+                    &luma_curves_params(&gained, &IDENTITY_CURVE, &IDENTITY_CURVE,
+                                        &IDENTITY_CURVE),
+                    None,
+                )
+                .build(),
+        )
+        .expect("a curve whose white point moved left is a legal program");
+        assert_eq!(ops.len(), 1);
+        let lut = curve_lut(&gained);
+        let encoded_white = srgb_decode_value(0.7);
+        assert!(
+            apply_curve_value(&lut, encoded_white) > 0.98,
+            "the moved white point should reach full output"
+        );
+        assert!(
+            apply_curve_value(&lut, srgb_decode_value(0.85)) >= 1.0,
+            "input above the white point stays clipped"
+        );
+        assert!(apply_curve_value(&lut, srgb_decode_value(0.2)) > srgb_decode_value(0.2));
     }
 
     fn tone_program(shadows: f32) -> Vec<u8> {

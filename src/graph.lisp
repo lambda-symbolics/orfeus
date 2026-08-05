@@ -26,7 +26,9 @@ negatives.")
 
 (defparameter *crop-keys* '(:left :top :width :height :angle))
 
-(defparameter *curve-channel-keys* '(:red-points :green-points :blue-points))
+(defparameter *curve-channel-keys*
+  '(:red-points :green-points :blue-points :master-points)
+  "Curve channels in wire order: the three channels, then luma over all.")
 
 (defparameter *identity-curve-points*
   '(0.0 0.0 0.33 0.33 0.67 0.67 1.0 1.0)
@@ -92,7 +94,7 @@ POSITION, when set, is the node's (x y) spot on the graph editor canvas."
   (unless (and (listp params)
                (plist-known-keys-p params *curve-channel-keys*))
     (graph-invalid params
-                   "expected :red-points :green-points :blue-points"))
+                   "expected :red-points :green-points :blue-points :master-points"))
   (dolist (key *curve-channel-keys*)
     (let ((points (getf params key)))
       (when points

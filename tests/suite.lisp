@@ -429,12 +429,13 @@
                                   :curves
                                   :params (list :red-points points))))
     (and (graph-validate graph)
-         ;; The wire format flattens all three channels, filling unset
-         ;; ones with the identity diagonal.
+         ;; The wire format flattens the three channels and the luma curve,
+         ;; filling unset ones with the identity diagonal.
          (let ((params (orfeus::graph-node-program-parameters node)))
-           (and (= 24 (length params))
+           (and (= 32 (length params))
                 (= 0.05 (second params))
-                (= 0.33 (nth 10 params))))
+                (= 0.33 (nth 10 params))
+                (= 0.33 (nth 26 params))))
          (eql 10 (rest (assoc :curves orfeus::*graph-node-kind-codes*)))
          ;; Points survive the project S-expression round trip.
          (let* ((decoded (sexp->graph (graph->sexp graph)))
@@ -1077,9 +1078,9 @@
                  :output 1))
          (bytes (orfeus::graph->program-bytes graph)))
     (equalp bytes
-            ;; magic "ORFG", version 1, one node: exposure(2), input 0,
+            ;; magic "ORFG", version 2, one node: exposure(2), input 0,
             ;; no second input, one parameter 0.5f0, no string.
-            (coerce #(#x4F #x52 #x46 #x47  1 0 0 0  1 0 0 0
+            (coerce #(#x4F #x52 #x46 #x47  2 0 0 0  1 0 0 0
                       2 0 0 0  0 0 0 0  #xFF #xFF #xFF #xFF
                       1 0 0 0  0 0 0 #x3F  0 0 0 0)
                     '(simple-array (unsigned-byte 8) (*))))))
