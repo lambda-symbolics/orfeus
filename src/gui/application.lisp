@@ -1492,6 +1492,14 @@ new cache entry is published."
                                          (+ left inner-width -34
                                             (* column 11))
                                          label-y))))
+                    (lightfast:draw-font :size 12))
+                  ;; The trace is decoded from the settled preview, so during a
+                  ;; drag it still shows the grade before the current one. Say
+                  ;; so rather than let it be read as the live result.
+                  (when after-live-p
+                    (lightfast:draw-color-rgb :red 150 :green 130 :blue 60)
+                    (lightfast:draw-font :size 10)
+                    (lightfast:draw-text "settling" (+ left 4) (+ top 11))
                     (lightfast:draw-font :size 12)))
                  (t
                   (lightfast:draw-color-rgb :red 128 :green 128 :blue 134)
@@ -4181,7 +4189,9 @@ new cache entry is published."
                           after-live-height (fifth event)
                           after-live-p t)
                     (incf after-live-generation)
-                    (when after-canvas (lightfast:redraw after-canvas))))
+                    (when after-canvas (lightfast:redraw after-canvas))
+                    ;; The scope now trails the image, so repaint its notice.
+                    (when scope-canvas (lightfast:redraw scope-canvas))))
                  (:histogram
                   (if (and (= (second event) preview-generation)
                            (equal (third event) after-preview-file))
