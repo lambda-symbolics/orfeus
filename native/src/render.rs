@@ -1468,15 +1468,15 @@ fn area_coverage(source: usize, target: usize) -> Vec<(usize, Vec<f32>)> {
 /// never mistaken for hardware acceleration.
 pub(crate) fn gpu_status_message(status: GpuStatus<'_>) -> String {
     match status {
-        GpuStatus::Disabled => "orfeus: Vulkan tone transfer is disabled by \
+        GpuStatus::Disabled => "orfeus: Vulkan compute is disabled by \
              ORFEUS_GPU=0; using the CPU path"
             .to_string(),
         GpuStatus::Unavailable(reason) => format!(
-            "orfeus: WARNING Vulkan tone transfer is unavailable, \
+            "orfeus: WARNING Vulkan compute is unavailable, \
              falling back to the CPU path: {reason}"
         ),
         GpuStatus::Active(adapter) => {
-            format!("orfeus: Vulkan tone transfer active on {adapter}")
+            format!("orfeus: Vulkan compute active on {adapter}")
         }
     }
 }
@@ -1490,7 +1490,7 @@ pub(crate) enum GpuStatus<'a> {
 /// Reports STATUS on stderr the first time the process reaches it. Returns
 /// true when it printed, so callers and tests can tell the once-only
 /// behaviour apart from repeated frames.
-fn report_gpu_status_once(cell: &OnceLock<()>, status: GpuStatus<'_>) -> bool {
+pub(crate) fn report_gpu_status_once(cell: &OnceLock<()>, status: GpuStatus<'_>) -> bool {
     if cell.set(()).is_ok() {
         eprintln!("{}", gpu_status_message(status));
         true
@@ -1499,17 +1499,17 @@ fn report_gpu_status_once(cell: &OnceLock<()>, status: GpuStatus<'_>) -> bool {
     }
 }
 
-fn gpu_disabled_notice() -> &'static OnceLock<()> {
+pub(crate) fn gpu_disabled_notice() -> &'static OnceLock<()> {
     static CELL: OnceLock<OnceLock<()>> = OnceLock::new();
     CELL.get_or_init(OnceLock::new)
 }
 
-fn gpu_fallback_notice() -> &'static OnceLock<()> {
+pub(crate) fn gpu_fallback_notice() -> &'static OnceLock<()> {
     static CELL: OnceLock<OnceLock<()>> = OnceLock::new();
     CELL.get_or_init(OnceLock::new)
 }
 
-fn gpu_active_notice() -> &'static OnceLock<()> {
+pub(crate) fn gpu_active_notice() -> &'static OnceLock<()> {
     static CELL: OnceLock<OnceLock<()>> = OnceLock::new();
     CELL.get_or_init(OnceLock::new)
 }

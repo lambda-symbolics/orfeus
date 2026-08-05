@@ -1,0 +1,39 @@
+#version 450
+
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0, std430) readonly buffer Camera {
+    float camera[];
+};
+layout(set = 0, binding = 1, std430) writeonly buffer Linear {
+    float linear_rgb[];
+};
+
+#include "stage.glsl"
+
+// Mirrors `color::reconstruct_clipped`: a saturated photosite recorded only a
+// lower bound, so white balance would otherwise spread flat clipped values into
+// a magenta cast. Lifting each clipped channel to the brightest balanced channel
+// of its pixel reconstructs a blown highlight as bright grey.
+//
+// Unused channels arrive as zero with a zero gain and a zero matrix column, so
+// three- and four-color cameras share this code without branching. A zero can
+// never win `peak`: reconstruction only reads it once some channel clipped, and
+// a clipped channel's balanced value is positive.
+void main() {
+    uint pixel = stage_pixel();
+    if (pixel >= parameters.counts.x) {
+        return;
+    }
+    uint source = pixel * parameters.counts.y;
+    vec4 raw = vec4(camera[source], camera[source + 1u], camera[source + 2u],
+                    parameters.counts.y == 4u ? camera[source + 3u] : 0.0);
+    vec4 balanced = raw * parameters.white_balance;
+    float peak = max(max(balanced.x, balanced.y), max(balanced.z, balanced.w));
+    vec4 clipped = clamp((raw - parameters.clip.x) / (1.0 - parameters.clip.x), 0.0, 1.0);
+    balanced += clipped * max(peak - balanced, 0.0);
+
+    uint target = pixel * 3u;
+    linear_rgb[target] = dot(parameters.matrix_rows[0], balanced);
+    linear_rgb[target + 1u] = dot(parameters.matrix_rows[1], balanced);
+    linear_rgb[target + 2u] = dot(parameters.matrix_rows[2], balanced);
+}

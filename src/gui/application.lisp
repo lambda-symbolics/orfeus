@@ -820,6 +820,9 @@ new cache entry is published."
     ;; Load both CFFI bridges before workers can race to initialize them.
     (orfeus:native-bridge-version)
     (load-gui-preview-library)
+    ;; Vulkan initialization costs enough to show on the first frames, so spend
+    ;; it while the window is still being built.
+    (orfeus:native-gpu-warm-up)
     (let* ((project initial-project)
            (model (make-gui-model :project project
                                   :project-path initial-path))

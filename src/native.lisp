@@ -147,6 +147,19 @@
   (native-library-load)
   (%native-bridge-abi-version))
 
+(defcfun ("orfeus_gpu_warm_up" %gpu-warm-up) :void)
+
+(defun native-gpu-warm-up ()
+  "Start building the Vulkan compute context on a background thread.
+
+Vulkan initialization costs enough to show on a session's first renders. This
+returns at once, so a caller can spend it during startup instead."
+  (when (native-bridge-available-p)
+    (sb-int:with-float-traps-masked (:invalid :divide-by-zero :overflow
+                                     :underflow :inexact)
+      (%gpu-warm-up))
+    t))
+
 (defun native-error-message (buffer)
   (foreign-string-to-lisp buffer :encoding :utf-8))
 

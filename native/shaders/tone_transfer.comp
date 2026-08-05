@@ -5,6 +5,8 @@ layout(set = 0, binding = 0, std430) buffer Pixels {
     float rgb[];
 };
 
+#include "stage.glsl"
+
 float transfer(float value) {
     if (value <= 0.0031308) {
         return 12.92 * value;
@@ -13,11 +15,11 @@ float transfer(float value) {
 }
 
 void main() {
-    uint pixel = gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * 65535u * 256u;
-    uint offset = pixel * 3u;
-    if (offset + 2u >= rgb.length()) {
+    uint pixel = stage_pixel();
+    if (pixel >= parameters.counts.x) {
         return;
     }
+    uint offset = pixel * 3u;
     vec3 input_rgb = vec3(rgb[offset], rgb[offset + 1u], rgb[offset + 2u]);
     float luminance = dot(input_rgb, vec3(0.2126729, 0.7151522, 0.072175));
     if (!(luminance > 0.0) || isinf(luminance) || isnan(luminance)) {

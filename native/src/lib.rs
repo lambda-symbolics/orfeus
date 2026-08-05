@@ -481,6 +481,16 @@ pub unsafe extern "C" fn orfeus_dng_extract_original(
     }
 }
 
+/// Begin building the Vulkan compute context on a background thread.
+///
+/// Initialization costs enough to show on the first frames a session renders.
+/// Calling this once at startup moves that cost off the render path; calling it
+/// again, or on a machine with no usable adapter, does nothing.
+#[unsafe(no_mangle)]
+pub extern "C" fn orfeus_gpu_warm_up() {
+    gpu::warm_up();
+}
+
 /// Report version 1 render/export capabilities.
 ///
 /// The returned bit set intentionally omits source EXIF/XMP preservation: the

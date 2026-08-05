@@ -143,7 +143,7 @@ fn usable_white_balance<const N: usize>(white_balance: &[f32; 4]) -> Result<[f32
 
 /// Camera level at which a photosite counts as saturated. Rawler's rescale maps
 /// every channel's white level to 1.0, so a clipped channel arrives at unity.
-const CLIP_ONSET: f32 = 0.97;
+pub(crate) const CLIP_ONSET: f32 = 0.97;
 
 /// Raises clipped channels to the brightest balanced channel of their pixel.
 ///
@@ -173,6 +173,9 @@ fn transform_pixels<const N: usize>(
     white_balance: &[f32; N],
     matrix: &[[f32; N]; 3],
 ) -> Vec<f32> {
+    if let Some(output) = gpu_transform_pixels(&pixels, white_balance, matrix) {
+        return output;
+    }
     use rayon::prelude::*;
     let mut output = vec![0.0_f32; pixels.len() * 3];
     output
@@ -191,6 +194,104 @@ fn transform_pixels<const N: usize>(
             }
         });
     output
+}
+
+/// Runs the camera transform as a compute dispatch, or returns `None` so the
+/// caller uses the CPU path.
+///
+/// The stage is a white-balance multiply, a highlight reconstruction, and a
+/// 3xN matrix per pixel: no neighbours, no branches worth speaking of, and a
+/// whole frame's worth of independent work, which is exactly what a compute
+/// dispatch is for. It runs once per decode over the full-resolution image, so
+/// it lands on cold opens and on every export.
+fn gpu_transform_pixels<const N: usize>(
+    pixels: &[[f32; N]],
+    white_balance: &[f32; N],
+    matrix: &[[f32; N]; 3],
+) -> Option<Vec<f32>> {
+    use super::render::{
+        GpuStatus, gpu_active_notice, gpu_disabled_notice, gpu_fallback_notice,
+        report_gpu_status_once,
+    };
+    // Below a quarter-megapixel the dispatch overhead — command recording,
+    // submission, and the fence wait — costs more than the CPU pass it would
+    // replace, so thumbnails and unit tests stay on the CPU.
+    const PIXEL_THRESHOLD: usize = 1 << 18;
+    if pixels.len() < PIXEL_THRESHOLD {
+        return None;
+    }
+    if !super::gpu::requested() {
+        report_gpu_status_once(gpu_disabled_notice(), GpuStatus::Disabled);
+        return None;
+    }
+    let mut gains = [0.0_f32; 4];
+    gains[..N].copy_from_slice(white_balance);
+    let mut rows = [[0.0_f32; 4]; 3];
+    for (padded, row) in rows.iter_mut().zip(matrix) {
+        padded[..N].copy_from_slice(row);
+    }
+    let camera = pixels.as_flattened();
+    let profiling = std::env::var_os("ORFEUS_PROFILE").is_some();
+    let attempt = std::panic::catch_unwind(|| {
+        super::gpu::camera_to_linear_srgb(camera, N, gains, rows, CLIP_ONSET)
+    });
+    match attempt {
+        Ok(Ok((output, dispatch))) => {
+            report_gpu_status_once(
+                gpu_active_notice(),
+                GpuStatus::Active(&dispatch.adapter_name),
+            );
+            if profiling {
+                eprintln!(
+                    "orfeus-profile gpu-stage=camera-matrix adapter={:?} milliseconds={:.3}",
+                    dispatch.adapter_name, dispatch.milliseconds
+                );
+            }
+            Some(output)
+        }
+        Ok(Err(error)) => {
+            report_gpu_status_once(gpu_fallback_notice(), GpuStatus::Unavailable(&error));
+            if profiling {
+                eprintln!("orfeus-profile gpu-stage=camera-matrix fallback=cpu error={error:?}");
+            }
+            None
+        }
+        Err(_) => {
+            report_gpu_status_once(
+                gpu_fallback_notice(),
+                GpuStatus::Unavailable("the Vulkan backend panicked"),
+            );
+            if profiling {
+                eprintln!("orfeus-profile gpu-stage=camera-matrix fallback=cpu error=panic");
+            }
+            None
+        }
+    }
+}
+
+/// The single-threaded CPU reference for the camera stage, for GPU agreement
+/// tests and benchmarks. `camera` is interleaved by `white_balance.len()`.
+#[cfg(test)]
+pub(crate) fn camera_to_linear_srgb_reference<const N: usize>(
+    camera: &[f32],
+    white_balance: &[f32],
+    matrix: &[[f32; N]; 3],
+) -> Vec<f32> {
+    camera
+        .chunks_exact(N)
+        .flat_map(|pixel| {
+            let pixel: [f32; N] = std::array::from_fn(|channel| pixel[channel]);
+            let mut balanced: [f32; N] =
+                std::array::from_fn(|channel| pixel[channel] * white_balance[channel]);
+            reconstruct_clipped(&pixel, &mut balanced);
+            matrix.map(|row| {
+                row.iter()
+                    .zip(&balanced)
+                    .map(|(coefficient, channel)| coefficient * channel)
+                    .sum::<f32>()
+            })
+        })
+        .collect()
 }
 
 /// Converts demosaiced camera channels to white-balanced, unclipped linear sRGB.

@@ -1,48 +1,95 @@
-//! Direct-Vulkan compute for the fused display-tone and sRGB-transfer stage.
+//! Direct-Vulkan compute for the per-pixel color stages.
+//!
+//! Two stages run here: the camera-to-linear-sRGB matrix with highlight
+//! reconstruction, and the fused display-tone and sRGB-transfer pass. Both are
+//! pure per-pixel arithmetic over a whole image, so they suit a compute
+//! dispatch and share one pipeline layout, one descriptor set, and one pair of
+//! buffers.
 //!
 //! The backend is on by default; set `ORFEUS_GPU=0` to force the CPU path, or
 //! `ORFEUS_GPU=discrete` to prefer a discrete adapter over an integrated one.
 //! Any initialization, allocation, submission, or readback failure leaves the
-//! input untouched so the renderer can run the CPU implementation, and a
-//! failed initialization is remembered so later renders skip the attempt.
+//! input untouched so the renderer can run the CPU implementation, and a failed
+//! initialization is remembered so later renders skip the attempt.
 
 use std::ffi::{CStr, CString};
 use std::io::Cursor;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock, TryLockError};
 use std::time::Instant;
 
+use ash::vk::Handle;
 use ash::{Device, Entry, Instance, vk};
 
-const SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tone_transfer.spv"));
+const TONE_TRANSFER_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tone_transfer.spv"));
+const CAMERA_MATRIX_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/camera_matrix.spv"));
+
+/// The push-constant block declared in `shaders/stage.glsl`.
+///
+/// Every member is four-component so std140 and std430 agree on the offsets.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct Parameters {
+    counts: [u32; 4],
+    clip: [f32; 4],
+    white_balance: [f32; 4],
+    matrix_rows: [[f32; 4]; 3],
+}
+
+impl Parameters {
+    fn bytes(&self) -> &[u8] {
+        // A plain `repr(C)` aggregate of `u32` and `f32`, so every byte is
+        // initialized and no padding is exposed.
+        unsafe {
+            std::slice::from_raw_parts(
+                (self as *const Self).cast::<u8>(),
+                std::mem::size_of::<Self>(),
+            )
+        }
+    }
+}
+
+/// One logical buffer: a host-mapped upload buffer plus a device-local mirror,
+/// or a single host-visible device-local buffer when the adapter shares memory
+/// with the host.
+///
+/// Integrated adapters — which this renderer prefers, because these stages are
+/// transfer-bound — expose `DEVICE_LOCAL | HOST_VISIBLE` heaps, so the two
+/// in-device copies per dispatch are pure waste there. A 20 MP frame moves
+/// 240 MB per copy, which is the single largest avoidable cost in the dispatch.
+#[derive(Default)]
+struct Slot {
+    host: vk::Buffer,
+    host_memory: vk::DeviceMemory,
+    mapped: usize,
+    device: vk::Buffer,
+    device_memory: vk::DeviceMemory,
+    capacity: vk::DeviceSize,
+    unified: bool,
+}
 
 struct Context {
     _entry: Entry,
     instance: Instance,
-    physical_device: vk::PhysicalDevice,
     device: Device,
     queue: vk::Queue,
+    memory_properties: vk::PhysicalDeviceMemoryProperties,
     command_pool: vk::CommandPool,
     descriptor_set_layout: vk::DescriptorSetLayout,
     pipeline_layout: vk::PipelineLayout,
-    pipeline: vk::Pipeline,
+    tone_transfer: vk::Pipeline,
+    camera_matrix: vk::Pipeline,
     descriptor_pool: vk::DescriptorPool,
     descriptor_set: vk::DescriptorSet,
     command: vk::CommandBuffer,
     fence: vk::Fence,
-    staging: vk::Buffer,
-    staging_memory: vk::DeviceMemory,
-    staging_mapped: usize,
-    storage: vk::Buffer,
-    storage_memory: vk::DeviceMemory,
-    capacity: vk::DeviceSize,
+    input: Slot,
+    output: Slot,
     max_storage_buffer_range: vk::DeviceSize,
     adapter_name: String,
 }
 
 // Queue submission and command-pool allocation require external synchronization.
 static CONTEXT: OnceLock<Result<Mutex<Context>, String>> = OnceLock::new();
-static INITIALIZING: AtomicBool = AtomicBool::new(false);
 
 pub(crate) struct DispatchProfile {
     pub(crate) adapter_name: String,
@@ -57,27 +104,26 @@ fn requested_value(value: Option<&std::ffi::OsStr>) -> bool {
     !value.is_some_and(|value| value == "0")
 }
 
+/// Builds the Vulkan context on a background thread.
+///
+/// Initialization takes long enough to be visible on the first frames, and a
+/// render that arrives mid-initialization simply waits for it — waiting costs
+/// far less than the CPU fallback it would otherwise take.
+pub(crate) fn warm_up() {
+    if !requested() || CONTEXT.get().is_some() {
+        return;
+    }
+    std::thread::Builder::new()
+        .name("orfeus-gpu-warm-up".to_string())
+        .spawn(|| {
+            let _ = context();
+        })
+        .ok();
+}
+
 fn context() -> Result<&'static Mutex<Context>, String> {
-    if let Some(result) = CONTEXT.get() {
-        return result.as_ref().map_err(Clone::clone);
-    }
-    if INITIALIZING
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
-        return Err("Vulkan context is initializing".to_string());
-    }
-    struct InitializationGuard;
-    impl Drop for InitializationGuard {
-        fn drop(&mut self) {
-            INITIALIZING.store(false, Ordering::Release);
-        }
-    }
-    let _guard = InitializationGuard;
-    let _ = CONTEXT.set(initialize().map(Mutex::new));
     CONTEXT
-        .get()
-        .expect("Vulkan context initialization did not publish a result")
+        .get_or_init(|| initialize().map(Mutex::new))
         .as_ref()
         .map_err(Clone::clone)
 }
@@ -140,6 +186,13 @@ fn software_allowed_value(
     test.is_some_and(|value| value == "1") || request.is_some_and(|value| value == "software")
 }
 
+/// Set `ORFEUS_GPU_STAGING=1` to take the discrete-adapter staging path on an
+/// adapter that offers unified memory, so both paths can be validated on one
+/// machine.
+fn staging_forced() -> bool {
+    std::env::var_os("ORFEUS_GPU_STAGING").as_deref() == Some(std::ffi::OsStr::new("1"))
+}
+
 fn adapter_is_usable(kind: vk::PhysicalDeviceType, software_allowed: bool) -> bool {
     kind != vk::PhysicalDeviceType::CPU || software_allowed
 }
@@ -152,6 +205,29 @@ fn adapter_kind_name(kind: vk::PhysicalDeviceType) -> &'static str {
         vk::PhysicalDeviceType::CPU => "cpu",
         _ => "other",
     }
+}
+
+unsafe fn create_pipeline(
+    device: &Device,
+    layout: vk::PipelineLayout,
+    spirv: &[u8],
+) -> Result<vk::Pipeline, String> {
+    let words = ash::util::read_spv(&mut Cursor::new(spirv))
+        .map_err(|error| format!("read embedded SPIR-V: {error}"))?;
+    let module_info = vk::ShaderModuleCreateInfo::default().code(&words);
+    let module = unsafe { device.create_shader_module(&module_info, None) }
+        .map_err(|error| vk_error("shader module creation", error))?;
+    let stage = vk::PipelineShaderStageCreateInfo::default()
+        .stage(vk::ShaderStageFlags::COMPUTE)
+        .module(module)
+        .name(c"main");
+    let pipeline_info = [vk::ComputePipelineCreateInfo::default()
+        .stage(stage)
+        .layout(layout)];
+    let result =
+        unsafe { device.create_compute_pipelines(vk::PipelineCache::null(), &pipeline_info, None) };
+    unsafe { device.destroy_shader_module(module, None) };
+    Ok(result.map_err(|(_, error)| vk_error("compute pipeline creation", error))?[0])
 }
 
 fn initialize() -> Result<Context, String> {
@@ -223,43 +299,33 @@ fn initialize() -> Result<Context, String> {
         let command_pool = device
             .create_command_pool(&command_pool_info, None)
             .map_err(|error| vk_error("command-pool creation", error))?;
-        let binding = [vk::DescriptorSetLayoutBinding::default()
-            .binding(0)
-            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-            .descriptor_count(1)
-            .stage_flags(vk::ShaderStageFlags::COMPUTE)];
-        let descriptor_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&binding);
+        let bindings: [vk::DescriptorSetLayoutBinding; 2] = std::array::from_fn(|binding| {
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(binding as u32)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE)
+        });
+        let descriptor_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
         let descriptor_set_layout = device
             .create_descriptor_set_layout(&descriptor_info, None)
             .map_err(|error| vk_error("descriptor layout creation", error))?;
         let set_layouts = [descriptor_set_layout];
-        let pipeline_layout_info =
-            vk::PipelineLayoutCreateInfo::default().set_layouts(&set_layouts);
+        let push_constants = [vk::PushConstantRange::default()
+            .stage_flags(vk::ShaderStageFlags::COMPUTE)
+            .offset(0)
+            .size(std::mem::size_of::<Parameters>() as u32)];
+        let pipeline_layout_info = vk::PipelineLayoutCreateInfo::default()
+            .set_layouts(&set_layouts)
+            .push_constant_ranges(&push_constants);
         let pipeline_layout = device
             .create_pipeline_layout(&pipeline_layout_info, None)
             .map_err(|error| vk_error("pipeline layout creation", error))?;
-        let words = ash::util::read_spv(&mut Cursor::new(SHADER))
-            .map_err(|error| format!("read embedded SPIR-V: {error}"))?;
-        let module_info = vk::ShaderModuleCreateInfo::default().code(&words);
-        let module = device
-            .create_shader_module(&module_info, None)
-            .map_err(|error| vk_error("shader module creation", error))?;
-        let entry_name = c"main";
-        let stage = vk::PipelineShaderStageCreateInfo::default()
-            .stage(vk::ShaderStageFlags::COMPUTE)
-            .module(module)
-            .name(entry_name);
-        let pipeline_info = [vk::ComputePipelineCreateInfo::default()
-            .stage(stage)
-            .layout(pipeline_layout)];
-        let pipeline_result =
-            device.create_compute_pipelines(vk::PipelineCache::null(), &pipeline_info, None);
-        device.destroy_shader_module(module, None);
-        let pipeline =
-            pipeline_result.map_err(|(_, error)| vk_error("compute pipeline creation", error))?[0];
+        let tone_transfer = create_pipeline(&device, pipeline_layout, TONE_TRANSFER_SHADER)?;
+        let camera_matrix = create_pipeline(&device, pipeline_layout, CAMERA_MATRIX_SHADER)?;
         let pool_size = [vk::DescriptorPoolSize::default()
             .ty(vk::DescriptorType::STORAGE_BUFFER)
-            .descriptor_count(1)];
+            .descriptor_count(bindings.len() as u32)];
         let descriptor_pool_info = vk::DescriptorPoolCreateInfo::default()
             .max_sets(1)
             .pool_sizes(&pool_size);
@@ -288,24 +354,21 @@ fn initialize() -> Result<Context, String> {
             .into_owned();
         Ok(Context {
             _entry: entry,
+            memory_properties: instance.get_physical_device_memory_properties(physical_device),
             instance,
-            physical_device,
             device,
             queue,
             command_pool,
             descriptor_set_layout,
             pipeline_layout,
-            pipeline,
+            tone_transfer,
+            camera_matrix,
             descriptor_pool,
             descriptor_set,
             command,
             fence,
-            staging: vk::Buffer::null(),
-            staging_memory: vk::DeviceMemory::null(),
-            staging_mapped: 0,
-            storage: vk::Buffer::null(),
-            storage_memory: vk::DeviceMemory::null(),
-            capacity: 0,
+            input: Slot::default(),
+            output: Slot::default(),
             max_storage_buffer_range: properties.limits.max_storage_buffer_range.into(),
             adapter_name,
         })
@@ -313,24 +376,23 @@ fn initialize() -> Result<Context, String> {
 }
 
 unsafe fn create_buffer(
-    context: &Context,
+    device: &Device,
+    memory_properties: &vk::PhysicalDeviceMemoryProperties,
     size: vk::DeviceSize,
-    usage: vk::BufferUsageFlags,
     required_memory_flags: vk::MemoryPropertyFlags,
     preferred_memory_flags: vk::MemoryPropertyFlags,
 ) -> Result<(vk::Buffer, vk::DeviceMemory), String> {
     let info = vk::BufferCreateInfo::default()
         .size(size)
-        .usage(usage)
+        .usage(
+            vk::BufferUsageFlags::TRANSFER_SRC
+                | vk::BufferUsageFlags::TRANSFER_DST
+                | vk::BufferUsageFlags::STORAGE_BUFFER,
+        )
         .sharing_mode(vk::SharingMode::EXCLUSIVE);
-    let buffer = unsafe { context.device.create_buffer(&info, None) }
+    let buffer = unsafe { device.create_buffer(&info, None) }
         .map_err(|error| vk_error("buffer creation", error))?;
-    let requirements = unsafe { context.device.get_buffer_memory_requirements(buffer) };
-    let memory_properties = unsafe {
-        context
-            .instance
-            .get_physical_device_memory_properties(context.physical_device)
-    };
+    let requirements = unsafe { device.get_buffer_memory_requirements(buffer) };
     let memory_type = (0..memory_properties.memory_type_count)
         .filter(|index| {
             requirements.memory_type_bits & (1 << index) != 0
@@ -347,29 +409,35 @@ unsafe fn create_buffer(
     let memory_type = match memory_type {
         Ok(value) => value,
         Err(error) => {
-            unsafe { context.device.destroy_buffer(buffer, None) };
+            unsafe { device.destroy_buffer(buffer, None) };
             return Err(error);
         }
     };
     let allocation = vk::MemoryAllocateInfo::default()
         .allocation_size(requirements.size)
         .memory_type_index(memory_type);
-    let memory = match unsafe { context.device.allocate_memory(&allocation, None) } {
+    let memory = match unsafe { device.allocate_memory(&allocation, None) } {
         Ok(memory) => memory,
         Err(error) => {
-            unsafe { context.device.destroy_buffer(buffer, None) };
+            unsafe { device.destroy_buffer(buffer, None) };
             return Err(vk_error("buffer memory allocation", error));
         }
     };
-    if let Err(error) = unsafe { context.device.bind_buffer_memory(buffer, memory, 0) } {
+    if let Err(error) = unsafe { device.bind_buffer_memory(buffer, memory, 0) } {
         unsafe {
-            context.device.destroy_buffer(buffer, None);
-            context.device.free_memory(memory, None);
+            device.destroy_buffer(buffer, None);
+            device.free_memory(memory, None);
         }
         return Err(vk_error("buffer memory binding", error));
     }
     Ok((buffer, memory))
 }
+
+/// Buffers are grown in coarse steps so a slightly larger frame reuses the
+/// current allocation, but not so coarse that a 20 MP image reserves twice the
+/// memory it needs — rounding 240 MB up to a power of two would waste 16 MB
+/// short of a further 100 MB per slot.
+const CAPACITY_GRANULARITY: vk::DeviceSize = 4 << 20;
 
 fn rounded_capacity(
     size: vk::DeviceSize,
@@ -380,144 +448,232 @@ fn rounded_capacity(
             "Vulkan storage request {size} exceeds adapter limit {max_storage_buffer_range}"
         ));
     }
-    let capacity = size
-        .checked_next_power_of_two()
-        .ok_or_else(|| format!("Vulkan storage capacity overflow for {size} bytes"))?;
-    if capacity > max_storage_buffer_range {
-        return Err(format!(
-            "Vulkan rounded storage capacity {capacity} exceeds adapter limit {max_storage_buffer_range}"
-        ));
-    }
-    Ok(capacity)
+    let rounded = size
+        .div_ceil(CAPACITY_GRANULARITY)
+        .saturating_mul(CAPACITY_GRANULARITY);
+    Ok(rounded.clamp(size, max_storage_buffer_range.max(size)))
 }
 
-#[derive(Debug, Eq, PartialEq)]
-struct DispatchSize {
-    bytes: vk::DeviceSize,
-    groups_x: u32,
-    groups_y: u32,
-}
+impl Slot {
+    /// The buffer the shader binds: the shared allocation when the adapter has
+    /// unified memory, otherwise the device-local mirror.
+    fn storage(&self) -> vk::Buffer {
+        self.device
+    }
 
-fn checked_dispatch_size(rgb_len: usize) -> Result<DispatchSize, String> {
-    if rgb_len == 0 || !rgb_len.is_multiple_of(3) {
-        return Err("GPU RGB input must contain non-empty triplets".to_string());
+    unsafe fn destroy(&mut self, device: &Device) {
+        if self.capacity == 0 {
+            return;
+        }
+        unsafe {
+            device.unmap_memory(self.host_memory);
+            if !self.unified {
+                device.destroy_buffer(self.device, None);
+                device.free_memory(self.device_memory, None);
+            }
+            device.destroy_buffer(self.host, None);
+            device.free_memory(self.host_memory, None);
+        }
+        *self = Self::default();
     }
-    let scalar_count = u32::try_from(rgb_len)
-        .map_err(|_| format!("GPU RGB input has unsupported scalar count {rgb_len}"))?;
-    let pixel_count = scalar_count / 3;
-    let group_count = pixel_count.div_ceil(256);
-    let groups_x = group_count.min(65_535);
-    let groups_y = group_count.div_ceil(65_535);
-    if groups_y > 65_535 {
-        return Err(format!(
-            "GPU RGB input requires unsupported dispatch {groups_x}x{groups_y}"
-        ));
-    }
-    let bytes = vk::DeviceSize::try_from(
-        rgb_len
-            .checked_mul(std::mem::size_of::<f32>())
-            .ok_or_else(|| format!("GPU RGB byte size overflow for {rgb_len} scalars"))?,
-    )
-    .map_err(|_| format!("GPU RGB byte size is unsupported for {rgb_len} scalars"))?;
-    Ok(DispatchSize {
-        bytes,
-        groups_x,
-        groups_y,
-    })
-}
 
-fn ensure_capacity(context: &mut Context, size: vk::DeviceSize) -> Result<(), String> {
-    let capacity = rounded_capacity(size, context.max_storage_buffer_range)?;
-    if context.capacity >= size {
-        return Ok(());
-    }
-    let host_flags = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
-    let (staging, staging_memory) = unsafe {
-        create_buffer(
-            context,
-            capacity,
-            vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST,
-            host_flags,
-            vk::MemoryPropertyFlags::HOST_CACHED,
-        )?
-    };
-    let (storage, storage_memory) = match unsafe {
-        create_buffer(
-            context,
-            capacity,
-            vk::BufferUsageFlags::TRANSFER_SRC
-                | vk::BufferUsageFlags::TRANSFER_DST
-                | vk::BufferUsageFlags::STORAGE_BUFFER,
-            vk::MemoryPropertyFlags::DEVICE_LOCAL,
-            vk::MemoryPropertyFlags::empty(),
-        )
-    } {
-        Ok(resources) => resources,
-        Err(error) => {
+    unsafe fn ensure(
+        &mut self,
+        device: &Device,
+        memory_properties: &vk::PhysicalDeviceMemoryProperties,
+        size: vk::DeviceSize,
+        max_storage_buffer_range: vk::DeviceSize,
+    ) -> Result<(), String> {
+        if self.capacity >= size {
+            return Ok(());
+        }
+        let capacity = rounded_capacity(size, max_storage_buffer_range)?;
+        let host_flags =
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+        // A single buffer that is both mappable and device-local removes the two
+        // whole-image copies inside the device. Integrated adapters offer it;
+        // discrete ones fall back to a staging pair.
+        let unified = if staging_forced() {
+            Err("staging path forced by ORFEUS_GPU_STAGING=1".to_string())
+        } else {
             unsafe {
-                context.device.destroy_buffer(staging, None);
-                context.device.free_memory(staging_memory, None);
+                create_buffer(
+                    device,
+                    memory_properties,
+                    capacity,
+                    host_flags | vk::MemoryPropertyFlags::DEVICE_LOCAL,
+                    vk::MemoryPropertyFlags::HOST_CACHED,
+                )
+            }
+        };
+        let (shared, host, host_memory) = match unified {
+            Ok((buffer, memory)) => (true, buffer, memory),
+            Err(_) => {
+                let (buffer, memory) = unsafe {
+                    create_buffer(
+                        device,
+                        memory_properties,
+                        capacity,
+                        host_flags,
+                        vk::MemoryPropertyFlags::HOST_CACHED,
+                    )?
+                };
+                (false, buffer, memory)
+            }
+        };
+        let mut replacement = Slot {
+            host,
+            host_memory,
+            mapped: 0,
+            device: host,
+            device_memory: vk::DeviceMemory::null(),
+            capacity,
+            unified: shared,
+        };
+        let outcome = (|| -> Result<(), String> {
+            if !shared {
+                let (buffer, memory) = unsafe {
+                    create_buffer(
+                        device,
+                        memory_properties,
+                        capacity,
+                        vk::MemoryPropertyFlags::DEVICE_LOCAL,
+                        vk::MemoryPropertyFlags::empty(),
+                    )?
+                };
+                replacement.device = buffer;
+                replacement.device_memory = memory;
+            }
+            let mapped =
+                unsafe { device.map_memory(host_memory, 0, capacity, vk::MemoryMapFlags::empty()) }
+                    .map_err(|error| vk_error("persistent host mapping", error))?;
+            replacement.mapped = mapped as usize;
+            Ok(())
+        })();
+        if let Err(error) = outcome {
+            unsafe {
+                if !replacement.device_memory.is_null() {
+                    device.destroy_buffer(replacement.device, None);
+                    device.free_memory(replacement.device_memory, None);
+                }
+                device.destroy_buffer(host, None);
+                device.free_memory(host_memory, None);
             }
             return Err(error);
         }
-    };
-    let mapped = match unsafe {
-        context
-            .device
-            .map_memory(staging_memory, 0, capacity, vk::MemoryMapFlags::empty())
-    } {
-        Ok(mapped) => mapped,
-        Err(error) => {
-            unsafe {
-                context.device.destroy_buffer(storage, None);
-                context.device.free_memory(storage_memory, None);
-                context.device.destroy_buffer(staging, None);
-                context.device.free_memory(staging_memory, None);
-            }
-            return Err(vk_error("persistent staging mapping", error));
+        unsafe { self.destroy(device) };
+        *self = replacement;
+        if std::env::var_os("ORFEUS_PROFILE").is_some() {
+            eprintln!(
+                "orfeus-profile gpu-slot bytes={size} capacity={capacity} memory={}",
+                if shared { "unified" } else { "staged" }
+            );
         }
-    };
+        Ok(())
+    }
 
-    unsafe {
-        if context.capacity != 0 {
-            context.device.unmap_memory(context.staging_memory);
-            context.device.destroy_buffer(context.storage, None);
-            context.device.free_memory(context.storage_memory, None);
-            context.device.destroy_buffer(context.staging, None);
-            context.device.free_memory(context.staging_memory, None);
+    /// Copies `values` into the host-visible buffer.
+    unsafe fn upload(&self, values: &[f32]) {
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                values.as_ptr().cast::<u8>(),
+                self.mapped as *mut u8,
+                std::mem::size_of_val(values),
+            );
         }
     }
-    context.staging = staging;
-    context.staging_memory = staging_memory;
-    context.staging_mapped = mapped as usize;
-    context.storage = storage;
-    context.storage_memory = storage_memory;
-    context.capacity = capacity;
 
-    let buffer_info = [vk::DescriptorBufferInfo::default()
-        .buffer(context.storage)
-        .range(context.capacity)];
-    let writes = [vk::WriteDescriptorSet::default()
-        .dst_set(context.descriptor_set)
-        .dst_binding(0)
-        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-        .buffer_info(&buffer_info)];
-    unsafe { context.device.update_descriptor_sets(&writes, &[]) };
-    Ok(())
+    /// Reads the host-visible buffer's leading `scalars` into a fresh vector.
+    unsafe fn download(&self, scalars: usize) -> Vec<f32> {
+        let mut values = Vec::<f32>::with_capacity(scalars);
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                self.mapped as *const u8,
+                values.as_mut_ptr().cast::<u8>(),
+                scalars * std::mem::size_of::<f32>(),
+            );
+            values.set_len(scalars);
+        }
+        values
+    }
 }
 
-/// Runs the fused stage and replaces `rgb` only after a successful readback.
+fn byte_size(scalars: usize) -> Result<vk::DeviceSize, String> {
+    vk::DeviceSize::try_from(
+        scalars
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| format!("GPU byte size overflow for {scalars} scalars"))?,
+    )
+    .map_err(|_| format!("GPU byte size is unsupported for {scalars} scalars"))
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct DispatchGroups {
+    x: u32,
+    y: u32,
+}
+
+fn dispatch_groups(pixel_count: usize) -> Result<DispatchGroups, String> {
+    if pixel_count == 0 {
+        return Err("GPU stage needs at least one pixel".to_string());
+    }
+    let pixel_count = u32::try_from(pixel_count)
+        .map_err(|_| format!("GPU stage has unsupported pixel count {pixel_count}"))?;
+    let group_count = pixel_count.div_ceil(256);
+    let x = group_count.min(65_535);
+    let y = group_count.div_ceil(65_535);
+    if y > 65_535 {
+        return Err(format!("GPU stage requires unsupported dispatch {x}x{y}"));
+    }
+    Ok(DispatchGroups { x, y })
+}
+
+/// Which pipeline a dispatch runs, and where the result lands.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Stage {
+    /// Rewrites the input buffer in place.
+    ToneTransfer,
+    /// Reads the input buffer and writes three scalars per pixel to the output.
+    CameraMatrix,
+}
+
+impl Stage {
+    fn writes_separate_output(self) -> bool {
+        self == Self::CameraMatrix
+    }
+}
+
+fn locked() -> Result<std::sync::MutexGuard<'static, Context>, String> {
+    match context()?.try_lock() {
+        Ok(context) => Ok(context),
+        Err(TryLockError::WouldBlock) => Err("Vulkan device is busy".to_string()),
+        Err(TryLockError::Poisoned(_)) => Err("Vulkan context lock poisoned".to_string()),
+    }
+}
+
+/// Runs the fused display-tone and sRGB-transfer stage in place.
+///
+/// `rgb` is replaced only after a successful readback.
 pub(crate) fn tone_and_transfer(rgb: &mut [f32]) -> Result<DispatchProfile, String> {
-    let dispatch_size = checked_dispatch_size(rgb.len())?;
-    let mut context = match context()?.try_lock() {
-        Ok(context) => context,
-        Err(TryLockError::WouldBlock) => return Err("Vulkan device is busy".to_string()),
-        Err(TryLockError::Poisoned(_)) => {
-            return Err("Vulkan context lock poisoned".to_string());
-        }
+    if rgb.is_empty() || !rgb.len().is_multiple_of(3) {
+        return Err("GPU RGB input must contain non-empty triplets".to_string());
+    }
+    let pixel_count = rgb.len() / 3;
+    let parameters = Parameters {
+        counts: [pixel_count as u32, 3, 0, 0],
+        ..Parameters::default()
     };
+    let mut context = locked()?;
     let started = Instant::now();
-    let output = unsafe { dispatch(&mut context, rgb, dispatch_size) }?;
+    let output = unsafe {
+        dispatch(
+            &mut context,
+            Stage::ToneTransfer,
+            parameters,
+            rgb,
+            rgb.len(),
+        )
+    }?;
     rgb.copy_from_slice(&output);
     Ok(DispatchProfile {
         adapter_name: context.adapter_name.clone(),
@@ -525,20 +681,100 @@ pub(crate) fn tone_and_transfer(rgb: &mut [f32]) -> Result<DispatchProfile, Stri
     })
 }
 
+/// Applies white balance, highlight reconstruction, and the camera-to-sRGB
+/// matrix, returning three linear-sRGB scalars per pixel.
+///
+/// `camera` holds `channels` interleaved scalars per pixel; `matrix_rows` are
+/// the matrix rows zero-padded to four channels, matching `white_balance`.
+pub(crate) fn camera_to_linear_srgb(
+    camera: &[f32],
+    channels: usize,
+    white_balance: [f32; 4],
+    matrix_rows: [[f32; 4]; 3],
+    clip_onset: f32,
+) -> Result<(Vec<f32>, DispatchProfile), String> {
+    if !(3..=4).contains(&channels) {
+        return Err(format!("GPU camera stage cannot use {channels} channels"));
+    }
+    if camera.is_empty() || !camera.len().is_multiple_of(channels) {
+        return Err("GPU camera input must contain non-empty whole pixels".to_string());
+    }
+    let pixel_count = camera.len() / channels;
+    let parameters = Parameters {
+        counts: [pixel_count as u32, channels as u32, 0, 0],
+        clip: [clip_onset, 0.0, 0.0, 0.0],
+        white_balance,
+        matrix_rows,
+    };
+    let mut context = locked()?;
+    let started = Instant::now();
+    let output = unsafe {
+        dispatch(
+            &mut context,
+            Stage::CameraMatrix,
+            parameters,
+            camera,
+            pixel_count * 3,
+        )
+    }?;
+    Ok((
+        output,
+        DispatchProfile {
+            adapter_name: context.adapter_name.clone(),
+            milliseconds: started.elapsed().as_secs_f64() * 1000.0,
+        },
+    ))
+}
+
+/// Uploads `input`, runs `stage`, and returns `output_scalars` read back.
 unsafe fn dispatch(
     context: &mut Context,
-    rgb: &[f32],
-    dispatch_size: DispatchSize,
+    stage: Stage,
+    parameters: Parameters,
+    input: &[f32],
+    output_scalars: usize,
 ) -> Result<Vec<f32>, String> {
-    let size = dispatch_size.bytes;
-    ensure_capacity(context, size)?;
+    let groups = dispatch_groups(parameters.counts[0] as usize)?;
+    let input_bytes = byte_size(input.len())?;
+    let output_bytes = byte_size(output_scalars)?;
+    let separate = stage.writes_separate_output();
+    let properties = context.memory_properties;
+    let limit = context.max_storage_buffer_range;
     unsafe {
-        std::ptr::copy_nonoverlapping(
-            rgb.as_ptr().cast::<u8>(),
-            context.staging_mapped as *mut u8,
-            size as usize,
-        )
+        context
+            .input
+            .ensure(&context.device, &properties, input_bytes, limit)
+    }?;
+    if separate {
+        unsafe {
+            context
+                .output
+                .ensure(&context.device, &properties, output_bytes, limit)
+        }?;
+    }
+    unsafe { context.input.upload(input) };
+
+    let read_slot = if separate {
+        &context.output
+    } else {
+        &context.input
     };
+    let buffer_infos = [
+        [vk::DescriptorBufferInfo::default()
+            .buffer(context.input.storage())
+            .range(context.input.capacity)],
+        [vk::DescriptorBufferInfo::default()
+            .buffer(read_slot.storage())
+            .range(read_slot.capacity)],
+    ];
+    let writes: [vk::WriteDescriptorSet; 2] = std::array::from_fn(|binding| {
+        vk::WriteDescriptorSet::default()
+            .dst_set(context.descriptor_set)
+            .dst_binding(binding as u32)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(&buffer_infos[binding])
+    });
+    unsafe { context.device.update_descriptor_sets(&writes, &[]) };
 
     unsafe {
         context
@@ -550,34 +786,44 @@ unsafe fn dispatch(
         vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
     unsafe { context.device.begin_command_buffer(context.command, &begin) }
         .map_err(|error| vk_error("command recording begin", error))?;
-    let copy = [vk::BufferCopy::default().size(size)];
+
+    // Host writes to coherent memory before a submission are visible to the
+    // dispatch, so a unified slot needs no upload copy or barrier at all.
+    if !context.input.unified {
+        let copy = [vk::BufferCopy::default().size(input_bytes)];
+        let barrier = [buffer_barrier(
+            context.input.storage(),
+            input_bytes,
+            vk::AccessFlags::TRANSFER_WRITE,
+            vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+        )];
+        unsafe {
+            context.device.cmd_copy_buffer(
+                context.command,
+                context.input.host,
+                context.input.device,
+                &copy,
+            );
+            context.device.cmd_pipeline_barrier(
+                context.command,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &barrier,
+                &[],
+            );
+        }
+    }
+
+    let pipeline = match stage {
+        Stage::ToneTransfer => context.tone_transfer,
+        Stage::CameraMatrix => context.camera_matrix,
+    };
     unsafe {
         context
             .device
-            .cmd_copy_buffer(context.command, context.staging, context.storage, &copy)
-    };
-    let barrier = [vk::BufferMemoryBarrier::default()
-        .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-        .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
-        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-        .buffer(context.storage)
-        .size(size)];
-    unsafe {
-        context.device.cmd_pipeline_barrier(
-            context.command,
-            vk::PipelineStageFlags::TRANSFER,
-            vk::PipelineStageFlags::COMPUTE_SHADER,
-            vk::DependencyFlags::empty(),
-            &[],
-            &barrier,
-            &[],
-        );
-        context.device.cmd_bind_pipeline(
-            context.command,
-            vk::PipelineBindPoint::COMPUTE,
-            context.pipeline,
-        );
+            .cmd_bind_pipeline(context.command, vk::PipelineBindPoint::COMPUTE, pipeline);
         context.device.cmd_bind_descriptor_sets(
             context.command,
             vk::PipelineBindPoint::COMPUTE,
@@ -586,38 +832,69 @@ unsafe fn dispatch(
             &[context.descriptor_set],
             &[],
         );
-    }
-    unsafe {
-        context.device.cmd_dispatch(
+        context.device.cmd_push_constants(
             context.command,
-            dispatch_size.groups_x,
-            dispatch_size.groups_y,
-            1,
-        )
-    };
-    let barrier = [vk::BufferMemoryBarrier::default()
-        .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-        .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
-        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-        .buffer(context.storage)
-        .size(size)];
-    unsafe {
-        context.device.cmd_pipeline_barrier(
-            context.command,
-            vk::PipelineStageFlags::COMPUTE_SHADER,
-            vk::PipelineStageFlags::TRANSFER,
-            vk::DependencyFlags::empty(),
-            &[],
-            &barrier,
-            &[],
+            context.pipeline_layout,
+            vk::ShaderStageFlags::COMPUTE,
+            0,
+            parameters.bytes(),
         );
         context
             .device
-            .cmd_copy_buffer(context.command, context.storage, context.staging, &copy);
-        context.device.end_command_buffer(context.command)
+            .cmd_dispatch(context.command, groups.x, groups.y, 1);
     }
-    .map_err(|error| vk_error("command recording end", error))?;
+
+    let read_slot = if separate {
+        &context.output
+    } else {
+        &context.input
+    };
+    if read_slot.unified {
+        let barrier = [buffer_barrier(
+            read_slot.storage(),
+            output_bytes,
+            vk::AccessFlags::SHADER_WRITE,
+            vk::AccessFlags::HOST_READ,
+        )];
+        unsafe {
+            context.device.cmd_pipeline_barrier(
+                context.command,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::HOST,
+                vk::DependencyFlags::empty(),
+                &[],
+                &barrier,
+                &[],
+            )
+        };
+    } else {
+        let barrier = [buffer_barrier(
+            read_slot.storage(),
+            output_bytes,
+            vk::AccessFlags::SHADER_WRITE,
+            vk::AccessFlags::TRANSFER_READ,
+        )];
+        let copy = [vk::BufferCopy::default().size(output_bytes)];
+        unsafe {
+            context.device.cmd_pipeline_barrier(
+                context.command,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &barrier,
+                &[],
+            );
+            context.device.cmd_copy_buffer(
+                context.command,
+                read_slot.device,
+                read_slot.host,
+                &copy,
+            );
+        }
+    }
+    unsafe { context.device.end_command_buffer(context.command) }
+        .map_err(|error| vk_error("command recording end", error))?;
 
     unsafe { context.device.reset_fences(&[context.fence]) }
         .map_err(|error| vk_error("fence reset", error))?;
@@ -640,35 +917,42 @@ unsafe fn dispatch(
         return Err(vk_error("dispatch wait", error));
     }
 
-    let mut output = Vec::<f32>::with_capacity(rgb.len());
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            context.staging_mapped as *const u8,
-            output.as_mut_ptr().cast(),
-            size as usize,
-        );
-        output.set_len(rgb.len());
-    }
-    Ok(output)
+    let read_slot = if separate {
+        &context.output
+    } else {
+        &context.input
+    };
+    Ok(unsafe { read_slot.download(output_scalars) })
+}
+
+fn buffer_barrier(
+    buffer: vk::Buffer,
+    size: vk::DeviceSize,
+    source: vk::AccessFlags,
+    destination: vk::AccessFlags,
+) -> vk::BufferMemoryBarrier<'static> {
+    vk::BufferMemoryBarrier::default()
+        .src_access_mask(source)
+        .dst_access_mask(destination)
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .buffer(buffer)
+        .size(size)
 }
 
 impl Drop for Context {
     fn drop(&mut self) {
         unsafe {
             let _ = self.device.device_wait_idle();
-            if self.capacity != 0 {
-                self.device.unmap_memory(self.staging_memory);
-                self.device.destroy_buffer(self.storage, None);
-                self.device.free_memory(self.storage_memory, None);
-                self.device.destroy_buffer(self.staging, None);
-                self.device.free_memory(self.staging_memory, None);
-            }
+            self.input.destroy(&self.device);
+            self.output.destroy(&self.device);
             self.device.destroy_fence(self.fence, None);
             self.device
                 .free_command_buffers(self.command_pool, &[self.command]);
             self.device
                 .destroy_descriptor_pool(self.descriptor_pool, None);
-            self.device.destroy_pipeline(self.pipeline, None);
+            self.device.destroy_pipeline(self.tone_transfer, None);
+            self.device.destroy_pipeline(self.camera_matrix, None);
             self.device
                 .destroy_pipeline_layout(self.pipeline_layout, None);
             self.device
@@ -694,6 +978,10 @@ mod tests {
                 1.055 * value.max(0.0).powf(1.0 / 2.4) - 0.055
             };
         }
+    }
+
+    fn gpu_testing_requested() -> bool {
+        std::env::var_os("ORFEUS_GPU_TEST").as_deref() == Some(std::ffi::OsStr::new("1"))
     }
 
     #[test]
@@ -751,33 +1039,60 @@ mod tests {
     }
 
     #[test]
-    fn capacity_rounding_respects_storage_buffer_range() {
-        assert_eq!(rounded_capacity(64, 64), Ok(64));
-        assert_eq!(rounded_capacity(33, 64), Ok(64));
-        assert!(rounded_capacity(129, 128).is_err());
-        assert!(rounded_capacity(65, 100).is_err());
-        assert!(rounded_capacity(vk::DeviceSize::MAX, vk::DeviceSize::MAX).is_err());
+    fn capacity_grows_in_coarse_steps_within_the_adapter_limit() {
+        // Anything under one step reserves exactly one step.
+        assert_eq!(rounded_capacity(1, 1 << 30), Ok(CAPACITY_GRANULARITY));
+        assert_eq!(
+            rounded_capacity(CAPACITY_GRANULARITY, 1 << 30),
+            Ok(CAPACITY_GRANULARITY)
+        );
+        assert_eq!(
+            rounded_capacity(CAPACITY_GRANULARITY + 1, 1 << 30),
+            Ok(2 * CAPACITY_GRANULARITY)
+        );
+        // A request the adapter cannot serve is an error, but one it can serve
+        // is never rounded past the limit.
+        assert!(rounded_capacity((1 << 30) + 1, 1 << 30).is_err());
+        assert_eq!(rounded_capacity(100, 100), Ok(100));
+        // 20 MP of linear RGB reserves within one step of what it needs, where
+        // rounding to a power of two would have reserved 256 MB.
+        let twenty_megapixels = 20_000_000 * 3 * 4;
+        let capacity = rounded_capacity(twenty_megapixels, u32::MAX.into()).unwrap();
+        assert!(capacity >= twenty_megapixels);
+        assert!(capacity - twenty_megapixels < CAPACITY_GRANULARITY);
     }
 
     #[test]
     fn dispatch_sizing_is_checked_without_a_gpu() {
-        assert!(checked_dispatch_size(0).is_err());
-        assert!(checked_dispatch_size(2).is_err());
+        assert!(dispatch_groups(0).is_err());
+        assert_eq!(dispatch_groups(256), Ok(DispatchGroups { x: 1, y: 1 }));
+        assert_eq!(dispatch_groups(257).unwrap().x, 2);
+        // Past one row of groups the dispatch spills onto further rows, which
+        // the shaders account for when they rebuild the pixel index.
+        let widest = dispatch_groups(u32::MAX as usize).unwrap();
+        assert_eq!(widest.x, 65_535);
+        assert_eq!(widest.y, 257);
+        #[cfg(target_pointer_width = "64")]
+        assert!(dispatch_groups(u32::MAX as usize + 1).is_err());
         assert_eq!(
-            checked_dispatch_size(256 * 3),
-            Ok(DispatchSize {
-                bytes: (256 * 3 * std::mem::size_of::<f32>()) as vk::DeviceSize,
-                groups_x: 1,
-                groups_y: 1,
-            })
-        );
-        assert_eq!(checked_dispatch_size(257 * 3).unwrap().groups_x, 2);
-        assert_eq!(
-            checked_dispatch_size(u32::MAX as usize).unwrap().groups_y,
-            86
+            byte_size(3),
+            Ok(3 * std::mem::size_of::<f32>() as vk::DeviceSize)
         );
         #[cfg(target_pointer_width = "64")]
-        assert!(checked_dispatch_size(u32::MAX as usize + 3).is_err());
+        assert!(byte_size(usize::MAX).is_err());
+    }
+
+    #[test]
+    fn the_push_constant_block_matches_the_shader_declaration() {
+        // Six four-component members, within the 128 bytes Vulkan guarantees.
+        assert_eq!(std::mem::size_of::<Parameters>(), 6 * 16);
+        assert!(std::mem::size_of::<Parameters>() <= 128);
+        let parameters = Parameters {
+            counts: [7, 3, 0, 0],
+            ..Parameters::default()
+        };
+        assert_eq!(parameters.bytes().len(), std::mem::size_of::<Parameters>());
+        assert_eq!(parameters.bytes()[0], 7);
     }
 
     #[test]
@@ -786,6 +1101,9 @@ mod tests {
         let original = invalid.clone();
         assert!(tone_and_transfer(&mut invalid).is_err());
         assert_eq!(invalid, original);
+        assert!(camera_to_linear_srgb(&[0.5; 3], 2, [1.0; 4], [[0.0; 4]; 3], 0.97).is_err());
+        assert!(camera_to_linear_srgb(&[], 3, [1.0; 4], [[0.0; 4]; 3], 0.97).is_err());
+        assert!(camera_to_linear_srgb(&[0.5; 4], 3, [1.0; 4], [[0.0; 4]; 3], 0.97).is_err());
     }
 
     #[test]
@@ -799,7 +1117,7 @@ mod tests {
 
     #[test]
     fn actual_gpu_matches_cpu_when_explicitly_requested_for_testing() {
-        if std::env::var_os("ORFEUS_GPU_TEST").as_deref() != Some(std::ffi::OsStr::new("1")) {
+        if !gpu_testing_requested() {
             return;
         }
         let mut gpu = vec![0.0, 0.0, 0.0, 0.18, 0.18, 0.18, 4.0, 2.0, 1.0];
@@ -809,6 +1127,42 @@ mod tests {
         for (actual, expected) in gpu.into_iter().zip(cpu) {
             assert!(
                 (actual - expected).abs() <= 2.0e-5,
+                "{actual} != {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn actual_gpu_camera_matrix_matches_cpu_when_requested_for_testing() {
+        if !gpu_testing_requested() {
+            return;
+        }
+        let white_balance = [2.2, 1.0, 1.5, 0.0];
+        let matrix = [
+            [1.7, -0.6, -0.1, 0.0],
+            [-0.2, 1.4, -0.2, 0.0],
+            [0.0, -0.4, 1.4, 0.0],
+        ];
+        // Unclipped, fully blown, and single-channel-clipped pixels together.
+        let camera = vec![
+            0.4, 0.5, 0.6, 1.0, 1.0, 1.0, 1.0, 0.3, 0.25, 0.5, 1.0, 0.7, 0.0, 0.0, 0.0,
+        ];
+        let expected = crate::color::camera_to_linear_srgb_reference(
+            &camera,
+            &white_balance[..3],
+            &[
+                [matrix[0][0], matrix[0][1], matrix[0][2]],
+                [matrix[1][0], matrix[1][1], matrix[1][2]],
+                [matrix[2][0], matrix[2][1], matrix[2][2]],
+            ],
+        );
+        let (actual, _) =
+            camera_to_linear_srgb(&camera, 3, white_balance, matrix, crate::color::CLIP_ONSET)
+                .expect("Vulkan camera matrix dispatch");
+        assert_eq!(actual.len(), expected.len());
+        for (actual, expected) in actual.into_iter().zip(expected) {
+            assert!(
+                (actual - expected).abs() <= 1.0e-5 * expected.abs().max(1.0),
                 "{actual} != {expected}"
             );
         }
@@ -850,5 +1204,47 @@ mod tests {
             first_profile.milliseconds, warm_times[1]
         );
         assert!(max_error <= 2.0e-5, "GPU maximum error {max_error}");
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan GPU and prints machine-specific timings"]
+    fn benchmark_camera_matrix_against_cpu() {
+        let pixels = 20_000_000;
+        let camera: Vec<f32> = (0..pixels * 3)
+            .map(|index| (index % 1009) as f32 / 1000.0)
+            .collect();
+        let white_balance = [2.2, 1.0, 1.5, 0.0];
+        let rows = [[1.7, -0.6, -0.1], [-0.2, 1.4, -0.2], [0.0, -0.4, 1.4_f32]];
+        let started = Instant::now();
+        let cpu =
+            crate::color::camera_to_linear_srgb_reference(&camera, &white_balance[..3], &rows);
+        let cpu_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let padded = [
+            [rows[0][0], rows[0][1], rows[0][2], 0.0],
+            [rows[1][0], rows[1][1], rows[1][2], 0.0],
+            [rows[2][0], rows[2][1], rows[2][2], 0.0],
+        ];
+        let mut warm_times = Vec::new();
+        let mut max_error = 0.0_f32;
+        let mut adapter_name = String::new();
+        for _ in 0..3 {
+            let (gpu, profile) =
+                camera_to_linear_srgb(&camera, 3, white_balance, padded, crate::color::CLIP_ONSET)
+                    .expect("Vulkan camera matrix dispatch");
+            warm_times.push(profile.milliseconds);
+            adapter_name = profile.adapter_name;
+            max_error = max_error.max(
+                gpu.iter()
+                    .zip(&cpu)
+                    .map(|(gpu, cpu)| (gpu - cpu).abs())
+                    .fold(0.0_f32, f32::max),
+            );
+        }
+        warm_times.sort_by(f64::total_cmp);
+        eprintln!(
+            "camera-matrix-benchmark pixels={pixels} cpu_ms={cpu_ms:.3} gpu_warm_with_transfer_ms={warm_times:?} gpu_warm_median_ms={:.3} adapter={adapter_name:?} max_error={max_error}",
+            warm_times[1]
+        );
+        assert!(max_error <= 1.0e-4, "GPU maximum error {max_error}");
     }
 }

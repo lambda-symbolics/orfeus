@@ -43,6 +43,7 @@
    #:make-project
    #:native-bridge-available-p
    #:native-bridge-version
+   #:native-gpu-warm-up
    #:native-library-incompatible
    #:native-library-unavailable
    #:orfeus-error
