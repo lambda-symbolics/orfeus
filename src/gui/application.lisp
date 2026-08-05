@@ -3551,64 +3551,104 @@ new cache entry is published."
                (when (and chosen (plusp (length chosen)))
                  (setf (lightfast:value export-dialog-destination) chosen))))
            (build-export-dialog ()
-             (let ((dialog (lightfast:make-window :width 460 :height 268
-                                                :label "Export")))
+             ;; Laid out by Lightfast's flex engine: rows of label, control and
+             ;; trailing button, with the destination field taking the slack.
+             ;; No pixel coordinates to keep in sync with one another.
+             (let* ((dialog (lightfast:make-window :width 470 :height 264
+                                                   :label "Export"))
+                    (rows '())
+                    (label-width 104)
+                    (row-height 26))
                (setf export-dialog dialog)
-               (lightfast:make-label :parent dialog :x 12 :y 12 :width 120
-                                   :height 24 :label "Destination")
-               (setf export-dialog-destination
-                     (lightfast:make-input :parent dialog :x 120 :y 12
-                                         :width 236 :height 26))
-               (lightfast:make-button :parent dialog :x 364 :y 12 :width 84
-                                    :height 26 :label "Browse..."
-                                    :callback
-                                    (lambda (&rest ignored)
-                                      (declare (ignore ignored))
-                                      (browse-export-destination)))
-               (setf export-dialog-scope
-                     (lightfast:field-control
-                      (lightfast:make-labeled-choice
-                       :parent dialog :x 12 :y 48 :width 436 :height 26
-                       :label "Photographs" :label-width 104
-                       :items '("Current photograph" "Selected photographs"
-                                "All photographs"))))
-               (setf export-dialog-quality
-                     (lightfast:field-control
-                      (lightfast:make-labeled-control
-                       :int :parent dialog :x 12 :y 84 :width 240 :height 26
-                       :label "JPEG quality" :label-width 104)))
-               (setf export-dialog-width
-                     (lightfast:field-control
-                      (lightfast:make-labeled-control
-                       :int :parent dialog :x 12 :y 116 :width 240 :height 26
-                       :label "Maximum width" :label-width 104)))
-               (setf export-dialog-height
-                     (lightfast:field-control
-                      (lightfast:make-labeled-control
-                       :int :parent dialog :x 12 :y 148 :width 240 :height 26
-                       :label "Maximum height" :label-width 104)))
-               (lightfast:make-label :parent dialog :x 258 :y 116 :width 190
-                                   :height 48 :label "0 keeps the full size")
-               (setf export-dialog-metadata
-                     (lightfast:make-check-button
-                      :parent dialog :x 116 :y 180 :width 200 :height 24
-                      :label "Preserve metadata"))
-               (setf export-dialog-timestamp
-                     (lightfast:make-check-button
-                      :parent dialog :x 116 :y 206 :width 200 :height 24
-                      :label "Timestamp filenames"))
-               (lightfast:make-button :parent dialog :x 244 :y 234 :width 96
-                                    :height 26 :label "Cancel"
-                                    :callback
-                                    (lambda (&rest ignored)
-                                      (declare (ignore ignored))
-                                      (lightfast:hide export-dialog)))
-               (lightfast:make-button :parent dialog :x 348 :y 234 :width 100
-                                    :height 26 :label "Export"
-                                    :callback
-                                    (lambda (&rest ignored)
-                                      (declare (ignore ignored))
-                                      (start-dialog-export)))
+               (labels ((field (label control &optional trailing)
+                          ;; One labelled row; TRAILING is an optional button
+                          ;; pinned to the right edge.
+                          (push (lightfast:make-layout-row
+                                 :basis row-height :shrink 0 :gap 8
+                                 :children
+                                 (append
+                                  (list (lightfast:make-layout-item
+                                         label :basis label-width :shrink 0)
+                                        (lightfast:make-layout-item
+                                         control :basis 0 :grow 1))
+                                  (when trailing
+                                    (list (lightfast:make-layout-item
+                                           trailing :basis 88 :shrink 0)))))
+                                rows)
+                          control)
+                        (text (caption)
+                          (lightfast:make-label :parent dialog :x 0 :y 0
+                                                :width label-width
+                                                :height row-height
+                                                :label caption))
+                        (number-input ()
+                          (lightfast:field-control
+                           (lightfast:make-labeled-control
+                            :int :parent dialog :x 0 :y 0 :width 120
+                            :height row-height :label "" :label-width 0)))
+                        (button (caption action width)
+                          (lightfast:make-button
+                           :parent dialog :x 0 :y 0 :width width
+                           :height row-height :label caption
+                           :callback (lambda (&rest ignored)
+                                       (declare (ignore ignored))
+                                       (funcall action)))))
+                 (setf export-dialog-destination
+                       (field (text "Destination")
+                              (lightfast:make-input :parent dialog :x 0 :y 0
+                                                    :width 200
+                                                    :height row-height)
+                              (button "Browse..."
+                                      #'browse-export-destination 88)))
+                 (setf export-dialog-scope
+                       (field (text "Photographs")
+                              (lightfast:make-choice
+                               :parent dialog :x 0 :y 0
+                               :width 200 :height row-height
+                               :items '("Current photograph"
+                                        "Selected photographs"
+                                        "All photographs"))))
+                 (setf export-dialog-quality
+                       (field (text "JPEG quality") (number-input))
+                       export-dialog-width
+                       (field (text "Maximum width") (number-input))
+                       export-dialog-height
+                       (field (text "Maximum height") (number-input)))
+                 (push (lightfast:make-layout-item
+                        (text "0 keeps the full size")
+                        :basis 20 :shrink 0)
+                       rows)
+                 (setf export-dialog-metadata
+                       (lightfast:make-check-button
+                        :parent dialog :x 0 :y 0 :width 200 :height 24
+                        :label "Preserve metadata"))
+                 (push (lightfast:make-layout-item export-dialog-metadata
+                                                   :basis 24 :shrink 0)
+                       rows)
+                 (setf export-dialog-timestamp
+                       (lightfast:make-check-button
+                        :parent dialog :x 0 :y 0 :width 200 :height 24
+                        :label "Timestamp filenames"))
+                 (push (lightfast:make-layout-item export-dialog-timestamp
+                                                   :basis 24 :shrink 0)
+                       rows)
+                 (push (lightfast:make-layout-row
+                        :basis 28 :shrink 0 :gap 8 :justify :end
+                        :children
+                        (list (lightfast:make-layout-item
+                               (button "Cancel"
+                                       (lambda ()
+                                         (lightfast:hide export-dialog))
+                                       96)
+                               :basis 96 :shrink 0)
+                              (lightfast:make-layout-item
+                               (button "Export" #'start-dialog-export 100)
+                               :basis 100 :shrink 0)))
+                       rows))
+               (lightfast:layout-on-resize
+                dialog
+                (lightfast:make-layout-column :padding 12 :gap 8
+                                              :children (nreverse rows)))
                dialog))
            (open-export-dialog (&optional scope)
              (unless export-dialog
