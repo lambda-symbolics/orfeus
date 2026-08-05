@@ -141,26 +141,51 @@ fn usable_white_balance<const N: usize>(white_balance: &[f32; 4]) -> Result<[f32
     Ok(std::array::from_fn(|index| white_balance[index]))
 }
 
+/// Camera level at which a photosite counts as saturated. Rawler's rescale maps
+/// every channel's white level to 1.0, so a clipped channel arrives at unity.
+const CLIP_ONSET: f32 = 0.97;
+
+/// Raises clipped channels to the brightest balanced channel of their pixel.
+///
+/// A saturated photosite recorded no ratio: the sensor stopped before the true
+/// value was known, so all that is known is a lower bound. Per-channel white
+/// balance then multiplies those flat clipped values apart — a blown neutral
+/// becomes (2.2, 1.0, 1.5) on a daylight-balanced camera, a strong magenta that
+/// the display tone curve hides at normal exposure and reveals the moment the
+/// highlights are pulled down.
+///
+/// The brightest balanced channel is itself a lower bound on the true neutral
+/// level, so lifting each clipped channel to it reconstructs a blown highlight
+/// as bright grey. A highlight where only one channel clipped already peaks in
+/// that channel, so its hue survives untouched.
+fn reconstruct_clipped<const N: usize>(camera: &[f32; N], balanced: &mut [f32; N]) {
+    let peak = balanced.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    for (value, raw) in balanced.iter_mut().zip(camera) {
+        let clipped = ((raw - CLIP_ONSET) / (1.0 - CLIP_ONSET)).clamp(0.0, 1.0);
+        if clipped > 0.0 {
+            *value += clipped * (peak - *value).max(0.0);
+        }
+    }
+}
+
 fn transform_pixels<const N: usize>(
     pixels: Vec<[f32; N]>,
     white_balance: &[f32; N],
     matrix: &[[f32; N]; 3],
 ) -> Vec<f32> {
     use rayon::prelude::*;
-    // Fold the white-balance gains into the matrix so the per-pixel work is a
-    // single small matrix product.
-    let balanced: [[f32; N]; 3] = std::array::from_fn(|row| {
-        std::array::from_fn(|column| matrix[row][column] * white_balance[column])
-    });
     let mut output = vec![0.0_f32; pixels.len() * 3];
     output
         .par_chunks_exact_mut(3)
         .zip(pixels.par_iter())
         .for_each(|(destination, pixel)| {
-            for (value, row) in destination.iter_mut().zip(&balanced) {
+            let mut balanced: [f32; N] =
+                std::array::from_fn(|channel| pixel[channel] * white_balance[channel]);
+            reconstruct_clipped(pixel, &mut balanced);
+            for (value, row) in destination.iter_mut().zip(matrix) {
                 *value = row
                     .iter()
-                    .zip(pixel)
+                    .zip(&balanced)
                     .map(|(coefficient, channel)| coefficient * channel)
                     .sum();
             }
@@ -238,6 +263,68 @@ mod tests {
         close(result.data[0], 2.0);
         close(result.data[1], 0.5);
         close(result.data[2], -0.25);
+    }
+
+    /// Rows that sum alike, so camera neutral stays neutral through the matrix.
+    fn passthrough_matrix() -> Vec<f32> {
+        vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+    }
+
+    fn balanced_through(pixel: [f32; 3], white_balance: [f32; 4]) -> Vec<f32> {
+        intermediate_to_linear_srgb(
+            Intermediate::ThreeColor(Color2D::<f32, 3>::new_with(vec![pixel], 1, 1)),
+            &matrices(Illuminant::D65, passthrough_matrix()),
+            white_balance,
+        )
+        .unwrap()
+        .data
+    }
+
+    #[test]
+    fn a_blown_highlight_reconstructs_as_neutral_not_magenta() {
+        // Every channel saturated: white balance would otherwise spread the
+        // flat clipped values into a strong cast, which shows up the moment
+        // exposure pulls the highlight back into range.
+        let white_balance = [2.2, 1.0, 1.5, f32::NAN];
+        let neutral = balanced_through([1.0, 1.0, 1.0], white_balance);
+        close(neutral[0], neutral[1]);
+        close(neutral[1], neutral[2]);
+        // Reconstructed at the brightest balanced channel: a lower bound on
+        // the true level, so the highlight stays bright rather than dimming.
+        close(neutral[0], 2.2);
+    }
+
+    #[test]
+    fn reconstruction_lifts_only_clipped_channels() {
+        let reconstruct = |camera: [f32; 3]| {
+            let gains = [2.2, 1.0, 1.5];
+            let mut balanced: [f32; 3] =
+                std::array::from_fn(|channel| camera[channel] * gains[channel]);
+            reconstruct_clipped(&camera, &mut balanced);
+            balanced
+        };
+        // Every channel saturated: all three land on the brightest balanced
+        // channel, which is a lower bound on the true neutral level.
+        let blown = reconstruct([1.0, 1.0, 1.0]);
+        close(blown[0], 2.2);
+        close(blown[1], 2.2);
+        close(blown[2], 2.2);
+        // A saturated red light clips only in red, and red is already the
+        // brightest balanced channel, so its hue survives untouched.
+        let red = reconstruct([1.0, 0.3, 0.25]);
+        close(red[0], 2.2);
+        close(red[1], 0.3);
+        close(red[2], 0.375);
+        // Green alone clipped: it rises to the peak, red and blue stay put.
+        let green = reconstruct([0.5, 1.0, 0.7]);
+        close(green[0], 1.1);
+        close(green[1], 1.1);
+        close(green[2], 1.05);
+        // Well below the clip onset nothing is touched at all.
+        let unclipped = reconstruct([0.4, 0.5, 0.6]);
+        close(unclipped[0], 0.88);
+        close(unclipped[1], 0.5);
+        close(unclipped[2], 0.9);
     }
 
     #[test]
