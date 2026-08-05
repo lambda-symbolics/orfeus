@@ -768,7 +768,9 @@
         (placed (orfeus:make-graph-node :id 2 :kind :exposure
                                         :position '(31.0 97.0))))
     (orfeus/gui::ensure-graph-node-positions (list unplaced placed))
-    (check (equal '(18.0 52.0) (orfeus:graph-node-position unplaced))
+    (check (equal (list 18.0
+                        (float (+ 6 orfeus/gui::*graph-row-pitch*) 1.0))
+                  (orfeus:graph-node-position unplaced))
            "Default graph node position was not assigned before dragging")
     (check (equal '(31.0 97.0) (orfeus:graph-node-position placed))
            "Existing dragged graph node position was replaced"))
@@ -786,7 +788,10 @@
            "Positioned drag node did not belong to the stored graph"))
   (multiple-value-bind (x y width height)
       (orfeus/gui::graph-output-box-position '())
-    (check (equal (list 18 50 orfeus/gui::*graph-node-width* 22)
+    (check (equal (list 18
+                        (+ 34 orfeus/gui::*graph-well-height*)
+                        orfeus/gui::*graph-node-width*
+                        orfeus/gui::*graph-well-height*)
                   (list x y width height))
            "Empty graph OUT geometry failed: ~S"
            (list x y width height)))
@@ -795,7 +800,8 @@
     (multiple-value-bind (x y width height)
         (orfeus/gui::graph-output-box-position (list node))
       (declare (ignore x width height))
-      (check (= 122 y) "Populated graph OUT geometry was ~D" y))))
+      (check (= (+ 70 orfeus/gui::*graph-node-height* 28) y)
+             "Populated graph OUT geometry was ~D" y))))
 
 (defun test-discard-pending-tasks ()
   (let ((queue (orfeus/gui::make-gui-queue))

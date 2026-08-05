@@ -92,7 +92,7 @@ buffer, with no JPEG or file on the path.")
 (defparameter *graph-row-pitch* 58
   "Vertical distance between auto-laid-out nodes on the graph canvas.")
 
-(defparameter *inspector-min-height* 360
+(defparameter *inspector-min-height* 378
   "Minimum inspector height that keeps the complete Curves panel accessible.")
 
 (defun node-kind-label (kind)

@@ -1537,10 +1537,7 @@ pub(crate) fn apply_display_transform(image: &mut RgbImage, profiling: bool) {
                 true
             }
             Ok(Err(error)) => {
-                report_gpu_status_once(
-                    gpu_fallback_notice(),
-                    GpuStatus::Unavailable(&error),
-                );
+                report_gpu_status_once(gpu_fallback_notice(), GpuStatus::Unavailable(&error));
                 if profiling {
                     eprintln!(
                         "orfeus-profile gpu-stage=tone-transfer fallback=cpu error={error:?}"
@@ -1821,16 +1818,18 @@ pub(crate) fn scaled_source_for_render(
     };
     let bounded = max_width > 0 || max_height > 0;
     if cache_mode != CACHE_USE || !bounded {
-        return Arc::new(match downscale_from(
-            &decoded.data,
-            decoded.width,
-            decoded.height,
-            max_width,
-            max_height,
-        ) {
-            Some(scaled) => scaled,
-            None => full(decoded),
-        });
+        return Arc::new(
+            match downscale_from(
+                &decoded.data,
+                decoded.width,
+                decoded.height,
+                max_width,
+                max_height,
+            ) {
+                Some(scaled) => scaled,
+                None => full(decoded),
+            },
+        );
     }
     let key: ScaledSourceKey = (
         input.to_string_lossy().into_owned(),
@@ -2260,9 +2259,7 @@ mod tests {
 
     #[test]
     fn gpu_fallback_complains_once_and_names_the_reason() {
-        let message = gpu_status_message(GpuStatus::Unavailable(
-            "ERROR_INCOMPATIBLE_DRIVER",
-        ));
+        let message = gpu_status_message(GpuStatus::Unavailable("ERROR_INCOMPATIBLE_DRIVER"));
         assert!(message.contains("WARNING"), "{message}");
         assert!(message.contains("ERROR_INCOMPATIBLE_DRIVER"), "{message}");
         assert!(message.contains("CPU"), "{message}");
@@ -2270,9 +2267,7 @@ mod tests {
         let disabled = gpu_status_message(GpuStatus::Disabled);
         assert!(disabled.contains("ORFEUS_GPU=0"), "{disabled}");
         assert!(!disabled.contains("WARNING"), "{disabled}");
-        assert!(
-            gpu_status_message(GpuStatus::Active("llvmpipe")).contains("llvmpipe")
-        );
+        assert!(gpu_status_message(GpuStatus::Active("llvmpipe")).contains("llvmpipe"));
         // One line per process, however many frames render.
         let cell = OnceLock::new();
         assert!(report_gpu_status_once(&cell, GpuStatus::Disabled));

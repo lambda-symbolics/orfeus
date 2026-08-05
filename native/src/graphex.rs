@@ -610,8 +610,7 @@ pub(crate) fn execute_graph_cached(
 ) -> Result<RgbImage, Error> {
     let count = ops.len();
     if count == 0 {
-        let mut image =
-            render::orient(render::own_source(source), context.orientation);
+        let mut image = render::orient(render::own_source(source), context.orientation);
         to_display(&mut image);
         return Ok(image);
     }
@@ -836,8 +835,8 @@ pub(crate) fn execute_graph_cached(
                 // Per-channel monotone curves on the encoded signal, then the
                 // luma curve over all three: the film-stock "decompression"
                 // for inverted negatives.
-                let luma = (!is_identity_curve(&op.params[24..32]))
-                    .then(|| curve_lut(&op.params[24..32]));
+                let luma =
+                    (!is_identity_curve(&op.params[24..32])).then(|| curve_lut(&op.params[24..32]));
                 let luts = [
                     channel_lut(&op.params[0..8], luma.as_deref()),
                     channel_lut(&op.params[8..16], luma.as_deref()),
@@ -1590,8 +1589,7 @@ mod tests {
                     NODE_CURVES,
                     0,
                     -1,
-                    &luma_curves_params(&gained, &IDENTITY_CURVE, &IDENTITY_CURVE,
-                                        &IDENTITY_CURVE),
+                    &luma_curves_params(&gained, &IDENTITY_CURVE, &IDENTITY_CURVE, &IDENTITY_CURVE),
                     None,
                 )
                 .build(),
@@ -1640,16 +1638,28 @@ mod tests {
         let first = parse_graph(&tone_program(0.3)).unwrap();
         let second = parse_graph(&tone_program(0.7)).unwrap();
         let source = gradient_image();
-        execute_graph_cached(&first, Arc::new(source.clone()), &context(7), Some(key.clone())).unwrap();
-        let resumed =
-            execute_graph_cached(&second, Arc::new(source.clone()), &context(7), Some(key.clone())).unwrap();
+        execute_graph_cached(
+            &first,
+            Arc::new(source.clone()),
+            &context(7),
+            Some(key.clone()),
+        )
+        .unwrap();
+        let resumed = execute_graph_cached(
+            &second,
+            Arc::new(source.clone()),
+            &context(7),
+            Some(key.clone()),
+        )
+        .unwrap();
         let cold = execute_graph(&second, source.clone(), &context(7)).unwrap();
         assert_eq!(resumed.width, cold.width);
         assert_eq!(resumed.height, cold.height);
         assert!(max_difference(&resumed, &cold) == 0.0);
         // A third tweak resumes from the refreshed checkpoint.
         let third = parse_graph(&tone_program(0.9)).unwrap();
-        let resumed = execute_graph_cached(&third, Arc::new(source.clone()), &context(7), Some(key)).unwrap();
+        let resumed =
+            execute_graph_cached(&third, Arc::new(source.clone()), &context(7), Some(key)).unwrap();
         let cold = execute_graph(&third, source, &context(7)).unwrap();
         assert!(max_difference(&resumed, &cold) == 0.0);
     }
@@ -1670,7 +1680,8 @@ mod tests {
         // Rendering photo B with its own key must not reuse A's registers.
         let edited = parse_graph(&tone_program(0.8)).unwrap();
         let via_cache =
-            execute_graph_cached(&edited, Arc::new(bright.clone()), &context(7), Some(key_b)).unwrap();
+            execute_graph_cached(&edited, Arc::new(bright.clone()), &context(7), Some(key_b))
+                .unwrap();
         let cold = execute_graph(&edited, bright, &context(7)).unwrap();
         assert!(max_difference(&via_cache, &cold) == 0.0);
     }
