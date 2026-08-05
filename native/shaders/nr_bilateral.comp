@@ -1,0 +1,53 @@
+#version 450
+
+// One axis of the edge-guided 5-tap blur. Taps are spaced `counts.w` apart, and
+// each is weighted by a binomial kernel divided by how far the guide plane
+// departs from the centre, so the blur stops at edges. Two dispatches — one per
+// axis — make the separable pass that `render::edge_guided_blur_into` performs
+// band by band on the CPU.
+
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0, std430) buffer Planes {
+    float plane[];
+};
+
+#include "stage.glsl"
+
+const float KERNEL[5] = float[5](1.0, 4.0, 6.0, 4.0, 1.0);
+
+void main() {
+    uint pixel = stage_pixel();
+    if (pixel >= parameters.counts.x) {
+        return;
+    }
+    uint width = parameters.counts.y;
+    uint height = parameters.counts.z;
+    int step = int(parameters.counts.w);
+    uint source = parameters.offsets.x;
+    uint guide = parameters.offsets.y;
+    uint target = parameters.offsets.z;
+    bool vertical = parameters.flags.x == 1u;
+
+    int x = int(pixel % width);
+    int y = int(pixel / width);
+    float center = plane[guide + pixel];
+    float sigma = 0.012 + 0.055 * sqrt(max(center, 0.0));
+    float inverse = 1.0 / (sigma * sigma);
+
+    float sum = 0.0;
+    float weight_sum = 0.0;
+    for (int tap = -2; tap <= 2; ++tap) {
+        int offset = tap * step;
+        uint index;
+        if (vertical) {
+            index = uint(clamp(y + offset, 0, int(height) - 1)) * width + uint(x);
+        } else {
+            index = uint(y) * width + uint(clamp(x + offset, 0, int(width) - 1));
+        }
+        float distance = plane[guide + index] - center;
+        float weight = KERNEL[tap + 2] / (1.0 + distance * distance * inverse);
+        sum += plane[source + index] * weight;
+        weight_sum += weight;
+    }
+    plane[target + pixel] = sum / weight_sum;
+}

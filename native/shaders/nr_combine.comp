@@ -1,0 +1,40 @@
+#version 450
+
+// Mode 0: blend a plane toward a filtered copy of itself, as
+// `render::blend_toward` does.
+//
+// Mode 1: the luma recombination. The two blur scales are subtracted to give a
+// fine and a coarse detail band; each is soft-thresholded so noise-sized detail
+// vanishes while real edges survive, then both are added back onto the coarse
+// base. This is the loop that follows the two luma blurs on the CPU.
+
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0, std430) buffer Planes {
+    float plane[];
+};
+
+#include "stage.glsl"
+
+float soft_threshold(float value, float threshold) {
+    return sign(value) * max(abs(value) - threshold, 0.0);
+}
+
+void main() {
+    uint pixel = stage_pixel();
+    if (pixel >= parameters.counts.x) {
+        return;
+    }
+    uint target = parameters.offsets.z + pixel;
+    if (parameters.flags.y == 0u) {
+        float filtered = plane[parameters.offsets.x + pixel];
+        plane[target] += (filtered - plane[target]) * parameters.scalars.x;
+        return;
+    }
+    float value = plane[target];
+    float scale_one = plane[parameters.offsets.x + pixel];
+    float scale_two = plane[parameters.offsets.y + pixel];
+    float threshold = parameters.scalars.x * (0.012 + 0.035 * sqrt(max(value, 0.0)));
+    float fine = soft_threshold(value - scale_one, threshold);
+    float coarse = soft_threshold(scale_one - scale_two, threshold * 0.45);
+    plane[target] = scale_two + coarse + fine;
+}

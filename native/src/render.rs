@@ -860,7 +860,83 @@ fn soft_threshold(value: f32, threshold: f32) -> f32 {
     value.signum() * (value.abs() - threshold).max(0.0)
 }
 
+/// Edge-aware noise reduction. Set `ORFEUS_GPU_NOISE=1` for the compute path.
+///
+/// The shaders exist, agree with this implementation, and are the largest stage
+/// in an export — but they are off by default because they measured slower. At
+/// 20 MP on a 13700H: CPU 354-362 ms, Iris Xe 418-479 ms, RTX 2000 348-414 ms.
+///
+/// The dispatch itself is competitive (176 ms on the RTX, 310 ms on the Iris Xe
+/// against 355 ms of CPU). What sinks it is everything around the dispatch. Two
+/// reasons, both fixable, neither fixed here:
+///
+/// * The CPU version is banded, so each separable blur keeps its horizontal
+///   intermediate in cache. The shader writes that intermediate to a full plane
+///   and reads it back, adding gigabytes of traffic across the eight blurs. A
+///   shared-memory tiled blur would remove it.
+/// * Uploading and downloading a 20 MP frame, and reserving the 720 MB of
+///   resident planes, costs 170-240 ms per call. That vanishes once the image
+///   stays on the device between stages, which is what makes this code worth
+///   keeping: under a resident pipeline the dispatch times above beat the CPU
+///   outright.
 pub(crate) fn apply_noise_reduction(image: &mut RgbImage, luma: f32, chroma: f32) {
+    if (luma == 0.0 && chroma == 0.0) || image.width < 3 || image.height < 3 {
+        return;
+    }
+    if gpu_noise_reduction(image, luma, chroma) {
+        return;
+    }
+    cpu_noise_reduction(image, luma, chroma)
+}
+
+fn gpu_noise_reduction(image: &mut RgbImage, luma: f32, chroma: f32) -> bool {
+    if !super::gpu::requested() || !gpu_noise_reduction_requested() {
+        return false;
+    }
+    let profiling = std::env::var_os("ORFEUS_PROFILE").is_some();
+    let (width, height) = (image.width, image.height);
+    let attempt = catch_unwind(AssertUnwindSafe(|| {
+        super::gpu::noise_reduction(&mut image.data, width, height, luma, chroma)
+    }));
+    match attempt {
+        Ok(Ok(dispatch)) => {
+            report_gpu_status_once(
+                gpu_active_notice(),
+                GpuStatus::Active(&dispatch.adapter_name),
+            );
+            if profiling {
+                eprintln!(
+                    "orfeus-profile gpu-stage=noise-reduction adapter={:?} milliseconds={:.3}",
+                    dispatch.adapter_name, dispatch.milliseconds
+                );
+            }
+            true
+        }
+        Ok(Err(error)) => {
+            report_gpu_status_once(gpu_fallback_notice(), GpuStatus::Unavailable(&error));
+            if profiling {
+                eprintln!("orfeus-profile gpu-stage=noise-reduction fallback=cpu error={error:?}");
+            }
+            false
+        }
+        Err(_) => {
+            report_gpu_status_once(
+                gpu_fallback_notice(),
+                GpuStatus::Unavailable("the Vulkan backend panicked"),
+            );
+            if profiling {
+                eprintln!("orfeus-profile gpu-stage=noise-reduction fallback=cpu error=panic");
+            }
+            false
+        }
+    }
+}
+
+fn gpu_noise_reduction_requested() -> bool {
+    std::env::var_os("ORFEUS_GPU_NOISE").as_deref() == Some(std::ffi::OsStr::new("1"))
+}
+
+pub(crate) fn cpu_noise_reduction(image: &mut RgbImage, luma: f32, chroma: f32) {
     if (luma == 0.0 && chroma == 0.0) || image.width < 3 || image.height < 3 {
         return;
     }

@@ -1,0 +1,49 @@
+#version 450
+
+// 3x3 median, the chroma pass's first defence against isolated speckles.
+// Paeth's 19-exchange network, the same one `render::median_of_9` uses.
+
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0, std430) buffer Planes {
+    float plane[];
+};
+
+#include "stage.glsl"
+
+#define EXCHANGE(a, b) if (s[b] < s[a]) { float t = s[a]; s[a] = s[b]; s[b] = t; }
+
+void main() {
+    uint pixel = stage_pixel();
+    if (pixel >= parameters.counts.x) {
+        return;
+    }
+    uint width = parameters.counts.y;
+    uint height = parameters.counts.z;
+    uint source = parameters.offsets.x;
+    uint target = parameters.offsets.z;
+
+    int x = int(pixel % width);
+    int y = int(pixel / width);
+    int left = max(x - 1, 0);
+    int right = min(x + 1, int(width) - 1);
+    uint above = uint(max(y - 1, 0)) * width;
+    uint middle = uint(y) * width;
+    uint below = uint(min(y + 1, int(height) - 1)) * width;
+
+    float s[9] = float[9](
+        plane[source + above + uint(left)], plane[source + above + uint(x)],
+        plane[source + above + uint(right)],
+        plane[source + middle + uint(left)], plane[source + middle + uint(x)],
+        plane[source + middle + uint(right)],
+        plane[source + below + uint(left)], plane[source + below + uint(x)],
+        plane[source + below + uint(right)]);
+
+    EXCHANGE(1, 2) EXCHANGE(4, 5) EXCHANGE(7, 8)
+    EXCHANGE(0, 1) EXCHANGE(3, 4) EXCHANGE(6, 7)
+    EXCHANGE(1, 2) EXCHANGE(4, 5) EXCHANGE(7, 8)
+    EXCHANGE(0, 3) EXCHANGE(5, 8) EXCHANGE(4, 7)
+    EXCHANGE(3, 6) EXCHANGE(1, 4) EXCHANGE(2, 5)
+    EXCHANGE(4, 7) EXCHANGE(4, 2) EXCHANGE(6, 4)
+    EXCHANGE(4, 2)
+    plane[target + pixel] = s[4];
+}

@@ -23,6 +23,10 @@ use ash::vk::Handle;
 use ash::{Device, Entry, Instance, vk};
 
 const TONE_TRANSFER_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tone_transfer.spv"));
+const NR_YCBCR_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/nr_ycbcr.spv"));
+const NR_BILATERAL_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/nr_bilateral.spv"));
+const NR_MEDIAN_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/nr_median.spv"));
+const NR_COMBINE_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/nr_combine.spv"));
 
 /// The push-constant block declared in `shaders/stage.glsl`.
 ///
@@ -32,6 +36,9 @@ const TONE_TRANSFER_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/to
 #[derive(Clone, Copy, Debug, Default)]
 struct Parameters {
     counts: [u32; 4],
+    offsets: [u32; 4],
+    scalars: [f32; 4],
+    flags: [u32; 4],
 }
 
 impl Parameters {
@@ -76,6 +83,10 @@ struct Context {
     descriptor_set_layout: vk::DescriptorSetLayout,
     pipeline_layout: vk::PipelineLayout,
     tone_transfer: vk::Pipeline,
+    nr_ycbcr: vk::Pipeline,
+    nr_bilateral: vk::Pipeline,
+    nr_median: vk::Pipeline,
+    nr_combine: vk::Pipeline,
     descriptor_pool: vk::DescriptorPool,
     descriptor_set: vk::DescriptorSet,
     command: vk::CommandBuffer,
@@ -317,6 +328,10 @@ fn initialize() -> Result<Context, String> {
             .create_pipeline_layout(&pipeline_layout_info, None)
             .map_err(|error| vk_error("pipeline layout creation", error))?;
         let tone_transfer = create_pipeline(&device, pipeline_layout, TONE_TRANSFER_SHADER)?;
+        let nr_ycbcr = create_pipeline(&device, pipeline_layout, NR_YCBCR_SHADER)?;
+        let nr_bilateral = create_pipeline(&device, pipeline_layout, NR_BILATERAL_SHADER)?;
+        let nr_median = create_pipeline(&device, pipeline_layout, NR_MEDIAN_SHADER)?;
+        let nr_combine = create_pipeline(&device, pipeline_layout, NR_COMBINE_SHADER)?;
         let pool_size = [vk::DescriptorPoolSize::default()
             .ty(vk::DescriptorType::STORAGE_BUFFER)
             .descriptor_count(bindings.len() as u32)];
@@ -356,6 +371,10 @@ fn initialize() -> Result<Context, String> {
             descriptor_set_layout,
             pipeline_layout,
             tone_transfer,
+            nr_ycbcr,
+            nr_bilateral,
+            nr_median,
+            nr_combine,
             descriptor_pool,
             descriptor_set,
             command,
@@ -660,6 +679,7 @@ pub(crate) fn tone_and_transfer(rgb: &mut [f32]) -> Result<DispatchProfile, Stri
     let pixel_count = rgb.len() / 3;
     let parameters = Parameters {
         counts: [pixel_count as u32, 3, 0, 0],
+        ..Parameters::default()
     };
     let mut context = locked()?;
     let started = Instant::now();
@@ -670,52 +690,285 @@ pub(crate) fn tone_and_transfer(rgb: &mut [f32]) -> Result<DispatchProfile, Stri
     })
 }
 
-/// Uploads `pixels`, runs the stage over them, and reads the result back over
-/// them. `pixels` is left untouched unless the dispatch completed.
-unsafe fn dispatch(
-    context: &mut Context,
+/// Planes the noise reduction keeps resident, laid out end to end in one buffer.
+///
+/// Every dispatch takes plane offsets in its push constants, so the whole filter
+/// records as a single submission against a single descriptor set. Nothing is
+/// rebound and nothing round-trips to the host between passes, which is the
+/// whole reason this stage pays for a GPU where the camera matrix did not.
+#[derive(Clone, Copy)]
+struct Planes {
+    rgb: u32,
+    luma: u32,
+    blue: u32,
+    red: u32,
+    /// The finer blur scale during the luma pass, then a chroma scratch plane.
+    first: u32,
+    /// The coarser blur scale, then the chroma blur's result.
+    second: u32,
+    /// Where a separable blur leaves its horizontal half.
+    scratch: u32,
+}
+
+impl Planes {
+    /// Total scalars: three interleaved channels plus six single-channel planes.
+    const PLANE_COUNT: usize = 6;
+
+    fn new(pixel_count: usize) -> Result<(Self, usize), String> {
+        let stride = u32::try_from(pixel_count)
+            .map_err(|_| format!("GPU noise reduction cannot address {pixel_count} pixels"))?;
+        let total = pixel_count
+            .checked_mul(3 + Self::PLANE_COUNT)
+            .ok_or_else(|| "GPU noise reduction plane size overflow".to_string())?;
+        let plane = |index: u32| 3 * stride + index * stride;
+        Ok((
+            Self {
+                rgb: 0,
+                luma: plane(0),
+                blue: plane(1),
+                red: plane(2),
+                first: plane(3),
+                second: plane(4),
+                scratch: plane(5),
+            },
+            total,
+        ))
+    }
+}
+
+/// One recorded dispatch: which pipeline, and the push constants it reads.
+struct Pass {
+    pipeline: vk::Pipeline,
     parameters: Parameters,
-    pixels: &mut [f32],
+}
+
+/// The pipelines a noise-reduction run dispatches, so the pass list can be
+/// built — and its shape tested — without a device.
+#[derive(Clone, Copy, Default)]
+struct NoisePipelines {
+    ycbcr: vk::Pipeline,
+    bilateral: vk::Pipeline,
+    median: vk::Pipeline,
+    combine: vk::Pipeline,
+}
+
+impl NoisePipelines {
+    fn of(context: &Context) -> Self {
+        Self {
+            ycbcr: context.nr_ycbcr,
+            bilateral: context.nr_bilateral,
+            median: context.nr_median,
+            combine: context.nr_combine,
+        }
+    }
+}
+
+/// Builds the pass list for one noise-reduction run.
+struct PassBuilder {
+    pipelines: NoisePipelines,
+    passes: Vec<Pass>,
+    counts: [u32; 4],
+    planes: Planes,
+}
+
+impl PassBuilder {
+    fn new(pipelines: NoisePipelines, width: usize, height: usize, planes: Planes) -> Self {
+        Self {
+            pipelines,
+            passes: Vec::new(),
+            counts: [(width * height) as u32, width as u32, height as u32, 0],
+            planes,
+        }
+    }
+
+    fn push(&mut self, pipeline: vk::Pipeline, parameters: Parameters) {
+        self.passes.push(Pass {
+            pipeline,
+            parameters,
+        });
+    }
+
+    fn ycbcr(&mut self, inverse: bool) {
+        let planes = self.planes;
+        self.push(
+            self.pipelines.ycbcr,
+            Parameters {
+                counts: self.counts,
+                offsets: [planes.rgb, planes.luma, planes.blue, planes.red],
+                flags: [0, u32::from(inverse), 0, 0],
+                ..Parameters::default()
+            },
+        );
+    }
+
+    /// A separable edge-guided blur from `source` into `target`, guided by
+    /// `guide`, leaving its horizontal half in the scratch plane.
+    fn blur(&mut self, source: u32, guide: u32, target: u32, step: u32) {
+        let scratch = self.planes.scratch;
+        let mut counts = self.counts;
+        counts[3] = step;
+        for (axis, from, to) in [(0, source, scratch), (1, scratch, target)] {
+            self.push(
+                self.pipelines.bilateral,
+                Parameters {
+                    counts,
+                    offsets: [from, guide, to, 0],
+                    flags: [axis, 0, 0, 0],
+                    ..Parameters::default()
+                },
+            );
+        }
+    }
+
+    fn median(&mut self, source: u32, target: u32) {
+        self.push(
+            self.pipelines.median,
+            Parameters {
+                counts: self.counts,
+                offsets: [source, 0, target, 0],
+                ..Parameters::default()
+            },
+        );
+    }
+
+    fn blend(&mut self, target: u32, filtered: u32, amount: f32) {
+        self.push(
+            self.pipelines.combine,
+            Parameters {
+                counts: self.counts,
+                offsets: [filtered, 0, target, 0],
+                scalars: [amount, 0.0, 0.0, 0.0],
+                flags: [0, 0, 0, 0],
+            },
+        );
+    }
+
+    fn recombine_luma(&mut self, strength: f32) {
+        let planes = self.planes;
+        self.push(
+            self.pipelines.combine,
+            Parameters {
+                counts: self.counts,
+                offsets: [planes.first, planes.second, planes.luma, 0],
+                scalars: [strength, 0.0, 0.0, 0.0],
+                flags: [0, 1, 0, 0],
+            },
+        );
+    }
+}
+
+/// The pass list implementing `render::apply_noise_reduction` on the GPU.
+fn noise_reduction_passes(
+    pipelines: NoisePipelines,
+    width: usize,
+    height: usize,
+    planes: Planes,
+    luma: f32,
+    chroma: f32,
+) -> Vec<Pass> {
+    let mut builder = PassBuilder::new(pipelines, width, height, planes);
+    builder.ycbcr(false);
+    let luma_strength = luma.clamp(0.0, 1.0);
+    if luma_strength > 0.0 {
+        // Two scales of the same edge-guided blur, one twice as wide as the
+        // other, so fine and coarse detail can be thresholded separately.
+        builder.blur(planes.luma, planes.luma, planes.first, 1);
+        builder.blur(planes.first, planes.luma, planes.second, 2);
+        builder.recombine_luma(luma_strength);
+    }
+    let chroma_strength = chroma.clamp(0.0, 1.0);
+    if chroma_strength > 0.0 {
+        for channel in [planes.blue, planes.red] {
+            builder.median(channel, planes.scratch);
+            // The median lands in the scratch plane, which the blur below then
+            // reuses, so blend it away first.
+            builder.blend(channel, planes.scratch, (chroma_strength * 1.5).min(1.0));
+            for (step, amount) in [
+                (1, (chroma_strength * 1.8).min(1.0)),
+                (2, (chroma_strength * 1.25).min(1.0)),
+                (4, ((chroma_strength - 0.2) * 1.25).clamp(0.0, 1.0)),
+            ] {
+                if amount > 0.0 {
+                    // Chroma follows the filtered luma, so edges stay put.
+                    builder.blur(channel, planes.luma, planes.second, step);
+                    builder.blend(channel, planes.second, amount);
+                }
+            }
+        }
+    }
+    builder.ycbcr(true);
+    builder.passes
+}
+
+/// Runs the whole edge-aware noise reduction on the GPU, rewriting `rgb`.
+///
+/// `rgb` is interleaved linear RGB. It is left untouched unless every pass
+/// completed, so the caller can fall back to the CPU implementation.
+pub(crate) fn noise_reduction(
+    rgb: &mut [f32],
+    width: usize,
+    height: usize,
+    luma: f32,
+    chroma: f32,
+) -> Result<DispatchProfile, String> {
+    let pixel_count = width
+        .checked_mul(height)
+        .ok_or_else(|| "GPU noise reduction size overflow".to_string())?;
+    if pixel_count == 0 || rgb.len() != pixel_count * 3 {
+        return Err(format!(
+            "GPU noise reduction needs {pixel_count} RGB triplets, got {}",
+            rgb.len()
+        ));
+    }
+    if width < 3 || height < 3 {
+        return Err("GPU noise reduction needs at least three rows and columns".to_string());
+    }
+    let (planes, scalars) = Planes::new(pixel_count)?;
+    let groups = dispatch_groups(pixel_count)?;
+    let bytes = byte_size(scalars)?;
+    let mut context = locked()?;
+    let started = Instant::now();
+    let passes = noise_reduction_passes(
+        NoisePipelines::of(&context),
+        width,
+        height,
+        planes,
+        luma,
+        chroma,
+    );
+    unsafe { record_and_run(&mut context, rgb, bytes, groups, &passes) }?;
+    Ok(DispatchProfile {
+        adapter_name: context.adapter_name.clone(),
+        milliseconds: started.elapsed().as_secs_f64() * 1000.0,
+    })
+}
+
+/// Uploads `rgb` into the plane buffer, runs every pass in one submission, and
+/// reads the RGB plane back.
+unsafe fn record_and_run(
+    context: &mut Context,
+    rgb: &mut [f32],
+    bytes: vk::DeviceSize,
+    groups: DispatchGroups,
+    passes: &[Pass],
 ) -> Result<(), String> {
-    let groups = dispatch_groups(parameters.counts[0] as usize)?;
-    let input_bytes = byte_size(pixels.len())?;
     let properties = context.memory_properties;
     let limit = context.max_storage_buffer_range;
     unsafe {
         context
             .input
-            .ensure(&context.device, &properties, input_bytes, limit)
+            .ensure(&context.device, &properties, bytes, limit)
     }?;
-    unsafe { context.input.upload(pixels) };
-
-    let buffer_info = [vk::DescriptorBufferInfo::default()
-        .buffer(context.input.storage())
-        .range(context.input.capacity)];
-    let writes = [vk::WriteDescriptorSet::default()
-        .dst_set(context.descriptor_set)
-        .dst_binding(0)
-        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-        .buffer_info(&buffer_info)];
-    unsafe { context.device.update_descriptor_sets(&writes, &[]) };
-
-    unsafe {
-        context
-            .device
-            .reset_command_buffer(context.command, vk::CommandBufferResetFlags::empty())
-    }
-    .map_err(|error| vk_error("command buffer reset", error))?;
-    let begin =
-        vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-    unsafe { context.device.begin_command_buffer(context.command, &begin) }
-        .map_err(|error| vk_error("command recording begin", error))?;
-
-    // Host writes to coherent memory before a submission are visible to the
-    // dispatch, so a unified slot needs no upload copy or barrier at all.
+    unsafe { context.input.upload(rgb) };
+    bind_input(context);
+    unsafe { begin_recording(context) }?;
+    let rgb_bytes = byte_size(rgb.len())?;
     if !context.input.unified {
-        let copy = [vk::BufferCopy::default().size(input_bytes)];
+        // Only the RGB plane needs uploading; the rest are written before read.
+        let copy = [vk::BufferCopy::default().size(rgb_bytes)];
         let barrier = [buffer_barrier(
             context.input.storage(),
-            input_bytes,
+            bytes,
             vk::AccessFlags::TRANSFER_WRITE,
             vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
         )];
@@ -737,13 +990,7 @@ unsafe fn dispatch(
             );
         }
     }
-
     unsafe {
-        context.device.cmd_bind_pipeline(
-            context.command,
-            vk::PipelineBindPoint::COMPUTE,
-            context.tone_transfer,
-        );
         context.device.cmd_bind_descriptor_sets(
             context.command,
             vk::PipelineBindPoint::COMPUTE,
@@ -752,23 +999,101 @@ unsafe fn dispatch(
             &[context.descriptor_set],
             &[],
         );
-        context.device.cmd_push_constants(
-            context.command,
-            context.pipeline_layout,
-            vk::ShaderStageFlags::COMPUTE,
-            0,
-            parameters.bytes(),
-        );
+    }
+    // Each pass reads what its predecessor wrote, so they are serialized.
+    let between = [buffer_barrier(
+        context.input.storage(),
+        bytes,
+        vk::AccessFlags::SHADER_WRITE,
+        vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+    )];
+    for (index, pass) in passes.iter().enumerate() {
+        if index > 0 {
+            unsafe {
+                context.device.cmd_pipeline_barrier(
+                    context.command,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &between,
+                    &[],
+                )
+            };
+        }
+        unsafe {
+            context.device.cmd_bind_pipeline(
+                context.command,
+                vk::PipelineBindPoint::COMPUTE,
+                pass.pipeline,
+            );
+            context.device.cmd_push_constants(
+                context.command,
+                context.pipeline_layout,
+                vk::ShaderStageFlags::COMPUTE,
+                0,
+                pass.parameters.bytes(),
+            );
+            context
+                .device
+                .cmd_dispatch(context.command, groups.x, groups.y, 1);
+        }
+    }
+    unsafe { finish_recording(context, rgb_bytes) }?;
+    unsafe { submit_and_wait(context) }?;
+    unsafe { context.input.download(rgb) };
+    Ok(())
+}
+
+/// Uploads `pixels`, runs the stage over them, and reads the result back over
+/// them. `pixels` is left untouched unless the dispatch completed.
+unsafe fn dispatch(
+    context: &mut Context,
+    parameters: Parameters,
+    pixels: &mut [f32],
+) -> Result<(), String> {
+    let groups = dispatch_groups(parameters.counts[0] as usize)?;
+    let bytes = byte_size(pixels.len())?;
+    let passes = [Pass {
+        pipeline: context.tone_transfer,
+        parameters,
+    }];
+    unsafe { record_and_run(context, pixels, bytes, groups, &passes) }
+}
+
+fn bind_input(context: &Context) {
+    let buffer_info = [vk::DescriptorBufferInfo::default()
+        .buffer(context.input.storage())
+        .range(context.input.capacity)];
+    let writes = [vk::WriteDescriptorSet::default()
+        .dst_set(context.descriptor_set)
+        .dst_binding(0)
+        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+        .buffer_info(&buffer_info)];
+    unsafe { context.device.update_descriptor_sets(&writes, &[]) };
+}
+
+unsafe fn begin_recording(context: &Context) -> Result<(), String> {
+    unsafe {
         context
             .device
-            .cmd_dispatch(context.command, groups.x, groups.y, 1);
+            .reset_command_buffer(context.command, vk::CommandBufferResetFlags::empty())
     }
+    .map_err(|error| vk_error("command buffer reset", error))?;
+    let begin =
+        vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+    unsafe { context.device.begin_command_buffer(context.command, &begin) }
+        .map_err(|error| vk_error("command recording begin", error))
+}
 
-    let read_slot = &context.input;
-    if read_slot.unified {
+/// Makes the leading `bytes` of the storage buffer readable by the host, then
+/// closes the command buffer.
+unsafe fn finish_recording(context: &Context, bytes: vk::DeviceSize) -> Result<(), String> {
+    let slot = &context.input;
+    if slot.unified {
         let barrier = [buffer_barrier(
-            read_slot.storage(),
-            input_bytes,
+            slot.storage(),
+            bytes,
             vk::AccessFlags::SHADER_WRITE,
             vk::AccessFlags::HOST_READ,
         )];
@@ -785,12 +1110,12 @@ unsafe fn dispatch(
         };
     } else {
         let barrier = [buffer_barrier(
-            read_slot.storage(),
-            input_bytes,
+            slot.storage(),
+            bytes,
             vk::AccessFlags::SHADER_WRITE,
             vk::AccessFlags::TRANSFER_READ,
         )];
-        let copy = [vk::BufferCopy::default().size(input_bytes)];
+        let copy = [vk::BufferCopy::default().size(bytes)];
         unsafe {
             context.device.cmd_pipeline_barrier(
                 context.command,
@@ -801,39 +1126,35 @@ unsafe fn dispatch(
                 &barrier,
                 &[],
             );
-            context.device.cmd_copy_buffer(
-                context.command,
-                read_slot.device,
-                read_slot.host,
-                &copy,
-            );
+            context
+                .device
+                .cmd_copy_buffer(context.command, slot.device, slot.host, &copy);
         }
     }
     unsafe { context.device.end_command_buffer(context.command) }
-        .map_err(|error| vk_error("command recording end", error))?;
+        .map_err(|error| vk_error("command recording end", error))
+}
 
+unsafe fn submit_and_wait(context: &Context) -> Result<(), String> {
     unsafe { context.device.reset_fences(&[context.fence]) }
         .map_err(|error| vk_error("fence reset", error))?;
     let commands = [context.command];
     let submit = [vk::SubmitInfo::default().command_buffers(&commands)];
-    if let Err(error) = unsafe {
+    unsafe {
         context
             .device
             .queue_submit(context.queue, &submit, context.fence)
-    } {
-        return Err(vk_error("queue submission", error));
     }
+    .map_err(|error| vk_error("queue submission", error))?;
     if let Err(error) = unsafe {
         context
             .device
-            .wait_for_fences(&[context.fence], true, 10_000_000_000)
+            .wait_for_fences(&[context.fence], true, 30_000_000_000)
     } {
         // Do not reuse resources which may still be in flight.
         let _ = unsafe { context.device.device_wait_idle() };
         return Err(vk_error("dispatch wait", error));
     }
-
-    unsafe { context.input.download(pixels) };
     Ok(())
 }
 
@@ -862,7 +1183,15 @@ impl Drop for Context {
                 .free_command_buffers(self.command_pool, &[self.command]);
             self.device
                 .destroy_descriptor_pool(self.descriptor_pool, None);
-            self.device.destroy_pipeline(self.tone_transfer, None);
+            for pipeline in [
+                self.tone_transfer,
+                self.nr_ycbcr,
+                self.nr_bilateral,
+                self.nr_median,
+                self.nr_combine,
+            ] {
+                self.device.destroy_pipeline(pipeline, None);
+            }
             self.device
                 .destroy_pipeline_layout(self.pipeline_layout, None);
             self.device
@@ -888,6 +1217,12 @@ mod tests {
                 1.055 * value.max(0.0).powf(1.0 / 2.4) - 0.055
             };
         }
+    }
+
+    /// Passes a run would record, for asserting the sequence without a device.
+    fn pass_count(luma: f32, chroma: f32) -> usize {
+        let (planes, _) = Planes::new(64).unwrap();
+        noise_reduction_passes(NoisePipelines::default(), 8, 8, planes, luma, chroma).len()
     }
 
     fn gpu_testing_requested() -> bool {
@@ -995,10 +1330,11 @@ mod tests {
     #[test]
     fn the_push_constant_block_matches_the_shader_declaration() {
         // Four-component members, within the 128 bytes Vulkan guarantees.
-        assert_eq!(std::mem::size_of::<Parameters>(), 16);
+        assert_eq!(std::mem::size_of::<Parameters>(), 4 * 16);
         assert!(std::mem::size_of::<Parameters>() <= 128);
         let parameters = Parameters {
             counts: [7, 3, 0, 0],
+            ..Parameters::default()
         };
         assert_eq!(parameters.bytes().len(), std::mem::size_of::<Parameters>());
         assert_eq!(parameters.bytes()[0], 7);
@@ -1036,6 +1372,93 @@ mod tests {
                 "{actual} != {expected}"
             );
         }
+    }
+
+    /// The noise reduction is many passes deep, so agreement is checked against
+    /// the CPU implementation rather than against a hand-computed expectation.
+    #[test]
+    fn actual_gpu_noise_reduction_matches_cpu_when_requested_for_testing() {
+        if !gpu_testing_requested() {
+            return;
+        }
+        let (width, height) = (61, 43);
+        // Structure plus a repeating high-frequency ripple, so edges and noise
+        // both exercise the guided weights and the soft thresholds.
+        let data: Vec<f32> = (0..width * height * 3)
+            .map(|index| {
+                let pixel = index / 3;
+                let (x, y) = (pixel % width, pixel / width);
+                let base = if x > width / 2 { 0.62 } else { 0.14 };
+                let ripple = ((index % 7) as f32 - 3.0) * 0.011;
+                let slope = y as f32 / height as f32 * 0.2;
+                (base + ripple + slope).max(0.0)
+            })
+            .collect();
+        for (luma, chroma) in [(0.6, 0.0), (0.0, 0.5), (0.45, 0.35), (1.0, 1.0)] {
+            let mut expected = crate::render::RgbImage {
+                width,
+                height,
+                data: data.clone(),
+            };
+            crate::render::cpu_noise_reduction(&mut expected, luma, chroma);
+            let mut actual = data.clone();
+            noise_reduction(&mut actual, width, height, luma, chroma)
+                .expect("Vulkan noise reduction dispatch");
+            let mut worst = 0.0_f32;
+            for (actual, expected) in actual.iter().zip(&expected.data) {
+                worst = worst.max((actual - expected).abs());
+            }
+            // The CPU path sums its taps with FMA in a different order, so the
+            // two agree to single-precision rounding rather than bit for bit.
+            assert!(
+                worst <= 2.0e-4,
+                "luma {luma} chroma {chroma} differed by {worst}"
+            );
+        }
+    }
+
+    #[test]
+    fn noise_reduction_rejects_sizes_it_cannot_run() {
+        // Too small for a 3x3 neighbourhood, and a mismatched buffer length.
+        assert!(noise_reduction(&mut [0.0; 3 * 4], 2, 2, 0.5, 0.5).is_err());
+        assert!(noise_reduction(&mut [0.0; 10], 4, 4, 0.5, 0.5).is_err());
+        assert!(noise_reduction(&mut [], 0, 0, 0.5, 0.5).is_err());
+    }
+
+    #[test]
+    fn the_plane_layout_leaves_no_overlap() {
+        let (planes, total) = Planes::new(100).unwrap();
+        assert_eq!(planes.rgb, 0);
+        let mut starts = [
+            planes.luma,
+            planes.blue,
+            planes.red,
+            planes.first,
+            planes.second,
+            planes.scratch,
+        ];
+        starts.sort_unstable();
+        // Every plane starts past the interleaved RGB and a whole plane apart.
+        assert_eq!(starts[0], 300);
+        for pair in starts.windows(2) {
+            assert_eq!(pair[1] - pair[0], 100);
+        }
+        assert_eq!(total, 100 * (3 + Planes::PLANE_COUNT));
+        assert_eq!(*starts.last().unwrap() as usize + 100, total);
+    }
+
+    /// The pass list is what makes this one submission rather than many, so its
+    /// shape is asserted without needing a device.
+    #[test]
+    fn the_pass_list_follows_the_requested_strengths() {
+        assert_eq!(pass_count(0.0, 0.0), 2, "conversions only");
+        // Luma adds two separable blurs and one recombination.
+        assert_eq!(pass_count(0.5, 0.0), 2 + 5);
+        // Each chroma channel adds a median, its blend, and three blurs with
+        // their blends; the widest blur only switches on above 0.2.
+        assert_eq!(pass_count(0.0, 0.1), 2 + 2 * (2 + 2 * 3));
+        assert_eq!(pass_count(0.0, 0.5), 2 + 2 * (2 + 3 * 3));
+        assert_eq!(pass_count(0.5, 0.5), 2 + 5 + 2 * (2 + 3 * 3));
     }
 
     #[test]

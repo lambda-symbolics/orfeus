@@ -1,0 +1,37 @@
+#version 450
+
+// Interleaved linear RGB to and from the luma/chroma planes the noise reduction
+// works in. Mode 0 splits, mode 1 recombines. Mirrors the two loops that open
+// and close `render::apply_noise_reduction`.
+
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0, std430) buffer Planes {
+    float plane[];
+};
+
+#include "stage.glsl"
+
+void main() {
+    uint pixel = stage_pixel();
+    if (pixel >= parameters.counts.x) {
+        return;
+    }
+    uint rgb = parameters.offsets.x + pixel * 3u;
+    uint luma = parameters.offsets.y + pixel;
+    uint blue = parameters.offsets.z + pixel;
+    uint red = parameters.offsets.w + pixel;
+    if (parameters.flags.y == 0u) {
+        float y = 0.2126 * plane[rgb] + 0.7152 * plane[rgb + 1u]
+                + 0.0722 * plane[rgb + 2u];
+        plane[luma] = y;
+        plane[blue] = plane[rgb + 2u] - y;
+        plane[red] = plane[rgb] - y;
+    } else {
+        float y = plane[luma];
+        float r = y + plane[red];
+        float b = y + plane[blue];
+        plane[rgb] = r;
+        plane[rgb + 2u] = b;
+        plane[rgb + 1u] = (y - 0.2126 * r - 0.0722 * b) / 0.7152;
+    }
+}
