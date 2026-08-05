@@ -12,7 +12,12 @@ use image::codecs::tiff::TiffEncoder;
 use image::{ColorType, ImageEncoder};
 use lensfun::{Camera, Database, Lens, Modifier};
 use rawler::decoders::{RawDecodeParams, RawLoader};
-use rawler::imgop::develop::{ProcessingStep, RawDevelop};
+use rawler::imgop::Rect;
+use rawler::imgop::develop::{Intermediate, ProcessingStep, RawDevelop};
+use rawler::imgop::sensor::bayer::Demosaic;
+use rawler::imgop::sensor::bayer::superpixel::Superpixel3Channel;
+use rawler::pixarray::PixF32;
+use rawler::rawimage::{RawImage, RawPhotometricInterpretation};
 use rawler::rawsource::RawSource;
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
@@ -2075,7 +2080,95 @@ pub(crate) fn file_content_digest(input: &Path) -> Result<DecodeCacheKey, Error>
     Ok(hasher.finalize().into())
 }
 
-fn decode_linear_srgb(input: &Path, profiling: bool) -> Result<DecodedRaw, Error> {
+/// Develops a Bayer frame at half its linear resolution.
+///
+/// Each 2x2 sensor quad becomes one RGB pixel — red, the mean of the two greens,
+/// and blue — instead of interpolating a full-resolution colour value for every
+/// photosite. That is a quarter of the output pixels for a small fraction of the
+/// arithmetic, and every later stage then works on a quarter of the data.
+///
+/// A preview is downscaled to well under half resolution anyway, so the detail
+/// this drops is detail that was about to be thrown away. Exports never use it.
+///
+/// This mirrors `RawDevelop::develop_intermediate` with rawler's superpixel
+/// demosaic substituted for its PPG one, because that entry point hard-codes
+/// PPG. The crop handling is copied from it exactly: the default crop is
+/// expressed in full-resolution coordinates, so it has to be adapted to the
+/// active area and then halved, or a draft preview would frame differently from
+/// the export it is previewing.
+/// Requested output size at or below which a preview develops at half
+/// resolution.
+///
+/// The smallest sensor Orfeus targets is the PEN-F's 4608x3456, so a request
+/// this size or smaller is always downscaling by more than the factor of two
+/// that binning costs — the detail dropped was about to be resampled away.
+pub(crate) const DRAFT_MAX_DIMENSION: u32 = 2048;
+
+/// Whether a render asking for this output size should develop a draft.
+///
+/// Decided from the request alone rather than from the decoded dimensions,
+/// because the answer has to key the decode cache before anything is decoded.
+/// Set `ORFEUS_DRAFT=0` to always develop at full resolution.
+pub(crate) fn draft_requested(max_width: u32, max_height: u32) -> bool {
+    if std::env::var_os("ORFEUS_DRAFT").as_deref() == Some(std::ffi::OsStr::new("0")) {
+        return false;
+    }
+    max_width > 0
+        && max_height > 0
+        && max_width <= DRAFT_MAX_DIMENSION
+        && max_height <= DRAFT_MAX_DIMENSION
+}
+
+/// A draft decode is a different image from a full one, so it needs a different
+/// identity — in this cache and in the graph prefix cache, which keys on the
+/// same value.
+pub(crate) fn draft_identity(key: DecodeCacheKey) -> DecodeCacheKey {
+    let mut hasher = Sha256::new();
+    hasher.update(key);
+    hasher.update(b"orfeus-draft-v1");
+    hasher.finalize().into()
+}
+
+fn develop_half_resolution(raw: &RawImage) -> Option<Intermediate> {
+    let RawPhotometricInterpretation::Cfa(config) = &raw.photometric else {
+        return None;
+    };
+    if !config.cfa.is_rgb() || raw.cpp != 1 {
+        return None;
+    }
+    let mut scaled = raw.clone();
+    scaled.apply_scaling().ok()?;
+    let pixels = PixF32::new_with(
+        scaled.data.as_f32().into_owned(),
+        scaled.width,
+        scaled.height,
+    );
+    let active = scaled.active_area.unwrap_or(pixels.rect());
+    let binned = Superpixel3Channel::new().demosaic(&pixels, &config.cfa, &config.colors, active);
+    let Some(mut crop) = scaled.crop_area.or(scaled.active_area) else {
+        return Some(Intermediate::ThreeColor(binned));
+    };
+    crop = crop.adapt(&scaled.active_area.unwrap_or(crop));
+    crop.scale(0.5);
+    // The superpixel pass rounds an odd ROI down, so a crop may now exceed the
+    // binned image by a pixel; clamp rather than panic inside rawler's crop.
+    let dimensions = binned.dim();
+    if crop.p.x >= dimensions.w || crop.p.y >= dimensions.h {
+        return Some(Intermediate::ThreeColor(binned));
+    }
+    let width = crop.d.w.min(dimensions.w - crop.p.x);
+    let height = crop.d.h.min(dimensions.h - crop.p.y);
+    if width == 0 || height == 0 {
+        return Some(Intermediate::ThreeColor(binned));
+    }
+    let crop = Rect::new(crop.p, rawler::imgop::Dim2::new(width, height));
+    if crop.d == dimensions {
+        return Some(Intermediate::ThreeColor(binned));
+    }
+    Some(Intermediate::ThreeColor(binned.crop(crop)))
+}
+
+fn decode_linear_srgb(input: &Path, draft: bool, profiling: bool) -> Result<DecodedRaw, Error> {
     let mut stage_started = Instant::now();
     macro_rules! profile_stage {
         ($name:literal) => {
@@ -2112,9 +2205,14 @@ fn decode_linear_srgb(input: &Path, profiling: bool) -> Result<DecodedRaw, Error
         ProcessingStep::CropActiveArea,
         ProcessingStep::CropDefault,
     ];
-    let developed = RawDevelop { steps }
-        .develop_intermediate(&raw)
-        .map_err(|e| Error::Render(format!("RAW development: {e}")))?;
+    // A draft preview bins each sensor quad instead of interpolating every
+    // photosite; anything it cannot handle falls back to the full demosaic.
+    let developed = match draft.then(|| develop_half_resolution(&raw)).flatten() {
+        Some(binned) => binned,
+        None => RawDevelop { steps }
+            .develop_intermediate(&raw)
+            .map_err(|e| Error::Render(format!("RAW development: {e}")))?,
+    };
     profile_stage!("develop");
     // Start from the camera's neutral rendering for both as-shot and custom
     // temperature. Custom Kelvin is a relative chromatic adaptation around D65;
@@ -2146,6 +2244,7 @@ fn decode_linear_srgb(input: &Path, profiling: bool) -> Result<DecodedRaw, Error
 fn decoded_for_render_with_identity_using<F>(
     input: &Path,
     cache_mode: u32,
+    draft: bool,
     profiling: bool,
     decode: F,
 ) -> Result<(Arc<DecodedRaw>, Option<DecodeCacheKey>), Error>
@@ -2156,6 +2255,7 @@ where
         return Ok((Arc::new(decode()?), None));
     }
     let key = decode_cache_key(input)?;
+    let key = if draft { draft_identity(key) } else { key };
     let (cache_lock, cache_changed) = decode_cache();
     loop {
         let mut cache = cache_lock
@@ -2218,33 +2318,37 @@ where
 fn decoded_for_render_with<F>(
     input: &Path,
     cache_mode: u32,
+    draft: bool,
     profiling: bool,
     decode: F,
 ) -> Result<Arc<DecodedRaw>, Error>
 where
     F: FnOnce() -> Result<DecodedRaw, Error>,
 {
-    decoded_for_render_with_identity_using(input, cache_mode, profiling, decode)
+    decoded_for_render_with_identity_using(input, cache_mode, draft, profiling, decode)
         .map(|(decoded, _)| decoded)
 }
 
+/// Decodes at full quality. Colour sampling and analysis use this, because a
+/// binned image reports different values than the render it is sampled for.
 pub(crate) fn decoded_for_render(
     input: &Path,
     cache_mode: u32,
     profiling: bool,
 ) -> Result<Arc<DecodedRaw>, Error> {
-    decoded_for_render_with(input, cache_mode, profiling, || {
-        decode_linear_srgb(input, profiling)
+    decoded_for_render_with(input, cache_mode, false, profiling, || {
+        decode_linear_srgb(input, false, profiling)
     })
 }
 
 pub(crate) fn decoded_for_render_with_identity(
     input: &Path,
     cache_mode: u32,
+    draft: bool,
     profiling: bool,
 ) -> Result<(Arc<DecodedRaw>, Option<DecodeCacheKey>), Error> {
-    decoded_for_render_with_identity_using(input, cache_mode, profiling, || {
-        decode_linear_srgb(input, profiling)
+    decoded_for_render_with_identity_using(input, cache_mode, draft, profiling, || {
+        decode_linear_srgb(input, draft, profiling)
     })
 }
 
@@ -2394,6 +2498,32 @@ pub fn render(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn draft_is_requested_only_for_preview_sized_output() {
+        // An export asks for no bound, or a bound larger than any sensor.
+        assert!(!draft_requested(0, 0));
+        assert!(!draft_requested(0, 1200));
+        assert!(!draft_requested(6000, 4000));
+        assert!(!draft_requested(DRAFT_MAX_DIMENSION + 1, 1200));
+        // A preview asks for something every supported sensor dwarfs.
+        assert!(draft_requested(1600, 1200));
+        assert!(draft_requested(DRAFT_MAX_DIMENSION, DRAFT_MAX_DIMENSION));
+        // The smallest sensor Orfeus targets is still more than twice the
+        // threshold in both axes, so binning never has to upsample.
+        assert!(2 * DRAFT_MAX_DIMENSION <= 4608);
+        assert!(2 * (DRAFT_MAX_DIMENSION * 3 / 4) <= 3456);
+    }
+
+    #[test]
+    fn a_draft_decode_never_shares_an_identity_with_a_full_one() {
+        let key: DecodeCacheKey = [7; 32];
+        let other: DecodeCacheKey = [8; 32];
+        assert_ne!(draft_identity(key), key);
+        assert_ne!(draft_identity(key), draft_identity(other));
+        // Stable, so a second preview of the same file hits the cache.
+        assert_eq!(draft_identity(key), draft_identity(key));
+    }
+
     /// Times the noise reduction at export resolution, isolating it from decode
     /// and encode. Used to measure scratch-buffer handling, which is invisible
     /// in an end-to-end render's noise.
@@ -2530,7 +2660,7 @@ mod tests {
                 let loads = loads.clone();
                 thread::spawn(move || {
                     barrier.wait();
-                    decoded_for_render_with(&input, CACHE_USE, false, || {
+                    decoded_for_render_with(&input, CACHE_USE, false, false, || {
                         loads.fetch_add(1, Ordering::SeqCst);
                         thread::sleep(std::time::Duration::from_millis(50));
                         Ok(test_decoded_raw())
@@ -2557,21 +2687,22 @@ mod tests {
         let input = temp("cache-retry.raw");
         fs::write(&input, b"first cache source").unwrap();
         let panicked = catch_unwind(AssertUnwindSafe(|| {
-            let _ = decoded_for_render_with(&input, CACHE_USE, false, || {
+            let _ = decoded_for_render_with(&input, CACHE_USE, false, false, || {
                 panic!("synthetic decoder panic")
             });
         }));
         assert!(panicked.is_err());
-        let failed = decoded_for_render_with(&input, CACHE_USE, false, || {
+        let failed = decoded_for_render_with(&input, CACHE_USE, false, false, || {
             Err(Error::Render("synthetic decode failure".into()))
         });
         assert!(failed.is_err());
-        let changed = decoded_for_render_with(&input, CACHE_USE, false, || {
+        let changed = decoded_for_render_with(&input, CACHE_USE, false, false, || {
             fs::write(&input, b"other cache source").unwrap();
             Ok(test_decoded_raw())
         });
         assert!(matches!(changed, Err(Error::Render(message)) if message.contains("changed")));
-        let retried = decoded_for_render_with(&input, CACHE_USE, false, || Ok(test_decoded_raw()));
+        let retried =
+            decoded_for_render_with(&input, CACHE_USE, false, false, || Ok(test_decoded_raw()));
         assert!(retried.is_ok());
         fs::remove_file(input).unwrap();
     }

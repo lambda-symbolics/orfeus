@@ -1176,8 +1176,11 @@ fn render_graph_image(
     } else {
         None
     };
+    // A request small enough to be a preview develops a draft: each sensor quad
+    // becomes one pixel rather than interpolating a colour for every photosite.
+    let draft = render::draft_requested(frame.max_width, frame.max_height);
     let (decoded, source_identity): (Arc<DecodedRaw>, Option<render::DecodeCacheKey>) =
-        render::decoded_for_render_with_identity(input, cache_mode, profiling)?;
+        render::decoded_for_render_with_identity(input, cache_mode, draft, profiling)?;
     let (native_max_width, native_max_height) =
         render::native_downscale_bounds(decoded.orientation, frame.max_width, frame.max_height);
     let source = render::scaled_source_for_render(
