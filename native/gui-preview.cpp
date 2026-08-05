@@ -2,6 +2,7 @@
 #include <FL/Fl_Image.H>
 #include <FL/Fl_JPEG_Image.H>
 #include <FL/Fl_Native_File_Chooser.H>
+#include <FL/Fl_RGB_Image.H>
 #include <FL/Fl_Widget.H>
 #include <FL/fl_draw.H>
 #include <algorithm>
@@ -206,10 +207,48 @@ extern "C" int orfeus_gui_preview_draw_rect(long long widget_id,
     return 1;
 }
 
-extern "C" int orfeus_gui_preview_histogram(const char *path,
-                                            int *bins,
-                                            int bin_count) {
-    if (!path || !*path || !bins || bin_count <= 0 || bin_count > INT_MAX / 3) {
+// Turns waveform occupancy counts into the drawable RGB image. Each cell's
+// density is normalized against whichever is smaller: that channel's peak, or
+// the count a broad flat trace would produce. A flat frame therefore still
+// fills the scope, while one enormous pile-up cannot dim everything else.
+void shade_waveform(const unsigned *counts,
+                    unsigned char *rgb,
+                    int columns,
+                    int levels,
+                    double pixels_per_column) {
+    const size_t cells = static_cast<size_t>(columns) * levels;
+    for (size_t channel = 0; channel < 3; ++channel) {
+        unsigned peak = 0;
+        for (size_t cell = 0; cell < cells; ++cell) {
+            peak = std::max(peak, counts[cell * 3 + channel]);
+        }
+        const double limit =
+            std::max(1.0, std::min(static_cast<double>(peak),
+                                   std::max(1.0, pixels_per_column / 8.0)));
+        for (size_t cell = 0; cell < cells; ++cell) {
+            const double value =
+                std::min(1.0, counts[cell * 3 + channel] / limit);
+            rgb[cell * 3 + channel] = static_cast<unsigned char>(
+                std::lround(255.0 * std::pow(value, 0.6)));
+        }
+    }
+}
+
+// Reads the preview JPEG once and fills either or both scope views. BINS is
+// the per-channel level histogram. RGB is the waveform image: one row per
+// level with row zero the brightest, one column per image column band, and
+// each channel's trace density in its own byte, ready to blit as an RGB
+// overlay. Clipping shows up as a solid line along the top edge.
+extern "C" int orfeus_gui_preview_scopes(const char *path,
+                                         int *bins,
+                                         int bin_count,
+                                         unsigned char *rgb,
+                                         int columns,
+                                         int levels) {
+    if (!path || !*path) return 0;
+    if (!bins && !rgb) return 0;
+    if (bins && (bin_count <= 0 || bin_count > 4096)) return 0;
+    if (rgb && (columns <= 0 || levels <= 0 || columns > 4096 || levels > 4096)) {
         return 0;
     }
 
@@ -219,64 +258,110 @@ extern "C" int orfeus_gui_preview_histogram(const char *path,
         std::calloc(1, sizeof(jpeg_decompress_struct)));
     auto *error = static_cast<JpegErrorManager *>(
         std::calloc(1, sizeof(JpegErrorManager)));
-    if (!decoder || !error) {
+    unsigned *counts =
+        rgb ? static_cast<unsigned *>(
+                  std::calloc(static_cast<size_t>(columns) * levels * 3,
+                              sizeof(unsigned)))
+            : nullptr;
+    // Every exit below runs through this so the longjmp path leaks nothing.
+    auto release = [&](int result) {
+        std::free(counts);
         std::free(decoder);
         std::free(error);
         std::fclose(file);
-        return 0;
-    }
+        return result;
+    };
+    if (!decoder || !error || (rgb && !counts)) return release(0);
 
     decoder->err = jpeg_std_error(&error->base);
     error->base.error_exit = jpeg_error_exit;
     if (setjmp(error->jump_buffer)) {
         jpeg_destroy_decompress(decoder);
-        std::free(decoder);
-        std::free(error);
-        std::fclose(file);
-        return 0;
+        return release(0);
     }
 
     jpeg_create_decompress(decoder);
     jpeg_stdio_src(decoder, file);
     if (jpeg_read_header(decoder, TRUE) != JPEG_HEADER_OK) {
         jpeg_destroy_decompress(decoder);
-        std::free(decoder);
-        std::free(error);
-        std::fclose(file);
-        return 0;
+        return release(0);
     }
     decoder->out_color_space = JCS_RGB;
     jpeg_start_decompress(decoder);
     if (decoder->output_components != 3) {
         jpeg_destroy_decompress(decoder);
-        std::free(decoder);
-        std::free(error);
-        std::fclose(file);
-        return 0;
+        return release(0);
     }
 
     const JDIMENSION row_size = decoder->output_width * decoder->output_components;
     JSAMPARRAY row = (*decoder->mem->alloc_sarray)(
         reinterpret_cast<j_common_ptr>(decoder), JPOOL_IMAGE, row_size, 1);
     const size_t plane_size = static_cast<size_t>(bin_count);
-    std::fill(bins, bins + 3 * plane_size, 0);
+    if (bins) std::fill(bins, bins + 3 * plane_size, 0);
+    const JDIMENSION width = decoder->output_width;
     while (decoder->output_scanline < decoder->output_height) {
         jpeg_read_scanlines(decoder, row, 1);
-        for (JDIMENSION x = 0; x < decoder->output_width; ++x) {
+        for (JDIMENSION x = 0; x < width; ++x) {
             const unsigned char *pixel = row[0] + x * decoder->output_components;
+            const size_t column =
+                rgb ? static_cast<size_t>(x) * columns / width : 0;
             for (size_t channel = 0; channel < 3; ++channel) {
-                const size_t bin = static_cast<size_t>(pixel[channel]) * plane_size / 256;
-                int &count = bins[channel * plane_size + bin];
-                if (count < INT_MAX) ++count;
+                const size_t value = pixel[channel];
+                if (bins) {
+                    int &count = bins[channel * plane_size + value * plane_size / 256];
+                    if (count < INT_MAX) ++count;
+                }
+                if (rgb) {
+                    const size_t level = value * static_cast<size_t>(levels) / 256;
+                    const size_t cell =
+                        (static_cast<size_t>(levels - 1 - level) * columns + column) * 3;
+                    unsigned &count = counts[cell + channel];
+                    if (count < UINT_MAX) ++count;
+                }
             }
         }
     }
+    const double pixels_per_column =
+        rgb ? static_cast<double>(decoder->output_height) * width / columns : 0.0;
 
     jpeg_finish_decompress(decoder);
     jpeg_destroy_decompress(decoder);
-    std::free(decoder);
-    std::free(error);
-    std::fclose(file);
+    if (rgb) shade_waveform(counts, rgb, columns, levels, pixels_per_column);
+    return release(1);
+}
+
+extern "C" int orfeus_gui_preview_histogram(const char *path,
+                                            int *bins,
+                                            int bin_count) {
+    if (!bins) return 0;
+    return orfeus_gui_preview_scopes(path, bins, bin_count, nullptr, 0, 0);
+}
+
+// Blits a borrowed RGB8 buffer scaled into an absolute rectangle: the scope
+// views hand over one small image instead of thousands of filled rectangles.
+extern "C" int orfeus_gui_preview_draw_rgb_rect(long long widget_id,
+                                                const unsigned char *rgb,
+                                                int width,
+                                                int height,
+                                                int x,
+                                                int y,
+                                                int rect_width,
+                                                int rect_height) {
+    if (!rgb || width <= 0 || height <= 0 || rect_width <= 0 || rect_height <= 0) {
+        return 0;
+    }
+    Fl_Widget *widget = clfl_bridge::find_widget(widget_id);
+    if (!widget) return 0;
+    const int clip_x = std::max(x, widget->x());
+    const int clip_y = std::max(y, widget->y());
+    const int clip_right = std::min(x + rect_width, widget->x() + widget->w());
+    const int clip_bottom = std::min(y + rect_height, widget->y() + widget->h());
+    if (clip_right <= clip_x || clip_bottom <= clip_y) return 0;
+    Fl_RGB_Image image(rgb, width, height, 3);
+    image.scale(rect_width, rect_height, 0, 1);
+    fl_push_clip(clip_x, clip_y, clip_right - clip_x, clip_bottom - clip_y);
+    image.draw(x, y);
+    fl_pop_clip();
     return 1;
 }
 

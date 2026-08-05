@@ -31,6 +31,12 @@
   (path :string) (width :pointer) (height :pointer))
 (cffi:defcfun ("orfeus_gui_preview_histogram" %gui-preview-histogram) :int
   (path :string) (bins :pointer) (bin-count :int))
+(cffi:defcfun ("orfeus_gui_preview_scopes" %gui-preview-scopes) :int
+  (path :string) (bins :pointer) (bin-count :int)
+  (rgb :pointer) (columns :int) (levels :int))
+(cffi:defcfun ("orfeus_gui_preview_draw_rgb_rect" %gui-preview-draw-rgb-rect) :int
+  (widget-id :long-long) (rgb :pointer) (width :int) (height :int)
+  (x :int) (y :int) (rect-width :int) (rect-height :int))
 (cffi:defcfun ("orfeus_gui_preview_draw_buffer" %gui-preview-draw-buffer) :int
   (widget-id :long-long) (rgb :pointer) (width :int) (height :int)
   (generation :int) (zoom :double) (center-x :double) (center-y :double))
@@ -68,6 +74,45 @@
                          (cffi:mem-aref buffer :int
                                         (+ (* channel bins) index)))))))
         (values (plane 0) (plane 1) (plane 2))))))
+
+(defparameter *waveform-columns* 256
+  "Column bands across the frame's width in the waveform scope.")
+
+(defparameter *waveform-levels* 128
+  "Level rows in the waveform scope, row zero being the brightest.")
+
+(defun waveform-buffer-size ()
+  (* *waveform-columns* *waveform-levels* 3))
+
+(defun allocate-waveform-buffer ()
+  "Allocate one reusable RGB8 image for the waveform scope."
+  (cffi:foreign-alloc :unsigned-char :count (waveform-buffer-size)
+                                     :initial-element 0))
+
+(defun preview-scopes (pathname buffer &key (bins 64))
+  "Fill BUFFER with PATHNAME's waveform image; return its histogram planes.
+
+BUFFER must hold WAVEFORM-BUFFER-SIZE bytes. Returns the red, green, and
+blue level histograms, or NIL when the preview cannot be read."
+  (load-gui-preview-library)
+  (cffi:with-foreign-object (counts :int (* 3 bins))
+    (when (plusp (%gui-preview-scopes (namestring pathname) counts bins
+                                      buffer *waveform-columns*
+                                      *waveform-levels*))
+      (flet ((plane (channel)
+               (let ((vector (make-array bins)))
+                 (dotimes (index bins vector)
+                   (setf (aref vector index)
+                         (cffi:mem-aref counts :int
+                                        (+ (* channel bins) index)))))))
+        (values (plane 0) (plane 1) (plane 2))))))
+
+(defun draw-waveform (canvas buffer x y width height)
+  "Blit the waveform image in BUFFER into CANVAS's absolute rectangle."
+  (load-gui-preview-library)
+  (plusp (%gui-preview-draw-rgb-rect (cl-fltk:widget-id canvas) buffer
+                                     *waveform-columns* *waveform-levels*
+                                     x y width height)))
 
 (defun preview-file-size (pathname)
   "Return the decoded width and height of preview PATHNAME."
