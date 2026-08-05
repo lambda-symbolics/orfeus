@@ -118,6 +118,41 @@ when present, replaces the flat pipeline with an explicit node graph."
   (photos '()))
 
 (declaim (ftype (function (t) t) graph->sexp graph->render-sexp sexp->graph))
+(declaim (ftype (function (t) t) graph-copy))
+
+(defun copy-photo-job-deep (job)
+  "Return a PHOTO-JOB sharing no mutable structure with JOB."
+  (make-photo-job
+   :input-path (photo-job-input-path job)
+   :output-path (photo-job-output-path job)
+   :overrides (copy-list (photo-job-overrides job))
+   :disabled-stages (copy-list (photo-job-disabled-stages job))
+   :graph (let ((graph (photo-job-graph job)))
+            (when graph (graph-copy graph)))))
+
+(defun copy-processing-preset-deep (preset)
+  "Return a PROCESSING-PRESET sharing no mutable structure with PRESET."
+  (make-processing-preset
+   :name (processing-preset-name preset)
+   :settings (copy-processing-settings (processing-preset-settings preset))
+   :source-photo (processing-preset-source-photo preset)
+   :disabled-stages (copy-list (processing-preset-disabled-stages preset))
+   :graph (let ((graph (processing-preset-graph preset)))
+            (when graph (graph-copy graph)))))
+
+(defun copy-project-deep (project)
+  "Return a PROJECT sharing no mutable structure with PROJECT.
+
+Every setting value is a number, boolean, string, or pathname, so copying the
+structs and lists that hold them is enough to make the result independent.
+Editing one project can never be seen through the other, which is what lets a
+frontend keep undo snapshots."
+  (make-project
+   :output-directory (project-output-directory project)
+   :defaults (copy-processing-settings (project-defaults project))
+   :export-settings (copy-export-settings (project-export-settings project))
+   :presets (mapcar #'copy-processing-preset-deep (project-presets project))
+   :photos (mapcar #'copy-photo-job-deep (project-photos project))))
 
 (defun project-invalid (datum control &rest arguments)
   (error 'invalid-project-data

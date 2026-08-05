@@ -24,6 +24,105 @@
     (orfeus/gui:gui-model-reset-selected model)
     (check (null (orfeus:photo-job-overrides job)) "Reset did not clear overrides")))
 
+(defun test-undo-history ()
+  (let* ((job (orfeus:make-photo-job :input-path #P"one.orf"
+                                     :overrides '(:exposure 1.0)))
+         (project (orfeus:make-project :output-directory #P"exports/"
+                                       :photos (list job)))
+         (model (orfeus/gui:make-gui-model :project project))
+         (exposure (lambda ()
+                     (getf (orfeus:photo-job-overrides
+                            (orfeus/gui:gui-model-selected-job model))
+                           :exposure))))
+    (check (not (orfeus/gui:gui-model-can-undo-p model))
+           "A fresh model claimed something to undo")
+    ;; One discrete edit steps back and forward again.
+    (let ((orfeus/gui::*undo-coalesce-seconds* 0))
+      (orfeus/gui:gui-model-set-setting model :exposure 2.0)
+      (check (= 2.0 (funcall exposure)) "Edit did not take effect")
+      (check (orfeus/gui:gui-model-can-undo-p model) "Edit was not recorded")
+      (check (orfeus/gui:gui-model-undo model) "Undo refused a recorded edit")
+      (check (= 1.0 (funcall exposure)) "Undo did not restore the value")
+      (check (orfeus/gui:gui-model-can-redo-p model) "Undo offered no redo")
+      (check (orfeus/gui:gui-model-redo model) "Redo refused an undone edit")
+      (check (= 2.0 (funcall exposure)) "Redo did not reapply the value")
+      ;; A fresh edit abandons the redo branch.
+      (orfeus/gui:gui-model-undo model)
+      (orfeus/gui:gui-model-set-setting model :exposure 3.0)
+      (check (not (orfeus/gui:gui-model-can-redo-p model))
+             "A new edit kept a stale redo step")
+      ;; Distinct controls are distinct steps even back to back.
+      (orfeus/gui:gui-model-set-setting model :grain-amount 0.5)
+      (orfeus/gui:gui-model-undo model)
+      (check (and (null (getf (orfeus:photo-job-overrides
+                               (orfeus/gui:gui-model-selected-job model))
+                              :grain-amount))
+                  (= 3.0 (funcall exposure)))
+             "Undo of one control disturbed another"))
+    ;; Undo restores a copy, so the stack cannot be reached through the project.
+    (let ((depth (length (orfeus/gui::gui-model-undo-stack model))))
+      (setf (orfeus:photo-job-overrides
+             (orfeus/gui:gui-model-selected-job model))
+            '(:exposure 99.0))
+      (orfeus/gui:gui-model-undo model)
+      (check (/= 99.0 (funcall exposure))
+             "A snapshot shared structure with the live project")
+      (check (= (1- depth) (length (orfeus/gui::gui-model-undo-stack model)))
+             "Undo did not consume exactly one step")))
+  ;; A run of edits to one control is one undo, however many ticks it took.
+  (let* ((job (orfeus:make-photo-job :input-path #P"one.orf"))
+         (project (orfeus:make-project :output-directory #P"exports/"
+                                       :photos (list job)))
+         (model (orfeus/gui:make-gui-model :project project)))
+    (dotimes (tick 20)
+      (orfeus/gui:gui-model-set-setting model :exposure (/ tick 10.0)))
+    (check (= 1 (length (orfeus/gui::gui-model-undo-stack model)))
+           "A slider drag did not collapse into one undo step")
+    (orfeus/gui:gui-model-undo model)
+    (check (null (getf (orfeus:photo-job-overrides
+                        (orfeus/gui:gui-model-selected-job model))
+                       :exposure))
+           "Undoing a drag did not return to before the drag"))
+  ;; Adding a node and writing its parameters is one action, so it is one undo.
+  (let* ((job (orfeus:make-photo-job :input-path #P"one.orf"
+                                     :graph (orfeus:default-processing-graph)))
+         (project (orfeus:make-project :output-directory #P"exports/"
+                                       :photos (list job)))
+         (model (orfeus/gui:make-gui-model :project project))
+         (before (length (orfeus:processing-graph-nodes
+                          (orfeus:photo-job-graph job)))))
+    (orfeus/gui:gui-model-add-node model :exposure)
+    (check (= 1 (length (orfeus/gui::gui-model-undo-stack model)))
+           "Adding a node recorded more than one step")
+    (let ((node (orfeus/gui:gui-model-selected-node model)))
+      (check node "Adding a node did not select it")
+      (orfeus/gui:gui-model-undo model)
+      (check (= before (length (orfeus:processing-graph-nodes
+                                (orfeus:photo-job-graph
+                                 (orfeus/gui:gui-model-selected-job model)))))
+             "Undo did not remove the added node")
+      (orfeus/gui:gui-model-redo model)
+      ;; The restored graph holds different objects, so the selection has to be
+      ;; recovered by id rather than by identity.
+      (let ((restored (orfeus/gui:gui-model-selected-node model)))
+        (check restored "Redo lost the node selection")
+        (check (= (orfeus:graph-node-id node) (orfeus:graph-node-id restored))
+               "Redo selected a different node than the edit had"))))
+  ;; History is bounded, and opening something else starts a new session.
+  (let* ((project (orfeus:make-project
+                   :output-directory #P"exports/"
+                   :photos (list (orfeus:make-photo-job :input-path #P"one.orf"))))
+         (model (orfeus/gui:make-gui-model :project project))
+         (orfeus/gui::*undo-coalesce-seconds* 0)
+         (orfeus/gui::*undo-depth* 4))
+    (dotimes (step 10)
+      (orfeus/gui:gui-model-set-setting model :exposure (float step)))
+    (check (= 4 (length (orfeus/gui::gui-model-undo-stack model)))
+           "History grew past its depth limit")
+    (orfeus/gui::gui-model-replace-project model (orfeus/gui::gui-empty-project))
+    (check (not (orfeus/gui:gui-model-can-undo-p model))
+           "Opening a project left the previous one's history behind")))
+
 (defun test-preset-bulk-application ()
   (let* ((jobs (loop for name in '("one" "two" "three")
                      collect (orfeus:make-photo-job
@@ -1006,6 +1105,7 @@
 (defun run-tests ()
   (test-lightfast-root-layout-and-export-validation)
   (test-model-settings)
+  (test-undo-history)
   (test-preset-bulk-application)
   (test-grade-workflow)
   (test-node-graph-model)

@@ -1,5 +1,49 @@
 (in-package #:orfeus/tests)
 
+(defun project-deep-copy-is-independent-p ()
+  "A deep project copy must share no structure an edit could reach."
+  (let* ((graph (orfeus:default-processing-graph))
+         (job (orfeus:make-photo-job :input-path #P"one.orf"
+                                     :overrides '(:exposure 1.0)
+                                     :disabled-stages '(:film)
+                                     :graph graph))
+         (preset (orfeus:make-processing-preset
+                  :name "look"
+                  :settings (orfeus:make-processing-settings :exposure 0.5)
+                  :disabled-stages '(:optics)
+                  :graph (orfeus:graph-copy graph)))
+         (project (orfeus:make-project :output-directory #P"exports/"
+                                       :defaults (orfeus:make-processing-settings
+                                                  :exposure 2.0)
+                                       :presets (list preset)
+                                       :photos (list job)))
+         (copy (orfeus:copy-project-deep project)))
+    ;; Mutate every mutable place in the original.
+    (setf (orfeus:photo-job-overrides job) '(:exposure 9.0)
+          (orfeus:photo-job-disabled-stages job) '()
+          (orfeus:processing-settings-exposure (orfeus:project-defaults project)) 9.0
+          (orfeus:processing-preset-disabled-stages preset) '()
+          (orfeus:processing-settings-exposure
+           (orfeus:processing-preset-settings preset)) 9.0)
+    (dolist (node (orfeus:processing-graph-nodes graph))
+      (setf (orfeus:graph-node-bypassed-p node) t))
+    (let ((copied-job (first (orfeus:project-photos copy)))
+          (copied-preset (first (orfeus:project-presets copy))))
+      (and (equal '(:exposure 1.0) (orfeus:photo-job-overrides copied-job))
+           (equal '(:film) (orfeus:photo-job-disabled-stages copied-job))
+           (= 2.0 (orfeus:processing-settings-exposure
+                   (orfeus:project-defaults copy)))
+           (equal '(:optics) (orfeus:processing-preset-disabled-stages
+                              copied-preset))
+           (= 0.5 (orfeus:processing-settings-exposure
+                   (orfeus:processing-preset-settings copied-preset)))
+           (notany #'orfeus:graph-node-bypassed-p
+                   (orfeus:processing-graph-nodes
+                    (orfeus:photo-job-graph copied-job)))
+           (notany #'orfeus:graph-node-bypassed-p
+                   (orfeus:processing-graph-nodes
+                    (orfeus:processing-preset-graph copied-preset)))))))
+
 (defun test-temporary-pathname (suffix)
   (merge-pathnames
    (format nil "orfeus-test-~D-~D.~A"
@@ -1438,6 +1482,8 @@
              (and (stringp (orfeus-version))
                   (plusp (length (orfeus-version)))))
       (check "project S-expressions round trip" (project-round-trip-p))
+      (check "deep project copies share nothing an edit can reach"
+             (project-deep-copy-is-independent-p))
       (check "project files round trip" (project-file-round-trip-p))
       (check "export settings round trip" (export-settings-round-trip-p))
       (check "processing presets round trip" (processing-presets-round-trip-p))

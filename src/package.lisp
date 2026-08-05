@@ -81,6 +81,9 @@
    #:processing-graph
    #:make-processing-graph
    #:copy-processing-graph
+   #:copy-project-deep
+   #:copy-photo-job-deep
+   #:copy-processing-preset-deep
    #:processing-graph-nodes
    #:processing-graph-output
    #:graph-validate

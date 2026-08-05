@@ -36,6 +36,9 @@
            #:gui-model-selected-index #:gui-model-selected-indices
            #:gui-model-selected-job #:gui-model-selected-jobs
            #:gui-model-selected-node
+           #:gui-model-undo #:gui-model-redo
+           #:gui-model-can-undo-p #:gui-model-can-redo-p
+           #:gui-model-checkpoint #:gui-model-clear-history
            #:gui-model-selected-settings #:gui-model-set-selected-indices
            #:gui-model-set-node-params
            #:gui-model-setting #:gui-model-set-setting

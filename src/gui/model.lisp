@@ -10,7 +10,125 @@ renumbering, so the selection stays valid across graph edits."
   (selected-indices '() :type list)
   (edit-target :photo :type (member :photo :defaults))
   (selected-node nil)
-  project-path)
+  project-path
+  (undo-stack '() :type list)
+  (redo-stack '() :type list))
+
+(defparameter *undo-depth* 64
+  "Edits kept for undo. Each entry copies the project, so this bounds memory.")
+
+(defparameter *undo-coalesce-seconds* 3/2
+  "Window within which repeated edits of the same control share one undo entry.
+
+Dragging a slider calls GUI-MODEL-SET-SETTING on every tick; without this each
+tick would become its own undo step and one drag would take a hundred undos to
+reverse.")
+
+(defstruct (gui-snapshot (:constructor %make-gui-snapshot))
+  "One reversible point in the editing session.
+
+SELECTED-NODE is recorded by id rather than by identity: restoring rebuilds the
+graph, so the node objects differ even though their ids do not."
+  project
+  (selected-index 0 :type fixnum)
+  (selected-indices '() :type list)
+  (edit-target :photo :type (member :photo :defaults))
+  selected-node-id
+  coalesce-key
+  (time 0))
+
+(defun gui-model-snapshot (model &optional coalesce-key)
+  "Capture MODEL's reversible state."
+  (%make-gui-snapshot
+   :project (orfeus:copy-project-deep (gui-model-project model))
+   :selected-index (gui-model-selected-index model)
+   :selected-indices (copy-list (gui-model-selected-indices model))
+   :edit-target (gui-model-edit-target model)
+   :selected-node-id (let ((node (gui-model-selected-node model)))
+                       (and node (orfeus:graph-node-id node)))
+   :coalesce-key coalesce-key
+   :time (get-internal-real-time)))
+
+(defun gui-snapshot-supersedes-p (snapshot coalesce-key)
+  "True when a new edit under COALESCE-KEY belongs to SNAPSHOT's edit already."
+  (and coalesce-key
+       snapshot
+       (equal (gui-snapshot-coalesce-key snapshot) coalesce-key)
+       (< (- (get-internal-real-time) (gui-snapshot-time snapshot))
+          (* *undo-coalesce-seconds* internal-time-units-per-second))))
+
+(defvar *inside-model-edit* nil
+  "True while an edit that has already recorded its undo entry is running.
+
+A few model mutators are built from others — setting a control on a graph-graded
+photo adds a node and writes its parameters. Binding this around those inner
+calls keeps one user action to one undo step, and keeps the recorded state the
+one from before the action rather than from halfway through it.")
+
+(defun gui-model-checkpoint (model &optional coalesce-key)
+  "Record MODEL's current state so GUI-MODEL-UNDO can return to it.
+
+Call this immediately before mutating. Consecutive edits sharing COALESCE-KEY
+collapse into the entry already on the stack, so one slider drag is one undo.
+Returns true when a new entry was pushed."
+  (cond
+    (*inside-model-edit* nil)
+    ((gui-snapshot-supersedes-p (first (gui-model-undo-stack model)) coalesce-key)
+     ;; The stack already holds the state before this run of edits started;
+     ;; keep it and let the run stay one step. Redo is still discarded: the
+     ;; edit continues to diverge from whatever was undone.
+     (setf (gui-model-redo-stack model) '())
+     nil)
+    (t
+     (push (gui-model-snapshot model coalesce-key) (gui-model-undo-stack model))
+     (let ((stack (gui-model-undo-stack model)))
+       (when (> (length stack) *undo-depth*)
+         (setf (gui-model-undo-stack model) (subseq stack 0 *undo-depth*))))
+     (setf (gui-model-redo-stack model) '())
+     t)))
+
+(defun gui-model-clear-history (model)
+  "Forget every undo and redo step, as when a different project is opened."
+  (setf (gui-model-undo-stack model) '()
+        (gui-model-redo-stack model) '())
+  model)
+
+(defun gui-model-can-undo-p (model)
+  (and (gui-model-undo-stack model) t))
+
+(defun gui-model-can-redo-p (model)
+  (and (gui-model-redo-stack model) t))
+
+(defun gui-model-restore (model snapshot)
+  "Make SNAPSHOT current, leaving SNAPSHOT itself reusable."
+  (setf (gui-model-project model)
+        (orfeus:copy-project-deep (gui-snapshot-project snapshot))
+        (gui-model-selected-index model) (gui-snapshot-selected-index snapshot)
+        (gui-model-selected-indices model)
+        (copy-list (gui-snapshot-selected-indices snapshot))
+        (gui-model-edit-target model) (gui-snapshot-edit-target snapshot))
+  (setf (gui-model-selected-node model)
+        (let ((id (gui-snapshot-selected-node-id snapshot))
+              (job (gui-model-selected-job model)))
+          (when (and id job (photo-job-graph job))
+            (orfeus:graph-find-node (photo-job-graph job) id))))
+  model)
+
+(defun gui-model-undo (model)
+  "Step back one edit. Returns true when there was one to step back to."
+  (let ((previous (pop (gui-model-undo-stack model))))
+    (when previous
+      (push (gui-model-snapshot model) (gui-model-redo-stack model))
+      (gui-model-restore model previous)
+      t)))
+
+(defun gui-model-redo (model)
+  "Step forward one undone edit. Returns true when there was one."
+  (let ((next (pop (gui-model-redo-stack model))))
+    (when next
+      (push (gui-model-snapshot model) (gui-model-undo-stack model))
+      (gui-model-restore model next)
+      t)))
 
 (defun gui-bundled-lut-paths ()
   "Return bundled CUBE LUT pathnames in stable display order."
@@ -66,6 +184,7 @@ renumbering, so the selection stays valid across graph edits."
         (gui-model-selected-indices model)
         (if (project-photos project) '(0) '())
         (gui-model-edit-target model) :photo)
+  (gui-model-clear-history model)
   model)
 
 (defun gui-model-set-selected-indices (model indices)
@@ -92,6 +211,7 @@ renumbering, so the selection stays valid across graph edits."
 
 (defun gui-model-add-photos (model pathnames)
   "Append unique PATHNAMES to MODEL's project and select the first addition."
+  (gui-model-checkpoint model)
   (let* ((project (gui-model-project model))
          (photos (project-photos project))
          (existing (mapcar #'photo-job-input-path photos))
@@ -117,6 +237,7 @@ renumbering, so the selection stays valid across graph edits."
 
 (defun gui-model-remove-selected (model)
   "Remove and return MODEL's selected photo jobs, safely clamping selection."
+  (gui-model-checkpoint model)
   (let* ((project (gui-model-project model))
          (photos (project-photos project))
          (indices (or (gui-model-selected-indices model)
@@ -151,6 +272,7 @@ renumbering, so the selection stays valid across graph edits."
 
 (defun gui-model-save-preset (model name)
   "Save selected effective settings under NAME, replacing a same-named preset."
+  (gui-model-checkpoint model)
   (let* ((trimmed (string-trim '(#\Space #\Tab #\Newline #\Return) name))
          (project (gui-model-project model)))
     (unless (plusp (length trimmed))
@@ -185,8 +307,10 @@ override semantics."
                        :test #'string-equal :key #'processing-preset-name)))
     (unless preset
       (error "Unknown preset ~S." name))
+    (gui-model-checkpoint model)
     (if (orfeus:processing-preset-graph preset)
-        (gui-model-apply-preset-graph model preset)
+        (let ((*inside-model-edit* t))
+          (gui-model-apply-preset-graph model preset))
         (let ((overrides (orfeus::processing-settings->sexp
                           (processing-preset-settings preset)))
               (jobs (gui-model-acting-jobs model)))
@@ -289,7 +413,9 @@ chain, exactly like adding a node before dragging its slider."
   (when (member key '(:lens-correction-p
                       :chromatic-aberration-correction-p))
     (setf value (gui-boolean-value value)))
-  (cond
+  (gui-model-checkpoint model (list :setting key))
+  (let ((*inside-model-edit* t))
+   (cond
     ((eq (gui-model-edit-target model) :defaults)
      (set-default-setting (project-defaults (gui-model-project model))
                           key value))
@@ -302,7 +428,7 @@ chain, exactly like adding a node before dragging its slider."
                                                (stage-of-setting-key key)))))
              (gui-model-set-node-params model node (list key value)))
            (setf (photo-job-overrides job)
-                 (plist-put (photo-job-overrides job) key value))))))
+                 (plist-put (photo-job-overrides job) key value)))))))
   value)
 
 (defun gui-model-acting-jobs (model)
@@ -313,6 +439,7 @@ chain, exactly like adding a node before dragging its slider."
 
 (defun gui-model-reset-selected (model)
   "Clear overrides, stage bypasses, and node graphs from selected photos."
+  (gui-model-checkpoint model)
   (dolist (job (gui-model-acting-jobs model))
     (setf (photo-job-overrides job) '()
           (orfeus:photo-job-disabled-stages job) '()
@@ -338,6 +465,7 @@ chain, exactly like adding a node before dragging its slider."
 (defun gui-model-toggle-stage (model stage)
   "Toggle STAGE bypass across the selection; primary photo decides direction.
 Returns :BYPASSED, :ENABLED, or :NONE without a photograph."
+  (gui-model-checkpoint model)
   (let ((jobs (gui-model-acting-jobs model)))
     (if (null jobs)
         :none
@@ -383,6 +511,7 @@ Returns :BYPASSED, :ENABLED, or :NONE without a photograph."
 
 The still stores the full node graph (deriving one for flat photos), so
 applying it reproduces the grade node for node."
+  (gui-model-checkpoint model)
   (let ((job (gui-model-selected-job model)))
     (when job
       (let* ((project (gui-model-project model))
@@ -404,6 +533,7 @@ applying it reproduces the grade node for node."
 
 (defun gui-model-paste-grade (model grade disabled-stages)
   "Apply GRADE and DISABLED-STAGES to every selected photo; return the count."
+  (gui-model-checkpoint model)
   (let ((jobs (gui-model-acting-jobs model)))
     (dolist (job jobs)
       (orfeus:photo-job-apply-grade job grade disabled-stages))
@@ -424,6 +554,8 @@ Photographs still on flat settings get an equivalent throwaway graph."
 (defun gui-model-ensure-graph (model)
   "Convert the selected photo to graph grading when it is still flat."
   (let ((job (gui-model-selected-job model)))
+    (when (and job (null (photo-job-graph job)))
+      (gui-model-checkpoint model))
     (when job
       (or (photo-job-graph job)
           (let ((graph (orfeus:settings->graph
@@ -466,7 +598,9 @@ downstream node of that stage."
 Without AFTER, film nodes append at the output and every other kind lands at
 the end of the scene-linear chain. Signals INVALID-PROJECT-DATA when the
 placement breaks the film-domain rules."
-  (let ((graph (gui-model-ensure-graph model)))
+  (gui-model-checkpoint model)
+  (let ((graph (let ((*inside-model-edit* t))
+                 (gui-model-ensure-graph model))))
     (when graph
       (let* ((after-id (or after
                            (if (eq kind :film)
@@ -479,6 +613,7 @@ placement breaks the film-domain rules."
 
 (defun gui-model-delete-node (model node)
   "Delete NODE from the selected photo's graph."
+  (gui-model-checkpoint model)
   (let ((job (gui-model-selected-job model)))
     (when (and job (photo-job-graph job))
       (orfeus:graph-delete-node (photo-job-graph job)
@@ -489,6 +624,7 @@ placement breaks the film-domain rules."
 
 (defun gui-model-move-node (model node direction)
   "Move NODE one step :EARLIER or :LATER along its chain; true on success."
+  (gui-model-checkpoint model)
   (let ((job (gui-model-selected-job model)))
     (when (and job (photo-job-graph job))
       (let ((graph (photo-job-graph job)))
@@ -505,6 +641,7 @@ placement breaks the film-domain rules."
 
 (defun gui-model-set-node-kind (model node kind)
   "Assign a correction KIND to NODE on the selected photo's graph."
+  (gui-model-checkpoint model)
   (let* ((job (gui-model-selected-job model))
          (graph (and job (photo-job-graph job))))
     (when (and graph
@@ -513,6 +650,7 @@ placement breaks the film-domain rules."
 
 (defun gui-model-set-primary-input (model node input-id)
   "Point NODE's primary input at INPUT-ID on the selected photo's graph."
+  (gui-model-checkpoint model)
   (let* ((job (gui-model-selected-job model))
          (graph (and job (photo-job-graph job))))
     (when (and graph
@@ -522,6 +660,7 @@ placement breaks the film-domain rules."
 
 (defun gui-model-set-output (model node)
   "Make NODE the selected photo's graph output."
+  (gui-model-checkpoint model)
   (let* ((job (gui-model-selected-job model))
          (graph (and job (photo-job-graph job))))
     (when (and graph
@@ -533,6 +672,7 @@ placement breaks the film-domain rules."
 
 Returns true when the graph changed; invalid placements signal after the
 core rolls the graph back."
+  (gui-model-checkpoint model)
   (let* ((job (gui-model-selected-job model))
          (graph (and job (photo-job-graph job))))
     (when (and graph
@@ -542,6 +682,7 @@ core rolls the graph back."
 
 (defun gui-model-set-blend-input (model blend source-node)
   "Point BLEND's second branch at SOURCE-NODE (or NIL for the source)."
+  (gui-model-checkpoint model)
   (let* ((job (gui-model-selected-job model))
          (graph (and job (photo-job-graph job))))
     (when (and graph
@@ -554,13 +695,14 @@ core rolls the graph back."
 
 (defun gui-model-toggle-node (model node)
   "Toggle NODE's bypass; returns :BYPASSED or :ENABLED."
-  (declare (ignore model))
+  (gui-model-checkpoint model)
   (setf (orfeus:graph-node-bypassed-p node)
         (not (orfeus:graph-node-bypassed-p node)))
   (if (orfeus:graph-node-bypassed-p node) :bypassed :enabled))
 
 (defun gui-model-set-node-params (model node new-params)
   "Merge NEW-PARAMS into NODE's parameters, validating the graph."
+  (gui-model-checkpoint model (list :node-params (orfeus:graph-node-id node)))
   (let* ((job (gui-model-selected-job model))
          (graph (and job (photo-job-graph job)))
          (previous (orfeus:graph-node-params node)))
@@ -591,6 +733,7 @@ core rolls the graph back."
 
 BYPASS-KINDS lists node kinds switched off in the applied copies, so a grade
 can be taken without, say, its optics or white balance. Returns the count."
+  (gui-model-checkpoint model)
   (let ((jobs (gui-model-acting-jobs model))
         (template (if bypass-kinds
                       (graph-with-bypassed-kinds graph bypass-kinds)
@@ -609,8 +752,10 @@ can be taken without, say, its optics or white balance. Returns the count."
 
 (defun gui-model-apply-preset-graph (model preset &key bypass-kinds)
   "Apply PRESET's node graph to the whole selection; returns the count."
-  (gui-model-paste-graph model (gui-model-preset-graph preset)
-                         :bypass-kinds bypass-kinds))
+  (gui-model-checkpoint model)
+  (let ((*inside-model-edit* t))
+    (gui-model-paste-graph model (gui-model-preset-graph preset)
+                           :bypass-kinds bypass-kinds)))
 
 (defun gui-photo-output-path (model job)
   "Return JOB's render output using the shared core project semantics."

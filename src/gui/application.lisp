@@ -1837,6 +1837,27 @@ new cache entry is published."
                      (set-status (format nil "Copied ~D source path~:P"
                                          (length jobs))))
                    (set-status "No photographs selected"))))
+           (step-history (direction)
+             ;; Undo and redo restore the whole project, so every view that
+             ;; reads it has to be told, not just the one the edit came from.
+             (if (funcall (ecase direction
+                            (:undo #'gui-model-undo)
+                            (:redo #'gui-model-redo))
+                          model)
+                 (progn
+                   (sync-controls)
+                   (sync-node-tools)
+                   (sync-export-controls)
+                   (when graph-canvas (lightfast:redraw graph-canvas))
+                   (refresh-gallery)
+                   (redraw-thumbnails)
+                   (schedule-edited-preview)
+                   (set-status (ecase direction
+                                 (:undo "Undid one edit")
+                                 (:redo "Redid one edit"))))
+                 (set-status (ecase direction
+                               (:undo "Nothing left to undo")
+                               (:redo "Nothing left to redo")))))
            (reset-selected-photo-edits ()
              (let ((count (length (gui-model-acting-jobs model))))
                (if (plusp count)
@@ -4314,6 +4335,17 @@ new cache entry is published."
                                                     (declare (ignore ignored))
                                                     (lightfast:quit))
                                :shortcut (logior +menu-ctrl+ (char-code #\q)))
+        (lightfast:add-menu-item menu "Edit/Undo"
+                               (lambda (&rest ignored)
+                                 (declare (ignore ignored))
+                                 (step-history :undo))
+                               :shortcut (logior +menu-ctrl+ (char-code #\z)))
+        (lightfast:add-menu-item menu "Edit/Redo"
+                               (lambda (&rest ignored)
+                                 (declare (ignore ignored))
+                                 (step-history :redo))
+                               :shortcut (logior +menu-ctrl+ +menu-shift+
+                                                 (char-code #\z)))
         (lightfast:add-menu-item menu "Edit/Copy Grade"
                                (lambda (&rest ignored)
                                  (declare (ignore ignored))
