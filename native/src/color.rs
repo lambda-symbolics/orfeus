@@ -168,19 +168,18 @@ fn reconstruct_clipped<const N: usize>(camera: &[f32; N], balanced: &mut [f32; N
     }
 }
 
+/// White balance, highlight reconstruction, and the camera matrix, per pixel.
+///
+/// This stage stays on the CPU deliberately, though it looks like an obvious
+/// compute dispatch: every pixel is independent and there are no neighbours to
+/// gather. It is pure multiply-add, so the CPU is already memory-bandwidth-bound
+/// running it and gets the arithmetic essentially free, while a dispatch has to
+/// move the same bytes plus a host copy each way. A shader for it measured
+/// 84.3 ms at 20 MP on a 13700H's Iris Xe against 25.6 ms here, and 31 seconds
+/// on the same machine's RTX 2000 across PCIe. Only stages with real arithmetic
+/// per byte — the tone transfer's `pow`, for one — repay the round trip.
 fn transform_pixels<const N: usize>(
     pixels: Vec<[f32; N]>,
-    white_balance: &[f32; N],
-    matrix: &[[f32; N]; 3],
-) -> Vec<f32> {
-    if let Some(output) = gpu_transform_pixels(&pixels, white_balance, matrix) {
-        return output;
-    }
-    cpu_transform_pixels(&pixels, white_balance, matrix)
-}
-
-pub(crate) fn cpu_transform_pixels<const N: usize>(
-    pixels: &[[f32; N]],
     white_balance: &[f32; N],
     matrix: &[[f32; N]; 3],
 ) -> Vec<f32> {
@@ -202,104 +201,6 @@ pub(crate) fn cpu_transform_pixels<const N: usize>(
             }
         });
     output
-}
-
-/// Runs the camera transform as a compute dispatch, or returns `None` so the
-/// caller uses the CPU path.
-///
-/// The stage is a white-balance multiply, a highlight reconstruction, and a
-/// 3xN matrix per pixel: no neighbours, no branches worth speaking of, and a
-/// whole frame's worth of independent work, which is exactly what a compute
-/// dispatch is for. It runs once per decode over the full-resolution image, so
-/// it lands on cold opens and on every export.
-fn gpu_transform_pixels<const N: usize>(
-    pixels: &[[f32; N]],
-    white_balance: &[f32; N],
-    matrix: &[[f32; N]; 3],
-) -> Option<Vec<f32>> {
-    use super::render::{
-        GpuStatus, gpu_active_notice, gpu_disabled_notice, gpu_fallback_notice,
-        report_gpu_status_once,
-    };
-    // Below a quarter-megapixel the dispatch overhead — command recording,
-    // submission, and the fence wait — costs more than the CPU pass it would
-    // replace, so thumbnails and unit tests stay on the CPU.
-    const PIXEL_THRESHOLD: usize = 1 << 18;
-    if pixels.len() < PIXEL_THRESHOLD {
-        return None;
-    }
-    if !super::gpu::requested() {
-        report_gpu_status_once(gpu_disabled_notice(), GpuStatus::Disabled);
-        return None;
-    }
-    let mut gains = [0.0_f32; 4];
-    gains[..N].copy_from_slice(white_balance);
-    let mut rows = [[0.0_f32; 4]; 3];
-    for (padded, row) in rows.iter_mut().zip(matrix) {
-        padded[..N].copy_from_slice(row);
-    }
-    let camera = pixels.as_flattened();
-    let profiling = std::env::var_os("ORFEUS_PROFILE").is_some();
-    let attempt = std::panic::catch_unwind(|| {
-        super::gpu::camera_to_linear_srgb(camera, N, gains, rows, CLIP_ONSET)
-    });
-    match attempt {
-        Ok(Ok((output, dispatch))) => {
-            report_gpu_status_once(
-                gpu_active_notice(),
-                GpuStatus::Active(&dispatch.adapter_name),
-            );
-            if profiling {
-                eprintln!(
-                    "orfeus-profile gpu-stage=camera-matrix adapter={:?} milliseconds={:.3}",
-                    dispatch.adapter_name, dispatch.milliseconds
-                );
-            }
-            Some(output)
-        }
-        Ok(Err(error)) => {
-            report_gpu_status_once(gpu_fallback_notice(), GpuStatus::Unavailable(&error));
-            if profiling {
-                eprintln!("orfeus-profile gpu-stage=camera-matrix fallback=cpu error={error:?}");
-            }
-            None
-        }
-        Err(_) => {
-            report_gpu_status_once(
-                gpu_fallback_notice(),
-                GpuStatus::Unavailable("the Vulkan backend panicked"),
-            );
-            if profiling {
-                eprintln!("orfeus-profile gpu-stage=camera-matrix fallback=cpu error=panic");
-            }
-            None
-        }
-    }
-}
-
-/// The single-threaded CPU reference for the camera stage, for GPU agreement
-/// tests and benchmarks. `camera` is interleaved by `white_balance.len()`.
-#[cfg(test)]
-pub(crate) fn camera_to_linear_srgb_reference<const N: usize>(
-    camera: &[f32],
-    white_balance: &[f32],
-    matrix: &[[f32; N]; 3],
-) -> Vec<f32> {
-    camera
-        .chunks_exact(N)
-        .flat_map(|pixel| {
-            let pixel: [f32; N] = std::array::from_fn(|channel| pixel[channel]);
-            let mut balanced: [f32; N] =
-                std::array::from_fn(|channel| pixel[channel] * white_balance[channel]);
-            reconstruct_clipped(&pixel, &mut balanced);
-            matrix.map(|row| {
-                row.iter()
-                    .zip(&balanced)
-                    .map(|(coefficient, channel)| coefficient * channel)
-                    .sum::<f32>()
-            })
-        })
-        .collect()
 }
 
 /// Converts demosaiced camera channels to white-balanced, unclipped linear sRGB.

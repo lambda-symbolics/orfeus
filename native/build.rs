@@ -2,7 +2,7 @@ use std::env;
 use std::path::PathBuf;
 use std::process::Command;
 
-const STAGES: [&str; 2] = ["tone_transfer", "camera_matrix"];
+const STAGES: [&str; 1] = ["tone_transfer"];
 
 fn main() {
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR"));
