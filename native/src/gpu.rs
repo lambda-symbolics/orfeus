@@ -1215,10 +1215,21 @@ mod tests {
             .collect();
         let white_balance = [2.2, 1.0, 1.5, 0.0];
         let rows = [[1.7, -0.6, -0.1], [-0.2, 1.4, -0.2], [0.0, -0.4, 1.4_f32]];
-        let started = Instant::now();
-        let cpu =
-            crate::color::camera_to_linear_srgb_reference(&camera, &white_balance[..3], &rows);
-        let cpu_ms = started.elapsed().as_secs_f64() * 1000.0;
+        // Compare against the production CPU path, which is rayon-parallel: a
+        // single-threaded reference would flatter the GPU on a many-core host.
+        let interleaved: Vec<[f32; 3]> = camera
+            .chunks_exact(3)
+            .map(|pixel| [pixel[0], pixel[1], pixel[2]])
+            .collect();
+        let balance: [f32; 3] = [white_balance[0], white_balance[1], white_balance[2]];
+        let mut cpu_times = Vec::new();
+        let mut cpu = Vec::new();
+        for _ in 0..5 {
+            let started = Instant::now();
+            cpu = crate::color::cpu_transform_pixels(&interleaved, &balance, &rows);
+            cpu_times.push(started.elapsed().as_secs_f64() * 1000.0);
+        }
+        cpu_times.sort_by(f64::total_cmp);
         let padded = [
             [rows[0][0], rows[0][1], rows[0][2], 0.0],
             [rows[1][0], rows[1][1], rows[1][2], 0.0],
@@ -1227,7 +1238,7 @@ mod tests {
         let mut warm_times = Vec::new();
         let mut max_error = 0.0_f32;
         let mut adapter_name = String::new();
-        for _ in 0..3 {
+        for _ in 0..5 {
             let (gpu, profile) =
                 camera_to_linear_srgb(&camera, 3, white_balance, padded, crate::color::CLIP_ONSET)
                     .expect("Vulkan camera matrix dispatch");
@@ -1242,8 +1253,10 @@ mod tests {
         }
         warm_times.sort_by(f64::total_cmp);
         eprintln!(
-            "camera-matrix-benchmark pixels={pixels} cpu_ms={cpu_ms:.3} gpu_warm_with_transfer_ms={warm_times:?} gpu_warm_median_ms={:.3} adapter={adapter_name:?} max_error={max_error}",
-            warm_times[1]
+            "camera-matrix-benchmark pixels={pixels} threads={} cpu_ms={cpu_times:?} cpu_median_ms={:.3} gpu_ms={warm_times:?} gpu_median_ms={:.3} adapter={adapter_name:?} max_error={max_error}",
+            rayon::current_num_threads(),
+            cpu_times[2],
+            warm_times[2]
         );
         assert!(max_error <= 1.0e-4, "GPU maximum error {max_error}");
     }

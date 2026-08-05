@@ -176,6 +176,14 @@ fn transform_pixels<const N: usize>(
     if let Some(output) = gpu_transform_pixels(&pixels, white_balance, matrix) {
         return output;
     }
+    cpu_transform_pixels(&pixels, white_balance, matrix)
+}
+
+pub(crate) fn cpu_transform_pixels<const N: usize>(
+    pixels: &[[f32; N]],
+    white_balance: &[f32; N],
+    matrix: &[[f32; N]; 3],
+) -> Vec<f32> {
     use rayon::prelude::*;
     let mut output = vec![0.0_f32; pixels.len() * 3];
     output
