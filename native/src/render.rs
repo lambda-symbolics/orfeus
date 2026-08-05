@@ -2390,6 +2390,40 @@ pub fn render(
 
 #[cfg(test)]
 mod tests {
+    /// Times the noise reduction at export resolution, isolating it from decode
+    /// and encode. Used to measure scratch-buffer handling, which is invisible
+    /// in an end-to-end render's noise.
+    #[test]
+    #[ignore = "prints machine-specific timings"]
+    fn benchmark_noise_reduction_at_export_resolution() {
+        let (width, height) = (5184, 3888);
+        let source: Vec<f32> = (0..width * height * 3)
+            .map(|index| {
+                let ripple = ((index % 11) as f32 - 5.0) * 0.008;
+                (0.3 + ripple + (index % 1409) as f32 / 4000.0).max(0.0)
+            })
+            .collect();
+        let mut times = Vec::new();
+        for _ in 0..5 {
+            let mut image = RgbImage {
+                width,
+                height,
+                data: source.clone(),
+            };
+            let started = std::time::Instant::now();
+            cpu_noise_reduction(&mut image, 0.35, 0.35);
+            times.push(started.elapsed().as_secs_f64() * 1000.0);
+            assert!(image.data.iter().all(|value| value.is_finite()));
+        }
+        times.sort_by(f64::total_cmp);
+        eprintln!(
+            "noise-reduction-benchmark pixels={} threads={} ms={times:?} median={:.1}",
+            width * height,
+            rayon::current_num_threads(),
+            times[2]
+        );
+    }
+
     use super::*;
     use image::{ImageDecoder, ImageReader};
     use std::io::Cursor;
