@@ -577,8 +577,57 @@ type StagePoint = (usize, u32);
 const STAGE_ENTRY: u32 = 0;
 const STAGE_FILM_GRAIN: u32 = 1;
 
-/// Cache key: input path, decoded dimensions, bounded render dimensions.
-pub(crate) type PrefixKey = (String, usize, usize, u32, u32, usize);
+/// Render context and external resources that can affect a cached checkpoint.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PrefixContextKey {
+    make: String,
+    model: String,
+    lens_name: String,
+    focal_bits: u32,
+    explicit_profile: Option<String>,
+    focal_reducer_bits: u32,
+    crop_factor_bits: u32,
+    grain_seed: u64,
+    orientation: u16,
+    film_luts: Vec<(String, render::DecodeCacheKey)>,
+}
+
+/// Cache key: input identity, bounded render dimensions, and every dependency
+/// that can affect an intermediate graph checkpoint.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PrefixKey {
+    input_path: String,
+    decoded_width: usize,
+    decoded_height: usize,
+    max_width: u32,
+    max_height: u32,
+    source_identity: render::DecodeCacheKey,
+    context: PrefixContextKey,
+}
+
+fn prefix_context_key(
+    ops: &[GraphOp],
+    context: &GraphContext<'_>,
+) -> Result<PrefixContextKey, Error> {
+    let film_luts = ops
+        .iter()
+        .filter(|op| op.kind == NODE_FILM && op.params[0] > 0.0)
+        .filter_map(|op| op.text.as_ref())
+        .map(|path| Ok((path.clone(), render::file_content_digest(Path::new(path))?)))
+        .collect::<Result<Vec<_>, Error>>()?;
+    Ok(PrefixContextKey {
+        make: context.make.to_owned(),
+        model: context.model.to_owned(),
+        lens_name: context.lens_name.to_owned(),
+        focal_bits: context.focal.to_bits(),
+        explicit_profile: context.explicit_profile.map(str::to_owned),
+        focal_reducer_bits: context.focal_reducer.to_bits(),
+        crop_factor_bits: context.crop_factor.to_bits(),
+        grain_seed: context.grain_seed,
+        orientation: context.orientation,
+        film_luts,
+    })
+}
 
 const PREFIX_CACHE_CAPACITY: usize = 2;
 const PREFIX_SNAPSHOT_LIMIT: usize = 3;
@@ -1127,7 +1176,8 @@ fn render_graph_image(
     } else {
         None
     };
-    let decoded: Arc<DecodedRaw> = render::decoded_for_render(input, cache_mode, profiling)?;
+    let (decoded, source_identity): (Arc<DecodedRaw>, Option<render::DecodeCacheKey>) =
+        render::decoded_for_render_with_identity(input, cache_mode, profiling)?;
     let (native_max_width, native_max_height) =
         render::native_downscale_bounds(decoded.orientation, frame.max_width, frame.max_height);
     let source = render::scaled_source_for_render(
@@ -1158,17 +1208,20 @@ fn render_graph_image(
         orientation: decoded.orientation,
     };
     let bounded = native_max_width > 0 || native_max_height > 0;
-    let prefix_key = (cache_mode == render::CACHE_USE && bounded).then(|| {
-        (
-            input.to_string_lossy().into_owned(),
-            decoded.width,
-            decoded.height,
-            native_max_width,
-            native_max_height,
-            // A re-decoded file gets a fresh Arc, invalidating stale entries.
-            Arc::as_ptr(&decoded) as usize,
-        )
-    });
+    let prefix_key = if cache_mode == render::CACHE_USE && bounded {
+        Some(PrefixKey {
+            input_path: input.to_string_lossy().into_owned(),
+            decoded_width: decoded.width,
+            decoded_height: decoded.height,
+            max_width: native_max_width,
+            max_height: native_max_height,
+            source_identity: source_identity
+                .expect("decode cache identity is present when cache mode is CACHE_USE"),
+            context: prefix_context_key(&ops, &context)?,
+        })
+    } else {
+        None
+    };
     execute_graph_cached(&ops, source, &context, prefix_key)
 }
 
@@ -1240,6 +1293,73 @@ mod tests {
             grain_seed: seed,
             orientation: 1,
         }
+    }
+
+    fn test_prefix_key(name: &str, context: &GraphContext<'_>) -> PrefixKey {
+        PrefixKey {
+            input_path: name.into(),
+            decoded_width: 24,
+            decoded_height: 16,
+            max_width: 24,
+            max_height: 16,
+            source_identity: [0; 32],
+            context: prefix_context_key(&[], context).unwrap(),
+        }
+    }
+
+    #[test]
+    fn prefix_context_key_tracks_context_and_lut_identity() {
+        let base = GraphContext {
+            make: "Olympus",
+            model: "PEN-F",
+            lens_name: "M.Zuiko",
+            focal: 25.0,
+            explicit_profile: Some("profile"),
+            focal_reducer: 0.71,
+            crop_factor: 2.0,
+            grain_seed: 7,
+            orientation: 6,
+        };
+        let key = prefix_context_key(&[], &base).unwrap();
+        assert_eq!(key.make, "Olympus");
+        assert_eq!(key.model, "PEN-F");
+        assert_eq!(key.lens_name, "M.Zuiko");
+        assert_eq!(key.focal_bits, 25.0_f32.to_bits());
+        assert_eq!(key.explicit_profile.as_deref(), Some("profile"));
+        assert_eq!(key.focal_reducer_bits, 0.71_f32.to_bits());
+        assert_eq!(key.crop_factor_bits, 2.0_f32.to_bits());
+        assert_eq!(key.grain_seed, 7);
+        assert_eq!(key.orientation, 6);
+        assert_ne!(
+            key,
+            prefix_context_key(
+                &[],
+                &GraphContext {
+                    grain_seed: 8,
+                    ..base
+                }
+            )
+            .unwrap()
+        );
+
+        let path = std::env::temp_dir().join(format!(
+            "orfeus-prefix-lut-{}-{}.cube",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        std::fs::write(&path, "LUT_3D_SIZE 2\n").unwrap();
+        let path_text = path.to_string_lossy().into_owned();
+        let ops = parse_graph(
+            &GraphBuilder::new()
+                .node(NODE_FILM, 0, -1, &[1.0, 0.0, 1.0], Some(&path_text))
+                .build(),
+        )
+        .unwrap();
+        let before = prefix_context_key(&ops, &context(7)).unwrap();
+        std::fs::write(&path, "LUT_3D_SIZE 3\n").unwrap();
+        let after = prefix_context_key(&ops, &context(7)).unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert_ne!(before, after);
     }
 
     fn gradient_image() -> RgbImage {
@@ -1743,12 +1863,12 @@ mod tests {
 
     #[test]
     fn a_grain_edit_resumes_inside_the_film_node() {
-        let key: PrefixKey = ("grain-stage-test".into(), 24, 16, 24, 16, 1);
+        let key = test_prefix_key("grain-stage-test", &context(7));
         {
             let mut cache = prefix_cache()
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            cache.retain(|(held, _)| held.0 != "grain-stage-test");
+            cache.retain(|(held, _)| held.input_path != "grain-stage-test");
         }
         let first = parse_graph(&grain_program(0.3)).unwrap();
         let second = parse_graph(&grain_program(0.7)).unwrap();
@@ -1796,12 +1916,12 @@ mod tests {
 
     #[test]
     fn prefix_resume_matches_a_cold_render_exactly() {
-        let key: PrefixKey = ("prefix-test".into(), 24, 16, 24, 16, 1);
+        let key = test_prefix_key("prefix-test", &context(7));
         {
             let mut cache = prefix_cache()
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            cache.retain(|(held, _)| held.0 != "prefix-test");
+            cache.retain(|(held, _)| held.input_path != "prefix-test");
         }
         // First render primes the checkpoint; the tone edit then resumes
         // mid-program, with the blend pulling the source across the
@@ -1837,8 +1957,8 @@ mod tests {
 
     #[test]
     fn prefix_cache_keys_do_not_leak_across_photos() {
-        let key_a: PrefixKey = ("photo-a".into(), 24, 16, 24, 16, 1);
-        let key_b: PrefixKey = ("photo-b".into(), 24, 16, 24, 16, 1);
+        let key_a = test_prefix_key("photo-a", &context(7));
+        let key_b = test_prefix_key("photo-b", &context(7));
         let ops = parse_graph(&tone_program(0.5)).unwrap();
         let bright = {
             let mut image = gradient_image();

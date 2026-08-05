@@ -1768,7 +1768,7 @@ pub(crate) struct DecodedRaw {
     pub(crate) focal: f32,
 }
 
-type DecodeCacheKey = [u8; 32];
+pub(crate) type DecodeCacheKey = [u8; 32];
 type DecodeCacheEntries = Vec<(DecodeCacheKey, Arc<DecodedRaw>)>;
 
 #[derive(Default)]
@@ -1877,9 +1877,9 @@ pub(crate) fn own_source(source: Arc<RgbImage>) -> RgbImage {
 }
 
 /// A file's identity as the filesystem reports it, cheap to obtain.
-type StatIdentity = (u64, u64, u64, i64, i64);
+pub(crate) type StatIdentity = (u64, u64, u64, i64, i64);
 
-fn stat_identity(input: &Path) -> Result<StatIdentity, Error> {
+pub(crate) fn stat_identity(input: &Path) -> Result<StatIdentity, Error> {
     let metadata = std::fs::metadata(input)?;
     Ok((
         metadata.dev(),
@@ -1900,19 +1900,20 @@ pub(crate) fn lut_cache_len() -> usize {
 
 const LUT_CACHE_CAPACITY: usize = 4;
 
-/// Parsed .cube files, keyed by path and stat identity.
+/// Parsed .cube files, keyed by path and exact content digest.
 ///
 /// A film node re-reads its LUT every time the graph executes, so dragging
 /// grain used to re-parse tens of thousands of lines of text on every tick.
-/// The stat identity means an edited LUT on disk still takes effect.
+/// The digest means even a same-size edit with preserved timestamps takes effect.
 #[allow(clippy::type_complexity)]
-fn lut_cache() -> &'static Mutex<Vec<((PathBuf, StatIdentity), Arc<CubeLut>)>> {
-    static CACHE: OnceLock<Mutex<Vec<((PathBuf, StatIdentity), Arc<CubeLut>)>>> = OnceLock::new();
+fn lut_cache() -> &'static Mutex<Vec<((PathBuf, DecodeCacheKey), Arc<CubeLut>)>> {
+    static CACHE: OnceLock<Mutex<Vec<((PathBuf, DecodeCacheKey), Arc<CubeLut>)>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(Vec::new()))
 }
 
 pub(crate) fn cached_cube_lut(path: &Path) -> Result<Arc<CubeLut>, Error> {
-    let key = (path.to_path_buf(), stat_identity(path)?);
+    let digest = file_content_digest(path)?;
+    let key = (path.to_path_buf(), digest);
     {
         let mut cache = lut_cache()
             .lock()
@@ -1925,6 +1926,11 @@ pub(crate) fn cached_cube_lut(path: &Path) -> Result<Arc<CubeLut>, Error> {
         }
     }
     let lut = Arc::new(CubeLut::read(path)?);
+    if file_content_digest(path)? != digest {
+        return Err(Error::Render(
+            "film LUT changed while it was being read".into(),
+        ));
+    }
     let mut cache = lut_cache()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -1947,8 +1953,8 @@ fn key_memo() -> &'static Mutex<Vec<(StatIdentity, DecodeCacheKey)>> {
 /// when the decode cache already holds the image, so an unchanged inode,
 /// size, and modification time reuse the previous hash. Anything that
 /// rewrites the file changes at least one of those, and callers that must
-/// be certain use `decode_cache_key_uncached`.
-fn decode_cache_key(input: &Path) -> Result<DecodeCacheKey, Error> {
+/// be certain use `file_content_digest`.
+pub(crate) fn decode_cache_key(input: &Path) -> Result<DecodeCacheKey, Error> {
     let identity = stat_identity(input)?;
     {
         let mut memo = key_memo()
@@ -1961,7 +1967,7 @@ fn decode_cache_key(input: &Path) -> Result<DecodeCacheKey, Error> {
             return Ok(key);
         }
     }
-    let key = decode_cache_key_uncached(input)?;
+    let key = file_content_digest(input)?;
     let mut memo = key_memo()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -1973,7 +1979,7 @@ fn decode_cache_key(input: &Path) -> Result<DecodeCacheKey, Error> {
     Ok(key)
 }
 
-fn decode_cache_key_uncached(input: &Path) -> Result<DecodeCacheKey, Error> {
+pub(crate) fn file_content_digest(input: &Path) -> Result<DecodeCacheKey, Error> {
     let mut file = File::open(input)?;
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];
@@ -2055,17 +2061,17 @@ fn decode_linear_srgb(input: &Path, profiling: bool) -> Result<DecodedRaw, Error
     })
 }
 
-fn decoded_for_render_with<F>(
+fn decoded_for_render_with_identity_using<F>(
     input: &Path,
     cache_mode: u32,
     profiling: bool,
     decode: F,
-) -> Result<Arc<DecodedRaw>, Error>
+) -> Result<(Arc<DecodedRaw>, Option<DecodeCacheKey>), Error>
 where
     F: FnOnce() -> Result<DecodedRaw, Error>,
 {
     if cache_mode != CACHE_USE {
-        return Ok(Arc::new(decode()?));
+        return Ok((Arc::new(decode()?), None));
     }
     let key = decode_cache_key(input)?;
     let (cache_lock, cache_changed) = decode_cache();
@@ -2080,7 +2086,7 @@ where
             if profiling {
                 eprintln!("orfeus-profile stage=decode-cache hit=true");
             }
-            return Ok(decoded);
+            return Ok((decoded, Some(key)));
         }
         if cache.loading.insert(key) {
             break;
@@ -2095,7 +2101,7 @@ where
     let decode_result = catch_unwind(AssertUnwindSafe(decode));
     let result = match decode_result {
         Ok(result) => result.and_then(|decoded| {
-            if decode_cache_key_uncached(input)? != key {
+            if file_content_digest(input)? != key {
                 return Err(Error::Render(
                     "RAW source changed while it was being decoded".into(),
                 ));
@@ -2124,7 +2130,20 @@ where
         cache.entries.push((key, decoded.clone()));
     }
     cache_changed.notify_all();
-    result
+    result.map(|decoded| (decoded, Some(key)))
+}
+
+fn decoded_for_render_with<F>(
+    input: &Path,
+    cache_mode: u32,
+    profiling: bool,
+    decode: F,
+) -> Result<Arc<DecodedRaw>, Error>
+where
+    F: FnOnce() -> Result<DecodedRaw, Error>,
+{
+    decoded_for_render_with_identity_using(input, cache_mode, profiling, decode)
+        .map(|(decoded, _)| decoded)
 }
 
 pub(crate) fn decoded_for_render(
@@ -2133,6 +2152,16 @@ pub(crate) fn decoded_for_render(
     profiling: bool,
 ) -> Result<Arc<DecodedRaw>, Error> {
     decoded_for_render_with(input, cache_mode, profiling, || {
+        decode_linear_srgb(input, profiling)
+    })
+}
+
+pub(crate) fn decoded_for_render_with_identity(
+    input: &Path,
+    cache_mode: u32,
+    profiling: bool,
+) -> Result<(Arc<DecodedRaw>, Option<DecodeCacheKey>), Error> {
+    decoded_for_render_with_identity_using(input, cache_mode, profiling, || {
         decode_linear_srgb(input, profiling)
     })
 }
@@ -2362,12 +2391,12 @@ mod tests {
         fs::write(&path, [1, 2, 3, 4]).unwrap();
         let first = decode_cache_key(&path).unwrap();
         assert_eq!(first, decode_cache_key(&path).unwrap());
-        assert_eq!(first, decode_cache_key_uncached(&path).unwrap());
+        assert_eq!(first, file_content_digest(&path).unwrap());
         // A rewrite of a different length changes the stat identity.
         fs::write(&path, [4, 3, 2, 1, 0]).unwrap();
         let second = decode_cache_key(&path).unwrap();
         assert_ne!(first, second);
-        assert_eq!(second, decode_cache_key_uncached(&path).unwrap());
+        assert_eq!(second, file_content_digest(&path).unwrap());
         fs::remove_file(path).unwrap();
     }
 
