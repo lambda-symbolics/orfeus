@@ -2502,14 +2502,25 @@ new cache entry is published."
                (discard-gui-tasks background-queue :still)
                (clrhash gallery-thumbs)
                (setf gallery-stills
-                     (append (mapcar #'make-project-gallery-still
-                                     (project-presets project))
-                             (handler-case
-                                 (mapcar #'make-local-gallery-still
-                                         (orfeus:still-store-list))
-                               (error (condition)
-                                 (set-status (princ-to-string condition))
-                                 '())))
+                     (let* ((held (mapcar #'make-project-gallery-still
+                                          (project-presets project)))
+                            (names (mapcar #'gallery-still-identity held)))
+                       (append
+                        held
+                        ;; Grabbing writes both a project preset and a local
+                        ;; copy. The local one is the fallback for a lost
+                        ;; project or ejected media, so it earns a row only
+                        ;; when the project does not already hold that still.
+                        (remove-if
+                         (lambda (still)
+                           (member (gallery-still-identity still) names
+                                   :test #'equal))
+                         (handler-case
+                             (mapcar #'make-local-gallery-still
+                                     (orfeus:still-store-list))
+                           (error (condition)
+                             (set-status (princ-to-string condition))
+                             '())))))
                      gallery-selected
                      (gallery-selection-index gallery-stills selected-key))))
            (persist-still (preset)
@@ -2564,9 +2575,11 @@ new cache entry is published."
                     (generation gallery-generation)
                     (name (processing-preset-name preset))
                     (source (processing-preset-source-photo preset))
-                    (stored (when (eq :local (gallery-still-origin still))
-                              (ignore-errors
-                                (orfeus:still-store-thumbnail-pathname name)))))
+                    ;; Both origins keep the local thumbnail warm, so the
+                    ;; fallback copy stays usable once the project row is the
+                    ;; only one shown.
+                    (stored (ignore-errors
+                              (orfeus:still-store-thumbnail-pathname name))))
                (when (null (gethash key gallery-thumbs))
                  (cond
                    ((and source (probe-file source))
@@ -2596,7 +2609,15 @@ new cache entry is published."
                                    (queue-event queue
                                                 (list :still-thumb generation
                                                       key output stored)))
-                               (error () nil)))))))
+                               ;; A failed still render used to vanish, leaving
+                               ;; a permanently blank gallery cell with no clue
+                               ;; why. Report it instead.
+                               (error (condition)
+                                 (queue-event
+                                  queue
+                                  (list :status nil
+                                        (format nil "Still preview failed: ~A"
+                                                condition))))))))))
                    ;; Source gone (card ejected, file moved): fall back to
                    ;; the persisted local copy of the thumbnail.
                    ((and stored (probe-file stored))
