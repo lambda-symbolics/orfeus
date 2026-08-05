@@ -797,6 +797,9 @@ new cache entry is published."
            lens-name controls inspector-items tone-items lut-choice wb-choice target-choice
            export-quality export-max-width export-max-height export-metadata
            export-timestamp
+           export-dialog export-dialog-destination export-dialog-scope
+           export-dialog-quality export-dialog-width export-dialog-height
+           export-dialog-metadata export-dialog-timestamp
            gallery-canvas gallery-title preset-name-input
            preset-apply-button preset-save-button
            (gallery-scroll 0)
@@ -3335,6 +3338,181 @@ new cache entry is published."
                                      (list :done
                                            (format nil "~D photos"
                                                    (length completed))))))))))
+           (render-jobs (jobs label)
+             ;; Export an explicit set of photographs, reporting per-photo
+             ;; failures without abandoning the rest of the batch.
+             (setf progress-total 0
+                   progress-generation preview-generation)
+             (if (null jobs)
+                 (set-status "No photographs selected to export")
+                 (progn
+                   (ensure-directories-exist
+                    (merge-pathnames "placeholder"
+                                     (project-output-directory project)))
+                   (enqueue-gui-task
+                    queue :export
+                    (lambda ()
+                      (queue-event queue
+                                   (list :status nil
+                                         (format nil "Exporting ~A..." label)))
+                      (let ((completed 0) (failures 0))
+                        (dolist (job jobs)
+                          (handler-case
+                              (progn
+                                (render-photo-job project job
+                                                  :if-exists :supersede)
+                                (incf completed))
+                            (error () (incf failures))))
+                        (queue-event
+                         queue
+                         (if (plusp failures)
+                             (list :error
+                                   (format nil "Exported ~D; ~D failed"
+                                           completed failures))
+                             (list :done
+                                   (format nil "~D photograph~:P"
+                                           completed))))))))))
+           (export-dialog-integer (widget fallback)
+             (or (parse-integer (cl-fltk:value widget) :junk-allowed t)
+                 fallback))
+           (apply-export-dialog ()
+             ;; Returns true once the dialog's choices are stored on the
+             ;; project, so the caller may start the export.
+             (let ((settings (project-export-settings project))
+                   (destination (string-trim " "
+                                             (cl-fltk:value
+                                              export-dialog-destination))))
+               (handler-case
+                   (progn
+                     (when (zerop (length destination))
+                       (error "Choose a destination folder first"))
+                     (setf (project-output-directory project)
+                           (pathname
+                            (concatenate 'string
+                                         (string-right-trim "/" destination)
+                                         "/")))
+                     (let ((width (export-dialog-integer export-dialog-width 0))
+                           (height (export-dialog-integer export-dialog-height
+                                                          0)))
+                       (setf (export-settings-jpeg-quality settings)
+                             (max 1 (min 100 (export-dialog-integer
+                                              export-dialog-quality 92)))
+                             (export-settings-max-width settings)
+                             (when (plusp width) width)
+                             (export-settings-max-height settings)
+                             (when (plusp height) height)
+                             (export-settings-preserve-metadata-p settings)
+                             (string= "1" (cl-fltk:value
+                                           export-dialog-metadata))
+                             (export-settings-timestamp-filenames-p settings)
+                             (string= "1" (cl-fltk:value
+                                           export-dialog-timestamp))))
+                     (sync-export-controls)
+                     t)
+                 (error (condition)
+                   (set-status (princ-to-string condition))
+                   nil))))
+           (start-dialog-export ()
+             (when (apply-export-dialog)
+               (cl-fltk:hide export-dialog)
+               (let ((scope (cl-fltk:value export-dialog-scope)))
+                 (cond
+                   ((string-equal scope "All photographs") (render-all))
+                   ((string-equal scope "Selected photographs")
+                    (render-jobs (gui-model-selected-jobs model)
+                                 "the selection"))
+                   (t (render-selected))))))
+           (browse-export-destination ()
+             (let ((chosen (cl-fltk:choose-directory
+                            :title "Choose export folder"
+                            :preset-path (cl-fltk:value
+                                          export-dialog-destination))))
+               (when (and chosen (plusp (length chosen)))
+                 (setf (cl-fltk:value export-dialog-destination) chosen))))
+           (build-export-dialog ()
+             (let ((dialog (cl-fltk:make-window :width 460 :height 268
+                                                :label "Export")))
+               (setf export-dialog dialog)
+               (cl-fltk:make-label :parent dialog :x 12 :y 12 :width 120
+                                   :height 24 :label "Destination")
+               (setf export-dialog-destination
+                     (cl-fltk:make-input :parent dialog :x 120 :y 12
+                                         :width 236 :height 26))
+               (cl-fltk:make-button :parent dialog :x 364 :y 12 :width 84
+                                    :height 26 :label "Browse..."
+                                    :callback
+                                    (lambda (&rest ignored)
+                                      (declare (ignore ignored))
+                                      (browse-export-destination)))
+               (setf export-dialog-scope
+                     (cl-fltk:field-control
+                      (cl-fltk:make-labeled-choice
+                       :parent dialog :x 12 :y 48 :width 436 :height 26
+                       :label "Photographs" :label-width 104
+                       :items '("Current photograph" "Selected photographs"
+                                "All photographs"))))
+               (setf export-dialog-quality
+                     (cl-fltk:field-control
+                      (cl-fltk:make-labeled-control
+                       :int :parent dialog :x 12 :y 84 :width 240 :height 26
+                       :label "JPEG quality" :label-width 104)))
+               (setf export-dialog-width
+                     (cl-fltk:field-control
+                      (cl-fltk:make-labeled-control
+                       :int :parent dialog :x 12 :y 116 :width 240 :height 26
+                       :label "Maximum width" :label-width 104)))
+               (setf export-dialog-height
+                     (cl-fltk:field-control
+                      (cl-fltk:make-labeled-control
+                       :int :parent dialog :x 12 :y 148 :width 240 :height 26
+                       :label "Maximum height" :label-width 104)))
+               (cl-fltk:make-label :parent dialog :x 258 :y 116 :width 190
+                                   :height 48 :label "0 keeps the full size")
+               (setf export-dialog-metadata
+                     (cl-fltk:make-check-button
+                      :parent dialog :x 116 :y 180 :width 200 :height 24
+                      :label "Preserve metadata"))
+               (setf export-dialog-timestamp
+                     (cl-fltk:make-check-button
+                      :parent dialog :x 116 :y 206 :width 200 :height 24
+                      :label "Timestamp filenames"))
+               (cl-fltk:make-button :parent dialog :x 244 :y 234 :width 96
+                                    :height 26 :label "Cancel"
+                                    :callback
+                                    (lambda (&rest ignored)
+                                      (declare (ignore ignored))
+                                      (cl-fltk:hide export-dialog)))
+               (cl-fltk:make-button :parent dialog :x 348 :y 234 :width 100
+                                    :height 26 :label "Export"
+                                    :callback
+                                    (lambda (&rest ignored)
+                                      (declare (ignore ignored))
+                                      (start-dialog-export)))
+               dialog))
+           (open-export-dialog ()
+             (unless export-dialog
+               (build-export-dialog))
+             (let ((settings (project-export-settings project)))
+               (setf (cl-fltk:value export-dialog-destination)
+                     (namestring (project-output-directory project))
+                     (cl-fltk:value export-dialog-quality)
+                     (format nil "~D" (export-settings-jpeg-quality settings))
+                     (cl-fltk:value export-dialog-width)
+                     (format nil "~D" (or (export-settings-max-width settings)
+                                          0))
+                     (cl-fltk:value export-dialog-height)
+                     (format nil "~D" (or (export-settings-max-height settings)
+                                          0))
+                     (cl-fltk:value export-dialog-metadata)
+                     (if (export-settings-preserve-metadata-p settings) "1" "0")
+                     (cl-fltk:value export-dialog-timestamp)
+                     (if (export-settings-timestamp-filenames-p settings)
+                         "1" "0")
+                     (cl-fltk:value export-dialog-scope)
+                     (if (selected-job)
+                         "Current photograph"
+                         "All photographs")))
+             (cl-fltk:show export-dialog))
            (choose-lut ()
              (let ((path (cl-fltk:choose-file
                           :title "Choose 3D LUT"
@@ -3882,6 +4060,10 @@ new cache entry is published."
                                  (declare (ignore ignored))
                                  (grab-still))
                                :shortcut (logior +menu-ctrl+ (char-code #\g)))
+        (cl-fltk:add-menu-item menu "Process/Export..."
+                               (lambda (&rest ignored)
+                                 (declare (ignore ignored))
+                                 (open-export-dialog)))
         (cl-fltk:add-menu-item menu "Process/Export Current Photo"
                                (lambda (&rest ignored)
                                  (declare (ignore ignored))
@@ -3932,7 +4114,7 @@ new cache entry is published."
           (toolbar-button 48 :folder-open "Open project" #'open-project)
           (toolbar-button 78 :delete "Remove selected photographs" #'remove-selected-photo)
           (rule 112 7 1 24 150 150 150)
-          (toolbar-button 120 :export "Export current photograph" #'render-selected)
+          (toolbar-button 120 :export "Export photographs..." #'open-export-dialog)
           (toolbar-button 150 :pipeline "Show or hide Before and After" #'toggle-comparison)
           (rule 184 7 1 24 150 150 150)
           (toolbar-text-button 192 28 "−" "Zoom out" (lambda () (zoom-preview .8d0)))
