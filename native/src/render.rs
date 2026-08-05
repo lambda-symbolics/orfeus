@@ -2379,7 +2379,8 @@ pub fn render(
     } else {
         None
     };
-    let decoded = decoded_for_render(input, cache_mode, profiling)?;
+    let draft = draft_requested(settings.max_width, settings.max_height);
+    let (decoded, _) = decoded_for_render_with_identity(input, cache_mode, draft, profiling)?;
     let mut stage_started = Instant::now();
     macro_rules! profile_stage {
         ($name:literal) => {
