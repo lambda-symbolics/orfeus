@@ -2510,8 +2510,9 @@ mod tests {
         assert!(draft_requested(DRAFT_MAX_DIMENSION, DRAFT_MAX_DIMENSION));
         // The smallest sensor Orfeus targets is still more than twice the
         // threshold in both axes, so binning never has to upsample.
-        assert!(2 * DRAFT_MAX_DIMENSION <= 4608);
-        assert!(2 * (DRAFT_MAX_DIMENSION * 3 / 4) <= 3456);
+        const PEN_F_SENSOR: (u32, u32) = (4608, 3456);
+        const { assert!(2 * DRAFT_MAX_DIMENSION <= PEN_F_SENSOR.0) };
+        const { assert!(2 * (DRAFT_MAX_DIMENSION * 3 / 4) <= PEN_F_SENSOR.1) };
     }
 
     #[test]
