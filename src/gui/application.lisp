@@ -123,8 +123,23 @@ buffer, with no JPEG or file on the path.")
       (error "~A must be between ~D and ~D" label minimum maximum))
     value))
 
+(defparameter *export-format-captions*
+  '(("JPEG" . :jpeg) ("16-bit TIFF" . :tiff))
+  "Export encoders offered in the dialog, in menu order.")
+
+(defun export-format-from-caption (caption)
+  "Return the export format CAPTION names, defaulting to JPEG."
+  (or (cdr (assoc caption *export-format-captions* :test #'string-equal))
+      :jpeg))
+
+(defun export-format-caption (format)
+  "Return the dialog caption naming FORMAT."
+  (or (car (rassoc format *export-format-captions*))
+      "JPEG"))
+
 (defun update-project-export-settings
-    (project destination quality-text width-text height-text metadata-p timestamp-p)
+    (project destination format quality-text width-text height-text
+     metadata-p timestamp-p)
   "Validate and atomically store all export dialog values on PROJECT."
   (let ((destination (string-trim " " destination)))
     (when (zerop (length destination))
@@ -140,6 +155,7 @@ buffer, with no JPEG or file on the path.")
                     quality-text "JPEG quality" 92 1 100))
           (settings (project-export-settings project)))
       (setf (project-output-directory project) destination-path
+            (export-settings-format settings) format
             (export-settings-jpeg-quality settings) quality
             (export-settings-max-width settings) (when (plusp width) width)
             (export-settings-max-height settings) (when (plusp height) height)
@@ -879,7 +895,8 @@ new cache entry is published."
            export-quality export-max-width export-max-height export-metadata
            export-timestamp
            export-dialog export-dialog-destination export-dialog-scope
-           export-dialog-quality export-dialog-width export-dialog-height
+           export-dialog-format export-dialog-quality
+           export-dialog-width export-dialog-height
            export-dialog-metadata export-dialog-timestamp
            gallery-canvas gallery-title preset-name-input
            preset-apply-button preset-save-button
@@ -3526,6 +3543,8 @@ new cache entry is published."
                    (update-project-export-settings
                     project
                     (lightfast:value export-dialog-destination)
+                    (export-format-from-caption
+                     (lightfast:value export-dialog-format))
                     (lightfast:value export-dialog-quality)
                     (lightfast:value export-dialog-width)
                     (lightfast:value export-dialog-height)
@@ -3557,7 +3576,7 @@ new cache entry is published."
              ;; Laid out by Lightfast's flex engine: rows of label, control and
              ;; trailing button, with the destination field taking the slack.
              ;; No pixel coordinates to keep in sync with one another.
-             (let* ((dialog (lightfast:make-window :width 470 :height 264
+             (let* ((dialog (lightfast:make-window :width 470 :height 298
                                                    :label "Export"))
                     (rows '())
                     (label-width 104)
@@ -3611,6 +3630,13 @@ new cache entry is published."
                                :items '("Current photograph"
                                         "Selected photographs"
                                         "All photographs"))))
+                 (setf export-dialog-format
+                       (field (text "Format")
+                              (lightfast:make-choice
+                               :parent dialog :x 0 :y 0
+                               :width 200 :height row-height
+                               :items (mapcar #'car
+                                              *export-format-captions*))))
                  (setf export-dialog-quality
                        (field (text "JPEG quality") (number-input))
                        export-dialog-width
@@ -3659,6 +3685,9 @@ new cache entry is published."
              (let ((settings (project-export-settings project)))
                (setf (lightfast:value export-dialog-destination)
                      (namestring (project-output-directory project))
+                     (lightfast:value export-dialog-format)
+                     (export-format-caption
+                      (export-settings-format settings))
                      (lightfast:value export-dialog-quality)
                      (format nil "~D" (export-settings-jpeg-quality settings))
                      (lightfast:value export-dialog-width)

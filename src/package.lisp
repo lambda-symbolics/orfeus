@@ -26,6 +26,8 @@
    #:dng-original-error
    #:dng-original-filename
    #:export-settings
+   #:export-format-extension
+   #:export-settings-format
    #:export-settings-jpeg-quality
    #:export-settings-max-height
    #:export-settings-max-width

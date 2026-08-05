@@ -1,6 +1,7 @@
 (defpackage #:orfeus/gui
   (:use #:cl)
   (:import-from #:orfeus
+                #:export-format-extension #:export-settings-format
                 #:export-settings-jpeg-quality #:export-settings-max-height
                 #:export-settings-max-width #:export-settings-preserve-metadata-p
                 #:export-settings-timestamp-filenames-p

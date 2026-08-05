@@ -53,7 +53,9 @@ one-based suffix. Explicit :output paths are never rewritten."
           (merge-pathnames
            (make-pathname :name (photo-job-timestamp-output-stem
                                  project photo stem)
-                          :type "jpg")
+                          :type (export-format-extension
+                                 (export-settings-format
+                                  (project-export-settings project))))
            (project-output-directory project))))))
 
 (defun render-photo-job (project photo &key (if-exists :error))

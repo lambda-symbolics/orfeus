@@ -906,7 +906,7 @@
     (check (handler-case
                (progn
                  (orfeus/gui::update-project-export-settings
-                  project "new" "85px" "4096" "3072" nil t)
+                  project "new" :tiff "85px" "4096" "3072" nil t)
                  nil)
              (error () t))
            "Invalid export settings update did not signal")
@@ -915,19 +915,28 @@
     (check (and (= 91 (orfeus:export-settings-jpeg-quality settings))
                 (= 2048 (orfeus:export-settings-max-width settings))
                 (= 1536 (orfeus:export-settings-max-height settings))
+                (eq :jpeg (orfeus:export-settings-format settings))
                 (orfeus:export-settings-preserve-metadata-p settings)
                 (not (orfeus:export-settings-timestamp-filenames-p settings)))
            "Invalid export settings update partially mutated settings")
     (orfeus/gui::update-project-export-settings
-     project "new" "85" "4096" "0" nil t)
+     project "new" :tiff "85" "4096" "0" nil t)
     (check (equal #P"new/" (orfeus:project-output-directory project))
            "Valid export settings update did not change the destination")
     (check (and (= 85 (orfeus:export-settings-jpeg-quality settings))
                 (= 4096 (orfeus:export-settings-max-width settings))
                 (null (orfeus:export-settings-max-height settings))
+                (eq :tiff (orfeus:export-settings-format settings))
                 (not (orfeus:export-settings-preserve-metadata-p settings))
                 (orfeus:export-settings-timestamp-filenames-p settings))
-           "Valid export settings update did not commit every field"))
+           "Valid export settings update did not commit every field")
+    (check (string= "tif" (orfeus:export-format-extension :tiff))
+           "TIFF export format named the wrong extension")
+    (check (and (eq :tiff (orfeus/gui::export-format-from-caption "16-bit TIFF"))
+                (eq :jpeg (orfeus/gui::export-format-from-caption "nonsense"))
+                (string= "16-bit TIFF"
+                         (orfeus/gui::export-format-caption :tiff)))
+           "Export format captions did not round-trip"))
   (check (orfeus/gui::gallery-generation-event-current-p
           '(:still-error 4 "failed") 4)
          "Current still error was rejected")
