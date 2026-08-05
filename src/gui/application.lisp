@@ -258,10 +258,15 @@ exactly the curve the render applies."
   "Height of one still cell in the gallery grid.")
 
 (defstruct gallery-still
-  "One gallery row with an explicit project or local origin."
+  "One gallery row with an explicit project or local origin.
+
+UNAVAILABLE-P records that neither the source photograph nor a persisted
+thumbnail could be found, so the cell will never fill in and says so rather
+than looking like a render still in flight."
   origin
   identity
-  preset)
+  preset
+  (unavailable-p nil))
 
 (defun gallery-still-key (still)
   "Return the cache/task key for STILL, including its provenance."
@@ -2799,7 +2804,8 @@ new cache entry is published."
                    ;; Source gone (card ejected, file moved): fall back to
                    ;; the persisted local copy of the thumbnail.
                    ((and stored (probe-file stored))
-                    (setf (gethash key gallery-thumbs) stored))))))
+                    (setf (gethash key gallery-thumbs) stored))
+                   (t (setf (gallery-still-unavailable-p still) t))))))
            (refresh-gallery ()
              (reload-gallery-stills)
              (when gallery-canvas
@@ -2849,17 +2855,32 @@ new cache entry is published."
                               (lightfast:draw-filled-rect
                                cell-x cell-y (- *gallery-cell-width* 6)
                                (- *gallery-cell-height* 6)))
-                            (let ((thumb (gethash (gallery-still-key still) gallery-thumbs)))
-                              (if thumb
-                                  (draw-thumbnail-file
-                                   widget thumb (+ cell-x 3) (+ cell-y 3)
-                                   (- *gallery-cell-width* 12) 62)
-                                  (progn
-                                    (lightfast:draw-color-rgb
-                                     :red 205 :green 205 :blue 205)
-                                    (lightfast:draw-filled-rect
-                                     (+ cell-x 3) (+ cell-y 3)
-                                     (- *gallery-cell-width* 12) 62))))
+                            (let ((thumb (gethash (gallery-still-key still)
+                                                  gallery-thumbs))
+                                  (thumb-width (- *gallery-cell-width* 12)))
+                              (cond
+                                (thumb
+                                 (draw-thumbnail-file
+                                  widget thumb (+ cell-x 3) (+ cell-y 3)
+                                  thumb-width 62))
+                                ((gallery-still-unavailable-p still)
+                                 ;; Lost source and no kept thumbnail: an empty
+                                 ;; grey box was indistinguishable from one
+                                 ;; still rendering, so say which it is.
+                                 (lightfast:draw-color-rgb
+                                  :red 232 :green 216 :blue 216)
+                                 (lightfast:draw-filled-rect
+                                  (+ cell-x 3) (+ cell-y 3) thumb-width 62)
+                                 (lightfast:draw-color-rgb
+                                  :red 150 :green 90 :blue 90)
+                                 (lightfast:draw-font :size 10)
+                                 (lightfast:draw-text
+                                  "source missing" (+ cell-x 6) (+ cell-y 38)))
+                                (t
+                                 (lightfast:draw-color-rgb
+                                  :red 205 :green 205 :blue 205)
+                                 (lightfast:draw-filled-rect
+                                  (+ cell-x 3) (+ cell-y 3) thumb-width 62))))
                             (if selected
                                 (lightfast:draw-color-rgb :red 255 :green 255
                                                         :blue 255)
@@ -3459,6 +3480,15 @@ new cache entry is published."
                    (when graph-canvas (lightfast:redraw graph-canvas))
                    (schedule-edited-preview))
                (error (condition) (set-status (princ-to-string condition)))))
+           (report-export-progress (index total job output)
+             ;; A batch used to show one line for its whole run, so a long
+             ;; export looked stalled. Name the file about to be written.
+             (declare (ignore job))
+             (queue-event queue
+                          (list :status nil
+                                (format nil "Exporting ~D of ~D: ~A"
+                                        index total (file-namestring output))))
+             (values))
            (render-selected ()
              (setf progress-total 0
                    progress-generation preview-generation)
@@ -3490,7 +3520,9 @@ new cache entry is published."
                 (lambda ()
                   (queue-event queue (list :status nil "Exporting all photos..."))
                   (multiple-value-bind (completed failures)
-                      (project-render project :if-exists :supersede :on-error :continue)
+                      (project-render
+                       project :if-exists :supersede :on-error :continue
+                       :progress-callback #'report-export-progress)
                     (if failures
                         (queue-event queue
                                      (list :error
@@ -3518,8 +3550,15 @@ new cache entry is published."
                       (queue-event queue
                                    (list :status nil
                                          (format nil "Exporting ~A..." label)))
-                      (let ((completed 0) (failures 0))
+                      (let ((completed 0)
+                            (failures 0)
+                            (total (length jobs))
+                            (index 0))
                         (dolist (job jobs)
+                          (incf index)
+                          (report-export-progress
+                           index total job
+                           (photo-job-render-output project job))
                           (handler-case
                               (progn
                                 (render-photo-job project job
