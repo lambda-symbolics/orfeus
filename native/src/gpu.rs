@@ -597,18 +597,15 @@ impl Slot {
         }
     }
 
-    /// Reads the host-visible buffer's leading `scalars` into a fresh vector.
-    unsafe fn download(&self, scalars: usize) -> Vec<f32> {
-        let mut values = Vec::<f32>::with_capacity(scalars);
+    /// Reads the host-visible buffer's leading scalars over `values`.
+    unsafe fn download(&self, values: &mut [f32]) {
         unsafe {
             std::ptr::copy_nonoverlapping(
                 self.mapped as *const u8,
                 values.as_mut_ptr().cast::<u8>(),
-                scalars * std::mem::size_of::<f32>(),
+                std::mem::size_of_val(values),
             );
-            values.set_len(scalars);
         }
-        values
     }
 }
 
@@ -652,7 +649,10 @@ fn locked() -> Result<std::sync::MutexGuard<'static, Context>, String> {
 
 /// Runs the fused display-tone and sRGB-transfer stage in place.
 ///
-/// `rgb` is replaced only after a successful readback.
+/// Nothing writes to `rgb` until the dispatch has completed, so any earlier
+/// failure leaves the caller's pixels intact for the CPU path. The readback
+/// itself cannot fail — the fence has already been waited on — so it writes
+/// straight into `rgb` rather than through a 240 MB intermediate vector.
 pub(crate) fn tone_and_transfer(rgb: &mut [f32]) -> Result<DispatchProfile, String> {
     if rgb.is_empty() || !rgb.len().is_multiple_of(3) {
         return Err("GPU RGB input must contain non-empty triplets".to_string());
@@ -663,22 +663,22 @@ pub(crate) fn tone_and_transfer(rgb: &mut [f32]) -> Result<DispatchProfile, Stri
     };
     let mut context = locked()?;
     let started = Instant::now();
-    let output = unsafe { dispatch(&mut context, parameters, rgb) }?;
-    rgb.copy_from_slice(&output);
+    unsafe { dispatch(&mut context, parameters, rgb) }?;
     Ok(DispatchProfile {
         adapter_name: context.adapter_name.clone(),
         milliseconds: started.elapsed().as_secs_f64() * 1000.0,
     })
 }
 
-/// Uploads `input`, runs the stage over it in place, and reads it back.
+/// Uploads `pixels`, runs the stage over them, and reads the result back over
+/// them. `pixels` is left untouched unless the dispatch completed.
 unsafe fn dispatch(
     context: &mut Context,
     parameters: Parameters,
-    input: &[f32],
-) -> Result<Vec<f32>, String> {
+    pixels: &mut [f32],
+) -> Result<(), String> {
     let groups = dispatch_groups(parameters.counts[0] as usize)?;
-    let input_bytes = byte_size(input.len())?;
+    let input_bytes = byte_size(pixels.len())?;
     let properties = context.memory_properties;
     let limit = context.max_storage_buffer_range;
     unsafe {
@@ -686,7 +686,7 @@ unsafe fn dispatch(
             .input
             .ensure(&context.device, &properties, input_bytes, limit)
     }?;
-    unsafe { context.input.upload(input) };
+    unsafe { context.input.upload(pixels) };
 
     let buffer_info = [vk::DescriptorBufferInfo::default()
         .buffer(context.input.storage())
@@ -833,7 +833,8 @@ unsafe fn dispatch(
         return Err(vk_error("dispatch wait", error));
     }
 
-    Ok(unsafe { context.input.download(input.len()) })
+    unsafe { context.input.download(pixels) };
+    Ok(())
 }
 
 fn buffer_barrier(
