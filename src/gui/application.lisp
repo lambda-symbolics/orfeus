@@ -180,6 +180,36 @@ equally across the row, so no part of this knows the panel's size."
                                             :preferred-width *tone-slider-width*)
          (lightfast:make-layout-item input :basis 24 :shrink 0))))
 
+(defun labeled-field-layout (label control label-width)
+  "Return a caption-and-control row whose control takes the leftover width."
+  (lightfast:make-layout-row
+   :gap 8
+   :children
+   (list (lightfast:make-layout-item label :basis label-width :shrink 0)
+         (lightfast:make-layout-item control :basis 0 :grow 1 :min-width 100))))
+
+(defparameter *number-field-label-width* 88
+  "Width of a numeric control's caption, so every row's slider starts alike.")
+
+(defparameter *number-field-value-width* 78
+  "Width of a numeric control's spinner, which keeps its size as rows widen.")
+
+(defun number-field-layout (label slider value)
+  "Return one numeric control row: caption, slider, spinner.
+
+The slider absorbs the row's slack, so widening the inspector widens the
+sliders and nothing else has to be recomputed."
+  (lightfast:make-layout-row
+   :gap 8
+   :children
+   (list (lightfast:make-layout-item label
+                                     :basis *number-field-label-width*
+                                     :shrink 0)
+         (lightfast:make-layout-item slider :basis 0 :grow 1 :min-width 64)
+         (lightfast:make-layout-item value
+                                     :basis *number-field-value-width*
+                                     :shrink 0))))
+
 (defun tone-bands-layout (bands)
   "Return the row holding every tone BANDS column, in display order."
   (lightfast:make-layout-row :gap 4 :children bands))
@@ -917,7 +947,8 @@ new cache entry is published."
            curve-histogram waveform-buffer
            status progress before-preview-file after-preview-file
            after-preview-generation
-           lens-name controls inspector-items tone-items tone-widgets
+           lens-name controls inspector-items inspector-rows
+           tone-items tone-widgets
            lut-choice wb-choice target-choice
            export-quality export-max-width export-max-height export-metadata
            export-timestamp
@@ -3801,13 +3832,18 @@ new cache entry is published."
                                 &optional (basis :root))
              (push (list widget x y width-mode height basis) inspector-items)
              widget)
+           (register-inspector-row (layout x y height &optional (basis :root))
+             ;; A row laid out by the flex engine rather than by per-widget
+             ;; coordinates. Only its origin and height are fixed here; the
+             ;; engine divides the width.
+             (push (list layout x y height basis) inspector-rows)
+             layout)
            (register-field (field y &optional (basis :root))
-             (let ((label-x (if (eq basis :page) 12 8))
-                   (label-width (if (eq basis :page) 88 96)))
-               (register-inspector (lightfast:field-label field)
-                                   label-x y label-width 26 basis)
-               (register-inspector (lightfast:field-control field) 110 y
-                                   :control 26 basis))
+             (register-inspector-row
+              (labeled-field-layout (lightfast:field-label field)
+                                    (lightfast:field-control field)
+                                    (if (eq basis :page) 88 96))
+              (if (eq basis :page) 12 8) y 26 basis)
              field)
            (build-group (kind builder)
              ;; Collects everything BUILDER registers into one Node panel
@@ -3858,9 +3894,8 @@ new cache entry is published."
                  (lightfast:set-range widget minimum maximum)
                  (lightfast:set-step widget step)
                  (push (list key widget) controls))
-               (register-inspector label-widget 12 y 88 26 :page)
-               (register-inspector slider 110 y :slider 26 :page)
-               (register-inspector spinner 202 y :number 26 :page)
+               (register-inspector-row
+                (number-field-layout label-widget slider spinner) 12 y 26 :page)
                spinner))
            (make-tone-band (key short-label full-label)
              (let* ((callback (lambda (widget event value)
@@ -4016,18 +4051,10 @@ new cache entry is published."
                             (case width-mode
                               (:scope-control (max 100 (- right 98)))
                               (:control (max 100 (- basis-width 118)))
-                              (:slider (max 64 (- basis-width 204)))
-                              (:number 78)
                               (:frame (max 120 (- basis-width 8)))
                               (:fill (max 100 (- basis-width 24)))
-                              (:half-left (max 70 (floor (- right 30) 2)))
-                              (:half-right (max 70 (floor (- right 30) 2)))
                               (otherwise width-mode)))
-                          (item-x
-                            (case width-mode
-                              (:number (- basis-width 86))
-                              (:half-right (+ 18 (floor (- right 30) 2)))
-                              (otherwise x)))
+                          (item-x x)
                           (item-y (case y
                                     (:action-row (- main-height 34))
                                     (:chart-row (+ 84 scope-height))
@@ -4040,6 +4067,20 @@ new cache entry is published."
                      (lightfast:resize-widget
                       widget :x item-x :y item-y
                       :width item-width :height item-height))))
+               (dolist (row inspector-rows)
+                 (destructuring-bind (layout x y height basis) row
+                   (let ((width (if (eq basis :page) (- right 12) right)))
+                     (lightfast:apply-layout
+                      layout
+                      (lightfast:make-rect :x x
+                                           :y (case y
+                                                (:action-row (- main-height 34))
+                                                (:page-action-row
+                                                 (- page-height 30))
+                                                (otherwise y))
+                                           :width (max 120 (- width x 8))
+                                           :height height)
+                      :parent (if (eq basis :page) node-page inspector)))))
                (when tone-items
                  (lightfast:apply-layout
                   (tone-bands-layout (reverse tone-items))
@@ -4987,22 +5028,32 @@ new cache entry is published."
                          (declare (ignore ignored))
                          (reset-curve-channel)))
             12 :page-action-row :fill 26 :page)))
-        (register-inspector
-         (lightfast:make-button :parent inspector :x 12 :y 674
-                              :width 140 :height 26 :label "Reset selected"
-                              :callback (lambda (&rest ignored)
-                                          (declare (ignore ignored))
-                                          (gui-model-reset-selected model)
-                                          (sync-controls)
-                                                                (schedule-edited-preview)))
-         12 :action-row :half-left 26)
-        (register-inspector
-         (lightfast:make-button :parent inspector :x 166 :y 674
-                              :width 142 :height 26 :label "Export current"
-                              :callback (lambda (&rest ignored)
-                                          (declare (ignore ignored))
-                                          (render-selected)))
-         166 :action-row :half-right 26)
+        ;; The two footer buttons split the inspector's width evenly, which the
+        ;; flex engine does directly instead of two mirrored width modes that
+        ;; each had to recompute the same half.
+        (register-inspector-row
+         (lightfast:make-layout-row
+          :gap 12
+          :children
+          (list (lightfast:make-layout-item
+                 (lightfast:make-button
+                  :parent inspector :x 12 :y 674
+                  :width 140 :height 26 :label "Reset selected"
+                  :callback (lambda (&rest ignored)
+                              (declare (ignore ignored))
+                              (gui-model-reset-selected model)
+                              (sync-controls)
+                              (schedule-edited-preview)))
+                 :basis 0 :grow 1)
+                (lightfast:make-layout-item
+                 (lightfast:make-button
+                  :parent inspector :x 166 :y 674
+                  :width 142 :height 26 :label "Export current"
+                  :callback (lambda (&rest ignored)
+                              (declare (ignore ignored))
+                              (render-selected)))
+                 :basis 0 :grow 1)))
+         12 :action-row 26)
         (setf progress (lightfast:make-progress :parent window :x 0 :y 772
                                               :width 180 :height 28 :value "0")
               status (lightfast:make-status-bar :parent window :x 180 :y 772
