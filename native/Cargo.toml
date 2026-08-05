@@ -16,13 +16,16 @@ jpeg-encoder = { version = "=0.7.1", features = ["simd"] }
 lensfun = "=0.7.0"
 md-5 = "=0.10.6"
 mimalloc = { version = "=0.1.48", default-features = false, optional = true }
+rpmalloc = { version = "=0.2.2", optional = true }
 rawler = "=0.7.2"
 rayon = "=1.12.0"
 sha2 = "=0.10.9"
 
 [features]
-# Measured on a 13700H: no effect outside run-to-run noise, kept as a switch.
+# Both measured on a 13700H: no effect outside run-to-run noise. Kept as
+# switches so the question can be re-tested rather than re-argued.
 mimalloc-allocator = ["mimalloc"]
+rpmalloc-allocator = ["rpmalloc"]
 
 [profile.release]
 lto = "thin"

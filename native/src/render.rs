@@ -717,7 +717,9 @@ fn edge_guided_blur_into(
     output: &mut Vec<f32>,
 ) {
     let _ = horizontal;
-    output.clear();
+    // Grow to fit without clearing first. Every element is written below, so
+    // clearing would only force the whole plane to be re-zeroed on each call
+    // and throw away the point of reusing the buffer.
     output.resize(source.len(), 0.0);
     let use_avx = super::nn::fma_available();
     let reach = 2 * step;
@@ -731,7 +733,7 @@ fn edge_guided_blur_into(
             let halo_lo = y0.saturating_sub(reach);
             let halo_hi = (y0 + band_rows + reach).min(height);
             let halo_rows = halo_hi - halo_lo;
-            band_buffer.clear();
+            // Every row of the band is written by the horizontal pass below.
             band_buffer.resize(halo_rows * width, 0.0);
             // Fused pass one: horizontal blur for the band plus halo.
             for row in 0..halo_rows {
@@ -822,7 +824,7 @@ fn median_of_9(mut samples: [f32; 9]) -> f32 {
 }
 
 fn median_filter_3x3_into(source: &[f32], width: usize, height: usize, output: &mut Vec<f32>) {
-    output.clear();
+    // Written in full below, so no clear; see `edge_guided_blur_into`.
     output.resize(source.len(), 0.0);
     output
         .par_chunks_mut(width)

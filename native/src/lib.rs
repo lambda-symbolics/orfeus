@@ -10,6 +10,11 @@
 #[global_allocator]
 static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+/// The same question asked of rpmalloc, with `--features rpmalloc-allocator`.
+#[cfg(all(feature = "rpmalloc-allocator", not(feature = "mimalloc-allocator")))]
+#[global_allocator]
+static ALLOCATOR: rpmalloc::RpMalloc = rpmalloc::RpMalloc;
+
 use std::collections::HashSet;
 use std::ffi::{CStr, c_char};
 use std::fmt;
