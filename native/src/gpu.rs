@@ -122,6 +122,16 @@ fn adapter_rank(kind: vk::PhysicalDeviceType, preference: AdapterPreference) -> 
     }
 }
 
+fn adapter_kind_name(kind: vk::PhysicalDeviceType) -> &'static str {
+    match kind {
+        vk::PhysicalDeviceType::INTEGRATED_GPU => "integrated",
+        vk::PhysicalDeviceType::DISCRETE_GPU => "discrete",
+        vk::PhysicalDeviceType::VIRTUAL_GPU => "virtual",
+        vk::PhysicalDeviceType::CPU => "cpu",
+        _ => "other",
+    }
+}
+
 fn initialize() -> Result<Context, String> {
     let preference = preference();
     unsafe {
@@ -159,8 +169,8 @@ fn initialize() -> Result<Context, String> {
         if std::env::var_os("ORFEUS_PROFILE").is_some() {
             for (rank, _, queue_family, properties) in &candidates {
                 eprintln!(
-                    "orfeus-profile gpu-adapter rank={rank} queue-family={queue_family} type={:?} name={:?}",
-                    properties.device_type,
+                    "orfeus-profile gpu-adapter rank={rank} queue-family={queue_family} type={} name={:?}",
+                    adapter_kind_name(properties.device_type),
                     properties
                         .device_name_as_c_str()
                         .unwrap_or(c"unnamed")
