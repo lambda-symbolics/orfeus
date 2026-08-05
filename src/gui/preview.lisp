@@ -14,7 +14,7 @@
 
 (defun load-gui-preview-library ()
   (unless *gui-preview-library-loaded-p*
-    (cl-fltk:load-library)
+    (lightfast:load-library)
     (let ((path (gui-preview-library-pathname)))
       (unless (probe-file path)
         (error 'gui-preview-library-unavailable :path path))
@@ -47,7 +47,7 @@
                                 (filter "") (preset-path ""))
   "Return all photo pathnames selected by the canonical FLTK file chooser."
   (mapcar #'pathname
-          (or (cl-fltk:choose-files :title title
+          (or (lightfast:choose-files :title title
                                     :filter filter
                                     :preset-file preset-path)
               '())))
@@ -110,7 +110,7 @@ blue level histograms, or NIL when the preview cannot be read."
 (defun draw-waveform (canvas buffer x y width height)
   "Blit the waveform image in BUFFER into CANVAS's absolute rectangle."
   (load-gui-preview-library)
-  (plusp (%gui-preview-draw-rgb-rect (cl-fltk:widget-id canvas) buffer
+  (plusp (%gui-preview-draw-rgb-rect (lightfast:widget-id canvas) buffer
                                      *waveform-columns* *waveform-levels*
                                      x y width height)))
 
@@ -127,7 +127,7 @@ blue level histograms, or NIL when the preview cannot be read."
                                                 (center-y .5d0))
   "Draw PATHNAME in CANVAS at relative ZOOM around normalized source center."
   (load-gui-preview-library)
-  (plusp (%gui-preview-draw (cl-fltk:widget-id canvas) (namestring pathname)
+  (plusp (%gui-preview-draw (lightfast:widget-id canvas) (namestring pathname)
                             zoom center-x center-y)))
 
 (defun draw-preview-buffer (canvas pointer width height generation
@@ -137,12 +137,12 @@ blue level histograms, or NIL when the preview cannot be read."
 GENERATION keys the cached scaled copy; bump it whenever the buffer's
 contents change."
   (load-gui-preview-library)
-  (plusp (%gui-preview-draw-buffer (cl-fltk:widget-id canvas) pointer
+  (plusp (%gui-preview-draw-buffer (lightfast:widget-id canvas) pointer
                                    width height generation
                                    zoom center-x center-y)))
 
 (defun draw-thumbnail-file (canvas pathname x y width height)
   "Draw PATHNAME fitted inside the absolute rectangle in CANVAS."
   (load-gui-preview-library)
-  (plusp (%gui-preview-draw-rect (cl-fltk:widget-id canvas) (namestring pathname)
+  (plusp (%gui-preview-draw-rect (lightfast:widget-id canvas) (namestring pathname)
                                  x y width height)))

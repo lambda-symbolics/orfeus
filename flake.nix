@@ -35,8 +35,8 @@
         ];
 
         shellHook = ''
-          export CL_SOURCE_REGISTRY="$PWD//:$PWD/../fltk-sun//"
-          export ORFEUS_FLTK_SOURCE="$PWD/../fltk-sun"
+          export CL_SOURCE_REGISTRY="$PWD//:$PWD/../lightfast//"
+          export ORFEUS_LIGHTFAST_SOURCE="$PWD/../lightfast"
           export CARGO_TARGET_DIR="$PWD/native/target-nix"
           export ORFEUS_NATIVE_LIBRARY="$CARGO_TARGET_DIR/release/liborfeus_native.so"
           export LD_LIBRARY_PATH="${pkgs.lib.makeLibraryPath [ pkgs.vulkan-loader ]}:/run/opengl-driver/lib:/usr/lib:''${LD_LIBRARY_PATH:-}"

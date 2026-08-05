@@ -95,6 +95,62 @@ buffer, with no JPEG or file on the path.")
 (defparameter *inspector-min-height* 378
   "Minimum inspector height that keeps the complete Curves panel accessible.")
 
+(defun make-root-layout (menu toolbar main-tile progress status)
+  "Build the automatic Lightfast layout for Orfeus's top-level window regions."
+  (lightfast:make-layout-column
+   :children
+   (list
+    (lightfast:make-layout-item menu :basis 24 :shrink 0)
+    (lightfast:make-layout-item toolbar :basis 40 :shrink 0)
+    (lightfast:make-layout-item main-tile :basis 0 :grow 1 :min-height 200)
+    (lightfast:make-layout-row
+     :basis 28 :shrink 0
+     :children
+     (list
+      (lightfast:make-layout-item progress :basis 180 :shrink 0)
+      (lightfast:make-layout-item status :basis 0 :grow 1))))))
+
+(defun parse-export-integer-value (text label fallback minimum maximum)
+  "Parse one export dialog integer completely and enforce its inclusive range."
+  (let* ((text (string-trim " " text))
+         (value (if (zerop (length text))
+                    fallback
+                    (handler-case
+                        (parse-integer text)
+                      (error ()
+                        (error "~A must be a whole number" label))))))
+    (unless (<= minimum value maximum)
+      (error "~A must be between ~D and ~D" label minimum maximum))
+    value))
+
+(defun update-project-export-settings
+    (project destination quality-text width-text height-text metadata-p timestamp-p)
+  "Validate and atomically store all export dialog values on PROJECT."
+  (let ((destination (string-trim " " destination)))
+    (when (zerop (length destination))
+      (error "Choose a destination folder first"))
+    (let ((destination-path
+            (pathname
+             (concatenate 'string (string-right-trim "/" destination) "/")))
+          (width (parse-export-integer-value
+                  width-text "Maximum width" 0 0 100000))
+          (height (parse-export-integer-value
+                   height-text "Maximum height" 0 0 100000))
+          (quality (parse-export-integer-value
+                    quality-text "JPEG quality" 92 1 100))
+          (settings (project-export-settings project)))
+      (setf (project-output-directory project) destination-path
+            (export-settings-jpeg-quality settings) quality
+            (export-settings-max-width settings) (when (plusp width) width)
+            (export-settings-max-height settings) (when (plusp height) height)
+            (export-settings-preserve-metadata-p settings) metadata-p
+            (export-settings-timestamp-filenames-p settings) timestamp-p)
+      settings)))
+
+(defun gallery-generation-event-current-p (event generation)
+  "Return true when EVENT belongs to the current still-gallery GENERATION."
+  (= (second event) generation))
+
 (defun node-kind-label (kind)
   (or (rest (assoc kind *node-kind-labels*)) (string kind)))
 
@@ -297,6 +353,28 @@ from the anchor, and control-shift adds that range to the selection."
                  (cons row selected))
              row))
     (t (values (list row) row))))
+
+(defparameter *thumbnail-context-actions*
+  '((:export . "Export selected photographs...")
+    (:apply-still . "Apply selected still to selection")
+    (:reset-edits . "Remove edits from selection")
+    (:copy-paths . "Copy source paths")
+    (:divider . "-")
+    (:select-all . "Select all photographs")
+    (:remove . "Remove selection from project..."))
+  "Actions and labels shown by the photo sidebar's context menu.")
+
+(defun thumbnail-context-menu-items ()
+  "Return the labels for the photo sidebar's context menu."
+  (mapcar #'rest *thumbnail-context-actions*))
+
+(defun thumbnail-context-action-at (index)
+  "Return the photo sidebar action selected at zero-based INDEX, or NIL."
+  (and index (first (nth index *thumbnail-context-actions*))))
+
+(defun thumbnail-context-selection (selected row)
+  "Preserve SELECTED when ROW is already selected, otherwise select only ROW."
+  (if (member row selected) selected (list row)))
 
 (defun graph-view-signature (job graph selected-node)
   "Return a cheap identity of what the node graph editor should display.
@@ -774,7 +852,7 @@ new cache entry is published."
            (content-keys (make-hash-table :test #'equal))
             (content-keys-lock
               (sb-thread:make-mutex :name "Orfeus preview content keys"))
-           window menu toolbar toolbar-bottom-rule main-tile left-column
+           window menu toolbar toolbar-bottom-rule main-tile root-layout left-column
            filmstrip-pane gallery-pane center-pane
            thumbnail-canvas thumbnail-scrollbar photo-selection-label
            before-canvas after-canvas before-caption after-caption
@@ -881,8 +959,8 @@ new cache entry is published."
                  before-preview-file
                  after-preview-file))
            (redraw-previews ()
-             (when before-canvas (cl-fltk:redraw before-canvas))
-             (when after-canvas (cl-fltk:redraw after-canvas)))
+             (when before-canvas (lightfast:redraw before-canvas))
+             (when after-canvas (lightfast:redraw after-canvas)))
            (reset-preview-view ()
              (setf preview-zoom 1d0
                    preview-center-x .5d0
@@ -903,9 +981,9 @@ new cache entry is published."
                      (values after-live-width after-live-height)
                      (preview-file-size path))
                (when source-width
-                 (let ((fit (min (/ (cl-fltk:widget-width canvas)
+                 (let ((fit (min (/ (lightfast:widget-width canvas)
                                     (float source-width 1d0))
-                                 (/ (cl-fltk:widget-height canvas)
+                                 (/ (lightfast:widget-height canvas)
                                     (float source-height 1d0)))))
                    (let ((scale (min (max fit 2d0) (* fit zoom))))
                      (values (* source-width scale)
@@ -929,8 +1007,8 @@ new cache entry is published."
                  (multiple-value-bind (old-width old-height)
                      (preview-scaled-size canvas path old-zoom)
                    (when old-width
-                     (let* ((canvas-center-x (/ (cl-fltk:widget-width canvas) 2d0))
-                            (canvas-center-y (/ (cl-fltk:widget-height canvas) 2d0))
+                     (let* ((canvas-center-x (/ (lightfast:widget-width canvas) 2d0))
+                            (canvas-center-y (/ (lightfast:widget-height canvas) 2d0))
                             (source-x (+ preview-center-x
                                          (/ (- pointer-x canvas-center-x) old-width)))
                             (source-y (+ preview-center-y
@@ -946,7 +1024,7 @@ new cache entry is published."
                ;; the drag timer, or the sharp image would lag behind.
                (when (and after-live-p (> new-zoom 1.0001d0))
                  (when live-settle-id
-                   (ignore-errors (cl-fltk:remove-timeout live-settle-id))
+                   (ignore-errors (lightfast:remove-timeout live-settle-id))
                    (setf live-settle-id nil))
                  (discard-gui-tasks queue :after)
                  (enqueue-preview nil))
@@ -978,8 +1056,8 @@ new cache entry is published."
              (multiple-value-bind (scaled-width scaled-height)
                  (preview-scaled-size canvas path preview-zoom)
                (when scaled-width
-                 (let* ((width (cl-fltk:widget-width canvas))
-                        (height (cl-fltk:widget-height canvas))
+                 (let* ((width (lightfast:widget-width canvas))
+                        (height (lightfast:widget-height canvas))
                         (visible-x (min 1d0 (/ width scaled-width)))
                         (visible-y (min 1d0 (/ height scaled-height)))
                         (center-x (min (- 1d0 (/ visible-x 2))
@@ -1061,7 +1139,7 @@ new cache entry is published."
                       (list :left (float left 1.0) :top (float top 1.0)
                             :width (float width 1.0)
                             :height (float height 1.0)))
-                     (when after-canvas (cl-fltk:redraw after-canvas))
+                     (when after-canvas (lightfast:redraw after-canvas))
                      (set-status
                       (format nil "Crop ~,2F ~,2F ~,2Fx~,2F"
                               left top width height)))
@@ -1073,7 +1151,7 @@ new cache entry is published."
              (handler-case
                  (progn
                    (gui-model-set-node-params model node (list :angle angle))
-                   (when after-canvas (cl-fltk:redraw after-canvas))
+                   (when after-canvas (lightfast:redraw after-canvas))
                    (set-status (format nil "Crop angle ~,1F deg" angle)))
                (error (condition)
                  (set-status (princ-to-string condition)))))
@@ -1182,8 +1260,8 @@ new cache entry is published."
                                    cosine sine)
                  (crop-overlay-geometry widget)
                (when center-x
-                 (let* ((x (cl-fltk:widget-x widget))
-                        (y (cl-fltk:widget-y widget))
+                 (let* ((x (lightfast:widget-x widget))
+                        (y (lightfast:widget-y widget))
                         (corners
                           (loop for (dx dy) in (crop-corner-offsets
                                                 half-width half-height)
@@ -1193,27 +1271,27 @@ new cache entry is published."
                                                        cosine sine dx dy)
                                   (list (round (+ x px))
                                         (round (+ y py)))))))
-                   (cl-fltk:draw-push-clip x y
-                                           (cl-fltk:widget-width widget)
-                                           (cl-fltk:widget-height widget))
+                   (lightfast:draw-push-clip x y
+                                           (lightfast:widget-width widget)
+                                           (lightfast:widget-height widget))
                    (loop for (from to) in '((0 1) (1 2) (2 3) (3 0))
                          do (destructuring-bind (x1 y1) (nth from corners)
                               (destructuring-bind (x2 y2) (nth to corners)
-                                (cl-fltk:draw-color-rgb :red 20 :green 22
+                                (lightfast:draw-color-rgb :red 20 :green 22
                                                         :blue 26)
-                                (cl-fltk:draw-line (1+ x1) (1+ y1)
+                                (lightfast:draw-line (1+ x1) (1+ y1)
                                                    (1+ x2) (1+ y2))
-                                (cl-fltk:draw-color-rgb :red 235 :green 235
+                                (lightfast:draw-color-rgb :red 235 :green 235
                                                         :blue 240)
-                                (cl-fltk:draw-line x1 y1 x2 y2))))
+                                (lightfast:draw-line x1 y1 x2 y2))))
                    (loop for (px py) in corners
-                         do (cl-fltk:draw-color-rgb :red 20 :green 22
+                         do (lightfast:draw-color-rgb :red 20 :green 22
                                                     :blue 26)
-                            (cl-fltk:draw-filled-circle px py 5)
-                            (cl-fltk:draw-color-rgb :red 235 :green 235
+                            (lightfast:draw-filled-circle px py 5)
+                            (lightfast:draw-color-rgb :red 235 :green 235
                                                     :blue 240)
-                            (cl-fltk:draw-filled-circle px py 4))
-                   (cl-fltk:draw-pop-clip)))))
+                            (lightfast:draw-filled-circle px py 4))
+                   (lightfast:draw-pop-clip)))))
            (curves-editing-node ()
              ;; The editor drives the selected curves node, else the most
              ;; downstream curves node on the photo's real graph.
@@ -1275,8 +1353,8 @@ new cache entry is published."
            (curve-chart-geometry ()
              ;; The chart rectangle, widget-relative.
              (values 12 8
-                     (- (cl-fltk:widget-width curve-canvas) 24)
-                     (- (cl-fltk:widget-height curve-canvas) 16)))
+                     (- (lightfast:widget-width curve-canvas) 24)
+                     (- (lightfast:widget-height curve-canvas) 16)))
            (channel-clip-fraction (plane edge)
              ;; The share of samples piled into the darkest or brightest bin.
              (let ((total (reduce #'+ plane)))
@@ -1291,27 +1369,27 @@ new cache entry is published."
              ;; rising up the frame, so shadows sit at the bottom and
              ;; highlights at the top. Traces that reach an edge are clipping,
              ;; and the corner letters name the channels that got there.
-             (let* ((x (cl-fltk:widget-x widget))
-                    (y (cl-fltk:widget-y widget))
-                    (width (cl-fltk:widget-width widget))
-                    (height (cl-fltk:widget-height widget))
+             (let* ((x (lightfast:widget-x widget))
+                    (y (lightfast:widget-y widget))
+                    (width (lightfast:widget-width widget))
+                    (height (lightfast:widget-height widget))
                     (left (1+ x))
                     (top (1+ y))
                     (inner-width (- width 2))
                     (inner-height (- height 2)))
-               (cl-fltk:draw-color-rgb :red 8 :green 8 :blue 10)
-               (cl-fltk:draw-filled-rect x y width height)
+               (lightfast:draw-color-rgb :red 8 :green 8 :blue 10)
+               (lightfast:draw-filled-rect x y width height)
                (cond
                  ((and waveform-buffer (plusp inner-width) (plusp inner-height))
                   (draw-waveform widget waveform-buffer left top
                                  inner-width inner-height)
-                  (cl-fltk:draw-color-rgb :red 46 :green 46 :blue 54)
+                  (lightfast:draw-color-rgb :red 46 :green 46 :blue 54)
                   (dotimes (line 3)
                     (let ((grid-y (+ top (floor (* (1+ line) inner-height) 4))))
-                      (cl-fltk:draw-line left grid-y
+                      (lightfast:draw-line left grid-y
                                          (+ left inner-width -1) grid-y)))
                   (when curve-histogram
-                    (cl-fltk:draw-font :size 10)
+                    (lightfast:draw-font :size 10)
                     (loop for plane in curve-histogram
                           for label in '("R" "G" "B")
                           for column from 0
@@ -1328,37 +1406,37 @@ new cache entry is published."
                                                     orfeus:*curve-channel-keys*)
                                                t)
                                               (values 62 62 68))
-                                        (cl-fltk:draw-color-rgb :red red
+                                        (lightfast:draw-color-rgb :red red
                                                                 :green green
                                                                 :blue blue)
-                                        (cl-fltk:draw-text
+                                        (lightfast:draw-text
                                          label
                                          (+ left inner-width -34
                                             (* column 11))
                                          label-y))))
-                    (cl-fltk:draw-font :size 12)))
+                    (lightfast:draw-font :size 12)))
                  (t
-                  (cl-fltk:draw-color-rgb :red 128 :green 128 :blue 134)
-                  (cl-fltk:draw-font :size 11)
-                  (cl-fltk:draw-text "Waveform appears with the preview"
+                  (lightfast:draw-color-rgb :red 128 :green 128 :blue 134)
+                  (lightfast:draw-font :size 11)
+                  (lightfast:draw-text "Waveform appears with the preview"
                                      (+ left 12) (+ top (floor inner-height 2)))
-                  (cl-fltk:draw-font :size 12)))
-               (cl-fltk:draw-color-rgb :red 72 :green 72 :blue 80)
-               (cl-fltk:draw-rect x y width height)))
+                  (lightfast:draw-font :size 12)))
+               (lightfast:draw-color-rgb :red 72 :green 72 :blue 80)
+               (lightfast:draw-rect x y width height)))
            (draw-curve-editor (widget)
-             (let* ((x (cl-fltk:widget-x widget))
-                    (y (cl-fltk:widget-y widget))
-                    (width (cl-fltk:widget-width widget))
-                    (height (cl-fltk:widget-height widget))
+             (let* ((x (lightfast:widget-x widget))
+                    (y (lightfast:widget-y widget))
+                    (width (lightfast:widget-width widget))
+                    (height (lightfast:widget-height widget))
                     (node (curves-editing-node)))
-               (cl-fltk:draw-color-rgb :red 44 :green 44 :blue 48)
-               (cl-fltk:draw-filled-rect x y width height)
+               (lightfast:draw-color-rgb :red 44 :green 44 :blue 48)
+               (lightfast:draw-filled-rect x y width height)
                (multiple-value-bind (chart-x chart-y chart-w chart-h)
                    (curve-chart-geometry)
                  (let ((left (+ x chart-x))
                        (top (+ y chart-y)))
-                   (cl-fltk:draw-color-rgb :red 16 :green 16 :blue 18)
-                   (cl-fltk:draw-filled-rect left top chart-w chart-h)
+                   (lightfast:draw-color-rgb :red 16 :green 16 :blue 18)
+                   (lightfast:draw-filled-rect left top chart-w chart-h)
                    ;; Channel occupancy: dim cached RGB histogram bars behind
                    ;; the grid. Decoding runs on the background queue.
                    (when curve-histogram
@@ -1371,7 +1449,7 @@ new cache entry is published."
                                                           below (1- bins)
                                                         maximize
                                                         (aref plane index)))))
-                                (cl-fltk:draw-color-rgb :red red :green green
+                                (lightfast:draw-color-rgb :red red :green green
                                                         :blue blue)
                                 (loop for index from 0 below bins
                                       for value = (min 1.0
@@ -1390,29 +1468,29 @@ new cache entry is published."
                                                                     chart-w)
                                                                  bins)))
                                       do (when (plusp bar)
-                                           (cl-fltk:draw-filled-rect
+                                           (lightfast:draw-filled-rect
                                             bar-x (+ top chart-h (- bar))
                                             bar-w bar))))))
-                   (cl-fltk:draw-color-rgb :red 58 :green 58 :blue 64)
+                   (lightfast:draw-color-rgb :red 58 :green 58 :blue 64)
                    (dotimes (line 2)
                      (let ((grid-x (+ left (floor (* (1+ line) chart-w) 3)))
                            (grid-y (+ top (floor (* (1+ line) chart-h) 3))))
-                       (cl-fltk:draw-line grid-x top grid-x (+ top chart-h))
-                       (cl-fltk:draw-line left grid-y (+ left chart-w)
+                       (lightfast:draw-line grid-x top grid-x (+ top chart-h))
+                       (lightfast:draw-line left grid-y (+ left chart-w)
                                           grid-y)))
-                   (cl-fltk:draw-color-rgb :red 84 :green 84 :blue 92)
-                   (cl-fltk:draw-line left (+ top chart-h) (+ left chart-w)
+                   (lightfast:draw-color-rgb :red 84 :green 84 :blue 92)
+                   (lightfast:draw-line left (+ top chart-h) (+ left chart-w)
                                       top)
                    (if (null node)
                        (progn
-                         (cl-fltk:draw-color-rgb :red 205 :green 205
+                         (lightfast:draw-color-rgb :red 205 :green 205
                                                  :blue 210)
-                         (cl-fltk:draw-font :size 11)
-                         (cl-fltk:draw-text "Right-click the node strip"
+                         (lightfast:draw-font :size 11)
+                         (lightfast:draw-text "Right-click the node strip"
                                             (+ left 14) (+ top 26))
-                         (cl-fltk:draw-text "and add a Curves node"
+                         (lightfast:draw-text "and add a Curves node"
                                             (+ left 14) (+ top 42))
-                         (cl-fltk:draw-font :size 12))
+                         (lightfast:draw-font :size 12))
                        (progn
                          ;; Draw the two inactive curves, then the active
                          ;; channel on top with its control points.
@@ -1423,7 +1501,7 @@ new cache entry is published."
                              (multiple-value-bind (red green blue)
                                  (curve-channel-color
                                   key (eq key curve-channel))
-                               (cl-fltk:draw-color-rgb :red red :green green
+                               (lightfast:draw-color-rgb :red red :green green
                                                        :blue blue))
                              (loop with steps = 48
                                    for step from 0 below steps
@@ -1431,7 +1509,7 @@ new cache entry is published."
                                    for x1 = (/ (1+ step) (float steps))
                                    for y0 = (curve-spline-value points x0)
                                    for y1 = (curve-spline-value points x1)
-                                   do (cl-fltk:draw-line
+                                   do (lightfast:draw-line
                                        (+ left (round (* x0 (1- chart-w))))
                                        (+ top (round (* (- 1 y0)
                                                         (1- chart-h))))
@@ -1450,15 +1528,15 @@ new cache entry is published."
                                         (round (* (- 1 (nth (1+ (* index 2))
                                                             points))
                                                   (1- chart-h))))))
-                               (cl-fltk:draw-color-rgb :red 20 :green 20
+                               (lightfast:draw-color-rgb :red 20 :green 20
                                                        :blue 24)
-                               (cl-fltk:draw-filled-circle point-x point-y 5)
+                               (lightfast:draw-filled-circle point-x point-y 5)
                                (multiple-value-bind (red green blue)
                                    (curve-channel-color curve-channel t)
-                                 (cl-fltk:draw-color-rgb :red red
+                                 (lightfast:draw-color-rgb :red red
                                                          :green green
                                                          :blue blue))
-                               (cl-fltk:draw-filled-circle point-x point-y
+                               (lightfast:draw-filled-circle point-x point-y
                                                            4))))))))))
            (update-curve-drag (node x y)
              (multiple-value-bind (chart-x chart-y chart-w chart-h)
@@ -1485,7 +1563,7 @@ new cache entry is published."
                      (progn
                        (gui-model-set-node-params
                         model node (list curve-channel points))
-                       (cl-fltk:redraw curve-canvas)
+                       (lightfast:redraw curve-canvas)
                        (schedule-edited-preview)
                        (set-status
                         (format nil "~A point ~D: ~,2F ~,2F"
@@ -1500,7 +1578,7 @@ new cache entry is published."
                  (let ((node (curves-editing-node)))
                    (when node
                      (case event
-                       (#.cl-fltk:+event-push+
+                       (#.lightfast:+event-push+
                         (multiple-value-bind (chart-x chart-y chart-w
                                               chart-h)
                             (curve-chart-geometry)
@@ -1521,10 +1599,10 @@ new cache entry is published."
                                 (when (and (<= (abs (- x point-x)) 8)
                                            (<= (abs (- y point-y)) 8))
                                   (setf curve-drag index)))))))
-                       (#.cl-fltk:+event-drag+
+                       (#.lightfast:+event-drag+
                         (when curve-drag
                           (update-curve-drag node x y)))
-                       (#.cl-fltk:+event-release+
+                       (#.lightfast:+event-release+
                         (when curve-drag
                           (setf curve-drag nil)
                           (set-status
@@ -1552,7 +1630,7 @@ new cache entry is published."
                (declare (ignore dx state))
                (when x
                  (case event
-                   (#.cl-fltk:+event-push+
+                   (#.lightfast:+event-push+
                     (cond
                       (pick-color-node
                        (sample-base-at canvas x y))
@@ -1563,7 +1641,7 @@ new cache entry is published."
                              preview-drag-y y
                              preview-drag-center-x preview-center-x
                              preview-drag-center-y preview-center-y))))
-                   (#.cl-fltk:+event-drag+
+                   (#.lightfast:+event-drag+
                     (cond
                       (crop-drag (update-crop-drag x y))
                       (preview-drag-p
@@ -1579,14 +1657,14 @@ new cache entry is published."
                                      (- preview-drag-center-y
                                         (/ (- y preview-drag-y) height)))
                                (redraw-previews))))))))
-                   (#.cl-fltk:+event-release+
+                   (#.lightfast:+event-release+
                     (setf crop-drag nil
                           preview-drag-p nil))
-                   (#.cl-fltk:+event-wheel+
+                   (#.lightfast:+event-wheel+
                     (zoom-preview (if (minusp dy) 1.25d0 .8d0)
                                   canvas x y))))))
            (set-status (text)
-             (setf (cl-fltk:value status) text))
+             (setf (lightfast:value status) text))
            (selected-job ()
              (gui-model-selected-job model))
            (photo-content-key-for (job generation &optional refresh-p)
@@ -1603,7 +1681,7 @@ new cache entry is published."
              (if thumbnail-canvas
                  (max 0 (- (* (length (project-photos project))
                               (thumbnail-row-height))
-                           (cl-fltk:widget-height thumbnail-canvas)))
+                           (lightfast:widget-height thumbnail-canvas)))
                  0))
            (clamp-thumbnail-scroll ()
              (setf thumbnail-scroll
@@ -1612,11 +1690,11 @@ new cache entry is published."
              (when thumbnail-canvas
                (clamp-thumbnail-scroll)
                (when thumbnail-scrollbar
-                 (cl-fltk:set-range thumbnail-scrollbar
+                 (lightfast:set-range thumbnail-scrollbar
                                     0 (thumbnail-scroll-limit))
-                 (setf (cl-fltk:value thumbnail-scrollbar)
+                 (setf (lightfast:value thumbnail-scrollbar)
                        (format nil "~D" thumbnail-scroll)))
-               (cl-fltk:redraw thumbnail-canvas)))
+               (lightfast:redraw thumbnail-canvas)))
            (select-thumbnail-row (row state)
              (when (and (>= row 0) (< row (length (project-photos project))))
                (multiple-value-bind (selection anchor)
@@ -1631,13 +1709,13 @@ new cache entry is published."
                  (clear-previews)
                  (sync-controls)
                  (sync-node-tools)
-                 (when graph-canvas (cl-fltk:redraw graph-canvas))
+                 (when graph-canvas (lightfast:redraw graph-canvas))
                  (if selection
                      (schedule-initial-preview)
                      (progn
                        (incf preview-generation)
                        (when debounce-id
-                         (ignore-errors (cl-fltk:remove-timeout debounce-id))
+                         (ignore-errors (lightfast:remove-timeout debounce-id))
                          (setf debounce-id nil))
                        (discard-gui-tasks queue :before)
                        (discard-gui-tasks queue :after)
@@ -1648,22 +1726,86 @@ new cache entry is published."
                        (setf after-preview-generation nil
                              curve-histogram nil)))
                  (redraw-thumbnails))))
+           (select-all-thumbnails ()
+             (let ((indices (loop for index below (length (project-photos project))
+                                  collect index))
+                   (current (gui-model-selected-index model)))
+               (gui-model-set-selected-indices model indices)
+               (when indices
+                 (setf (gui-model-selected-index model)
+                       (min current (1- (length indices)))
+                       thumbnail-anchor (gui-model-selected-index model)))
+               (sync-controls)
+               (redraw-thumbnails)
+               (set-status (format nil "Selected ~D photograph~:P"
+                                   (length indices)))))
+           (copy-selected-photo-paths ()
+             (let ((jobs (gui-model-selected-jobs model)))
+               (if jobs
+                   (progn
+                     (lightfast:copy-text
+                      (format nil "~{~A~^~%~}"
+                              (mapcar (lambda (job)
+                                        (namestring (photo-job-input-path job)))
+                                      jobs)))
+                     (set-status (format nil "Copied ~D source path~:P"
+                                         (length jobs))))
+                   (set-status "No photographs selected"))))
+           (reset-selected-photo-edits ()
+             (let ((count (length (gui-model-acting-jobs model))))
+               (if (plusp count)
+                   (progn
+                     (gui-model-reset-selected model)
+                     (sync-controls)
+                     (sync-node-tools)
+                     (when graph-canvas (lightfast:redraw graph-canvas))
+                     (redraw-thumbnails)
+                     (schedule-edited-preview)
+                     (set-status (format nil "Removed edits from ~D photograph~:P"
+                                         count)))
+                   (set-status "No photographs selected"))))
+           (remove-selected-photo-with-confirmation ()
+             (let ((count (length (gui-model-selected-jobs model))))
+               (when (and (plusp count)
+                          (= 1 (lightfast:choice-box
+                                (format nil
+                                        "Remove ~D selected photograph~:P from this project?"
+                                        count)
+                                :button0 "Cancel" :button1 "Remove")))
+                 (remove-selected-photo))))
+           (show-thumbnail-context-menu (row)
+             (when (and (>= row 0) (< row (length (project-photos project))))
+               (let* ((selected (gui-model-selected-indices model))
+                      (context-selection
+                        (thumbnail-context-selection selected row)))
+                 (unless (equal selected context-selection)
+                   (select-thumbnail-row row 0)))
+               (case (thumbnail-context-action-at
+                      (lightfast:popup-menu (thumbnail-context-menu-items)))
+                 (:export (open-export-dialog "Selected photographs"))
+                 (:apply-still (apply-current-preset))
+                 (:reset-edits (reset-selected-photo-edits))
+                 (:copy-paths (copy-selected-photo-paths))
+                 (:select-all (select-all-thumbnails))
+                 (:remove (remove-selected-photo-with-confirmation)))))
            (handle-thumbnail-mouse (canvas event value)
-
              (multiple-value-bind (x y button dx dy state)
                  (parse-preview-event value)
-               (declare (ignore button dx))
+               (declare (ignore dx))
                (when y
                  (case event
-                   (#.cl-fltk:+event-push+
-                    (select-thumbnail-row
-                     (thumbnail-row-at y thumbnail-scroll
-                                       (thumbnail-row-height))
-                     (if (thumbnail-toggle-hit-p
-                          x (cl-fltk:widget-width canvas))
-                         (logior state +thumbnail-control-mask+)
-                         state)))
-                   (#.cl-fltk:+event-wheel+
+                   (#.lightfast:+event-push+
+                    (let ((row (thumbnail-row-at y thumbnail-scroll
+                                                 (thumbnail-row-height))))
+                      (if (= button 3)
+                          (show-thumbnail-context-menu row)
+                          (select-thumbnail-row
+                           row
+                           (if (thumbnail-toggle-hit-p
+                                x (lightfast:widget-width canvas))
+                               (logior state +thumbnail-control-mask+)
+                               state)))))
+                   (#.lightfast:+event-wheel+
                     (incf thumbnail-scroll (* dy 36))
                     (redraw-thumbnails))))))
            (clear-previews ()
@@ -1676,8 +1818,8 @@ new cache entry is published."
                (when path (forget-preview-file path)))
              (setf before-preview-file nil
                    after-preview-file nil)
-             (when before-canvas (cl-fltk:redraw before-canvas))
-             (when after-canvas (cl-fltk:redraw after-canvas)))
+             (when before-canvas (lightfast:redraw before-canvas))
+             (when after-canvas (lightfast:redraw after-canvas)))
            (publish-preview (role path generation)
              (let ((old-path (ecase role
                                (:before before-preview-file)
@@ -1687,28 +1829,28 @@ new cache entry is published."
                (forget-preview-file path)
                (ecase role
                  (:before (setf before-preview-file path)
-                          (cl-fltk:redraw before-canvas))
+                          (lightfast:redraw before-canvas))
                  (:after (setf after-preview-file path
                                after-preview-generation generation
                                after-live-p nil
                                (gethash (selected-job) thumbnail-files) path)
                          (schedule-curve-histogram path generation)
-                         (cl-fltk:redraw after-canvas)
+                         (lightfast:redraw after-canvas)
                          (when curve-canvas
-                           (cl-fltk:redraw curve-canvas))
+                           (lightfast:redraw curve-canvas))
                          (redraw-thumbnails)))))
            (sync-export-controls ()
              (when export-quality
                (let ((settings (project-export-settings project)))
-                 (setf (cl-fltk:value export-quality)
+                 (setf (lightfast:value export-quality)
                        (format nil "~D" (export-settings-jpeg-quality settings))
-                       (cl-fltk:value export-max-width)
+                       (lightfast:value export-max-width)
                        (format nil "~D" (or (export-settings-max-width settings) 0))
-                       (cl-fltk:value export-max-height)
+                       (lightfast:value export-max-height)
                        (format nil "~D" (or (export-settings-max-height settings) 0))
-                       (cl-fltk:value export-metadata)
+                       (lightfast:value export-metadata)
                        (if (export-settings-preserve-metadata-p settings) "1" "0")
-                       (cl-fltk:value export-timestamp)
+                       (lightfast:value export-timestamp)
                        (if (export-settings-timestamp-filenames-p settings)
                            "1" "0")))))
            (export-setting-changed (key widget)
@@ -1716,26 +1858,27 @@ new cache entry is published."
                  (let ((settings (project-export-settings project)))
                    (ecase key
                      (:jpeg-quality
-                      (let ((value (round (parse-number (cl-fltk:value widget)))))
-                        (unless (<= 1 value 100)
-                          (error "JPEG quality must be from 1 to 100."))
-                        (setf (export-settings-jpeg-quality settings) value)))
+                      (setf (export-settings-jpeg-quality settings)
+                            (parse-export-integer-value
+                             (lightfast:value widget) "JPEG quality" 92 1 100)))
                      (:max-width
-                      (let ((value (round (parse-number (cl-fltk:value widget)))))
-                        (when (minusp value) (error "Maximum width cannot be negative."))
+                      (let ((value (parse-export-integer-value
+                                    (lightfast:value widget)
+                                    "Maximum width" 0 0 100000)))
                         (setf (export-settings-max-width settings)
                               (unless (zerop value) value))))
                      (:max-height
-                      (let ((value (round (parse-number (cl-fltk:value widget)))))
-                        (when (minusp value) (error "Maximum height cannot be negative."))
+                      (let ((value (parse-export-integer-value
+                                    (lightfast:value widget)
+                                    "Maximum height" 0 0 100000)))
                         (setf (export-settings-max-height settings)
                               (unless (zerop value) value))))
                      (:preserve-metadata-p
                       (setf (export-settings-preserve-metadata-p settings)
-                            (gui-boolean-value (cl-fltk:value widget))))
+                            (gui-boolean-value (lightfast:value widget))))
                      (:timestamp-filenames-p
                       (setf (export-settings-timestamp-filenames-p settings)
-                            (gui-boolean-value (cl-fltk:value widget)))))
+                            (gui-boolean-value (lightfast:value widget)))))
                    (sync-export-controls)
                    (set-status "Export settings updated"))
                (error (condition)
@@ -1749,7 +1892,7 @@ new cache entry is published."
                            return name)
                    (let ((name (namestring path)))
                      (setf (gethash name lut-paths) name)
-                     (when lut-choice (cl-fltk:add-item lut-choice name))
+                     (when lut-choice (lightfast:add-item lut-choice name))
                      name))))
            (selected-photo-count ()
              (length (or (gui-model-selected-indices model)
@@ -1766,7 +1909,7 @@ new cache entry is published."
              (let* ((node (gui-model-selected-graph-node model))
                     (kind (and node (orfeus:graph-node-kind node))))
                (when kind-choice
-                 (setf (cl-fltk:value kind-choice)
+                 (setf (lightfast:value kind-choice)
                        (or (first (find kind *node-kind-choices*
                                         :key #'rest))
                            "None")))
@@ -1777,15 +1920,15 @@ new cache entry is published."
                                (otherwise (eq (first entry) kind)))))
                    (dolist (widget (rest entry))
                      (if show
-                         (cl-fltk:show widget)
-                         (cl-fltk:hide widget)))))
+                         (lightfast:show widget)
+                         (lightfast:hide widget)))))
                (when (and node blend-opacity-input
                           (orfeus:graph-node-blend-p node))
-                 (setf (cl-fltk:value blend-opacity-input)
+                 (setf (lightfast:value blend-opacity-input)
                        (format nil "~,2F"
                                (orfeus:graph-node-opacity node))))
                (when (and node crop-angle-input (eq kind :crop))
-                 (setf (cl-fltk:value crop-angle-input)
+                 (setf (lightfast:value crop-angle-input)
                        (format nil "~,1F"
                                (getf (orfeus:graph-node-params node)
                                      :angle 0.0))))))
@@ -1833,30 +1976,30 @@ new cache entry is published."
              ;; STYLE :terminal draws the darker RAW/OUT wells, :blend the
              ;; bluish body that marks a node with a second branch.
              (ecase style
-               (:terminal (cl-fltk:draw-color-rgb :red 78 :green 80 :blue 86))
-               (:bypassed (cl-fltk:draw-color-rgb :red 148 :green 148
+               (:terminal (lightfast:draw-color-rgb :red 78 :green 80 :blue 86))
+               (:bypassed (lightfast:draw-color-rgb :red 148 :green 148
                                                   :blue 148))
-               (:blend (cl-fltk:draw-color-rgb :red 176 :green 190 :blue 224))
-               (:normal (cl-fltk:draw-color-rgb :red 208 :green 208
+               (:blend (lightfast:draw-color-rgb :red 176 :green 190 :blue 224))
+               (:normal (lightfast:draw-color-rgb :red 208 :green 208
                                                 :blue 208)))
-             (cl-fltk:draw-filled-rect x y w h)
-             (cl-fltk:draw-color-rgb :red 240 :green 240 :blue 244)
-             (cl-fltk:draw-filled-rect x y w 1)
-             (cl-fltk:draw-filled-rect x y 1 h)
-             (cl-fltk:draw-color-rgb :red 70 :green 70 :blue 74)
-             (cl-fltk:draw-filled-rect x (+ y h -1) w 1)
-             (cl-fltk:draw-filled-rect (+ x w -1) y 1 h)
+             (lightfast:draw-filled-rect x y w h)
+             (lightfast:draw-color-rgb :red 240 :green 240 :blue 244)
+             (lightfast:draw-filled-rect x y w 1)
+             (lightfast:draw-filled-rect x y 1 h)
+             (lightfast:draw-color-rgb :red 70 :green 70 :blue 74)
+             (lightfast:draw-filled-rect x (+ y h -1) w 1)
+             (lightfast:draw-filled-rect (+ x w -1) y 1 h)
              (when selected
-               (cl-fltk:draw-color-rgb :red 40 :green 110 :blue 235)
-               (cl-fltk:draw-rect (1- x) (1- y) (+ w 2) (+ h 2))
-               (cl-fltk:draw-rect x y w h)
-               (cl-fltk:draw-rect (1+ x) (1+ y) (- w 2) (- h 2)))
+               (lightfast:draw-color-rgb :red 40 :green 110 :blue 235)
+               (lightfast:draw-rect (1- x) (1- y) (+ w 2) (+ h 2))
+               (lightfast:draw-rect x y w h)
+               (lightfast:draw-rect (1+ x) (1+ y) (- w 2) (- h 2)))
              (if (eq style :terminal)
-                 (cl-fltk:draw-color-rgb :red 225 :green 225 :blue 230)
-                 (cl-fltk:draw-color-rgb :red 10 :green 10 :blue 12))
-             (cl-fltk:draw-font :size 12)
-             (cl-fltk:draw-text label (+ x 10) (+ y (floor h 2) 5))
-             (cl-fltk:draw-font :size 12))
+                 (lightfast:draw-color-rgb :red 225 :green 225 :blue 230)
+                 (lightfast:draw-color-rgb :red 10 :green 10 :blue 12))
+             (lightfast:draw-font :size 12)
+             (lightfast:draw-text label (+ x 10) (+ y (floor h 2) 5))
+             (lightfast:draw-font :size 12))
            (draw-graph-wire (fx fy tx ty red green blue)
              ;; Wires leave the bottom of a node and enter the top of the
              ;; next, routed as two verticals joined by a horizontal so
@@ -1865,43 +2008,43 @@ new cache entry is published."
              (let ((mid (if (< fy ty)
                             (floor (+ fy ty) 2)
                             (+ fy 16))))
-               (cl-fltk:draw-color-rgb :red red :green green :blue blue)
+               (lightfast:draw-color-rgb :red red :green green :blue blue)
                (dotimes (pass 2)
-                 (cl-fltk:draw-line (+ fx pass) fy (+ fx pass) mid)
-                 (cl-fltk:draw-line fx (+ mid pass) tx (+ mid pass))
-                 (cl-fltk:draw-line (+ tx pass) mid (+ tx pass) ty))
+                 (lightfast:draw-line (+ fx pass) fy (+ fx pass) mid)
+                 (lightfast:draw-line fx (+ mid pass) tx (+ mid pass))
+                 (lightfast:draw-line (+ tx pass) mid (+ tx pass) ty))
                (dotimes (pass 2)
-                 (cl-fltk:draw-line (- tx 4) (- ty 5 pass) tx (- ty pass))
-                 (cl-fltk:draw-line (+ tx 4) (- ty 5 pass) tx (- ty pass)))))
+                 (lightfast:draw-line (- tx 4) (- ty 5 pass) tx (- ty pass))
+                 (lightfast:draw-line (+ tx 4) (- ty 5 pass) tx (- ty pass)))))
            (draw-graph-editor (widget)
-             (let* ((wx (cl-fltk:widget-x widget))
-                    (wy (cl-fltk:widget-y widget))
-                    (width (cl-fltk:widget-width widget))
-                    (height (cl-fltk:widget-height widget))
+             (let* ((wx (lightfast:widget-x widget))
+                    (wy (lightfast:widget-y widget))
+                    (width (lightfast:widget-width widget))
+                    (height (lightfast:widget-height widget))
                     (nodes (ensure-graph-node-positions (editor-nodes)))
                     (selected (gui-model-selected-graph-node model))
                     (ox (- wx graph-scroll-x))
                     (oy (- wy graph-scroll-y)))
-               (cl-fltk:draw-push-clip wx wy width height)
-               (cl-fltk:draw-color-rgb :red 52 :green 54 :blue 58)
-               (cl-fltk:draw-filled-rect wx wy width height)
+               (lightfast:draw-push-clip wx wy width height)
+               (lightfast:draw-color-rgb :red 52 :green 54 :blue 58)
+               (lightfast:draw-filled-rect wx wy width height)
                ;; A quiet dot grid anchored to graph space.
-               (cl-fltk:draw-color-rgb :red 66 :green 68 :blue 72)
+               (lightfast:draw-color-rgb :red 66 :green 68 :blue 72)
                (loop for gy from (* 24 (ceiling graph-scroll-y 24))
                        below (+ graph-scroll-y height) by 24
                      do (loop for gx from (* 24 (ceiling graph-scroll-x 24))
                                 below (+ graph-scroll-x width) by 24
-                              do (cl-fltk:draw-filled-rect (+ ox gx)
+                              do (lightfast:draw-filled-rect (+ ox gx)
                                                            (+ oy gy) 1 1)))
                (when (null nodes)
-                 (cl-fltk:draw-color-rgb :red 168 :green 170 :blue 174)
-                 (cl-fltk:draw-font :size 11)
-                 (cl-fltk:draw-text
+                 (lightfast:draw-color-rgb :red 168 :green 170 :blue 174)
+                 (lightfast:draw-font :size 11)
+                 (lightfast:draw-text
                   (if (selected-job)
                       "Right-click for a New Node"
                       "Open a photograph to grade")
                   (+ wx 14) (+ wy 52))
-                 (cl-fltk:draw-font :size 12))
+                 (lightfast:draw-font :size 12))
                (flet ((node-center-top (node)
                         (multiple-value-bind (x y w h) (graph-node-box node)
                           (declare (ignore h))
@@ -1942,21 +2085,21 @@ new cache entry is published."
                            (when fx
                              (let ((turn (+ tx 24))
                                    (drop (+ fy 14)))
-                               (cl-fltk:draw-color-rgb :red 96 :green 148
+                               (lightfast:draw-color-rgb :red 96 :green 148
                                                        :blue 235)
                                (dotimes (pass 2)
-                                 (cl-fltk:draw-line (+ fx pass) fy
+                                 (lightfast:draw-line (+ fx pass) fy
                                                     (+ fx pass) drop)
-                                 (cl-fltk:draw-line fx (+ drop pass)
+                                 (lightfast:draw-line fx (+ drop pass)
                                                     turn (+ drop pass))
-                                 (cl-fltk:draw-line (+ turn pass) drop
+                                 (lightfast:draw-line (+ turn pass) drop
                                                     (+ turn pass) ty)
-                                 (cl-fltk:draw-line turn (+ ty pass)
+                                 (lightfast:draw-line turn (+ ty pass)
                                                     tx (+ ty pass)))
                                (dotimes (pass 2)
-                                 (cl-fltk:draw-line (+ tx 5) (- ty 4 pass)
+                                 (lightfast:draw-line (+ tx 5) (- ty 4 pass)
                                                     (+ tx pass) ty)
-                                 (cl-fltk:draw-line (+ tx 5) (+ ty 4 pass)
+                                 (lightfast:draw-line (+ tx 5) (+ ty 4 pass)
                                                     (+ tx pass) ty)))))))))
                  ;; Output wire down to the OUT well.
                  (multiple-value-bind (out-x out-y out-w out-h)
@@ -2001,46 +2144,46 @@ new cache entry is published."
                                               (t :normal))
                                         (eq node selected))
                        (if (graph-node-active-p node)
-                           (cl-fltk:draw-color-rgb :red 40 :green 150
+                           (lightfast:draw-color-rgb :red 40 :green 150
                                                    :blue 40)
-                           (cl-fltk:draw-color-rgb :red 150 :green 150
+                           (lightfast:draw-color-rgb :red 150 :green 150
                                                    :blue 150))
-                       (cl-fltk:draw-filled-rect (+ bx w -13) (+ by 5) 8 8)
+                       (lightfast:draw-filled-rect (+ bx w -13) (+ by 5) 8 8)
                        ;; The input and output port nubs.
-                       (cl-fltk:draw-color-rgb :red 235 :green 235 :blue 240)
-                       (cl-fltk:draw-filled-rect (+ bx (floor w 2) -4)
+                       (lightfast:draw-color-rgb :red 235 :green 235 :blue 240)
+                       (lightfast:draw-filled-rect (+ bx (floor w 2) -4)
                                                  (+ by h -3) 9 6)
-                       (cl-fltk:draw-filled-rect (+ bx (floor w 2) -4)
+                       (lightfast:draw-filled-rect (+ bx (floor w 2) -4)
                                                  (- by 3) 9 6)
                        (when blend-p
                          ;; The fork made visible: an A branch arriving from
                          ;; above and a B branch from the right, merging into
                          ;; the single output below.
-                         (cl-fltk:draw-color-rgb :red 96 :green 148 :blue 235)
-                         (cl-fltk:draw-filled-rect (+ bx w -4)
+                         (lightfast:draw-color-rgb :red 96 :green 148 :blue 235)
+                         (lightfast:draw-filled-rect (+ bx w -4)
                                                    (+ by (floor h 2) -4)
                                                    7 9)
-                         (cl-fltk:draw-font :size 9)
-                         (cl-fltk:draw-color-rgb :red 30 :green 60 :blue 130)
-                         (cl-fltk:draw-text "A" (+ bx (floor w 2) 7)
+                         (lightfast:draw-font :size 9)
+                         (lightfast:draw-color-rgb :red 30 :green 60 :blue 130)
+                         (lightfast:draw-text "A" (+ bx (floor w 2) 7)
                                             (+ by 10))
-                         (cl-fltk:draw-text "B" (+ bx w -14)
+                         (lightfast:draw-text "B" (+ bx w -14)
                                             (+ by (floor h 2) 12))
-                         (cl-fltk:draw-font :size 12)
+                         (lightfast:draw-font :size 12)
                          (let ((cx (+ bx (floor w 2)))
                                (cy (+ by (floor h 2))))
-                           (cl-fltk:draw-line cx by cx cy)
-                           (cl-fltk:draw-line (+ bx w -6) cy cx cy)
-                           (cl-fltk:draw-line cx cy cx (+ by h))))
+                           (lightfast:draw-line cx by cx cy)
+                           (lightfast:draw-line (+ bx w -6) cy cx cy)
+                           (lightfast:draw-line cx cy cx (+ by h))))
                        (when bypassed
-                         (cl-fltk:draw-color-rgb :red 165 :green 40 :blue 40)
-                         (cl-fltk:draw-line bx (+ by h -1)
+                         (lightfast:draw-color-rgb :red 165 :green 40 :blue 40)
+                         (lightfast:draw-line bx (+ by h -1)
                                             (+ bx w -1) by)))))
                  ;; Source port nub.
                  (when (selected-job)
-                   (cl-fltk:draw-color-rgb :red 235 :green 235 :blue 240)
+                   (lightfast:draw-color-rgb :red 235 :green 235 :blue 240)
                    (multiple-value-bind (sx sy) (source-bottom)
-                     (cl-fltk:draw-filled-rect (- sx 3) (- sy 3) 7 6)))
+                     (lightfast:draw-filled-rect (- sx 3) (- sy 3) 7 6)))
                  ;; Wire rubber band.
                  (when (and node-drag (eq (first node-drag) :wire)
                             (getf (rest node-drag) :moved-p))
@@ -2051,17 +2194,17 @@ new cache entry is published."
                              (let ((node (nth from nodes)))
                                (and node (node-center-bottom node))))
                        (when fx
-                         (cl-fltk:draw-color-rgb :red 0 :green 0 :blue 128)
-                         (cl-fltk:draw-line
+                         (lightfast:draw-color-rgb :red 0 :green 0 :blue 128)
+                         (lightfast:draw-line
                           fx fy
                           (+ ox (getf (rest node-drag) :x))
                           (+ oy (getf (rest node-drag) :y))))))))
-               (cl-fltk:draw-pop-clip)))
+               (lightfast:draw-pop-clip)))
            (after-graph-edit (message)
              (sync-controls)
              (sync-node-tools)
-             (when graph-canvas (cl-fltk:redraw graph-canvas))
-             (when curve-canvas (cl-fltk:redraw curve-canvas))
+             (when graph-canvas (lightfast:redraw graph-canvas))
+             (when curve-canvas (lightfast:redraw curve-canvas))
              (redraw-previews)
              (schedule-edited-preview)
              (when message (set-status message)))
@@ -2078,8 +2221,8 @@ new cache entry is published."
                      (schedule-edited-preview))
                    (sync-controls)
                    (sync-node-tools)
-                   (when graph-canvas (cl-fltk:redraw graph-canvas))
-                   (when curve-canvas (cl-fltk:redraw curve-canvas))
+                   (when graph-canvas (lightfast:redraw graph-canvas))
+                   (when curve-canvas (lightfast:redraw curve-canvas))
                    (set-status (format nil "Node ~D: ~A~@[ (bypassed)~]"
                                        (orfeus:graph-node-id node)
                                        (node-kind-label
@@ -2092,7 +2235,7 @@ new cache entry is published."
                  (setf (gui-model-selected-node model) nil)
                  (sync-controls)
                  (sync-node-tools)
-                 (when graph-canvas (cl-fltk:redraw graph-canvas))
+                 (when graph-canvas (lightfast:redraw graph-canvas))
                  (when was-cropping
                    (schedule-edited-preview))
                  (set-status "Node deselected"))))
@@ -2185,7 +2328,7 @@ new cache entry is published."
                              (set-status (princ-to-string condition)))))))
                (orfeus:graph-node-kinds))))
            (show-node-menu (actions)
-             (let ((chosen (cl-fltk:popup-menu (mapcar #'first actions))))
+             (let ((chosen (lightfast:popup-menu (mapcar #'first actions))))
                (when chosen
                  (let ((action (rest (nth chosen actions))))
                    (when action (funcall action))))))
@@ -2224,7 +2367,7 @@ new cache entry is published."
                          ((:node :output-port)
                           (let ((target (nth index nodes)))
                             (if (or (null target) (eq target source-node))
-                                (cl-fltk:redraw graph-canvas)
+                                (lightfast:redraw graph-canvas)
                                 (if (gui-model-set-primary-input
                                      model target source-id)
                                     (after-graph-edit
@@ -2237,7 +2380,7 @@ new cache entry is published."
                                                   (orfeus:graph-node-kind
                                                    source-node))
                                                  "the source")))
-                                    (cl-fltk:redraw graph-canvas)))))
+                                    (lightfast:redraw graph-canvas)))))
                          (:branch-port
                           (let ((target (nth index nodes)))
                             (if (and target
@@ -2252,8 +2395,8 @@ new cache entry is published."
                                                   (orfeus:graph-node-kind
                                                    source-node))
                                                  "the source")))
-                                    (cl-fltk:redraw graph-canvas))
-                                (cl-fltk:redraw graph-canvas))))
+                                    (lightfast:redraw graph-canvas))
+                                (lightfast:redraw graph-canvas))))
                          (:output
                           (if source-node
                               (if (gui-model-set-output model source-node)
@@ -2262,11 +2405,11 @@ new cache entry is published."
                                            (node-kind-label
                                             (orfeus:graph-node-kind
                                              source-node))))
-                                  (cl-fltk:redraw graph-canvas))
-                              (cl-fltk:redraw graph-canvas)))
-                         (t (cl-fltk:redraw graph-canvas))))
+                                  (lightfast:redraw graph-canvas))
+                              (lightfast:redraw graph-canvas)))
+                         (t (lightfast:redraw graph-canvas))))
                    (error (condition)
-                     (cl-fltk:redraw graph-canvas)
+                     (lightfast:redraw graph-canvas)
                      (set-status (princ-to-string condition)))))))
            (handle-graph-mouse (widget event value)
              (declare (ignore widget))
@@ -2277,7 +2420,7 @@ new cache entry is published."
                  (let ((gx (+ x graph-scroll-x))
                        (gy (+ y graph-scroll-y)))
                    (case event
-                     (#.cl-fltk:+event-push+
+                     (#.lightfast:+event-push+
                       (multiple-value-bind (part index)
                           (graph-editor-hit gx gy)
                         (cond
@@ -2337,7 +2480,7 @@ new cache entry is published."
                                           :sx graph-scroll-x
                                           :sy graph-scroll-y
                                           :moved-p nil))))))))
-                     (#.cl-fltk:+event-drag+
+                     (#.lightfast:+event-drag+
                       (when node-drag
                         (let ((plist (rest node-drag)))
                           (case (first node-drag)
@@ -2353,12 +2496,12 @@ new cache entry is published."
                                                             (getf plist
                                                                   :dy)))
                                                   1.0)))
-                               (cl-fltk:redraw graph-canvas)))
+                               (lightfast:redraw graph-canvas)))
                             (:wire
                              (setf (getf plist :x) gx
                                    (getf plist :y) gy
                                    (getf plist :moved-p) t)
-                             (cl-fltk:redraw graph-canvas))
+                             (lightfast:redraw graph-canvas))
                             (:pan
                              (setf (getf plist :moved-p) t
                                    graph-scroll-x
@@ -2367,8 +2510,8 @@ new cache entry is published."
                                    graph-scroll-y
                                    (max 0 (- (getf plist :sy)
                                              (- y (getf plist :y)))))
-                             (cl-fltk:redraw graph-canvas))))))
-                     (#.cl-fltk:+event-release+
+                             (lightfast:redraw graph-canvas))))))
+                     (#.lightfast:+event-release+
                       (let ((drag node-drag))
                         (setf node-drag nil)
                         (when drag
@@ -2376,19 +2519,19 @@ new cache entry is published."
                             (:wire
                              (if (getf (rest drag) :moved-p)
                                  (drop-graph-wire drag gx gy)
-                                 (cl-fltk:redraw graph-canvas)))
-                            (:move (cl-fltk:redraw graph-canvas))
+                                 (lightfast:redraw graph-canvas)))
+                            (:move (lightfast:redraw graph-canvas))
                             (:pan
                              (unless (getf (rest drag) :moved-p)
                                (deselect-graph-node)))))))
-                     (#.cl-fltk:+event-wheel+
+                     (#.lightfast:+event-wheel+
                       (multiple-value-bind (right bottom)
                           (graph-content-extent)
                         (declare (ignore right))
                         (setf graph-scroll-y
                               (max 0 (min (max 0 (- bottom 60))
                                           (+ graph-scroll-y (* dy 32))))))
-                      (cl-fltk:redraw graph-canvas)))))))
+                      (lightfast:redraw graph-canvas)))))))
            (autocrop-negative (node)
              (let ((job (selected-job)))
                (when job
@@ -2430,7 +2573,7 @@ new cache entry is published."
            (pick-base-color (node)
              (let ((params (orfeus:graph-node-params node)))
                (multiple-value-bind (red green blue)
-                   (cl-fltk:choose-color
+                   (lightfast:choose-color
                     :title "Film base color"
                     :red (srgb-encode-component (getf params :red 1.0))
                     :green (srgb-encode-component (getf params :green 1.0))
@@ -2455,11 +2598,11 @@ new cache entry is published."
                    (when scaled-width
                      (let* ((normalized-x
                               (+ preview-center-x
-                                 (/ (- x (/ (cl-fltk:widget-width canvas) 2d0))
+                                 (/ (- x (/ (lightfast:widget-width canvas) 2d0))
                                     scaled-width)))
                             (normalized-y
                               (+ preview-center-y
-                                 (/ (- y (/ (cl-fltk:widget-height canvas)
+                                 (/ (- y (/ (lightfast:widget-height canvas)
                                             2d0))
                                     scaled-height))))
                        (handler-case
@@ -2539,7 +2682,7 @@ new cache entry is published."
                    (multiple-value-bind (stored condition)
                        (persist-still preset)
                      (refresh-gallery)
-                     (setf (cl-fltk:value preset-name-input)
+                     (setf (lightfast:value preset-name-input)
                            (processing-preset-name preset))
                      (sync-preset-action-label)
                      (set-status
@@ -2630,7 +2773,7 @@ new cache entry is published."
                                          name condition)
                                  (queue-event
                                   queue
-                                  (list :status nil
+                                  (list :still-error generation
                                         (format nil "Still preview failed: ~A"
                                                 condition))))))))))
                    ;; Source gone (card ejected, file moved): fall back to
@@ -2642,9 +2785,9 @@ new cache entry is published."
              (when gallery-canvas
                (dolist (still gallery-stills)
                  (request-still-thumbnail still))
-               (cl-fltk:redraw gallery-canvas)))
+               (lightfast:redraw gallery-canvas)))
            (gallery-columns ()
-             (max 1 (floor (- (cl-fltk:widget-width gallery-canvas) 8)
+             (max 1 (floor (- (lightfast:widget-width gallery-canvas) 8)
                            *gallery-cell-width*)))
            (gallery-index-at (x y)
              (let* ((columns (gallery-columns))
@@ -2660,15 +2803,15 @@ new cache entry is published."
                (max 0 (- (* (ceiling (length gallery-stills)
                                      columns)
                             *gallery-cell-height*)
-                         (- (cl-fltk:widget-height gallery-canvas) 8)))))
+                         (- (lightfast:widget-height gallery-canvas) 8)))))
            (draw-gallery (widget)
-             (let ((x (cl-fltk:widget-x widget))
-                   (y (cl-fltk:widget-y widget))
-                   (width (cl-fltk:widget-width widget))
-                   (height (cl-fltk:widget-height widget))
+             (let ((x (lightfast:widget-x widget))
+                   (y (lightfast:widget-y widget))
+                   (width (lightfast:widget-width widget))
+                   (height (lightfast:widget-height widget))
                    (columns (gallery-columns)))
-               (cl-fltk:draw-color-rgb :red 255 :green 255 :blue 255)
-               (cl-fltk:draw-filled-rect x y width height)
+               (lightfast:draw-color-rgb :red 255 :green 255 :blue 255)
+               (lightfast:draw-filled-rect x y width height)
                (loop for still in gallery-stills
                      for preset = (gallery-still-preset still)
                      for index from 0
@@ -2682,8 +2825,8 @@ new cache entry is published."
                        do (let ((name (processing-preset-name preset))
                                 (selected (eql index gallery-selected)))
                             (when selected
-                              (cl-fltk:draw-color-rgb :red 0 :green 0 :blue 128)
-                              (cl-fltk:draw-filled-rect
+                              (lightfast:draw-color-rgb :red 0 :green 0 :blue 128)
+                              (lightfast:draw-filled-rect
                                cell-x cell-y (- *gallery-cell-width* 6)
                                (- *gallery-cell-height* 6)))
                             (let ((thumb (gethash (gallery-still-key still) gallery-thumbs)))
@@ -2692,31 +2835,31 @@ new cache entry is published."
                                    widget thumb (+ cell-x 3) (+ cell-y 3)
                                    (- *gallery-cell-width* 12) 62)
                                   (progn
-                                    (cl-fltk:draw-color-rgb
+                                    (lightfast:draw-color-rgb
                                      :red 205 :green 205 :blue 205)
-                                    (cl-fltk:draw-filled-rect
+                                    (lightfast:draw-filled-rect
                                      (+ cell-x 3) (+ cell-y 3)
                                      (- *gallery-cell-width* 12) 62))))
                             (if selected
-                                (cl-fltk:draw-color-rgb :red 255 :green 255
+                                (lightfast:draw-color-rgb :red 255 :green 255
                                                         :blue 255)
-                                (cl-fltk:draw-color-rgb :red 0 :green 0
+                                (lightfast:draw-color-rgb :red 0 :green 0
                                                         :blue 0))
-                            (cl-fltk:draw-font :size 10)
-                            (cl-fltk:draw-text
+                            (lightfast:draw-font :size 10)
+                            (lightfast:draw-text
                              (if (> (length name) 14)
                                  (subseq name 0 14)
                                  name)
                              (+ cell-x 3) (+ cell-y 80))
-                            (cl-fltk:draw-font :size 12)))))
+                            (lightfast:draw-font :size 12)))))
            (gallery-select (index)
              (setf gallery-selected index)
              (let* ((still (nth index gallery-stills))
                     (preset (and still (gallery-still-preset still))))
                (when preset
-                 (setf (cl-fltk:value preset-name-input)
+                 (setf (lightfast:value preset-name-input)
                        (processing-preset-name preset))))
-             (cl-fltk:redraw gallery-canvas))
+             (lightfast:redraw gallery-canvas))
            (still-lens-note (preset)
              ;; Optics parameters travel, but the lens profile is re-matched
              ;; from each photo's own metadata; note when they differ.
@@ -2765,7 +2908,7 @@ new cache entry is published."
            (rename-still (still)
              (let* ((preset (gallery-still-preset still))
                     (old-name (processing-preset-name preset))
-                    (answer (cl-fltk:input-dialog "Still name"
+                    (answer (lightfast:input-dialog "Still name"
                                                   :initial old-name)))
                (when answer
                  (let ((new-name (string-trim '(#\Space #\Tab) answer)))
@@ -2800,7 +2943,7 @@ new cache entry is published."
                                        (orfeus:still-store-rename candidate old-name))
                                      (setf (processing-preset-name preset)
                                            new-name))
-                                 (setf (cl-fltk:value preset-name-input) new-name)
+                                 (setf (lightfast:value preset-name-input) new-name)
                                  (refresh-gallery)
                                  (set-status (format nil "Renamed ~A to ~A"
                                                      old-name new-name)))
@@ -2829,7 +2972,7 @@ new cache entry is published."
                                  (lambda () (rename-still still)))
                            (cons "Delete Still"
                                  (lambda () (delete-still still))))))
-               (let ((chosen (cl-fltk:popup-menu (mapcar #'first actions))))
+               (let ((chosen (lightfast:popup-menu (mapcar #'first actions))))
                  (when chosen
                    (let ((action (rest (nth chosen actions))))
                      (when action (funcall action)))))))
@@ -2840,7 +2983,7 @@ new cache entry is published."
                (declare (ignore dx state))
                (when x
                  (case event
-                   (#.cl-fltk:+event-push+
+                   (#.lightfast:+event-push+
                     (let ((index (gallery-index-at x y))
                           (now (get-internal-real-time)))
                       (when index
@@ -2856,28 +2999,28 @@ new cache entry is published."
                              (when still
                                (apply-still still))))
                           (t (setf gallery-click (cons now index)))))))
-                   (#.cl-fltk:+event-wheel+
+                   (#.lightfast:+event-wheel+
                     (setf gallery-scroll
                           (min (gallery-scroll-limit)
                                (max 0 (+ gallery-scroll (* dy 32)))))
-                    (cl-fltk:redraw gallery-canvas))))))
+                    (lightfast:redraw gallery-canvas))))))
            (sync-preset-action-label ()
              (let ((count (selected-photo-count)))
                (when preset-apply-button
-                 (setf (cl-fltk:label preset-apply-button)
+                 (setf (lightfast:label preset-apply-button)
                        (format nil "Apply to ~D photo~:P" count)))
                (when photo-selection-label
-                 (setf (cl-fltk:label photo-selection-label)
+                 (setf (lightfast:label photo-selection-label)
                        (format nil "Photos · ~D selected · boxes toggle" count)))))
            (save-current-preset ()
              (handler-case
                  (let ((preset (gui-model-save-preset
-                                model (cl-fltk:value preset-name-input))))
+                                model (lightfast:value preset-name-input))))
                    (remhash (processing-preset-name preset) gallery-thumbs)
                    (multiple-value-bind (stored condition)
                        (persist-still preset)
                      (refresh-gallery)
-                     (setf (cl-fltk:value preset-name-input)
+                     (setf (lightfast:value preset-name-input)
                            (processing-preset-name preset))
                      (set-status
                       (if stored
@@ -2896,22 +3039,22 @@ new cache entry is published."
            (sync-controls ()
              (dolist (entry controls)
                (let ((key (first entry)) (widget (second entry)))
-                 (setf (cl-fltk:value widget)
+                 (setf (lightfast:value widget)
                        (case key
                          ((:lens-correction-p :chromatic-aberration-correction-p)
                           (if (gui-model-setting model key) "1" "0"))
                          (otherwise (display-number (gui-model-setting model key)))))))
-             (setf (cl-fltk:value wb-choice)
+             (setf (lightfast:value wb-choice)
                    (if (gui-model-setting model :white-balance-temperature)
                        "Custom" "As shot")
-                   (cl-fltk:value target-choice)
+                   (lightfast:value target-choice)
                    (if (eq (gui-model-edit-target model) :defaults)
                        "Defaults" "Photo"))
              (when lut-choice
                (let ((path (gui-model-setting model :lut-path)))
-                 (setf (cl-fltk:value lut-choice)
+                 (setf (lightfast:value lut-choice)
                        (if path (lut-choice-name path) "None"))))
-             (setf (cl-fltk:label lens-name)
+             (setf (lightfast:label lens-name)
                    (let ((capture (selected-capture-description)))
                      (if capture
                          (format nil "Lens: ~A   |   ~A"
@@ -2935,7 +3078,7 @@ new cache entry is published."
              (clrhash content-keys)
                (refresh-gallery)
              (sync-node-tools)
-             (when graph-canvas (cl-fltk:redraw graph-canvas))
+             (when graph-canvas (lightfast:redraw graph-canvas))
              (sync-controls)
              (if (selected-job)
                  (schedule-initial-preview)
@@ -2964,7 +3107,7 @@ new cache entry is published."
                          (clear-previews)
                          (sync-controls)
                          (sync-node-tools)
-                         (when graph-canvas (cl-fltk:redraw graph-canvas))
+                         (when graph-canvas (lightfast:redraw graph-canvas))
                          (redraw-thumbnails)
                          (schedule-initial-preview)
                          (set-status (format nil "Added ~D photograph~:P" count)))
@@ -2980,7 +3123,7 @@ new cache entry is published."
                  (clear-previews)
                  (sync-controls)
                  (sync-node-tools)
-                 (when graph-canvas (cl-fltk:redraw graph-canvas))
+                 (when graph-canvas (lightfast:redraw graph-canvas))
                  (redraw-thumbnails)
                  (if (selected-job)
                      (progn
@@ -2989,7 +3132,7 @@ new cache entry is published."
                                            (length removed))))
                      (set-status "Project contains no photographs")))))
            (open-project ()
-             (let ((path (cl-fltk:choose-file
+             (let ((path (lightfast:choose-file
                           :title "Open Orfeus project"
                           :filter (fltk-file-filter "Orfeus project" "*.sexp")
                           :preset-file (picker-preset))))
@@ -2998,7 +3141,7 @@ new cache entry is published."
                  (replace-project (project-read path) (pathname path)))))
            (save-project (&optional choose-p)
              (let ((path (or (and (not choose-p) (gui-model-project-path model))
-                             (cl-fltk:choose-save-file
+                             (lightfast:choose-save-file
                               :title "Save Orfeus project"
                               :filter (fltk-file-filter "Orfeus project" "*.sexp")
                               :preset-file
@@ -3199,7 +3342,7 @@ new cache entry is published."
                  (enqueue-background-previews initial-p generation))))
            (schedule-initial-preview ()
              (when debounce-id
-               (ignore-errors (cl-fltk:remove-timeout debounce-id))
+               (ignore-errors (lightfast:remove-timeout debounce-id))
                (setf debounce-id nil))
              (incf preview-generation)
              (setf progress-total 0
@@ -3254,9 +3397,9 @@ new cache entry is published."
              ;; result: the content-keyed cache, histogram, thumbnails,
              ;; and background previews all refresh from it.
              (when live-settle-id
-               (ignore-errors (cl-fltk:remove-timeout live-settle-id)))
+               (ignore-errors (lightfast:remove-timeout live-settle-id)))
              (setf live-settle-id
-                   (cl-fltk:add-timeout
+                   (lightfast:add-timeout
                     0.5d0
                     (lambda ()
                       (setf live-settle-id nil)
@@ -3267,9 +3410,9 @@ new cache entry is published."
              (setf progress-total 0
                    progress-generation preview-generation)
              (when debounce-id
-               (ignore-errors (cl-fltk:remove-timeout debounce-id)))
+               (ignore-errors (lightfast:remove-timeout debounce-id)))
              (setf debounce-id
-                   (cl-fltk:add-timeout
+                   (lightfast:add-timeout
                     ;; Checkpointed live renders come back in tens of
                     ;; milliseconds, so track drags tightly.
                     (if (< live-render-ms 250) 0.04d0
@@ -3281,7 +3424,7 @@ new cache entry is published."
                       (schedule-live-settle)))))
            (setting-changed (key widget &optional allow-empty)
              (handler-case
-                 (let ((new-value (parse-number (cl-fltk:value widget)
+                 (let ((new-value (parse-number (lightfast:value widget)
                                                 allow-empty)))
                    (when (and (eq key :white-balance-tint)
                               (null (gui-model-setting
@@ -3292,8 +3435,8 @@ new cache entry is published."
                    (sync-controls)
                    (when (member key '(:white-balance-temperature
                                        :white-balance-tint))
-                     (setf (cl-fltk:value wb-choice) "Custom"))
-                   (when graph-canvas (cl-fltk:redraw graph-canvas))
+                     (setf (lightfast:value wb-choice) "Custom"))
+                   (when graph-canvas (lightfast:redraw graph-canvas))
                    (schedule-edited-preview))
                (error (condition) (set-status (princ-to-string condition)))))
            (render-selected ()
@@ -3372,50 +3515,28 @@ new cache entry is published."
                              (list :done
                                    (format nil "~D photograph~:P"
                                            completed))))))))))
-           (export-dialog-integer (widget fallback)
-             (or (parse-integer (cl-fltk:value widget) :junk-allowed t)
-                 fallback))
            (apply-export-dialog ()
              ;; Returns true once the dialog's choices are stored on the
              ;; project, so the caller may start the export.
-             (let ((settings (project-export-settings project))
-                   (destination (string-trim " "
-                                             (cl-fltk:value
-                                              export-dialog-destination))))
-               (handler-case
-                   (progn
-                     (when (zerop (length destination))
-                       (error "Choose a destination folder first"))
-                     (setf (project-output-directory project)
-                           (pathname
-                            (concatenate 'string
-                                         (string-right-trim "/" destination)
-                                         "/")))
-                     (let ((width (export-dialog-integer export-dialog-width 0))
-                           (height (export-dialog-integer export-dialog-height
-                                                          0)))
-                       (setf (export-settings-jpeg-quality settings)
-                             (max 1 (min 100 (export-dialog-integer
-                                              export-dialog-quality 92)))
-                             (export-settings-max-width settings)
-                             (when (plusp width) width)
-                             (export-settings-max-height settings)
-                             (when (plusp height) height)
-                             (export-settings-preserve-metadata-p settings)
-                             (string= "1" (cl-fltk:value
-                                           export-dialog-metadata))
-                             (export-settings-timestamp-filenames-p settings)
-                             (string= "1" (cl-fltk:value
-                                           export-dialog-timestamp))))
-                     (sync-export-controls)
-                     t)
-                 (error (condition)
-                   (set-status (princ-to-string condition))
-                   nil))))
+             (handler-case
+                 (progn
+                   (update-project-export-settings
+                    project
+                    (lightfast:value export-dialog-destination)
+                    (lightfast:value export-dialog-quality)
+                    (lightfast:value export-dialog-width)
+                    (lightfast:value export-dialog-height)
+                    (string= "1" (lightfast:value export-dialog-metadata))
+                    (string= "1" (lightfast:value export-dialog-timestamp)))
+                   (sync-export-controls)
+                   t)
+               (error (condition)
+                 (set-status (princ-to-string condition))
+                 nil)))
            (start-dialog-export ()
              (when (apply-export-dialog)
-               (cl-fltk:hide export-dialog)
-               (let ((scope (cl-fltk:value export-dialog-scope)))
+               (lightfast:hide export-dialog)
+               (let ((scope (lightfast:value export-dialog-scope)))
                  (cond
                    ((string-equal scope "All photographs") (render-all))
                    ((string-equal scope "Selected photographs")
@@ -3423,98 +3544,99 @@ new cache entry is published."
                                  "the selection"))
                    (t (render-selected))))))
            (browse-export-destination ()
-             (let ((chosen (cl-fltk:choose-directory
+             (let ((chosen (lightfast:choose-directory
                             :title "Choose export folder"
-                            :preset-path (cl-fltk:value
+                            :preset-path (lightfast:value
                                           export-dialog-destination))))
                (when (and chosen (plusp (length chosen)))
-                 (setf (cl-fltk:value export-dialog-destination) chosen))))
+                 (setf (lightfast:value export-dialog-destination) chosen))))
            (build-export-dialog ()
-             (let ((dialog (cl-fltk:make-window :width 460 :height 268
+             (let ((dialog (lightfast:make-window :width 460 :height 268
                                                 :label "Export")))
                (setf export-dialog dialog)
-               (cl-fltk:make-label :parent dialog :x 12 :y 12 :width 120
+               (lightfast:make-label :parent dialog :x 12 :y 12 :width 120
                                    :height 24 :label "Destination")
                (setf export-dialog-destination
-                     (cl-fltk:make-input :parent dialog :x 120 :y 12
+                     (lightfast:make-input :parent dialog :x 120 :y 12
                                          :width 236 :height 26))
-               (cl-fltk:make-button :parent dialog :x 364 :y 12 :width 84
+               (lightfast:make-button :parent dialog :x 364 :y 12 :width 84
                                     :height 26 :label "Browse..."
                                     :callback
                                     (lambda (&rest ignored)
                                       (declare (ignore ignored))
                                       (browse-export-destination)))
                (setf export-dialog-scope
-                     (cl-fltk:field-control
-                      (cl-fltk:make-labeled-choice
+                     (lightfast:field-control
+                      (lightfast:make-labeled-choice
                        :parent dialog :x 12 :y 48 :width 436 :height 26
                        :label "Photographs" :label-width 104
                        :items '("Current photograph" "Selected photographs"
                                 "All photographs"))))
                (setf export-dialog-quality
-                     (cl-fltk:field-control
-                      (cl-fltk:make-labeled-control
+                     (lightfast:field-control
+                      (lightfast:make-labeled-control
                        :int :parent dialog :x 12 :y 84 :width 240 :height 26
                        :label "JPEG quality" :label-width 104)))
                (setf export-dialog-width
-                     (cl-fltk:field-control
-                      (cl-fltk:make-labeled-control
+                     (lightfast:field-control
+                      (lightfast:make-labeled-control
                        :int :parent dialog :x 12 :y 116 :width 240 :height 26
                        :label "Maximum width" :label-width 104)))
                (setf export-dialog-height
-                     (cl-fltk:field-control
-                      (cl-fltk:make-labeled-control
+                     (lightfast:field-control
+                      (lightfast:make-labeled-control
                        :int :parent dialog :x 12 :y 148 :width 240 :height 26
                        :label "Maximum height" :label-width 104)))
-               (cl-fltk:make-label :parent dialog :x 258 :y 116 :width 190
+               (lightfast:make-label :parent dialog :x 258 :y 116 :width 190
                                    :height 48 :label "0 keeps the full size")
                (setf export-dialog-metadata
-                     (cl-fltk:make-check-button
+                     (lightfast:make-check-button
                       :parent dialog :x 116 :y 180 :width 200 :height 24
                       :label "Preserve metadata"))
                (setf export-dialog-timestamp
-                     (cl-fltk:make-check-button
+                     (lightfast:make-check-button
                       :parent dialog :x 116 :y 206 :width 200 :height 24
                       :label "Timestamp filenames"))
-               (cl-fltk:make-button :parent dialog :x 244 :y 234 :width 96
+               (lightfast:make-button :parent dialog :x 244 :y 234 :width 96
                                     :height 26 :label "Cancel"
                                     :callback
                                     (lambda (&rest ignored)
                                       (declare (ignore ignored))
-                                      (cl-fltk:hide export-dialog)))
-               (cl-fltk:make-button :parent dialog :x 348 :y 234 :width 100
+                                      (lightfast:hide export-dialog)))
+               (lightfast:make-button :parent dialog :x 348 :y 234 :width 100
                                     :height 26 :label "Export"
                                     :callback
                                     (lambda (&rest ignored)
                                       (declare (ignore ignored))
                                       (start-dialog-export)))
                dialog))
-           (open-export-dialog ()
+           (open-export-dialog (&optional scope)
              (unless export-dialog
                (build-export-dialog))
              (let ((settings (project-export-settings project)))
-               (setf (cl-fltk:value export-dialog-destination)
+               (setf (lightfast:value export-dialog-destination)
                      (namestring (project-output-directory project))
-                     (cl-fltk:value export-dialog-quality)
+                     (lightfast:value export-dialog-quality)
                      (format nil "~D" (export-settings-jpeg-quality settings))
-                     (cl-fltk:value export-dialog-width)
+                     (lightfast:value export-dialog-width)
                      (format nil "~D" (or (export-settings-max-width settings)
                                           0))
-                     (cl-fltk:value export-dialog-height)
+                     (lightfast:value export-dialog-height)
                      (format nil "~D" (or (export-settings-max-height settings)
                                           0))
-                     (cl-fltk:value export-dialog-metadata)
+                     (lightfast:value export-dialog-metadata)
                      (if (export-settings-preserve-metadata-p settings) "1" "0")
-                     (cl-fltk:value export-dialog-timestamp)
+                     (lightfast:value export-dialog-timestamp)
                      (if (export-settings-timestamp-filenames-p settings)
                          "1" "0")
-                     (cl-fltk:value export-dialog-scope)
-                     (if (selected-job)
-                         "Current photograph"
-                         "All photographs")))
-             (cl-fltk:show export-dialog))
+                     (lightfast:value export-dialog-scope)
+                     (or scope
+                         (if (selected-job)
+                             "Current photograph"
+                             "All photographs"))))
+             (lightfast:show export-dialog))
            (choose-lut ()
-             (let ((path (cl-fltk:choose-file
+             (let ((path (lightfast:choose-file
                           :title "Choose 3D LUT"
                           :filter (fltk-file-filter "Cube LUT" "*.{cube,CUBE}")
                           :preset-file (picker-preset))))
@@ -3528,7 +3650,7 @@ new cache entry is published."
              (sync-controls)
              (schedule-edited-preview))
            (set-wb-mode (widget)
-             (if (string-equal (cl-fltk:value widget) "As shot")
+             (if (string-equal (lightfast:value widget) "As shot")
                  (progn
                    (gui-model-set-setting model :white-balance-temperature nil)
                    (gui-model-set-setting model :white-balance-tint 0.0))
@@ -3549,9 +3671,9 @@ new cache entry is published."
            (register-field (field y &optional (basis :root))
              (let ((label-x (if (eq basis :page) 12 8))
                    (label-width (if (eq basis :page) 88 96)))
-               (register-inspector (cl-fltk:field-label field)
+               (register-inspector (lightfast:field-label field)
                                    label-x y label-width 26 basis)
-               (register-inspector (cl-fltk:field-control field) 110 y
+               (register-inspector (lightfast:field-control field) 110 y
                                    :control 26 basis))
              field)
            (build-group (kind builder)
@@ -3574,36 +3696,36 @@ new cache entry is published."
            (section-frame (parent title y height)
              ;; A classic engraved group frame whose title interrupts the
              ;; frame line, drawn behind the controls it surrounds.
-             (let ((frame (cl-fltk:make-box :parent parent :x 4 :y y
+             (let ((frame (lightfast:make-box :parent parent :x 4 :y y
                                             :width 300 :height height
                                             :label "")))
-               (cl-fltk:set-box frame cl-fltk:+box-engraved-frame+)
+               (lightfast:set-box frame lightfast:+box-engraved-frame+)
                (register-inspector frame 4 y :frame height :page))
              (let ((title-width (+ 14 (* 7 (length title))))
-                   (title-label (cl-fltk:make-label
+                   (title-label (lightfast:make-label
                                  :parent parent :x 14 :y (- y 8)
                                  :width 80 :height 16 :label title)))
-               (cl-fltk:set-box title-label cl-fltk:+box-flat-box+)
-               (cl-fltk:set-label-font title-label
-                                       cl-fltk:+font-helvetica-bold+)
+               (lightfast:set-box title-label lightfast:+box-flat-box+)
+               (lightfast:set-label-font title-label
+                                       lightfast:+font-helvetica-bold+)
                (register-inspector title-label 14 (- y 8) title-width 16
                                    :page)))
            (make-number-field (key label minimum maximum step y parent)
              (let* ((label-widget
-                      (cl-fltk:make-label :parent parent :x 12 :y y
+                      (lightfast:make-label :parent parent :x 12 :y y
                                           :width 88 :height 26 :label label))
                     (callback (lambda (widget event value)
                                 (declare (ignore event value))
                                 (setting-changed key widget)))
-                    (spinner (cl-fltk:make-spinner
+                    (spinner (lightfast:make-spinner
                               :parent parent :x 202 :y y
                               :width 78 :height 26 :callback callback))
-                    (slider (cl-fltk:make-slider
+                    (slider (lightfast:make-slider
                              :parent parent :x 110 :y y
                              :width 84 :height 26 :callback callback)))
                (dolist (widget (list slider spinner))
-                 (cl-fltk:set-range widget minimum maximum)
-                 (cl-fltk:set-step widget step)
+                 (lightfast:set-range widget minimum maximum)
+                 (lightfast:set-step widget step)
                  (push (list key widget) controls))
                (register-inspector label-widget 12 y 88 26 :page)
                (register-inspector slider 110 y :slider 26 :page)
@@ -3613,132 +3735,132 @@ new cache entry is published."
              (let* ((callback (lambda (widget event value)
                                 (declare (ignore event value))
                                 (setting-changed key widget)))
-                    (label (cl-fltk:make-label
+                    (label (lightfast:make-label
                             :parent node-page :x 0 :y 92 :width 32 :height 22
                             :label short-label))
-                    (slider (cl-fltk:make-vertical-slider
+                    (slider (lightfast:make-vertical-slider
                              :parent node-page :x 0 :y 116 :width 20 :height 120
                              :callback callback))
-                    (input (cl-fltk:make-value-input
+                    (input (lightfast:make-value-input
                             :parent node-page :x 0 :y 240 :width 32 :height 24
                             :callback callback)))
                (dolist (widget (list slider input))
-                 (cl-fltk:set-range widget -2 2)
-                 (cl-fltk:set-step widget 0.1)
-                 (cl-fltk:set-tooltip widget full-label)
+                 (lightfast:set-range widget -2 2)
+                 (lightfast:set-step widget 0.1)
+                 (lightfast:set-tooltip widget full-label)
                  (push (list key widget) controls))
                (push (list label index :label) tone-items)
                (push (list slider index :slider) tone-items)
                (push (list input index :input) tone-items)))
            (layout-left-pane (&optional ignored)
              (declare (ignore ignored))
-             (let ((width (cl-fltk:widget-width filmstrip-pane))
-                   (height (cl-fltk:widget-height filmstrip-pane))
+             (let ((width (lightfast:widget-width filmstrip-pane))
+                   (height (lightfast:widget-height filmstrip-pane))
                    (header-height 28))
                (when photo-selection-label
-                 (cl-fltk:resize-widget photo-selection-label :x 8 :y 2
+                 (lightfast:resize-widget photo-selection-label :x 8 :y 2
                                         :width (- width 16) :height 24))
-               (cl-fltk:resize-widget
+               (lightfast:resize-widget
                 thumbnail-canvas :x 0 :y header-height
                 :width (max 40 (- width 16)) :height (- height header-height))
                (when thumbnail-scrollbar
-                 (cl-fltk:resize-widget
+                 (lightfast:resize-widget
                   thumbnail-scrollbar :x (max 40 (- width 16)) :y header-height
                   :width 16 :height (- height header-height))))
              (redraw-thumbnails)
-             (cl-fltk:redraw filmstrip-pane))
+             (lightfast:redraw filmstrip-pane))
            (layout-center-pane (&optional ignored)
              (declare (ignore ignored))
-             (let* ((center (cl-fltk:widget-width center-pane))
-                    (main-height (cl-fltk:widget-height center-pane))
+             (let* ((center (lightfast:widget-width center-pane))
+                    (main-height (lightfast:widget-height center-pane))
                     (caption-height 22)
                     (viewer-height (max 100 (- main-height caption-height)))
                     (gutter 6)
                     (pane-width (floor (- center gutter) 2)))
                (if comparison-p
                    (progn
-                     (cl-fltk:show before-caption)
-                     (cl-fltk:show before-canvas)
-                     (cl-fltk:resize-widget before-caption :x 0 :y 0
+                     (lightfast:show before-caption)
+                     (lightfast:show before-canvas)
+                     (lightfast:resize-widget before-caption :x 0 :y 0
                                             :width pane-width :height caption-height)
-                     (cl-fltk:resize-widget before-canvas :x 0 :y caption-height
+                     (lightfast:resize-widget before-canvas :x 0 :y caption-height
                                             :width pane-width :height viewer-height)
-                     (cl-fltk:resize-widget after-caption
+                     (lightfast:resize-widget after-caption
                                             :x (+ pane-width gutter) :y 0
                                             :width (- center pane-width gutter)
                                             :height caption-height)
-                     (cl-fltk:resize-widget after-canvas
+                     (lightfast:resize-widget after-canvas
                                             :x (+ pane-width gutter) :y caption-height
                                             :width (- center pane-width gutter)
                                             :height viewer-height))
                    (progn
-                     (cl-fltk:hide before-caption)
-                     (cl-fltk:hide before-canvas)
-                     (cl-fltk:resize-widget after-caption :x 0 :y 0
+                     (lightfast:hide before-caption)
+                     (lightfast:hide before-canvas)
+                     (lightfast:resize-widget after-caption :x 0 :y 0
                                             :width center :height caption-height)
-                     (cl-fltk:resize-widget after-canvas :x 0 :y caption-height
+                     (lightfast:resize-widget after-canvas :x 0 :y caption-height
                                             :width center :height viewer-height)))
-               (cl-fltk:redraw center-pane)))
+               (lightfast:redraw center-pane)))
            (layout-graph-pane (&optional ignored)
              (declare (ignore ignored))
-             (let* ((width (cl-fltk:widget-width graph-pane))
-                    (height (cl-fltk:widget-height graph-pane))
+             (let* ((width (lightfast:widget-width graph-pane))
+                    (height (lightfast:widget-height graph-pane))
                     (button-width (max 48 (floor (- width 32) 3))))
                ;; A drag of the tile divider is the only thing that may change
                ;; the remembered share; our own layout pass must not ratchet it.
                (unless applying-layout-p
-                 (let ((column (cl-fltk:widget-height right-column)))
+                 (let ((column (lightfast:widget-height right-column)))
                    (when (plusp column)
                      (setf graph-height-fraction
                            (max 1/5 (min 4/5 (/ height column)))))))
                (when graph-title
-                 (cl-fltk:resize-widget graph-title :x 8 :y 4
+                 (lightfast:resize-widget graph-title :x 8 :y 4
                                         :width (- width 16) :height 18))
                (when still-button
-                 (cl-fltk:resize-widget still-button
+                 (lightfast:resize-widget still-button
                                         :x 8 :y 24
                                         :width button-width :height 22)
-                 (cl-fltk:resize-widget copy-grade-button
+                 (lightfast:resize-widget copy-grade-button
                                         :x (+ 12 button-width) :y 24
                                         :width button-width :height 22)
-                 (cl-fltk:resize-widget paste-grade-button
+                 (lightfast:resize-widget paste-grade-button
                                         :x (+ 16 (* 2 button-width)) :y 24
                                         :width button-width :height 22))
                (when graph-canvas
-                 (cl-fltk:resize-widget graph-canvas :x 2 :y 52
+                 (lightfast:resize-widget graph-canvas :x 2 :y 52
                                         :width (- width 4)
                                         :height (max 60 (- height 54))))
-               (cl-fltk:redraw graph-pane)))
+               (lightfast:redraw graph-pane)))
            (layout-gallery-pane (&optional ignored)
              (declare (ignore ignored))
-             (let* ((width (cl-fltk:widget-width gallery-pane))
-                    (height (cl-fltk:widget-height gallery-pane))
+             (let* ((width (lightfast:widget-width gallery-pane))
+                    (height (lightfast:widget-height gallery-pane))
                     (save-width 88)
                     (apply-width (max 120 (- width save-width 24))))
                (when gallery-title
-                 (cl-fltk:resize-widget gallery-title :x 8 :y 2
+                 (lightfast:resize-widget gallery-title :x 8 :y 2
                                         :width (- width 16) :height 18))
                (when gallery-canvas
-                 (cl-fltk:resize-widget gallery-canvas :x 4 :y 22
+                 (lightfast:resize-widget gallery-canvas :x 4 :y 22
                                         :width (- width 8)
                                         :height (max 60 (- height 88))))
                (when preset-name-input
-                 (cl-fltk:resize-widget preset-name-input
+                 (lightfast:resize-widget preset-name-input
                                         :x 8 :y (- height 60)
                                         :width (- width 16) :height 24))
                (when preset-apply-button
-                 (cl-fltk:resize-widget preset-apply-button
+                 (lightfast:resize-widget preset-apply-button
                                         :x (+ 16 save-width) :y (- height 32)
                                         :width apply-width :height 26))
                (when preset-save-button
-                 (cl-fltk:resize-widget preset-save-button
+                 (lightfast:resize-widget preset-save-button
                                         :x 8 :y (- height 32)
                                         :width save-width :height 26))
-               (cl-fltk:redraw gallery-pane)))
+               (lightfast:redraw gallery-pane)))
            (layout-inspector-pane (&optional ignored)
              (declare (ignore ignored))
-             (let* ((right (cl-fltk:widget-width inspector))
-                    (main-height (cl-fltk:widget-height inspector))
+             (let* ((right (lightfast:widget-width inspector))
+                    (main-height (lightfast:widget-height inspector))
                     (page-height (max 150 (- main-height 108)))
                     ;; The curves panel splits whatever the page has left
                     ;; between the waveform and the chart, with the reset
@@ -3746,11 +3868,11 @@ new cache entry is published."
                     (curve-space (max 130 (- page-height 76 38)))
                     (scope-height (max 56 (floor (* curve-space 2) 5)))
                     (chart-height (max 70 (- curve-space scope-height 8))))
-               (cl-fltk:resize-widget tabs :x 4 :y 40
+               (lightfast:resize-widget tabs :x 4 :y 40
                                       :width (- right 8)
                                       :height (- main-height 80))
                (dolist (page (list node-page export-page))
-                 (cl-fltk:resize-widget page :x 2 :y 24
+                 (lightfast:resize-widget page :x 2 :y 24
                                         :width (- right 12)
                                         :height page-height))
                (dolist (item inspector-items)
@@ -3784,7 +3906,7 @@ new cache entry is published."
                                          (:scope scope-height)
                                          (:chart chart-height)
                                          (otherwise item-height))))
-                     (cl-fltk:resize-widget
+                     (lightfast:resize-widget
                       widget :x item-x :y item-y
                       :width item-width :height item-height))))
                (let* ((page-width (- right 12))
@@ -3802,45 +3924,44 @@ new cache entry is published."
                                       (:input (+ column-x 2))))
                             (item-y (ecase role (:label 92) (:slider 116) (:input 240)))
                             (item-height (ecase role (:label 22) (:slider 120) (:input 24))))
-                       (cl-fltk:resize-widget widget :x item-x :y item-y
+                       (lightfast:resize-widget widget :x item-x :y item-y
                                               :width item-width :height item-height)))))
-               (cl-fltk:redraw inspector)))
+               (lightfast:redraw inspector)))
            (layout-ui (&optional ignored)
              (declare (ignore ignored))
              (setf applying-layout-p t)
              (unwind-protect
-             (let* ((width (cl-fltk:widget-width window))
-                    (height (cl-fltk:widget-height window))
-                    (top 64) (bottom 28)
-                    (main-height (max 200 (- height top bottom)))
-                    (left (min (max *left-sidebar-min-width* (- width 580))
+             (let* ((width (lightfast:widget-width window))
+                    (height (lightfast:widget-height window)))
+               (lightfast:apply-layout
+                root-layout
+                (lightfast:make-rect :width width :height height)
+                :parent window)
+               (let* ((main-height (lightfast:widget-height main-tile))
+                      (left (min (max *left-sidebar-min-width* (- width 580))
                                480
                                (max *left-sidebar-min-width*
                                     (if layout-initialized-p
-                                        (cl-fltk:widget-width left-column)
+                                        (lightfast:widget-width left-column)
                                         *left-sidebar-initial-width*))))
                     (right (min (max 280 (- width left 300))
                                 480
                                 (max 280
                                      (if layout-initialized-p
-                                         (cl-fltk:widget-width right-column)
+                                         (lightfast:widget-width right-column)
                                          (floor width 3)))))
                     (center (- width left right)))
-               (cl-fltk:resize-widget menu :x 0 :y 0 :width width :height 24)
-               (cl-fltk:resize-widget toolbar :x 0 :y 24 :width width :height 40)
                (when toolbar-bottom-rule
-                 (cl-fltk:resize-widget toolbar-bottom-rule :x 0 :y 38
+                 (lightfast:resize-widget toolbar-bottom-rule :x 0 :y 38
                                         :width width :height 2))
                (when lens-name
-                 (cl-fltk:resize-widget lens-name :x 342 :y 6
+                 (lightfast:resize-widget lens-name :x 342 :y 6
                                         :width (max 120 (- width 352)) :height 28))
-               (cl-fltk:resize-widget main-tile :x 0 :y top
-                                      :width width :height main-height)
-               (cl-fltk:resize-widget left-column :x 0 :y 0
+               (lightfast:resize-widget left-column :x 0 :y 0
                                       :width left :height main-height)
-               (cl-fltk:resize-widget center-pane :x left :y 0
+               (lightfast:resize-widget center-pane :x left :y 0
                                       :width center :height main-height)
-               (cl-fltk:resize-widget right-column :x (+ left center) :y 0
+               (lightfast:resize-widget right-column :x (+ left center) :y 0
                                       :width right :height main-height)
                ;; The left column splits into filmstrip and stills gallery,
                ;; the right into the Node panel and the graph editor.
@@ -3848,40 +3969,36 @@ new cache entry is published."
                        (min (- main-height 200)
                             (max 160
                                  (if layout-initialized-p
-                                     (cl-fltk:widget-height gallery-pane)
+                                     (lightfast:widget-height gallery-pane)
                                      (min 300 (floor main-height 3))))))
                      (graph-height
                        (min (- main-height *inspector-min-height*)
                             (max 160
                                  (round (* main-height
                                            graph-height-fraction))))))
-                 (cl-fltk:resize-widget filmstrip-pane :x 0 :y 0
+                 (lightfast:resize-widget filmstrip-pane :x 0 :y 0
                                         :width left
                                         :height (- main-height
                                                    gallery-height))
-                 (cl-fltk:resize-widget gallery-pane :x 0
+                 (lightfast:resize-widget gallery-pane :x 0
                                         :y (- main-height gallery-height)
                                         :width left :height gallery-height)
-                 (cl-fltk:resize-widget inspector :x 0 :y 0
+                 (lightfast:resize-widget inspector :x 0 :y 0
                                         :width right
                                         :height (- main-height graph-height))
-                 (cl-fltk:resize-widget graph-pane :x 0
+                 (lightfast:resize-widget graph-pane :x 0
                                         :y (- main-height graph-height)
                                         :width right :height graph-height))
-               (cl-fltk:resize-widget progress :x 0 :y (+ top main-height)
-                                      :width 180 :height bottom)
-               (cl-fltk:resize-widget status :x 180 :y (+ top main-height)
-                                      :width (- width 180) :height bottom)
                (layout-left-pane)
                (layout-gallery-pane)
                (layout-center-pane)
                (layout-inspector-pane)
                (layout-graph-pane)
                (unless layout-initialized-p
-                 (cl-fltk:init-sizes main-tile)
-                 (cl-fltk:init-sizes left-column)
-                 (cl-fltk:init-sizes right-column))
-               (setf layout-initialized-p t))
+                 (lightfast:init-sizes main-tile)
+                 (lightfast:init-sizes left-column)
+                 (lightfast:init-sizes right-column))
+               (setf layout-initialized-p t)))
                (setf applying-layout-p nil)))
            (poll ()
              (dolist (event (drain-events queue))
@@ -3902,7 +4019,7 @@ new cache entry is published."
                           after-live-height (fifth event)
                           after-live-p t)
                     (incf after-live-generation)
-                    (when after-canvas (cl-fltk:redraw after-canvas))))
+                    (when after-canvas (lightfast:redraw after-canvas))))
                  (:histogram
                   (if (and (= (second event) preview-generation)
                            (equal (third event) after-preview-file))
@@ -3910,16 +4027,21 @@ new cache entry is published."
                         (release-waveform)
                         (setf curve-histogram (fourth event)
                               waveform-buffer (fifth event))
-                        (when curve-canvas (cl-fltk:redraw curve-canvas))
-                        (when scope-canvas (cl-fltk:redraw scope-canvas)))
+                        (when curve-canvas (lightfast:redraw curve-canvas))
+                        (when scope-canvas (lightfast:redraw scope-canvas)))
                       (cffi:foreign-free (fifth event))))
                  (:thumbnail
                   (when (and (member (third event) (project-photos project) :test #'eq)
                              (null (gethash (third event) thumbnail-files)))
                     (setf (gethash (third event) thumbnail-files) (fourth event))
                     (redraw-thumbnails)))
+                 (:still-error
+                  (when (gallery-generation-event-current-p event
+                                                            gallery-generation)
+                    (set-status (third event))))
                  (:still-thumb
-                  (let ((still (and (= (second event) gallery-generation)
+                  (let ((still (and (gallery-generation-event-current-p
+                                     event gallery-generation)
                                     (find (third event) gallery-stills
                                           :key #'gallery-still-key
                                           :test #'equal))))
@@ -3932,7 +4054,7 @@ new cache entry is published."
                            (fourth event))))
                       (setf (gethash (third event) gallery-thumbs)
                             (fourth event))
-                      (when gallery-canvas (cl-fltk:redraw gallery-canvas)))))
+                      (when gallery-canvas (lightfast:redraw gallery-canvas)))))
                  (:done
                   (set-status (format nil "Exported ~A" (second event))))
                  (:error
@@ -3948,7 +4070,7 @@ new cache entry is published."
                (unless (equal signature graph-view-state)
                  (setf graph-view-state signature)
                  (sync-node-tools)
-                 (when graph-canvas (cl-fltk:redraw graph-canvas))))
+                 (when graph-canvas (lightfast:redraw graph-canvas))))
              ;; Progress belongs to the current preview generation or export
              ;; batch. Histogram and eviction maintenance are deliberately
              ;; excluded so cancellation cannot inherit an old high-water mark.
@@ -3963,150 +4085,150 @@ new cache entry is published."
                                            progress-generation)
                  (setf progress-total total
                        progress-generation generation
-                       (cl-fltk:value progress) (format nil "~D" percent))))))
+                       (lightfast:value progress) (format nil "~D" percent))))))
         (setf after-live-capacity
               (* *gui-live-preview-size* *gui-live-preview-size* 3)
               after-live-front (cffi:foreign-alloc
                                 :uint8 :count after-live-capacity)
               after-live-back (cffi:foreign-alloc
                                :uint8 :count after-live-capacity))
-        (setf window (cl-fltk:make-window :width 1280 :height 800
+        (setf window (lightfast:make-window :width 1280 :height 800
                                           :label "Orfeus"
                                           :app-id "org.orfeus.Orfeus"))
-        (cl-fltk:apply-classic-theme)
-        (cl-fltk:set-size-range window :min-width 960 :min-height 700)
-        (setf menu (cl-fltk:make-menu-bar :parent window :x 0 :y 0
+        (lightfast:apply-classic-theme)
+        (lightfast:set-size-range window :min-width 960 :min-height 700)
+        (setf menu (lightfast:make-menu-bar :parent window :x 0 :y 0
                                           :width 1280 :height 24))
-        (cl-fltk:add-menu-item menu "File/Open Photo" (lambda (&rest ignored)
+        (lightfast:add-menu-item menu "File/Open Photo" (lambda (&rest ignored)
                                                           (declare (ignore ignored))
                                                           (open-photo))
                                :shortcut (logior +menu-ctrl+ (char-code #\o)))
-        (cl-fltk:add-menu-item menu "File/Add Photos to Project"
+        (lightfast:add-menu-item menu "File/Add Photos to Project"
                                (lambda (&rest ignored)
                                  (declare (ignore ignored))
                                  (add-photos))
                                :shortcut (logior +menu-ctrl+ +menu-shift+
                                                  (char-code #\a)))
-        (cl-fltk:add-menu-item menu "File/Open Project" (lambda (&rest ignored)
+        (lightfast:add-menu-item menu "File/Open Project" (lambda (&rest ignored)
                                                             (declare (ignore ignored))
                                                             (open-project))
                                :shortcut (logior +menu-ctrl+ +menu-shift+
                                                  (char-code #\o)))
-        (cl-fltk:add-menu-item menu "File/Save Project" (lambda (&rest ignored)
+        (lightfast:add-menu-item menu "File/Save Project" (lambda (&rest ignored)
                                                             (declare (ignore ignored))
                                                             (save-project))
                                :shortcut (logior +menu-ctrl+ (char-code #\s)))
-        (cl-fltk:add-menu-item menu "File/Save Project As" (lambda (&rest ignored)
+        (lightfast:add-menu-item menu "File/Save Project As" (lambda (&rest ignored)
                                                                (declare (ignore ignored))
                                                                (save-project t))
                                :shortcut (logior +menu-ctrl+ +menu-shift+
                                                  (char-code #\s)))
-        (cl-fltk:add-menu-item menu "File/Export Current Photo"
+        (lightfast:add-menu-item menu "File/Export Current Photo"
                                (lambda (&rest ignored)
                                  (declare (ignore ignored))
                                  (render-selected))
                                :shortcut (logior +menu-ctrl+ (char-code #\e)))
-        (cl-fltk:add-menu-item menu "File/Export All Photos"
+        (lightfast:add-menu-item menu "File/Export All Photos"
                                (lambda (&rest ignored)
                                  (declare (ignore ignored))
                                  (render-all))
                                :shortcut (logior +menu-ctrl+ +menu-shift+
                                                  (char-code #\e)))
-        (cl-fltk:add-menu-item menu "File/Quit" (lambda (&rest ignored)
+        (lightfast:add-menu-item menu "File/Quit" (lambda (&rest ignored)
                                                     (declare (ignore ignored))
-                                                    (cl-fltk:quit))
+                                                    (lightfast:quit))
                                :shortcut (logior +menu-ctrl+ (char-code #\q)))
-        (cl-fltk:add-menu-item menu "Edit/Copy Grade"
+        (lightfast:add-menu-item menu "Edit/Copy Grade"
                                (lambda (&rest ignored)
                                  (declare (ignore ignored))
                                  (copy-grade))
                                :shortcut (logior +menu-ctrl+ +menu-shift+
                                                  (char-code #\c)))
-        (cl-fltk:add-menu-item menu "Edit/Paste Grade to Selected"
+        (lightfast:add-menu-item menu "Edit/Paste Grade to Selected"
                                (lambda (&rest ignored)
                                  (declare (ignore ignored))
                                  (paste-grade))
                                :shortcut (logior +menu-ctrl+ +menu-shift+
                                                  (char-code #\v)))
-        (cl-fltk:add-menu-item menu "Edit/Remove Selected Photos"
+        (lightfast:add-menu-item menu "Edit/Remove Selected Photos"
                                (lambda (&rest ignored)
                                  (declare (ignore ignored))
                                  (remove-selected-photo)))
-        (cl-fltk:add-menu-item menu "Edit/Reset Selected Photos"
+        (lightfast:add-menu-item menu "Edit/Reset Selected Photos"
                                (lambda (&rest ignored)
                                  (declare (ignore ignored))
                                  (gui-model-reset-selected model)
                                  (sync-controls)
                                               (schedule-edited-preview)))
-        (cl-fltk:add-menu-item menu "Edit/Reset Defaults"
+        (lightfast:add-menu-item menu "Edit/Reset Defaults"
                                (lambda (&rest ignored)
                                  (declare (ignore ignored))
                                  (setf (project-defaults project)
                                        (gui-default-processing-settings))
                                  (sync-controls)
                                               (schedule-edited-preview)))
-        (cl-fltk:add-menu-item menu "View/Before and After"
+        (lightfast:add-menu-item menu "View/Before and After"
                                (lambda (&rest ignored)
                                  (declare (ignore ignored))
                                  (toggle-comparison))
                                :shortcut (logior +menu-ctrl+ (char-code #\b)))
-        (cl-fltk:add-menu-item menu "View/Refresh Preview"
+        (lightfast:add-menu-item menu "View/Refresh Preview"
                                (lambda (&rest ignored)
                                  (declare (ignore ignored))
                                  (schedule-initial-preview))
                                :shortcut +key-f5+)
-        (cl-fltk:add-menu-item menu "Process/Grab Still"
+        (lightfast:add-menu-item menu "Process/Grab Still"
                                (lambda (&rest ignored)
                                  (declare (ignore ignored))
                                  (grab-still))
                                :shortcut (logior +menu-ctrl+ (char-code #\g)))
-        (cl-fltk:add-menu-item menu "Process/Export..."
+        (lightfast:add-menu-item menu "Process/Export..."
                                (lambda (&rest ignored)
                                  (declare (ignore ignored))
                                  (open-export-dialog)))
-        (cl-fltk:add-menu-item menu "Process/Export Current Photo"
+        (lightfast:add-menu-item menu "Process/Export Current Photo"
                                (lambda (&rest ignored)
                                  (declare (ignore ignored))
                                  (render-selected)))
-        (cl-fltk:add-menu-item menu "Process/Export All Photos"
+        (lightfast:add-menu-item menu "Process/Export All Photos"
                                (lambda (&rest ignored)
                                  (declare (ignore ignored))
                                  (render-all)))
-        (cl-fltk:add-menu-item menu "Help/About Orfeus"
+        (lightfast:add-menu-item menu "Help/About Orfeus"
                                (lambda (&rest ignored)
                                  (declare (ignore ignored))
-                                 (cl-fltk:message-box
+                                 (lightfast:message-box
                                   "Orfeus RAW processor\nOlympus PEN-F and OM-1")))
-        (setf toolbar (cl-fltk:make-panel :parent window :x 0 :y 24
+        (setf toolbar (lightfast:make-panel :parent window :x 0 :y 24
                                           :width 1280 :height 40 :label ""))
-        (cl-fltk:set-box toolbar cl-fltk:+box-flat-box+)
+        (lightfast:set-box toolbar lightfast:+box-flat-box+)
         (flet ((rule (x y width height red green blue)
-                 (let ((box (cl-fltk:make-box :parent toolbar :x x :y y
+                 (let ((box (lightfast:make-box :parent toolbar :x x :y y
                                               :width width :height height
                                               :label "")))
-                   (cl-fltk:set-box box cl-fltk:+box-flat-box+)
-                   (cl-fltk:set-color-rgb box :red red :green green :blue blue)
+                   (lightfast:set-box box lightfast:+box-flat-box+)
+                   (lightfast:set-color-rgb box :red red :green green :blue blue)
                    box))
                (toolbar-button (x icon tooltip action)
-                 (let ((button (cl-fltk:make-button
+                 (let ((button (lightfast:make-button
                                 :parent toolbar :x x :y 5 :width 28 :height 28
                                 :label ""
                                 :callback (lambda (&rest ignored)
                                             (declare (ignore ignored))
                                             (funcall action)))))
-                   (cl-fltk:set-box button cl-fltk:+box-flat-box+)
-                   (cl-fltk:set-stock-icon button icon)
-                   (cl-fltk:set-tooltip button tooltip)
+                   (lightfast:set-box button lightfast:+box-flat-box+)
+                   (lightfast:set-stock-icon button icon)
+                   (lightfast:set-tooltip button tooltip)
                    button))
                (toolbar-text-button (x width label tooltip action)
-                 (let ((button (cl-fltk:make-button
+                 (let ((button (lightfast:make-button
                                 :parent toolbar :x x :y 5 :width width :height 28
                                 :label label
                                 :callback (lambda (&rest ignored)
                                             (declare (ignore ignored))
                                             (funcall action)))))
-                   (cl-fltk:set-box button cl-fltk:+box-flat-box+)
-                   (cl-fltk:set-tooltip button tooltip)
+                   (lightfast:set-box button lightfast:+box-flat-box+)
+                   (lightfast:set-tooltip button tooltip)
                    button)))
           (rule 6 10 2 18 130 130 130)
           (rule 10 10 2 18 245 245 245)
@@ -4123,81 +4245,81 @@ new cache entry is published."
           (toolbar-text-button 292 38 "1:1" "Show image pixels at 1:1" #'preview-one-to-one)
           (rule 334 7 1 24 150 150 150)
           (setf toolbar-bottom-rule (rule 0 38 1280 2 145 145 145)))
-        (setf lens-name (cl-fltk:make-label :parent toolbar :x 342 :y 6
+        (setf lens-name (lightfast:make-label :parent toolbar :x 342 :y 6
                                             :width 912 :height 28
                                             :label "Lens: No photograph selected"))
-        (cl-fltk:set-label-font lens-name 1)
-        (setf main-tile (cl-fltk:make-tile :parent window :x 0 :y 64
+        (lightfast:set-label-font lens-name 1)
+        (setf main-tile (lightfast:make-tile :parent window :x 0 :y 64
                                            :width 1280 :height 708)
-              left-column (cl-fltk:make-tile :parent main-tile :x 0 :y 0
+              left-column (lightfast:make-tile :parent main-tile :x 0 :y 0
                                              :width 240 :height 708)
-              filmstrip-pane (cl-fltk:make-panel :parent left-column
+              filmstrip-pane (lightfast:make-panel :parent left-column
                                                  :x 0 :y 0
                                                  :width 240 :height 448
                                                  :label "")
-              gallery-pane (cl-fltk:make-panel :parent left-column
+              gallery-pane (lightfast:make-panel :parent left-column
                                                :x 0 :y 448
                                                :width 240 :height 260
                                                :label "")
-              center-pane (cl-fltk:make-panel :parent main-tile :x 240 :y 0
+              center-pane (lightfast:make-panel :parent main-tile :x 240 :y 0
                                               :width 720 :height 708 :label ""))
-        (cl-fltk:set-box gallery-pane cl-fltk:+box-flat-box+)
+        (lightfast:set-box gallery-pane lightfast:+box-flat-box+)
         (setf photo-selection-label
-              (cl-fltk:make-label
+              (lightfast:make-label
                :parent filmstrip-pane :x 8 :y 2 :width 224 :height 24
                :label "Photos · 1 selected · boxes toggle"))
-        (cl-fltk:set-label-font photo-selection-label cl-fltk:+font-helvetica-bold+)
+        (lightfast:set-label-font photo-selection-label lightfast:+font-helvetica-bold+)
         (setf thumbnail-canvas
-              (cl-fltk:make-canvas
+              (lightfast:make-canvas
                :parent filmstrip-pane :x 0 :y 28 :width 240 :height 420
                :callback
                (lambda (widget event value)
                  (declare (ignore event value))
-                 (let ((x (cl-fltk:widget-x widget))
-                       (y (cl-fltk:widget-y widget))
-                       (width (cl-fltk:widget-width widget))
-                       (height (cl-fltk:widget-height widget))
+                 (let ((x (lightfast:widget-x widget))
+                       (y (lightfast:widget-y widget))
+                       (width (lightfast:widget-width widget))
+                       (height (lightfast:widget-height widget))
                        (row-height (thumbnail-row-height)))
-                   (cl-fltk:draw-color-rgb :red 42 :green 44 :blue 46)
-                   (cl-fltk:draw-filled-rect x y width height)
+                   (lightfast:draw-color-rgb :red 42 :green 44 :blue 46)
+                   (lightfast:draw-filled-rect x y width height)
                    (loop for job in (project-photos project)
                          for row from 0
                          for row-y = (+ y (* row row-height) (- thumbnail-scroll))
                          when (and (< row-y (+ y height))
                                    (> (+ row-y row-height) y))
                            do (when (member row (gui-model-selected-indices model))
-                                (cl-fltk:draw-color-rgb :red 0 :green 0 :blue 128)
-                                (cl-fltk:draw-filled-rect x row-y width row-height))
+                                (lightfast:draw-color-rgb :red 0 :green 0 :blue 128)
+                                (lightfast:draw-filled-rect x row-y width row-height))
                               (let ((path (gethash job thumbnail-files)))
                                 (if path
                                     (draw-thumbnail-file widget path
                                                          (+ x 6) (+ row-y 6)
                                                          88 (- row-height 12))
                                     (progn
-                                      (cl-fltk:draw-color-rgb :red 62 :green 64 :blue 66)
-                                      (cl-fltk:draw-filled-rect
+                                      (lightfast:draw-color-rgb :red 62 :green 64 :blue 66)
+                                      (lightfast:draw-filled-rect
                                        (+ x 6) (+ row-y 6) 88 (- row-height 12)))))
-                              (cl-fltk:draw-color-rgb :red 235 :green 235 :blue 235)
-                              (cl-fltk:draw-text
+                              (lightfast:draw-color-rgb :red 235 :green 235 :blue 235)
+                              (lightfast:draw-text
                                (file-namestring (photo-job-input-path job))
                                (+ x 102) (+ row-y 30))
                               (let ((check-x (thumbnail-checkbox-x x width))
                                     (check-y (+ row-y 10)))
-                                (cl-fltk:draw-color-rgb :red 225 :green 225 :blue 225)
-                                (cl-fltk:draw-filled-rect check-x check-y 14 14)
+                                (lightfast:draw-color-rgb :red 225 :green 225 :blue 225)
+                                (lightfast:draw-filled-rect check-x check-y 14 14)
                                 (when (member row (gui-model-selected-indices model))
-                                  (cl-fltk:draw-color-rgb :red 0 :green 0 :blue 128)
-                                  (cl-fltk:draw-filled-rect (+ check-x 3) (+ check-y 3) 8 8)))
-                              (cl-fltk:draw-color-rgb :red 125 :green 127 :blue 129)
-                              (cl-fltk:draw-filled-rect x (+ row-y row-height -1)
+                                  (lightfast:draw-color-rgb :red 0 :green 0 :blue 128)
+                                  (lightfast:draw-filled-rect (+ check-x 3) (+ check-y 3) 8 8)))
+                              (lightfast:draw-color-rgb :red 125 :green 127 :blue 129)
+                              (lightfast:draw-filled-rect x (+ row-y row-height -1)
                                                        width 1))))))
-        (cl-fltk:set-tooltip
+        (lightfast:set-tooltip
          thumbnail-canvas
-         "Click a box to add or remove a photo; Shift-click selects a range")
-        (dolist (event (list cl-fltk:+event-push+ cl-fltk:+event-wheel+))
-          (cl-fltk:on thumbnail-canvas #'handle-thumbnail-mouse :event event))
+         "Click boxes to toggle; Shift-click selects a range; right-click for actions")
+        (dolist (event (list lightfast:+event-push+ lightfast:+event-wheel+))
+          (lightfast:on thumbnail-canvas #'handle-thumbnail-mouse :event event))
         (setf thumbnail-scrollbar
-              (cl-fltk:make-scrollbar
+              (lightfast:make-scrollbar
                :parent filmstrip-pane :x 224 :y 28 :width 16 :height 420
                :value "0"
                :callback
@@ -4207,34 +4329,34 @@ new cache entry is published."
                                    (round (parse-number
                                            (if (plusp (length (or value "")))
                                                value
-                                               (cl-fltk:value widget)))))))
+                                               (lightfast:value widget)))))))
                    (when position
                      (setf thumbnail-scroll position)
                      (clamp-thumbnail-scroll)
-                     (cl-fltk:redraw thumbnail-canvas))))))
-        (cl-fltk:scrollbar-set-orientation thumbnail-scrollbar :vertical)
-        (cl-fltk:set-step thumbnail-scrollbar 36)
+                     (lightfast:redraw thumbnail-canvas))))))
+        (lightfast:scrollbar-set-orientation thumbnail-scrollbar :vertical)
+        (lightfast:set-step thumbnail-scrollbar 36)
         (setf before-caption
-              (cl-fltk:make-label :parent center-pane :x 0 :y 0
+              (lightfast:make-label :parent center-pane :x 0 :y 0
                                   :width 357 :height 22
                                   :label "  Before · neutral RAW")
               after-caption
-              (cl-fltk:make-label :parent center-pane :x 363 :y 0
+              (lightfast:make-label :parent center-pane :x 363 :y 0
                                   :width 357 :height 22
                                   :label "  After · current adjustments"))
         (dolist (caption (list before-caption after-caption))
-          (cl-fltk:set-box caption cl-fltk:+box-thin-up-box+)
-          (cl-fltk:set-label-font caption cl-fltk:+font-helvetica-bold+))
+          (lightfast:set-box caption lightfast:+box-thin-up-box+)
+          (lightfast:set-label-font caption lightfast:+font-helvetica-bold+))
         (flet ((make-preview-canvas (role x)
-                 (cl-fltk:make-canvas
+                 (lightfast:make-canvas
                   :parent center-pane :x x :y 22 :width 357 :height 686
                   :callback
                   (lambda (widget event value)
                     (declare (ignore event value))
-                    (cl-fltk:draw-color-rgb :red 30 :green 32 :blue 34)
-                    (cl-fltk:draw-filled-rect
-                     (cl-fltk:widget-x widget) (cl-fltk:widget-y widget)
-                     (cl-fltk:widget-width widget) (cl-fltk:widget-height widget))
+                    (lightfast:draw-color-rgb :red 30 :green 32 :blue 34)
+                    (lightfast:draw-filled-rect
+                     (lightfast:widget-x widget) (lightfast:widget-y widget)
+                     (lightfast:widget-width widget) (lightfast:widget-height widget))
                     (let ((path (ecase role
                                   (:before before-preview-file)
                                   (:after after-preview-file)))
@@ -4258,45 +4380,45 @@ new cache entry is published."
                          (when (eq role :after)
                            (draw-crop-overlay widget)))
                         (t
-                         (cl-fltk:draw-color-rgb :red 205 :green 208 :blue 210)
-                         (cl-fltk:draw-text "Developing RAW preview..."
-                                            (+ (cl-fltk:widget-x widget) 20)
-                                            (+ (cl-fltk:widget-y widget) 36)))))))))
+                         (lightfast:draw-color-rgb :red 205 :green 208 :blue 210)
+                         (lightfast:draw-text "Developing RAW preview..."
+                                            (+ (lightfast:widget-x widget) 20)
+                                            (+ (lightfast:widget-y widget) 36)))))))))
           (setf before-canvas (make-preview-canvas :before 0)
                 after-canvas (make-preview-canvas :after 363))
           (dolist (canvas (list before-canvas after-canvas))
-            (dolist (event (list cl-fltk:+event-push+
-                                 cl-fltk:+event-drag+
-                                 cl-fltk:+event-release+
-                                 cl-fltk:+event-wheel+))
-              (cl-fltk:on canvas
+            (dolist (event (list lightfast:+event-push+
+                                 lightfast:+event-drag+
+                                 lightfast:+event-release+
+                                 lightfast:+event-wheel+))
+              (lightfast:on canvas
                           (lambda (widget callback-event value)
                             (handle-preview-mouse widget callback-event value))
                           :event event))))
-        (setf right-column (cl-fltk:make-tile :parent main-tile
+        (setf right-column (lightfast:make-tile :parent main-tile
                                               :x 960 :y 0
                                               :width 320 :height 708)
-              inspector (cl-fltk:make-panel :parent right-column :x 0 :y 0
+              inspector (lightfast:make-panel :parent right-column :x 0 :y 0
                                             :width 320 :height 425
                                             :label "")
-              graph-pane (cl-fltk:make-panel :parent right-column
+              graph-pane (lightfast:make-panel :parent right-column
                                              :x 0 :y 425
                                              :width 320 :height 283
                                              :label ""))
-        (cl-fltk:set-box graph-pane cl-fltk:+box-flat-box+)
-        (setf graph-title (cl-fltk:make-label :parent graph-pane
+        (lightfast:set-box graph-pane lightfast:+box-flat-box+)
+        (setf graph-title (lightfast:make-label :parent graph-pane
                                               :x 8 :y 4
                                               :width 304 :height 18
                                               :label "Node Graph"))
-        (cl-fltk:set-label-font graph-title cl-fltk:+font-helvetica-bold+)
+        (lightfast:set-label-font graph-title lightfast:+font-helvetica-bold+)
         (flet ((grade-button (x label tooltip action)
-                 (let ((button (cl-fltk:make-button
+                 (let ((button (lightfast:make-button
                                 :parent graph-pane :x x :y 24
                                 :width 96 :height 22 :label label
                                 :callback (lambda (&rest ignored)
                                             (declare (ignore ignored))
                                             (funcall action)))))
-                   (cl-fltk:set-tooltip button tooltip)
+                   (lightfast:set-tooltip button tooltip)
                    button)))
           (setf still-button
                 (grade-button 8 "Still" "Grab a still of the current grade"
@@ -4310,51 +4432,51 @@ new cache entry is published."
                               "Paste the copied node graph to the selection"
                               #'paste-grade)))
         (setf graph-canvas
-              (cl-fltk:make-canvas
+              (lightfast:make-canvas
                :parent graph-pane :x 2 :y 52 :width 316 :height 229
                :callback (lambda (widget event value)
                            (declare (ignore event value))
                            (draw-graph-editor widget))))
-        (cl-fltk:set-box graph-canvas cl-fltk:+box-flat-box+)
-        (cl-fltk:set-tooltip
+        (lightfast:set-box graph-canvas lightfast:+box-flat-box+)
+        (lightfast:set-tooltip
          graph-canvas
          "Drag nodes to arrange; drag a port to rewire; right-click to add")
-        (dolist (event (list cl-fltk:+event-push+
-                             cl-fltk:+event-drag+
-                             cl-fltk:+event-release+
-                             cl-fltk:+event-wheel+))
-          (cl-fltk:on graph-canvas #'handle-graph-mouse :event event))
+        (dolist (event (list lightfast:+event-push+
+                             lightfast:+event-drag+
+                             lightfast:+event-release+
+                             lightfast:+event-wheel+))
+          (lightfast:on graph-canvas #'handle-graph-mouse :event event))
         ;; The inspector lays its children out manually, so it must paint its
         ;; own background; a boxless group smears stale pixels during tile
         ;; drags and window resizes.
-        (cl-fltk:set-box inspector cl-fltk:+box-flat-box+)
+        (lightfast:set-box inspector lightfast:+box-flat-box+)
         (let ((scope-field
-                (cl-fltk:make-labeled-choice
+                (lightfast:make-labeled-choice
                  :parent inspector :x 8 :y 8 :width 300 :height 26
                  :label "Apply to" :label-width 96
                  :items '("Photo" "Defaults")
                  :callback (lambda (widget event value)
                              (declare (ignore event value))
                              (setf (gui-model-edit-target model)
-                                   (if (string-equal (cl-fltk:value widget)
+                                   (if (string-equal (lightfast:value widget)
                                                      "Defaults")
                                        :defaults :photo))
                              (sync-controls)))))
           (register-field scope-field 8)
-          (setf target-choice (cl-fltk:field-control scope-field)))
-        (setf tabs (cl-fltk:make-tabs :parent inspector :x 4 :y 40
+          (setf target-choice (lightfast:field-control scope-field)))
+        (setf tabs (lightfast:make-tabs :parent inspector :x 4 :y 40
                                       :width 312 :height 380)
-              node-page (cl-fltk:make-tab-page :parent tabs :x 2 :y 24
+              node-page (lightfast:make-tab-page :parent tabs :x 2 :y 24
                                                :width 308 :height 352
                                                :label "Node")
-              export-page (cl-fltk:make-tab-page :parent tabs :x 2 :y 24
+              export-page (lightfast:make-tab-page :parent tabs :x 2 :y 24
                                                  :width 308 :height 352
                                                  :label "Export"))
         (section-frame export-page "Output" 16 172)
         (flet ((export-integer-field (key label y)
-                 (cl-fltk:field-control
+                 (lightfast:field-control
                   (register-field
-                   (cl-fltk:make-labeled-control
+                   (lightfast:make-labeled-control
                     :int :parent export-page :x 12 :y y :width 292 :height 26
                     :label label :label-width 96
                     :callback (lambda (widget event value)
@@ -4366,7 +4488,7 @@ new cache entry is published."
                 export-max-height (export-integer-field :max-height "Maximum height" 90)
                 export-metadata
                 (register-inspector
-                 (cl-fltk:make-check-button
+                 (lightfast:make-check-button
                   :parent export-page :x 110 :y 122 :width 182 :height 26
                   :label "Preserve metadata"
                   :callback (lambda (widget event value)
@@ -4375,7 +4497,7 @@ new cache entry is published."
                  110 122 :control 26 :page)
                 export-timestamp
                 (register-inspector
-                 (cl-fltk:make-check-button
+                 (lightfast:make-check-button
                   :parent export-page :x 110 :y 154 :width 182 :height 26
                   :label "Timestamp filenames"
                   :callback (lambda (widget event value)
@@ -4384,32 +4506,32 @@ new cache entry is published."
                                                       widget)))
                  110 154 :control 26 :page)))
         ;; The stills gallery lives on the left column, PowerGrade style.
-        (setf gallery-title (cl-fltk:make-label :parent gallery-pane
+        (setf gallery-title (lightfast:make-label :parent gallery-pane
                                                 :x 8 :y 2
                                                 :width 224 :height 18
                                                 :label "Stills Gallery"))
-        (cl-fltk:set-label-font gallery-title cl-fltk:+font-helvetica-bold+)
+        (lightfast:set-label-font gallery-title lightfast:+font-helvetica-bold+)
         (setf gallery-canvas
-              (cl-fltk:make-canvas
+              (lightfast:make-canvas
                :parent gallery-pane :x 4 :y 22 :width 232 :height 172
                :callback (lambda (widget event value)
                            (declare (ignore event value))
                            (draw-gallery widget))))
-        (dolist (event (list cl-fltk:+event-push+ cl-fltk:+event-wheel+))
-          (cl-fltk:on gallery-canvas #'handle-gallery-mouse :event event))
+        (dolist (event (list lightfast:+event-push+ lightfast:+event-wheel+))
+          (lightfast:on gallery-canvas #'handle-gallery-mouse :event event))
         (setf preset-name-input
-              (cl-fltk:make-input :parent gallery-pane :x 8 :y 200
+              (lightfast:make-input :parent gallery-pane :x 8 :y 200
                                   :width 224 :height 24))
-        (cl-fltk:set-tooltip preset-name-input "Still or preset name")
+        (lightfast:set-tooltip preset-name-input "Still or preset name")
         (setf preset-save-button
-              (cl-fltk:make-button
+              (lightfast:make-button
                :parent gallery-pane :x 8 :y 228 :width 108 :height 26
                :label "Save current"
                :callback (lambda (&rest ignored)
                            (declare (ignore ignored))
                            (save-current-preset))))
         (setf preset-apply-button
-              (cl-fltk:make-button
+              (lightfast:make-button
                :parent gallery-pane :x 124 :y 228 :width 108 :height 26
                :label "Apply to 1 photo"
                :callback (lambda (&rest ignored)
@@ -4422,9 +4544,9 @@ new cache entry is published."
          :picker
          (lambda ()
            (setf kind-choice
-                 (cl-fltk:field-control
+                 (lightfast:field-control
                   (register-field
-                   (cl-fltk:make-labeled-choice
+                   (lightfast:make-labeled-choice
                     :parent node-page :x 12 :y 8 :width 292 :height 26
                     :label "Correction" :label-width 88
                     :items (mapcar #'first *node-kind-choices*)
@@ -4432,7 +4554,7 @@ new cache entry is published."
                     (lambda (widget event value)
                       (declare (ignore event value))
                       (let ((node (gui-model-selected-graph-node model))
-                            (kind (rest (assoc (cl-fltk:value widget)
+                            (kind (rest (assoc (lightfast:value widget)
                                                *node-kind-choices*
                                                :test #'string-equal))))
                         (when (and node kind
@@ -4454,7 +4576,7 @@ new cache entry is published."
          :none
          (lambda ()
            (register-inspector
-            (cl-fltk:make-label
+            (lightfast:make-label
              :parent node-page :x 12 :y 44 :width 292 :height 26
              :label "Select or create a node in the graph")
             12 44 :fill 26 :page)))
@@ -4462,7 +4584,7 @@ new cache entry is published."
          :node
          (lambda ()
            (register-inspector
-            (cl-fltk:make-label
+            (lightfast:make-label
              :parent node-page :x 12 :y 44 :width 292 :height 26
              :label "Pick a correction type above")
             12 44 :fill 26 :page)))
@@ -4470,9 +4592,9 @@ new cache entry is published."
          :white-balance
          (lambda ()
            (setf wb-choice
-                 (cl-fltk:field-control
+                 (lightfast:field-control
                   (register-field
-                   (cl-fltk:make-labeled-choice
+                   (lightfast:make-labeled-choice
                     :parent node-page :x 12 :y 44 :width 292 :height 26
                     :label "Mode" :label-width 88
                     :items '("As shot" "Custom")
@@ -4500,7 +4622,7 @@ new cache entry is published."
          :tone
          (lambda ()
            (register-inspector
-            (cl-fltk:make-label :parent node-page :x 12 :y 44
+            (lightfast:make-label :parent node-page :x 12 :y 44
                                 :width 292 :height 26
                                 :label "Tone Equalizer")
             12 44 :fill 26 :page)
@@ -4515,7 +4637,7 @@ new cache entry is published."
          :optics
          (lambda ()
            (let ((lens (register-inspector
-                        (cl-fltk:make-check-button
+                        (lightfast:make-check-button
                          :parent node-page :x 12 :y 44
                          :width 292 :height 26
                          :label "Apply lens distortion correction"
@@ -4524,14 +4646,14 @@ new cache entry is published."
                            (declare (ignore event value))
                            (gui-model-set-setting
                             model :lens-correction-p
-                            (string/= "0" (cl-fltk:value widget)))
+                            (string/= "0" (lightfast:value widget)))
                            (schedule-edited-preview)))
                         12 44 :fill 26 :page)))
              (push (list :lens-correction-p lens) controls))
            (make-number-field :lens-correction-strength "Strength"
                               0 2 0.05 76 node-page)
            (let ((tca (register-inspector
-                       (cl-fltk:make-check-button
+                       (lightfast:make-check-button
                         :parent node-page :x 12 :y 108
                         :width 292 :height 26
                         :label "Remove chromatic aberration"
@@ -4540,7 +4662,7 @@ new cache entry is published."
                           (declare (ignore event value))
                           (gui-model-set-setting
                            model :chromatic-aberration-correction-p
-                           (string/= "0" (cl-fltk:value widget)))
+                           (string/= "0" (lightfast:value widget)))
                           (schedule-edited-preview)))
                        12 108 :fill 26 :page)))
              (push (list :chromatic-aberration-correction-p tca)
@@ -4549,7 +4671,7 @@ new cache entry is published."
          :film
          (lambda ()
            (register-inspector
-            (cl-fltk:make-label :parent node-page :x 12 :y 44
+            (lightfast:make-label :parent node-page :x 12 :y 44
                                 :width 88 :height 26 :label "3D LUT")
             12 44 88 26 :page)
            (let ((items '("None")))
@@ -4560,13 +4682,13 @@ new cache entry is published."
              (setf items (append items '("Browse..."))
                    lut-choice
                    (register-inspector
-                    (cl-fltk:make-choice
+                    (lightfast:make-choice
                      :parent node-page :x 110 :y 44 :width 190 :height 26
                      :items items
                      :callback
                      (lambda (widget event value)
                        (declare (ignore event value))
-                       (let ((selection (cl-fltk:value widget)))
+                       (let ((selection (lightfast:value widget)))
                          (cond ((string= selection "Browse...")
                                 (choose-lut)
                                 (sync-controls))
@@ -4587,12 +4709,12 @@ new cache entry is published."
          :blend
          (lambda ()
            (register-inspector
-            (cl-fltk:make-label :parent node-page :x 12 :y 44
+            (lightfast:make-label :parent node-page :x 12 :y 44
                                 :width 88 :height 26 :label "Opacity")
             12 44 88 26 :page)
            (setf blend-opacity-input
                  (register-inspector
-                  (cl-fltk:make-spinner
+                  (lightfast:make-spinner
                    :parent node-page :x 110 :y 44 :width 84 :height 26
                    :callback
                    (lambda (widget event value)
@@ -4601,24 +4723,24 @@ new cache entry is published."
                        (when (and node (orfeus:graph-node-blend-p node))
                          (handler-case
                              (let ((opacity (parse-number
-                                             (cl-fltk:value widget))))
+                                             (lightfast:value widget))))
                                (setf (orfeus:graph-node-opacity node)
                                      (float (max 0 (min 1 opacity)) 1.0))
                                (when graph-canvas
-                                 (cl-fltk:redraw graph-canvas))
+                                 (lightfast:redraw graph-canvas))
                                (schedule-edited-preview))
                            (error (condition)
                              (set-status
                               (princ-to-string condition))))))))
                   110 44 84 26 :page))
-           (cl-fltk:set-range blend-opacity-input 0 1)
-           (cl-fltk:set-step blend-opacity-input 0.05)))
+           (lightfast:set-range blend-opacity-input 0 1)
+           (lightfast:set-step blend-opacity-input 0.05)))
         (build-group
          :color-subtract
          (lambda ()
            (flet ((subtract-button (y label action)
                     (register-inspector
-                     (cl-fltk:make-button
+                     (lightfast:make-button
                       :parent node-page :x 12 :y y :width 292 :height 26
                       :label label
                       :callback
@@ -4640,12 +4762,12 @@ new cache entry is published."
          :crop
          (lambda ()
            (register-inspector
-            (cl-fltk:make-label :parent node-page :x 12 :y 44
+            (lightfast:make-label :parent node-page :x 12 :y 44
                                 :width 88 :height 26 :label "Angle")
             12 44 88 26 :page)
            (setf crop-angle-input
                  (register-inspector
-                  (cl-fltk:make-spinner
+                  (lightfast:make-spinner
                    :parent node-page :x 110 :y 44 :width 84 :height 26
                    :callback
                    (lambda (widget event value)
@@ -4654,7 +4776,7 @@ new cache entry is published."
                        (when node
                          (handler-case
                              (let ((angle (parse-number
-                                           (cl-fltk:value widget))))
+                                           (lightfast:value widget))))
                                (set-crop-node-angle
                                 node
                                 (float (max -45 (min 45 angle)) 1.0)))
@@ -4662,10 +4784,10 @@ new cache entry is published."
                              (set-status
                               (princ-to-string condition))))))))
                   110 44 84 26 :page))
-           (cl-fltk:set-range crop-angle-input -45 45)
-           (cl-fltk:set-step crop-angle-input 0.1)
+           (lightfast:set-range crop-angle-input -45 45)
+           (lightfast:set-step crop-angle-input 0.1)
            (register-inspector
-            (cl-fltk:make-button
+            (lightfast:make-button
              :parent node-page :x 12 :y 76 :width 292 :height 26
              :label "Autocrop Negative"
              :callback (lambda (&rest ignored)
@@ -4674,7 +4796,7 @@ new cache entry is published."
                            (when node (autocrop-negative node)))))
             12 76 :fill 26 :page)
            (register-inspector
-            (cl-fltk:make-button
+            (lightfast:make-button
              :parent node-page :x 12 :y 108 :width 292 :height 26
              :label "Reset Crop"
              :callback (lambda (&rest ignored)
@@ -4689,7 +4811,7 @@ new cache entry is published."
                               "Crop reset to full frame")))))
             12 108 :fill 26 :page)
            (register-inspector
-            (cl-fltk:make-label
+            (lightfast:make-label
              :parent node-page :x 12 :y 140 :width 292 :height 26
              :label "Drag the rectangle on the preview")
             12 140 :fill 26 :page)))
@@ -4697,7 +4819,7 @@ new cache entry is published."
          :curves
          (lambda ()
            (let ((channel-field
-                   (cl-fltk:make-labeled-choice
+                   (lightfast:make-labeled-choice
                     :parent node-page :x 12 :y 44 :width 292 :height 26
                     :label "Channel" :label-width 88
                     :items '("Luma" "Red" "Green" "Blue")
@@ -4706,46 +4828,46 @@ new cache entry is published."
                       (declare (ignore event value))
                       (setf curve-channel
                             (cond ((string-equal
-                                    (cl-fltk:value widget) "Green")
+                                    (lightfast:value widget) "Green")
                                    :green-points)
                                   ((string-equal
-                                    (cl-fltk:value widget) "Blue")
+                                    (lightfast:value widget) "Blue")
                                    :blue-points)
                                   ((string-equal
-                                    (cl-fltk:value widget) "Luma")
+                                    (lightfast:value widget) "Luma")
                                    :master-points)
                                   (t :red-points)))
                       (when curve-canvas
-                        (cl-fltk:redraw curve-canvas))))))
+                        (lightfast:redraw curve-canvas))))))
              (register-field channel-field 44 :page))
            (setf scope-canvas
                  (register-inspector
-                  (cl-fltk:make-canvas
+                  (lightfast:make-canvas
                    :parent node-page :x 12 :y 76 :width 292 :height 104
                    :callback (lambda (widget event value)
                                (declare (ignore event value))
                                (draw-scope widget)))
                   12 76 :fill :scope :page))
-           (cl-fltk:set-tooltip
+           (lightfast:set-tooltip
             scope-canvas
             "Waveform: highlights at the top, shadows at the bottom")
            (setf curve-canvas
                  (register-inspector
-                  (cl-fltk:make-canvas
+                  (lightfast:make-canvas
                    :parent node-page :x 12 :y 188 :width 292 :height 150
                    :callback (lambda (widget event value)
                                (declare (ignore event value))
                                (draw-curve-editor widget)))
                   12 :chart-row :fill :chart :page))
-           (cl-fltk:set-tooltip
+           (lightfast:set-tooltip
             curve-canvas
             "Drag the points to shape the channel; the histogram shows occupancy")
-           (dolist (event (list cl-fltk:+event-push+
-                                cl-fltk:+event-drag+
-                                cl-fltk:+event-release+))
-             (cl-fltk:on curve-canvas #'handle-curve-mouse :event event))
+           (dolist (event (list lightfast:+event-push+
+                                lightfast:+event-drag+
+                                lightfast:+event-release+))
+             (lightfast:on curve-canvas #'handle-curve-mouse :event event))
            (register-inspector
-            (cl-fltk:make-button
+            (lightfast:make-button
              :parent node-page :x 12 :y 346 :width 292 :height 26
              :label "Reset Channel"
              :callback (lambda (&rest ignored)
@@ -4753,7 +4875,7 @@ new cache entry is published."
                          (reset-curve-channel)))
             12 :page-action-row :fill 26 :page)))
         (register-inspector
-         (cl-fltk:make-button :parent inspector :x 12 :y 674
+         (lightfast:make-button :parent inspector :x 12 :y 674
                               :width 140 :height 26 :label "Reset selected"
                               :callback (lambda (&rest ignored)
                                           (declare (ignore ignored))
@@ -4762,39 +4884,41 @@ new cache entry is published."
                                                                 (schedule-edited-preview)))
          12 :action-row :half-left 26)
         (register-inspector
-         (cl-fltk:make-button :parent inspector :x 166 :y 674
+         (lightfast:make-button :parent inspector :x 166 :y 674
                               :width 142 :height 26 :label "Export current"
                               :callback (lambda (&rest ignored)
                                           (declare (ignore ignored))
                                           (render-selected)))
          166 :action-row :half-right 26)
-        (setf progress (cl-fltk:make-progress :parent window :x 0 :y 772
+        (setf progress (lightfast:make-progress :parent window :x 0 :y 772
                                               :width 180 :height 28 :value "0")
-              status (cl-fltk:make-status-bar :parent window :x 180 :y 772
+              status (lightfast:make-status-bar :parent window :x 180 :y 772
                                                :width 1100 :height 28
-                                               :value "Ready"))
-        (cl-fltk:tile-size-range main-tile left-column
+                                               :value "Ready")
+              root-layout
+              (make-root-layout menu toolbar main-tile progress status))
+        (lightfast:tile-size-range main-tile left-column
                                  :min-width 180 :max-width 420)
-        (cl-fltk:tile-size-range main-tile center-pane :min-width 300)
-        (cl-fltk:tile-size-range main-tile right-column
+        (lightfast:tile-size-range main-tile center-pane :min-width 300)
+        (lightfast:tile-size-range main-tile right-column
                                  :min-width 280 :max-width 480)
-        (cl-fltk:tile-size-range left-column filmstrip-pane :min-height 140)
-        (cl-fltk:tile-size-range left-column gallery-pane :min-height 140)
-        (cl-fltk:tile-size-range right-column inspector
+        (lightfast:tile-size-range left-column filmstrip-pane :min-height 140)
+        (lightfast:tile-size-range left-column gallery-pane :min-height 140)
+        (lightfast:tile-size-range right-column inspector
                                  :min-height *inspector-min-height*)
-        (cl-fltk:tile-size-range right-column graph-pane :min-height 140)
-        (cl-fltk:on-resize window #'layout-ui)
-        (cl-fltk:on-resize filmstrip-pane #'layout-left-pane)
-        (cl-fltk:on-resize gallery-pane #'layout-gallery-pane)
-        (cl-fltk:on-resize center-pane #'layout-center-pane)
-        (cl-fltk:on-resize inspector #'layout-inspector-pane)
-        (cl-fltk:on-resize graph-pane #'layout-graph-pane)
+        (lightfast:tile-size-range right-column graph-pane :min-height 140)
+        (lightfast:on-resize window #'layout-ui)
+        (lightfast:on-resize filmstrip-pane #'layout-left-pane)
+        (lightfast:on-resize gallery-pane #'layout-gallery-pane)
+        (lightfast:on-resize center-pane #'layout-center-pane)
+        (lightfast:on-resize inspector #'layout-inspector-pane)
+        (lightfast:on-resize graph-pane #'layout-graph-pane)
         (gui-model-set-selected-indices
          model (if (project-photos project) '(0) '()))
         (sync-controls)
         (sync-node-tools)
         (layout-ui)
-        (setf poll-id (cl-fltk:add-timeout 0.08d0 #'poll :repeat t))
+        (setf poll-id (lightfast:add-timeout 0.08d0 #'poll :repeat t))
         ;; Best-effort housekeeping of the persistent preview cache.
         (enqueue-gui-task background-queue :evict
                           (lambda ()
@@ -4803,9 +4927,9 @@ new cache entry is published."
         (when (selected-job)
           (schedule-initial-preview))
         (unwind-protect
-             (progn (cl-fltk:show window) (cl-fltk:run))
-          (when poll-id (ignore-errors (cl-fltk:remove-timeout poll-id)))
-          (when debounce-id (ignore-errors (cl-fltk:remove-timeout debounce-id)))
+             (progn (lightfast:show window) (lightfast:run))
+          (when poll-id (ignore-errors (lightfast:remove-timeout poll-id)))
+          (when debounce-id (ignore-errors (lightfast:remove-timeout debounce-id)))
           (stop-gui-queue queue)
           (stop-gui-queue background-queue)
           (stop-gui-queue histogram-queue)
@@ -4818,7 +4942,7 @@ new cache entry is published."
           (ignore-errors
             (uiop:delete-directory-tree preview-session-directory :validate t
                                                                   :if-does-not-exist :ignore))
-          (when window (ignore-errors (cl-fltk:destroy window))))))))
+          (when window (ignore-errors (lightfast:destroy window))))))))
 
 (defun main (&optional pathname)
   "Launch Orfeus with optional PHOTO or PROJECT PATHNAME."

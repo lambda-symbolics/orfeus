@@ -312,7 +312,19 @@
       (orfeus/gui::thumbnail-selection-after-click
        '(1 4) 5 2 orfeus/gui::+thumbnail-shift-mask+)
     (check (equal '(2 3 4 5) selection) "Shift-click did not select an inclusive range")
-    (check (= 2 anchor) "Shift-click did not preserve the anchor")))
+    (check (= 2 anchor) "Shift-click did not preserve the anchor"))
+  (check (equal '(1 4) (orfeus/gui::thumbnail-context-selection '(1 4) 4))
+         "Right-clicking a selected thumbnail did not preserve the selection")
+  (check (equal '(3) (orfeus/gui::thumbnail-context-selection '(1 4) 3))
+         "Right-clicking an unselected thumbnail did not select only that row")
+  (check (equal '(:export :apply-still :reset-edits :copy-paths :divider
+                  :select-all :remove)
+                (loop for index below
+                      (length (orfeus/gui::thumbnail-context-menu-items))
+                      collect (orfeus/gui::thumbnail-context-action-at index)))
+         "Photo context menu actions do not match their visible order")
+  (check (null (orfeus/gui::thumbnail-context-action-at nil))
+         "Dismissing the photo context menu produced an action"))
 
 (defun test-bundled-film-lut-menu ()
   (let ((names (mapcar #'file-namestring (orfeus/gui::gui-bundled-lut-paths))))
@@ -848,7 +860,83 @@
                                                            nil)))
              "Adding a node did not change the signature"))))
 
+(defun test-lightfast-root-layout-and-export-validation ()
+  (let* ((layout (orfeus/gui::make-root-layout
+                  :menu :toolbar :main :progress :status))
+         (placements
+           (lightfast:compute-layout layout
+                                     (lightfast:make-rect :width 1000
+                                                          :height 800)))
+         (rect (lambda (target)
+                 (lightfast:layout-placement-rect
+                  (find target placements
+                        :key #'lightfast:layout-placement-target)))))
+    (flet ((check-rect (target x y width height)
+             (let ((held (funcall rect target)))
+               (check (equal (list x y width height)
+                             (list (lightfast:rect-x held)
+                                   (lightfast:rect-y held)
+                                   (lightfast:rect-width held)
+                                   (lightfast:rect-height held)))
+                      "Root layout placed ~S at ~S" target held))))
+      (check-rect :menu 0 0 1000 24)
+      (check-rect :toolbar 0 24 1000 40)
+      (check-rect :main 0 64 1000 708)
+      (check-rect :progress 0 772 180 28)
+      (check-rect :status 180 772 820 28)))
+  (check (= 92 (orfeus/gui::parse-export-integer-value "" "Quality" 92 1 100))
+         "Blank export value did not use its fallback")
+  (check (= 85 (orfeus/gui::parse-export-integer-value "85" "Quality" 92 1 100))
+         "Valid export value did not parse")
+  (dolist (text '("85px" "-1" "101"))
+    (check (handler-case
+               (progn
+                 (orfeus/gui::parse-export-integer-value text "Quality" 92 1 100)
+                 nil)
+             (error () t))
+           "Invalid export value ~S was accepted" text))
+  (let* ((settings (orfeus:make-export-settings
+                    :jpeg-quality 91
+                    :max-width 2048
+                    :max-height 1536
+                    :preserve-metadata-p t
+                    :timestamp-filenames-p nil))
+         (project (orfeus:make-project :output-directory #P"old/"
+                                       :export-settings settings)))
+    (check (handler-case
+               (progn
+                 (orfeus/gui::update-project-export-settings
+                  project "new" "85px" "4096" "3072" nil t)
+                 nil)
+             (error () t))
+           "Invalid export settings update did not signal")
+    (check (equal #P"old/" (orfeus:project-output-directory project))
+           "Invalid export settings update changed the destination")
+    (check (and (= 91 (orfeus:export-settings-jpeg-quality settings))
+                (= 2048 (orfeus:export-settings-max-width settings))
+                (= 1536 (orfeus:export-settings-max-height settings))
+                (orfeus:export-settings-preserve-metadata-p settings)
+                (not (orfeus:export-settings-timestamp-filenames-p settings)))
+           "Invalid export settings update partially mutated settings")
+    (orfeus/gui::update-project-export-settings
+     project "new" "85" "4096" "0" nil t)
+    (check (equal #P"new/" (orfeus:project-output-directory project))
+           "Valid export settings update did not change the destination")
+    (check (and (= 85 (orfeus:export-settings-jpeg-quality settings))
+                (= 4096 (orfeus:export-settings-max-width settings))
+                (null (orfeus:export-settings-max-height settings))
+                (not (orfeus:export-settings-preserve-metadata-p settings))
+                (orfeus:export-settings-timestamp-filenames-p settings))
+           "Valid export settings update did not commit every field"))
+  (check (orfeus/gui::gallery-generation-event-current-p
+          '(:still-error 4 "failed") 4)
+         "Current still error was rejected")
+  (check (not (orfeus/gui::gallery-generation-event-current-p
+               '(:still-error 3 "stale") 4))
+         "Stale still error was accepted"))
+
 (defun run-tests ()
+  (test-lightfast-root-layout-and-export-validation)
   (test-model-settings)
   (test-preset-bulk-application)
   (test-grade-workflow)

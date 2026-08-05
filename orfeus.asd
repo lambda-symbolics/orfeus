@@ -22,7 +22,7 @@
 
 (asdf:defsystem #:orfeus/gui
   :description "FLTK frontend for Orfeus."
-  :depends-on (#:orfeus #:cl-fltk)
+  :depends-on (#:orfeus #:lightfast)
   :components ((:module "src/gui"
                 :serial t
                 :components ((:file "package")

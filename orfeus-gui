@@ -9,9 +9,9 @@ fi
 
 cargo build --release --manifest-path native/Cargo.toml
 
-fltk_bridge="${ORFEUS_FLTK_SOURCE}/build/libcl_fltk_bridge.so"
-if [ ! -f "$fltk_bridge" ] || ldd "$fltk_bridge" 2>/dev/null | grep -q 'not found'; then
-  make -B -C "$ORFEUS_FLTK_SOURCE" cl-fltk-bridge
+lightfast_bridge="${ORFEUS_LIGHTFAST_SOURCE}/build/liblightfast.so"
+if [ ! -f "$lightfast_bridge" ] || ldd "$lightfast_bridge" 2>/dev/null | grep -q 'not found'; then
+  make -B -C "$ORFEUS_LIGHTFAST_SOURCE" native
 fi
 make gui-native
 

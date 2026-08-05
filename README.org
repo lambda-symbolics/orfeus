@@ -10,7 +10,7 @@ nix develop
 #+end_src
 
 The flake provides SBCL, Rust, LibRaw/Lensfun-related native dependencies,
-ExifTool, JPEG/TIFF support, and FLTK. Keep the sibling =../fltk-sun= checkout
+ExifTool, JPEG/TIFF support, and FLTK. Keep the sibling =../lightfast= checkout
 available when building the GUI.
 
 * Build
