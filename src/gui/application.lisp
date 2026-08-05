@@ -806,6 +806,12 @@ new cache entry is published."
            (gallery-thumbs (make-hash-table :test #'equal))
            (gallery-click (cons 0 -1))
            debounce-id poll-id comparison-p layout-initialized-p
+           ;; The divider is remembered as a share of the right column, not as
+           ;; an absolute height: a window that grows must hand the graph its
+           ;; proportion of the new space instead of freezing it at the height
+           ;; computed for the window's creation size.
+           (graph-height-fraction 62/100)
+           applying-layout-p
            (progress-total 0)
            (graph-view-state :unset)
            (last-render-ms 10000)
@@ -3467,6 +3473,13 @@ new cache entry is published."
              (let* ((width (cl-fltk:widget-width graph-pane))
                     (height (cl-fltk:widget-height graph-pane))
                     (button-width (max 48 (floor (- width 32) 3))))
+               ;; A drag of the tile divider is the only thing that may change
+               ;; the remembered share; our own layout pass must not ratchet it.
+               (unless applying-layout-p
+                 (let ((column (cl-fltk:widget-height right-column)))
+                   (when (plusp column)
+                     (setf graph-height-fraction
+                           (max 1/5 (min 4/5 (/ height column)))))))
                (when graph-title
                  (cl-fltk:resize-widget graph-title :x 8 :y 4
                                         :width (- width 16) :height 18))
@@ -3583,6 +3596,8 @@ new cache entry is published."
                (cl-fltk:redraw inspector)))
            (layout-ui (&optional ignored)
              (declare (ignore ignored))
+             (setf applying-layout-p t)
+             (unwind-protect
              (let* ((width (cl-fltk:widget-width window))
                     (height (cl-fltk:widget-height window))
                     (top 64) (bottom 28)
@@ -3627,11 +3642,8 @@ new cache entry is published."
                      (graph-height
                        (min (- main-height *inspector-min-height*)
                             (max 160
-                                 (if layout-initialized-p
-                                     (cl-fltk:widget-height graph-pane)
-                                     (min 560
-                                          (floor (* main-height 3)
-                                                 5)))))))
+                                 (round (* main-height
+                                           graph-height-fraction))))))
                  (cl-fltk:resize-widget filmstrip-pane :x 0 :y 0
                                         :width left
                                         :height (- main-height
@@ -3658,7 +3670,8 @@ new cache entry is published."
                  (cl-fltk:init-sizes main-tile)
                  (cl-fltk:init-sizes left-column)
                  (cl-fltk:init-sizes right-column))
-               (setf layout-initialized-p t)))
+               (setf layout-initialized-p t))
+               (setf applying-layout-p nil)))
            (poll ()
              (dolist (event (drain-events queue))
                (case (first event)
