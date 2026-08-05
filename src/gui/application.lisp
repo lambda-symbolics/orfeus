@@ -2560,15 +2560,23 @@ new cache entry is published."
                            (namestring
                             (or (ignore-errors (truename source)) source))
                            "none"))))
-               (merge-pathnames
-                (make-pathname
-                 :name (format nil "still-~(~A~)-~A-~A-~A"
-                               (gallery-still-origin still)
-                               (gallery-still-identity still)
-                               source-identity
-                               (preview-settings-key (still-recipe preset)))
-                 :type "jpg")
-                preview-directory)))
+               ;; Three whole digests overflowed the 255-byte filename limit
+               ;; once the atomic write added its dot prefix and temporary
+               ;; suffix, so every still preview failed to write. Sixty-four
+               ;; bits per component is plenty to key a cache file.
+               (flet ((short (text)
+                        (let ((text (string text)))
+                          (subseq text 0 (min 16 (length text))))))
+                 (merge-pathnames
+                  (make-pathname
+                   :name (format nil "still-~(~A~)-~A-~A-~A"
+                                 (gallery-still-origin still)
+                                 (short (gallery-still-identity still))
+                                 (short source-identity)
+                                 (short (preview-settings-key
+                                         (still-recipe preset))))
+                   :type "jpg")
+                  preview-directory))))
            (request-still-thumbnail (still)
              (let* ((preset (gallery-still-preset still))
                     (key (gallery-still-key still))
@@ -2611,8 +2619,12 @@ new cache entry is published."
                                                       key output stored)))
                                ;; A failed still render used to vanish, leaving
                                ;; a permanently blank gallery cell with no clue
-                               ;; why. Report it instead.
+                               ;; why. The status bar clips long reasons, so
+                               ;; the whole condition also goes to the log.
                                (error (condition)
+                                 (format *error-output*
+                                         "~&orfeus: still preview failed for ~A: ~A~%"
+                                         name condition)
                                  (queue-event
                                   queue
                                   (list :status nil
