@@ -1890,6 +1890,50 @@ fn stat_identity(input: &Path) -> Result<StatIdentity, Error> {
     ))
 }
 
+#[cfg(test)]
+pub(crate) fn lut_cache_len() -> usize {
+    lut_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .len()
+}
+
+const LUT_CACHE_CAPACITY: usize = 4;
+
+/// Parsed .cube files, keyed by path and stat identity.
+///
+/// A film node re-reads its LUT every time the graph executes, so dragging
+/// grain used to re-parse tens of thousands of lines of text on every tick.
+/// The stat identity means an edited LUT on disk still takes effect.
+#[allow(clippy::type_complexity)]
+fn lut_cache() -> &'static Mutex<Vec<((PathBuf, StatIdentity), Arc<CubeLut>)>> {
+    static CACHE: OnceLock<Mutex<Vec<((PathBuf, StatIdentity), Arc<CubeLut>)>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+pub(crate) fn cached_cube_lut(path: &Path) -> Result<Arc<CubeLut>, Error> {
+    let key = (path.to_path_buf(), stat_identity(path)?);
+    {
+        let mut cache = lut_cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(position) = cache.iter().position(|(held, _)| *held == key) {
+            let entry = cache.remove(position);
+            let lut = entry.1.clone();
+            cache.insert(0, entry);
+            return Ok(lut);
+        }
+    }
+    let lut = Arc::new(CubeLut::read(path)?);
+    let mut cache = lut_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cache.retain(|(held, _)| *held != key);
+    cache.insert(0, (key, lut.clone()));
+    cache.truncate(LUT_CACHE_CAPACITY);
+    Ok(lut)
+}
+
 const KEY_MEMO_CAPACITY: usize = 16;
 
 fn key_memo() -> &'static Mutex<Vec<(StatIdentity, DecodeCacheKey)>> {
@@ -2209,11 +2253,8 @@ pub fn render(
         let path = unsafe { CStr::from_ptr(settings.lut_path) }
             .to_str()
             .map_err(|_| Error::InvalidArgument("LUT path is not UTF-8"))?;
-        apply_lut(
-            &mut image,
-            &CubeLut::read(Path::new(path))?,
-            settings.lut_strength,
-        );
+        let lut = cached_cube_lut(Path::new(path))?;
+        apply_lut(&mut image, &lut, settings.lut_strength);
     }
     apply_grain(
         &mut image,
@@ -2796,10 +2837,19 @@ mod tests {
             .collect::<Vec<_>>();
         paths.sort();
         assert_eq!(paths.len(), 9, "unexpected bundled LUT count");
-        for path in paths {
-            CubeLut::read(&path)
+        for path in &paths {
+            CubeLut::read(path)
                 .unwrap_or_else(|error| panic!("invalid bundled LUT {}: {error}", path.display()));
         }
+        // Repeated reads of one LUT are served from the cache, so dragging a
+        // film node's grain no longer re-parses the file on every tick.
+        let first = &paths[0];
+        let once = cached_cube_lut(first).expect("cached bundled LUT");
+        let held = lut_cache_len();
+        let twice = cached_cube_lut(first).expect("cached bundled LUT");
+        assert!(Arc::ptr_eq(&once, &twice), "LUT was parsed twice");
+        assert_eq!(held, lut_cache_len(), "a cache hit must not add an entry");
+        assert!(held <= LUT_CACHE_CAPACITY);
     }
 
     #[test]

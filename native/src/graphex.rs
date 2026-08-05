@@ -795,7 +795,7 @@ pub(crate) fn execute_graph_cached(
                 if op.params[0] > 0.0
                     && let Some(path) = &op.text
                 {
-                    let lut = render::CubeLut::read(Path::new(path))?;
+                    let lut = render::cached_cube_lut(Path::new(path))?;
                     render::apply_lut(&mut image, &lut, op.params[0]);
                 }
                 if op.params[1] > 0.0 {
