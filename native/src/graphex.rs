@@ -562,8 +562,20 @@ struct PrefixSnapshot {
 /// an expensive node to a cheap downstream one stays instant too.
 struct PrefixEntry {
     ops: Vec<GraphOp>,
-    checkpoints: Vec<(usize, Vec<PrefixSnapshot>)>,
+    checkpoints: Vec<(StagePoint, Vec<PrefixSnapshot>)>,
 }
+
+/// Where a resume enters the program: an op index, and how far into that op the
+/// restored state already reached.
+///
+/// Film nodes are the one kind worth splitting. Their display transform and
+/// film LUT cost far more than the grain that follows, so grain gets its own
+/// stage: dragging grain resumes with the LUT result already in hand instead of
+/// re-running a tone map and a trilinear 3D lookup over every pixel.
+type StagePoint = (usize, u32);
+
+const STAGE_ENTRY: u32 = 0;
+const STAGE_FILM_GRAIN: u32 = 1;
 
 /// Cache key: input path, decoded dimensions, bounded render dimensions.
 pub(crate) type PrefixKey = (String, usize, usize, u32, u32, usize);
@@ -586,11 +598,39 @@ fn common_prefix_length(previous: &[GraphOp], current: &[GraphOp]) -> usize {
 
 /// The default checkpoint: right after the last expensive stage, so edits
 /// to the cheap grading tail never pay for optics or noise reduction again.
-fn default_snapshot_boundary(ops: &[GraphOp]) -> usize {
-    ops.iter()
+fn default_snapshot_boundary(ops: &[GraphOp]) -> StagePoint {
+    let index = ops
+        .iter()
         .rposition(|op| matches!(op.kind, NODE_OPTICS | NODE_NOISE_REDUCTION))
         .map(|index| index + 1)
-        .unwrap_or(0)
+        .unwrap_or(0);
+    (index, STAGE_ENTRY)
+}
+
+/// How much of the previous program the current one may resume from.
+///
+/// Ops are compared whole, with one exception: when the first difference is a
+/// film node whose LUT and its strength are unchanged, only grain differs, so a
+/// stage 1 checkpoint inside that node is still valid.
+fn resume_limit(previous: &[GraphOp], current: &[GraphOp]) -> StagePoint {
+    let common = common_prefix_length(previous, current);
+    if let (Some(before), Some(after)) = (previous.get(common), current.get(common))
+        && before.kind == NODE_FILM
+        && after.kind == NODE_FILM
+        && before.text == after.text
+        && before.params[0] == after.params[0]
+    {
+        return (common, STAGE_FILM_GRAIN);
+    }
+    (common, STAGE_ENTRY)
+}
+
+/// The last film node that actually lays down grain, whose pre-grain state is
+/// worth keeping. Only one is captured so a drag costs a single extra clone.
+fn film_grain_capture(ops: &[GraphOp]) -> Option<StagePoint> {
+    ops.iter()
+        .rposition(|op| op.kind == NODE_FILM && op.params[1] > 0.0)
+        .map(|index| (index, STAGE_FILM_GRAIN))
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -616,23 +656,23 @@ pub(crate) fn execute_graph_cached(
     }
     // Interactive resume: reuse the deepest checkpoint of the previous
     // program that still lies on this program's unchanged prefix.
-    let mut resume: Option<(usize, Vec<PrefixSnapshot>)> = None;
-    let mut capture_points: Vec<usize> = Vec::new();
+    let mut resume: Option<(StagePoint, Vec<PrefixSnapshot>)> = None;
+    let mut capture_points: Vec<StagePoint> = Vec::new();
     if let Some(key) = &cache_key {
         let mut cache = prefix_cache()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let common = if let Some(position) = cache.iter().position(|(held, _)| held == key) {
+        let limit = if let Some(position) = cache.iter().position(|(held, _)| held == key) {
             let entry = &cache[position].1;
-            let common = common_prefix_length(&entry.ops, ops);
-            if let Some((boundary, snapshots)) = entry
+            let limit = resume_limit(&entry.ops, ops);
+            if let Some((point, snapshots)) = entry
                 .checkpoints
                 .iter()
-                .filter(|(boundary, _)| *boundary > 0 && *boundary <= common)
-                .max_by_key(|(boundary, _)| *boundary)
+                .filter(|(point, _)| *point > (0, STAGE_ENTRY) && *point <= limit)
+                .max_by_key(|(point, _)| *point)
             {
                 resume = Some((
-                    *boundary,
+                    *point,
                     snapshots
                         .iter()
                         .map(|snapshot| PrefixSnapshot {
@@ -646,33 +686,48 @@ pub(crate) fn execute_graph_cached(
             }
             let held = cache.remove(position);
             cache.insert(0, held);
-            Some(common)
+            Some(limit)
         } else {
             None
         };
-        // Checkpoint at the edit's divergence point for same-node drags,
-        // and after the last expensive stage for downstream edits.
-        match common {
-            Some(common) if common < count => capture_points.push(common),
+        // Checkpoint at the edit's divergence point for same-node drags, after
+        // the last expensive stage for downstream edits, and before the grain
+        // of the last film node so grain drags skip its tone map and LUT.
+        match limit {
+            Some((common, _)) if common < count => capture_points.push((common, STAGE_ENTRY)),
             _ => {}
         }
         capture_points.push(default_snapshot_boundary(ops));
-        capture_points.retain(|point| *point > 0);
+        capture_points.extend(film_grain_capture(ops));
+        capture_points.retain(|point| *point > (0, STAGE_ENTRY));
         capture_points.sort_unstable();
         capture_points.dedup();
     }
-    let boundary = resume.as_ref().map(|(boundary, _)| *boundary).unwrap_or(0);
-    capture_points.retain(|point| *point >= boundary);
+    let (boundary, entry_stage) = resume
+        .as_ref()
+        .map(|(point, _)| *point)
+        .unwrap_or((0, STAGE_ENTRY));
+    capture_points.retain(|point| *point >= (boundary, entry_stage));
     // Remaining reader counts cover only the ops actually executed, so
-    // images still move instead of cloning on their last read.
+    // images still move instead of cloning on their last read. A stage 1
+    // resume re-reads its own half-finished register instead of its input.
     let mut uses = vec![0_usize; count + 1];
-    for op in &ops[boundary..] {
+    for (index, op) in ops.iter().enumerate().skip(boundary) {
+        if index == boundary && entry_stage != STAGE_ENTRY {
+            continue; // Reads its own register, counted below.
+        }
         uses[op.input_a] += 1;
         if op.kind == NODE_BLEND {
             uses[op.input_b] += 1;
         }
     }
     uses[count] += 1; // The final node feeds the output.
+    if entry_stage != STAGE_ENTRY {
+        // A stage 1 resume reads its own register and writes it straight back,
+        // so it needs the register present without spending a reader's budget:
+        // counting it as another reader would clone the whole image instead.
+        uses[boundary + 1] = uses[boundary + 1].max(1);
+    }
     let mut registers: Vec<Option<RgbImage>> = (0..=count).map(|_| None).collect();
     let mut domains = vec![Domain::Linear; count + 1];
     let mut oriented = vec![false; count + 1];
@@ -689,21 +744,29 @@ pub(crate) fn execute_graph_cached(
             if uses[0] > 0 && registers[0].is_none() {
                 registers[0] = Some(render::own_source(source));
             }
+            // Only grainy film nodes advance the seed, matching the loop, and
+            // a stage 1 resume has not laid down its own grain yet.
             film_ordinal = ops[..boundary]
                 .iter()
-                .filter(|op| op.kind == NODE_FILM)
+                .filter(|op| op.kind == NODE_FILM && op.params[1] > 0.0)
                 .count() as u64;
         }
         None => registers[0] = Some(render::own_source(source)),
     }
     let profiling = std::env::var_os("ORFEUS_PROFILE").is_some();
-    let mut captured: Vec<(usize, Vec<PrefixSnapshot>)> = Vec::new();
+    let mut captured: Vec<(StagePoint, Vec<PrefixSnapshot>)> = Vec::new();
     for (index, op) in ops.iter().enumerate().skip(boundary) {
         let node_started = profiling.then(std::time::Instant::now);
-        if capture_points.contains(&index)
+        let stage = if index == boundary {
+            entry_stage
+        } else {
+            STAGE_ENTRY
+        };
+        if stage == STAGE_ENTRY
+            && capture_points.contains(&(index, STAGE_ENTRY))
             && let Some(snapshots) = collect_snapshots(&registers, &domains, &oriented)
         {
-            captured.push((index, snapshots));
+            captured.push(((index, STAGE_ENTRY), snapshots));
         }
         let slot = index + 1;
         let take = |registers: &mut Vec<Option<RgbImage>>,
@@ -723,18 +786,27 @@ pub(crate) fn execute_graph_cached(
             uses[from] -= 1;
             Ok(image)
         };
-        let mut image = take(&mut registers, &mut uses, op.input_a)?;
-        domains[slot] = domains[op.input_a];
-        oriented[slot] = oriented[op.input_a];
-        if matches!(
-            op.kind,
-            NODE_NOISE_REDUCTION
-                | NODE_TONE
-                | NODE_FILM
-                | NODE_COLOR_SUBTRACT
-                | NODE_CROP
-                | NODE_CURVES
-        ) && !oriented[slot]
+        // A stage 1 resume already holds this op's own half-finished register,
+        // together with the domain and orientation it had reached.
+        let mut image = if stage == STAGE_ENTRY {
+            let image = take(&mut registers, &mut uses, op.input_a)?;
+            domains[slot] = domains[op.input_a];
+            oriented[slot] = oriented[op.input_a];
+            image
+        } else {
+            take(&mut registers, &mut uses, slot)?
+        };
+        if stage == STAGE_ENTRY
+            && matches!(
+                op.kind,
+                NODE_NOISE_REDUCTION
+                    | NODE_TONE
+                    | NODE_FILM
+                    | NODE_COLOR_SUBTRACT
+                    | NODE_CROP
+                    | NODE_CURVES
+            )
+            && !oriented[slot]
         {
             image = render::orient(image, context.orientation);
             oriented[slot] = true;
@@ -788,15 +860,32 @@ pub(crate) fn execute_graph_cached(
                 }
             }
             NODE_FILM => {
-                if domains[slot] == Domain::Linear {
-                    to_display(&mut image);
-                    domains[slot] = Domain::Display;
-                }
-                if op.params[0] > 0.0
-                    && let Some(path) = &op.text
-                {
-                    let lut = render::cached_cube_lut(Path::new(path))?;
-                    render::apply_lut(&mut image, &lut, op.params[0]);
+                if stage == STAGE_ENTRY {
+                    if domains[slot] == Domain::Linear {
+                        to_display(&mut image);
+                        domains[slot] = Domain::Display;
+                    }
+                    if op.params[0] > 0.0
+                        && let Some(path) = &op.text
+                    {
+                        let lut = render::cached_cube_lut(Path::new(path))?;
+                        render::apply_lut(&mut image, &lut, op.params[0]);
+                    }
+                    // Park the tone-mapped, LUT-applied image in its own
+                    // register so the snapshot machinery can see it, then take
+                    // it straight back to lay the grain down.
+                    if capture_points.contains(&(index, STAGE_FILM_GRAIN))
+                        && (index, STAGE_FILM_GRAIN) != (boundary, entry_stage)
+                    {
+                        registers[slot] = Some(image);
+                        if let Some(snapshots) = collect_snapshots(&registers, &domains, &oriented)
+                        {
+                            captured.push(((index, STAGE_FILM_GRAIN), snapshots));
+                        }
+                        image = registers[slot]
+                            .take()
+                            .ok_or(Error::Render("film stage register vanished".into()))?;
+                    }
                 }
                 if op.params[1] > 0.0 {
                     render::apply_grain(
@@ -870,21 +959,42 @@ pub(crate) fn execute_graph_cached(
         }
         registers[slot] = Some(image);
     }
-    if capture_points.contains(&count)
+    if capture_points.contains(&(count, STAGE_ENTRY))
         && let Some(snapshots) = collect_snapshots(&registers, &domains, &oriented)
     {
-        captured.push((count, snapshots));
+        captured.push(((count, STAGE_ENTRY), snapshots));
     }
-    if let (Some(key), false) = (&cache_key, captured.is_empty()) {
-        let entry = PrefixEntry {
-            ops: ops.to_vec(),
-            checkpoints: captured,
-        };
+    if let Some(key) = &cache_key {
         let mut cache = prefix_cache()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        cache.retain(|(held, _)| held != key);
-        cache.insert(0, (key.clone(), entry));
+        // Merge rather than replace. Checkpoints at or before the point this
+        // render resumed from still hold the same state, so keeping them lets
+        // a repeated drag reuse the one it entered on without re-cloning the
+        // image every tick.
+        if let Some(position) = cache.iter().position(|(held, _)| held == key) {
+            let entry = &mut cache[position].1;
+            entry.ops = ops.to_vec();
+            entry
+                .checkpoints
+                .retain(|(point, _)| *point <= (boundary, entry_stage));
+            for (point, snapshots) in captured {
+                entry.checkpoints.retain(|(held, _)| *held != point);
+                entry.checkpoints.push((point, snapshots));
+            }
+            if entry.checkpoints.is_empty() {
+                cache.remove(position);
+            } else {
+                let held = cache.remove(position);
+                cache.insert(0, held);
+            }
+        } else if !captured.is_empty() {
+            let entry = PrefixEntry {
+                ops: ops.to_vec(),
+                checkpoints: captured,
+            };
+            cache.insert(0, (key.clone(), entry));
+        }
         cache.truncate(PREFIX_CACHE_CAPACITY);
     }
     let tail_started = profiling.then(std::time::Instant::now);
@@ -899,8 +1009,9 @@ pub(crate) fn execute_graph_cached(
     }
     if let Some(started) = tail_started {
         eprintln!(
-            "orfeus-profile graph-tail resumed-from={} milliseconds={:.3}",
+            "orfeus-profile graph-tail resumed-from={}.{} milliseconds={:.3}",
             boundary,
+            entry_stage,
             started.elapsed().as_secs_f64() * 1000.0
         );
     }
@@ -1621,6 +1732,66 @@ mod tests {
             )
             .node(NODE_BLEND, 2, 0, &[0.6], None)
             .build()
+    }
+
+    fn grain_program(grain: f32) -> Vec<u8> {
+        GraphBuilder::new()
+            .node(NODE_EXPOSURE, 0, -1, &[0.4], None)
+            .node(NODE_FILM, 1, -1, &[0.0, grain, 1.0], None)
+            .build()
+    }
+
+    #[test]
+    fn a_grain_edit_resumes_inside_the_film_node() {
+        let key: PrefixKey = ("grain-stage-test".into(), 24, 16, 24, 16, 1);
+        {
+            let mut cache = prefix_cache()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            cache.retain(|(held, _)| held.0 != "grain-stage-test");
+        }
+        let first = parse_graph(&grain_program(0.3)).unwrap();
+        let second = parse_graph(&grain_program(0.7)).unwrap();
+        // Only grain differs, so the reusable point is inside the film node
+        // rather than at its entry.
+        assert_eq!(resume_limit(&first, &second), (1, STAGE_FILM_GRAIN));
+        assert_eq!(film_grain_capture(&second), Some((1, STAGE_FILM_GRAIN)));
+        let source = gradient_image();
+        execute_graph_cached(
+            &first,
+            Arc::new(source.clone()),
+            &context(7),
+            Some(key.clone()),
+        )
+        .unwrap();
+        let resumed = execute_graph_cached(
+            &second,
+            Arc::new(source.clone()),
+            &context(7),
+            Some(key.clone()),
+        )
+        .unwrap();
+        let cold = execute_graph(&second, source.clone(), &context(7)).unwrap();
+        assert_eq!(max_difference(&resumed, &cold), 0.0);
+        // Changing the LUT strength invalidates the stage: the film node's
+        // transform has to run again from its entry.
+        let strengthened = parse_graph(
+            &GraphBuilder::new()
+                .node(NODE_EXPOSURE, 0, -1, &[0.4], None)
+                .node(NODE_FILM, 1, -1, &[0.5, 0.7, 1.0], None)
+                .build(),
+        )
+        .unwrap();
+        assert_eq!(resume_limit(&second, &strengthened), (1, STAGE_ENTRY));
+        let resumed = execute_graph_cached(
+            &strengthened,
+            Arc::new(source.clone()),
+            &context(7),
+            Some(key),
+        )
+        .unwrap();
+        let cold = execute_graph(&strengthened, source, &context(7)).unwrap();
+        assert_eq!(max_difference(&resumed, &cold), 0.0);
     }
 
     #[test]
