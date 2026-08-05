@@ -163,6 +163,27 @@ buffer, with no JPEG or file on the path.")
             (export-settings-timestamp-filenames-p settings) timestamp-p)
       settings)))
 
+(defparameter *tone-slider-width* 20
+  "Width of one tone band's vertical slider, which does not stretch.")
+
+(defun tone-band-layout (label slider input)
+  "Return one tone band as a flex column: caption, slider, value.
+
+The slider takes whatever height the panel has left over, and the bands grow
+equally across the row, so no part of this knows the panel's size."
+  (lightfast:make-layout-column
+   :basis 0 :grow 1 :gap 2
+   :children
+   (list (lightfast:make-layout-item label :basis 22 :shrink 0)
+         (lightfast:make-layout-item slider :basis 0 :grow 1
+                                            :align-self :center
+                                            :preferred-width *tone-slider-width*)
+         (lightfast:make-layout-item input :basis 24 :shrink 0))))
+
+(defun tone-bands-layout (bands)
+  "Return the row holding every tone BANDS column, in display order."
+  (lightfast:make-layout-row :gap 4 :children bands))
+
 (defun gallery-generation-event-current-p (event generation)
   "Return true when EVENT belongs to the current still-gallery GENERATION."
   (= (second event) generation))
@@ -896,7 +917,8 @@ new cache entry is published."
            curve-histogram waveform-buffer
            status progress before-preview-file after-preview-file
            after-preview-generation
-           lens-name controls inspector-items tone-items lut-choice wb-choice target-choice
+           lens-name controls inspector-items tone-items tone-widgets
+           lut-choice wb-choice target-choice
            export-quality export-max-width export-max-height export-metadata
            export-timestamp
            export-dialog export-dialog-destination export-dialog-scope
@@ -3791,7 +3813,7 @@ new cache entry is published."
              ;; Collects everything BUILDER registers into one Node panel
              ;; visibility group; SYNC-NODE-TOOLS shows exactly one of them.
              (let ((items-before (length inspector-items))
-                   (tone-before (length tone-items)))
+                   (tone-before (length tone-widgets)))
                (funcall builder)
                (push (cons kind
                            (append
@@ -3799,10 +3821,8 @@ new cache entry is published."
                                     (subseq inspector-items 0
                                             (- (length inspector-items)
                                                items-before)))
-                            (mapcar #'first
-                                    (subseq tone-items 0
-                                            (- (length tone-items)
-                                               tone-before)))))
+                            (subseq tone-widgets 0
+                                    (- (length tone-widgets) tone-before))))
                      node-panel-groups)))
            (section-frame (parent title y height)
              ;; A classic engraved group frame whose title interrupts the
@@ -3842,7 +3862,7 @@ new cache entry is published."
                (register-inspector slider 110 y :slider 26 :page)
                (register-inspector spinner 202 y :number 26 :page)
                spinner))
-           (make-tone-band (key short-label full-label index)
+           (make-tone-band (key short-label full-label)
              (let* ((callback (lambda (widget event value)
                                 (declare (ignore event value))
                                 (setting-changed key widget)))
@@ -3860,9 +3880,9 @@ new cache entry is published."
                  (lightfast:set-step widget 0.1)
                  (lightfast:set-tooltip widget full-label)
                  (push (list key widget) controls))
-               (push (list label index :label) tone-items)
-               (push (list slider index :slider) tone-items)
-               (push (list input index :input) tone-items)))
+               (dolist (widget (list label slider input))
+                 (push widget tone-widgets))
+               (push (tone-band-layout label slider input) tone-items)))
            (layout-left-pane (&optional ignored)
              (declare (ignore ignored))
              (let ((width (lightfast:widget-width filmstrip-pane))
@@ -4020,23 +4040,13 @@ new cache entry is published."
                      (lightfast:resize-widget
                       widget :x item-x :y item-y
                       :width item-width :height item-height))))
-               (let* ((page-width (- right 12))
-                      (column-width (max 34 (floor (- page-width 32) 7))))
-                 (dolist (item tone-items)
-                   (destructuring-bind (widget index role) item
-                     (let* ((column-x (+ 14 (* index column-width)))
-                            (item-width (ecase role
-                                          (:label column-width)
-                                          (:slider 20)
-                                          (:input (max 30 (- column-width 6)))))
-                            (item-x (ecase role
-                                      (:label (+ column-x 4))
-                                      (:slider (+ column-x (floor (- column-width 20) 2)))
-                                      (:input (+ column-x 2))))
-                            (item-y (ecase role (:label 92) (:slider 116) (:input 240)))
-                            (item-height (ecase role (:label 22) (:slider 120) (:input 24))))
-                       (lightfast:resize-widget widget :x item-x :y item-y
-                                              :width item-width :height item-height)))))
+               (when tone-items
+                 (lightfast:apply-layout
+                  (tone-bands-layout (reverse tone-items))
+                  (lightfast:make-rect :x 14 :y 92
+                                       :width (max 70 (- right 40))
+                                       :height (max 100 (- page-height 100)))
+                  :parent node-page))
                (lightfast:redraw inspector)))
            (layout-ui (&optional ignored)
              (declare (ignore ignored))
@@ -4234,17 +4244,21 @@ new cache entry is published."
                                                                (save-project t))
                                :shortcut (logior +menu-ctrl+ +menu-shift+
                                                  (char-code #\s)))
+        (lightfast:add-menu-item menu "File/Export..."
+                               (lambda (&rest ignored)
+                                 (declare (ignore ignored))
+                                 (open-export-dialog))
+                               :shortcut (logior +menu-ctrl+ (char-code #\e)))
         (lightfast:add-menu-item menu "File/Export Current Photo"
                                (lambda (&rest ignored)
                                  (declare (ignore ignored))
                                  (render-selected))
-                               :shortcut (logior +menu-ctrl+ (char-code #\e)))
+                               :shortcut (logior +menu-ctrl+ +menu-shift+
+                                                 (char-code #\e)))
         (lightfast:add-menu-item menu "File/Export All Photos"
                                (lambda (&rest ignored)
                                  (declare (ignore ignored))
-                                 (render-all))
-                               :shortcut (logior +menu-ctrl+ +menu-shift+
-                                                 (char-code #\e)))
+                                 (render-all)))
         (lightfast:add-menu-item menu "File/Quit" (lambda (&rest ignored)
                                                     (declare (ignore ignored))
                                                     (lightfast:quit))
@@ -4293,18 +4307,6 @@ new cache entry is published."
                                  (declare (ignore ignored))
                                  (grab-still))
                                :shortcut (logior +menu-ctrl+ (char-code #\g)))
-        (lightfast:add-menu-item menu "Process/Export..."
-                               (lambda (&rest ignored)
-                                 (declare (ignore ignored))
-                                 (open-export-dialog)))
-        (lightfast:add-menu-item menu "Process/Export Current Photo"
-                               (lambda (&rest ignored)
-                                 (declare (ignore ignored))
-                                 (render-selected)))
-        (lightfast:add-menu-item menu "Process/Export All Photos"
-                               (lambda (&rest ignored)
-                                 (declare (ignore ignored))
-                                 (render-all)))
         (lightfast:add-menu-item menu "Help/About Orfeus"
                                (lambda (&rest ignored)
                                  (declare (ignore ignored))
@@ -4737,13 +4739,13 @@ new cache entry is published."
                                 :width 292 :height 26
                                 :label "Tone Equalizer")
             12 44 :fill 26 :page)
-           (make-tone-band :tone-blacks "Blk" "Blacks" 0)
-           (make-tone-band :tone-shadows "Shd" "Shadows" 1)
-           (make-tone-band :tone-dark-mids "DkM" "Dark mids" 2)
-           (make-tone-band :tone-midtones "Mid" "Midtones" 3)
-           (make-tone-band :tone-light-mids "LtM" "Light mids" 4)
-           (make-tone-band :tone-highlights "Hi" "Highlights" 5)
-           (make-tone-band :tone-whites "Wht" "Whites" 6)))
+           (make-tone-band :tone-blacks "Blk" "Blacks")
+           (make-tone-band :tone-shadows "Shd" "Shadows")
+           (make-tone-band :tone-dark-mids "DkM" "Dark mids")
+           (make-tone-band :tone-midtones "Mid" "Midtones")
+           (make-tone-band :tone-light-mids "LtM" "Light mids")
+           (make-tone-band :tone-highlights "Hi" "Highlights")
+           (make-tone-band :tone-whites "Wht" "Whites")))
         (build-group
          :optics
          (lambda ()

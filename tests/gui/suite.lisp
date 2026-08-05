@@ -937,6 +937,65 @@
                 (string= "16-bit TIFF"
                          (orfeus/gui::export-format-caption :tiff)))
            "Export format captions did not round-trip"))
+  ;; The tone bands are laid out by Lightfast's flex engine rather than by
+  ;; hand-computed columns, so assert the geometry it produces: seven equal
+  ;; columns, each with a fixed-width slider centred between caption and value.
+  (let* ((bands (loop for index below 7
+                      collect (orfeus/gui::tone-band-layout
+                               (list :label index)
+                               (list :slider index)
+                               (list :input index))))
+         (placements (lightfast:compute-layout
+                      (orfeus/gui::tone-bands-layout bands)
+                      (lightfast:make-rect :x 14 :y 92
+                                           :width 306 :height 300)))
+         (rect (lambda (role index)
+                 (loop for placement in placements
+                       when (equal (list role index)
+                                   (lightfast:layout-placement-target placement))
+                         return (lightfast:layout-placement-rect placement))))
+         (labels* (loop for index below 7 collect (funcall rect :label index)))
+         (sliders (loop for index below 7 collect (funcall rect :slider index)))
+         (inputs (loop for index below 7 collect (funcall rect :input index))))
+    (check (notany #'null (append labels* sliders inputs))
+           "Tone band layout did not place every widget")
+    ;; Leftover pixels are spread one per column rather than dropped, so equal
+    ;; columns may differ by one.
+    (let ((widths (mapcar #'lightfast:rect-width labels*)))
+      (check (<= (- (reduce #'max widths) (reduce #'min widths)) 1)
+             "Tone band columns came out unequal"))
+    (check (every (lambda (slider)
+                    (= orfeus/gui::*tone-slider-width*
+                       (lightfast:rect-width slider)))
+                  sliders)
+           "Tone band slider stretched instead of keeping its width")
+    (check (every (lambda (slider caption)
+                    (= (- (lightfast:rect-x slider) (lightfast:rect-x caption))
+                       (floor (- (lightfast:rect-width caption)
+                                 orfeus/gui::*tone-slider-width*)
+                              2)))
+                  sliders labels*)
+           "Tone band slider was not centred in its column")
+    (check (every (lambda (caption slider value)
+                    (and (<= (+ (lightfast:rect-y caption)
+                                (lightfast:rect-height caption))
+                             (lightfast:rect-y slider))
+                         (<= (+ (lightfast:rect-y slider)
+                                (lightfast:rect-height slider))
+                             (lightfast:rect-y value))))
+                  labels* sliders inputs)
+           "Tone band rows overlapped one another")
+    (check (loop for (first second) on labels*
+                 always (or (null second)
+                            (<= (+ (lightfast:rect-x first)
+                                   (lightfast:rect-width first))
+                                (lightfast:rect-x second))))
+           "Tone band columns overlapped one another")
+    ;; Every column together must still fit the rectangle it was given.
+    (check (<= (+ (lightfast:rect-x (car (last labels*)))
+                  (lightfast:rect-width (car (last labels*))))
+               320)
+           "Tone bands overflowed the panel they were laid out in"))
   (check (orfeus/gui::gallery-generation-event-current-p
           '(:still-error 4 "failed") 4)
          "Current still error was rejected")
