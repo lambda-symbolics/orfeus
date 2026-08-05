@@ -80,16 +80,19 @@ buffer, with no JPEG or file on the path.")
     ("Curves" . :curves))
   "Correction picker entries for the Node panel, in menu order.")
 
-(defparameter *graph-node-width* 96
+(defparameter *graph-node-width* 132
   "Width of a node box on the graph editor canvas.")
 
-(defparameter *graph-node-height* 30
+(defparameter *graph-node-height* 40
   "Height of a node box on the graph editor canvas.")
 
-(defparameter *graph-row-pitch* 46
+(defparameter *graph-well-height* 26
+  "Height of the RAW and OUT terminal wells on the graph editor canvas.")
+
+(defparameter *graph-row-pitch* 58
   "Vertical distance between auto-laid-out nodes on the graph canvas.")
 
-(defparameter *inspector-min-height* 385
+(defparameter *inspector-min-height* 360
   "Minimum inspector height that keeps the complete Curves panel accessible.")
 
 (defun node-kind-label (kind)
@@ -238,8 +241,11 @@ Existing positions are preserved so dragged nodes remain where the user put them
                 when place
                   maximize (+ (round (second place)) *graph-node-height*)
                     into maximum
-                finally (return (or maximum 28)))))
-    (values 18 (+ (max bottom 28) 22) *graph-node-width* 22)))
+                finally (return (or maximum (+ 6 *graph-well-height*))))))
+    (values 18
+            (+ (max bottom (+ 6 *graph-well-height*)) 28)
+            *graph-node-width*
+            *graph-well-height*)))
 
 (defun make-project-gallery-still (preset)
   (make-gallery-still :origin :project
@@ -783,9 +789,9 @@ new cache entry is published."
            kind-choice
            (node-panel-groups '())
            blend-opacity-input crop-angle-input
-           curve-canvas curve-drag
-           (curve-channel :red-points)
-           curve-histogram
+           curve-canvas curve-drag scope-canvas
+           (curve-channel :master-points)
+           curve-histogram waveform-buffer
            status progress before-preview-file after-preview-file
            after-preview-generation
            lens-name controls inspector-items tone-items lut-choice wb-choice target-choice
@@ -1225,31 +1231,111 @@ new cache entry is published."
                                   (values 55 110 55)))
                (:blue-points (if active
                                  (values 110 150 255)
-                                 (values 60 75 125)))))
+                                 (values 60 75 125)))
+               (:master-points (if active
+                                   (values 240 240 245)
+                                   (values 120 120 128)))))
            (curve-channel-label (key)
              (ecase key
                (:red-points "Red")
                (:green-points "Green")
-               (:blue-points "Blue")))
+               (:blue-points "Blue")
+               (:master-points "Luma")))
+           (release-waveform ()
+             (when waveform-buffer
+               (cffi:foreign-free waveform-buffer)
+               (setf waveform-buffer nil)))
            (schedule-curve-histogram (path generation)
-             ;; Histogram decoding is bounded to one pending background task;
-             ;; draw callbacks only consume the last completed result.
+             ;; Scope decoding is bounded to one pending background task; draw
+             ;; callbacks only consume the last completed result. The worker
+             ;; owns its waveform image until the event hands it over, so no
+             ;; buffer is ever read while a decode still writes to it.
              (discard-gui-tasks histogram-queue :histogram)
              (setf curve-histogram nil)
              (enqueue-gui-task
               histogram-queue :histogram
               (lambda ()
-                (multiple-value-bind (red green blue)
-                    (ignore-errors (preview-histogram path))
-                  (when red
-                    (queue-event queue
-                                 (list :histogram generation path
-                                       (list red green blue))))))))
+                (let ((image (allocate-waveform-buffer)))
+                  (multiple-value-bind (red green blue)
+                      (ignore-errors (preview-scopes path image))
+                    (if red
+                        (queue-event queue
+                                     (list :histogram generation path
+                                           (list red green blue) image))
+                        (cffi:foreign-free image)))))))
            (curve-chart-geometry ()
              ;; The chart rectangle, widget-relative.
              (values 12 8
                      (- (cl-fltk:widget-width curve-canvas) 24)
                      (- (cl-fltk:widget-height curve-canvas) 16)))
+           (channel-clip-fraction (plane edge)
+             ;; The share of samples piled into the darkest or brightest bin.
+             (let ((total (reduce #'+ plane)))
+               (if (plusp total)
+                   (/ (aref plane (ecase edge
+                                    (:low 0)
+                                    (:high (1- (length plane)))))
+                      (float total))
+                   0.0)))
+           (draw-scope (widget)
+             ;; The waveform: one column per band of image columns, levels
+             ;; rising up the frame, so shadows sit at the bottom and
+             ;; highlights at the top. Traces that reach an edge are clipping,
+             ;; and the corner letters name the channels that got there.
+             (let* ((x (cl-fltk:widget-x widget))
+                    (y (cl-fltk:widget-y widget))
+                    (width (cl-fltk:widget-width widget))
+                    (height (cl-fltk:widget-height widget))
+                    (left (1+ x))
+                    (top (1+ y))
+                    (inner-width (- width 2))
+                    (inner-height (- height 2)))
+               (cl-fltk:draw-color-rgb :red 8 :green 8 :blue 10)
+               (cl-fltk:draw-filled-rect x y width height)
+               (cond
+                 ((and waveform-buffer (plusp inner-width) (plusp inner-height))
+                  (draw-waveform widget waveform-buffer left top
+                                 inner-width inner-height)
+                  (cl-fltk:draw-color-rgb :red 46 :green 46 :blue 54)
+                  (dotimes (line 3)
+                    (let ((grid-y (+ top (floor (* (1+ line) inner-height) 4))))
+                      (cl-fltk:draw-line left grid-y
+                                         (+ left inner-width -1) grid-y)))
+                  (when curve-histogram
+                    (cl-fltk:draw-font :size 10)
+                    (loop for plane in curve-histogram
+                          for label in '("R" "G" "B")
+                          for column from 0
+                          do (loop for edge in '(:high :low)
+                                   for label-y = (if (eq edge :high)
+                                                     (+ top 11)
+                                                     (+ top inner-height -3))
+                                   do (multiple-value-bind (red green blue)
+                                          (if (> (channel-clip-fraction plane
+                                                                        edge)
+                                                 0.002)
+                                              (curve-channel-color
+                                               (nth column
+                                                    orfeus:*curve-channel-keys*)
+                                               t)
+                                              (values 62 62 68))
+                                        (cl-fltk:draw-color-rgb :red red
+                                                                :green green
+                                                                :blue blue)
+                                        (cl-fltk:draw-text
+                                         label
+                                         (+ left inner-width -34
+                                            (* column 11))
+                                         label-y))))
+                    (cl-fltk:draw-font :size 12)))
+                 (t
+                  (cl-fltk:draw-color-rgb :red 128 :green 128 :blue 134)
+                  (cl-fltk:draw-font :size 11)
+                  (cl-fltk:draw-text "Waveform appears with the preview"
+                                     (+ left 12) (+ top (floor inner-height 2)))
+                  (cl-fltk:draw-font :size 12)))
+               (cl-fltk:draw-color-rgb :red 72 :green 72 :blue 80)
+               (cl-fltk:draw-rect x y width height)))
            (draw-curve-editor (widget)
              (let* ((x (cl-fltk:widget-x widget))
                     (y (cl-fltk:widget-y widget))
@@ -1374,14 +1460,16 @@ new cache entry is published."
                       (raw-x (/ (- x chart-x) (float (1- chart-w))))
                       (raw-y (- 1 (/ (- y chart-y) (float (1- chart-h)))))
                       (new-y (max 0.0 (min 1.0 raw-y)))
-                      (new-x (cond ((= index 0) 0.0)
-                                   ((= index 3) 1.0)
-                                   (t (max (+ (nth (* 2 (1- index)) points)
-                                              0.02)
-                                          (min (- (nth (* 2 (1+ index))
-                                                       points)
-                                                  0.02)
-                                               raw-x))))))
+                      ;; Every point moves in x, the ends included: pulling the
+                      ;; white point left is how a channel gains without
+                      ;; disturbing the rest of the curve.
+                      (lower (if (zerop index)
+                                 0.0
+                                 (+ (nth (* 2 (1- index)) points) 0.02)))
+                      (upper (if (= index 3)
+                                 1.0
+                                 (- (nth (* 2 (1+ index)) points) 0.02)))
+                      (new-x (max lower (min upper raw-x))))
                  (setf (nth (* index 2) points) (float new-x 1.0)
                        (nth (1+ (* index 2)) points) (float new-y 1.0))
                  (handler-case
@@ -1547,6 +1635,7 @@ new cache entry is published."
                        (discard-gui-tasks background-queue :before)
                        (discard-gui-tasks background-queue :after)
                        (discard-gui-tasks histogram-queue :histogram)
+                       (release-waveform)
                        (setf after-preview-generation nil
                              curve-histogram nil)))
                  (redraw-thumbnails))))
@@ -1721,19 +1810,24 @@ new cache entry is published."
                             (return-from graph-editor-hit
                               (values :node index)))))
                (when (and (<= 18 gx (+ 18 *graph-node-width*))
-                          (<= 6 gy 28))
+                          (<= 6 gy (+ 6 *graph-well-height*)))
                  (return-from graph-editor-hit
-                   (values (if (>= gy 22) :source-port :source) nil)))
+                   (values (if (>= gy (+ 2 *graph-well-height*))
+                               :source-port
+                               :source)
+                           nil)))
                (multiple-value-bind (x y w h) (graph-output-box nodes)
                  (when (and (<= x gx (+ x w)) (<= y gy (+ y h)))
                    (return-from graph-editor-hit (values :output nil))))
                (values nil nil)))
            (draw-editor-box (x y w h label style selected)
-             ;; STYLE :terminal draws the darker RAW/OUT wells.
+             ;; STYLE :terminal draws the darker RAW/OUT wells, :blend the
+             ;; bluish body that marks a node with a second branch.
              (ecase style
                (:terminal (cl-fltk:draw-color-rgb :red 78 :green 80 :blue 86))
                (:bypassed (cl-fltk:draw-color-rgb :red 148 :green 148
                                                   :blue 148))
+               (:blend (cl-fltk:draw-color-rgb :red 176 :green 190 :blue 224))
                (:normal (cl-fltk:draw-color-rgb :red 208 :green 208
                                                 :blue 208)))
              (cl-fltk:draw-filled-rect x y w h)
@@ -1744,15 +1838,32 @@ new cache entry is published."
              (cl-fltk:draw-filled-rect x (+ y h -1) w 1)
              (cl-fltk:draw-filled-rect (+ x w -1) y 1 h)
              (when selected
-               (cl-fltk:draw-color-rgb :red 0 :green 0 :blue 128)
+               (cl-fltk:draw-color-rgb :red 40 :green 110 :blue 235)
+               (cl-fltk:draw-rect (1- x) (1- y) (+ w 2) (+ h 2))
                (cl-fltk:draw-rect x y w h)
                (cl-fltk:draw-rect (1+ x) (1+ y) (- w 2) (- h 2)))
              (if (eq style :terminal)
                  (cl-fltk:draw-color-rgb :red 225 :green 225 :blue 230)
                  (cl-fltk:draw-color-rgb :red 10 :green 10 :blue 12))
-             (cl-fltk:draw-font :size 11)
-             (cl-fltk:draw-text label (+ x 6) (+ y (- h 9)))
+             (cl-fltk:draw-font :size 12)
+             (cl-fltk:draw-text label (+ x 10) (+ y (floor h 2) 5))
              (cl-fltk:draw-font :size 12))
+           (draw-graph-wire (fx fy tx ty red green blue)
+             ;; Wires leave the bottom of a node and enter the top of the
+             ;; next, routed as two verticals joined by a horizontal so
+             ;; parallel branches never overlap, with an arrowhead at the
+             ;; input. Each segment is drawn twice for a two-pixel wire.
+             (let ((mid (if (< fy ty)
+                            (floor (+ fy ty) 2)
+                            (+ fy 16))))
+               (cl-fltk:draw-color-rgb :red red :green green :blue blue)
+               (dotimes (pass 2)
+                 (cl-fltk:draw-line (+ fx pass) fy (+ fx pass) mid)
+                 (cl-fltk:draw-line fx (+ mid pass) tx (+ mid pass))
+                 (cl-fltk:draw-line (+ tx pass) mid (+ tx pass) ty))
+               (dotimes (pass 2)
+                 (cl-fltk:draw-line (- tx 4) (- ty 5 pass) tx (- ty pass))
+                 (cl-fltk:draw-line (+ tx 4) (- ty 5 pass) tx (- ty pass)))))
            (draw-graph-editor (widget)
              (let* ((wx (cl-fltk:widget-x widget))
                     (wy (cl-fltk:widget-y widget))
@@ -1794,7 +1905,7 @@ new cache entry is published."
                           (values (+ ox x w) (+ oy y (floor h 2)))))
                       (source-bottom ()
                         (values (+ ox 18 (floor *graph-node-width* 2))
-                                (+ oy 28))))
+                                (+ oy 6 *graph-well-height*))))
                  ;; Wires first, boxes on top.
                  (dolist (node nodes)
                    (let ((inputs (orfeus:graph-node-inputs node)))
@@ -1807,9 +1918,9 @@ new cache entry is published."
                                   (find from nodes
                                         :key #'orfeus:graph-node-id))))
                          (when fx
-                           (cl-fltk:draw-color-rgb :red 132 :green 134
-                                                   :blue 140)
-                           (cl-fltk:draw-line fx fy tx ty))))
+                           (draw-graph-wire fx fy tx ty 150 152 158))))
+                     ;; A blend forks: its B branch runs down its own column
+                     ;; and turns in through the right-hand port.
                      (when (orfeus:graph-node-blend-p node)
                        (multiple-value-bind (tx ty) (node-right-middle node)
                          (multiple-value-bind (fx fy)
@@ -1820,10 +1931,24 @@ new cache entry is published."
                                     (find from nodes
                                           :key #'orfeus:graph-node-id))))
                            (when fx
-                             (cl-fltk:draw-color-rgb :red 90 :green 110
-                                                     :blue 190)
-                             (cl-fltk:draw-line fx fy (+ tx 8) ty)
-                             (cl-fltk:draw-line (+ tx 8) ty tx ty)))))))
+                             (let ((turn (+ tx 24))
+                                   (drop (+ fy 14)))
+                               (cl-fltk:draw-color-rgb :red 96 :green 148
+                                                       :blue 235)
+                               (dotimes (pass 2)
+                                 (cl-fltk:draw-line (+ fx pass) fy
+                                                    (+ fx pass) drop)
+                                 (cl-fltk:draw-line fx (+ drop pass)
+                                                    turn (+ drop pass))
+                                 (cl-fltk:draw-line (+ turn pass) drop
+                                                    (+ turn pass) ty)
+                                 (cl-fltk:draw-line turn (+ ty pass)
+                                                    tx (+ ty pass)))
+                               (dotimes (pass 2)
+                                 (cl-fltk:draw-line (+ tx 5) (- ty 4 pass)
+                                                    (+ tx pass) ty)
+                                 (cl-fltk:draw-line (+ tx 5) (+ ty 4 pass)
+                                                    (+ tx pass) ty)))))))))
                  ;; Output wire down to the OUT well.
                  (multiple-value-bind (out-x out-y out-w out-h)
                      (graph-output-box nodes)
@@ -1841,44 +1966,63 @@ new cache entry is published."
                              (node-center-bottom output-node)
                              (and graph (source-bottom)))
                        (when fx
-                         (cl-fltk:draw-color-rgb :red 132 :green 134
-                                                 :blue 140)
-                         (cl-fltk:draw-line fx fy
-                                            (+ ox out-x (floor out-w 2))
-                                            (+ oy out-y)))))
+                         (draw-graph-wire fx fy
+                                          (+ ox out-x (floor out-w 2))
+                                          (+ oy out-y)
+                                          150 152 158))))
                    ;; Terminal wells.
                    (when (selected-job)
                      (draw-editor-box (+ ox 18) (+ oy 6)
-                                      *graph-node-width* 22
+                                      *graph-node-width* *graph-well-height*
                                       "RAW" :terminal nil)
                      (draw-editor-box (+ ox out-x) (+ oy out-y)
-                                      out-w 22 "OUT" :terminal nil)))
+                                      out-w *graph-well-height*
+                                      "OUT" :terminal nil)))
                  ;; Node boxes.
                  (dolist (node nodes)
                    (multiple-value-bind (x y w h) (graph-node-box node)
-                     (let ((bx (+ ox x)) (by (+ oy y))
-                           (bypassed (orfeus:graph-node-bypassed-p node)))
+                     (let* ((bx (+ ox x)) (by (+ oy y))
+                            (bypassed (orfeus:graph-node-bypassed-p node))
+                            (blend-p (orfeus:graph-node-blend-p node)))
                        (draw-editor-box bx by w h
                                         (node-kind-label
                                          (orfeus:graph-node-kind node))
-                                        (if bypassed :bypassed :normal)
+                                        (cond (bypassed :bypassed)
+                                              (blend-p :blend)
+                                              (t :normal))
                                         (eq node selected))
                        (if (graph-node-active-p node)
                            (cl-fltk:draw-color-rgb :red 40 :green 150
                                                    :blue 40)
                            (cl-fltk:draw-color-rgb :red 150 :green 150
                                                    :blue 150))
-                       (cl-fltk:draw-filled-rect (+ bx w -11) (+ by 4) 7 7)
-                       ;; The output port nub.
+                       (cl-fltk:draw-filled-rect (+ bx w -13) (+ by 5) 8 8)
+                       ;; The input and output port nubs.
                        (cl-fltk:draw-color-rgb :red 235 :green 235 :blue 240)
-                       (cl-fltk:draw-filled-rect (+ bx (floor w 2) -3)
-                                                 (+ by h -3) 7 6)
-                       (when (orfeus:graph-node-blend-p node)
-                         (cl-fltk:draw-color-rgb :red 90 :green 110
-                                                 :blue 190)
-                         (cl-fltk:draw-filled-rect (+ bx w -3)
-                                                   (+ by (floor h 2) -3)
-                                                   6 7))
+                       (cl-fltk:draw-filled-rect (+ bx (floor w 2) -4)
+                                                 (+ by h -3) 9 6)
+                       (cl-fltk:draw-filled-rect (+ bx (floor w 2) -4)
+                                                 (- by 3) 9 6)
+                       (when blend-p
+                         ;; The fork made visible: an A branch arriving from
+                         ;; above and a B branch from the right, merging into
+                         ;; the single output below.
+                         (cl-fltk:draw-color-rgb :red 96 :green 148 :blue 235)
+                         (cl-fltk:draw-filled-rect (+ bx w -4)
+                                                   (+ by (floor h 2) -4)
+                                                   7 9)
+                         (cl-fltk:draw-font :size 9)
+                         (cl-fltk:draw-color-rgb :red 30 :green 60 :blue 130)
+                         (cl-fltk:draw-text "A" (+ bx (floor w 2) 7)
+                                            (+ by 10))
+                         (cl-fltk:draw-text "B" (+ bx w -14)
+                                            (+ by (floor h 2) 12))
+                         (cl-fltk:draw-font :size 12)
+                         (let ((cx (+ bx (floor w 2)))
+                               (cy (+ by (floor h 2))))
+                           (cl-fltk:draw-line cx by cx cy)
+                           (cl-fltk:draw-line (+ bx w -6) cy cx cy)
+                           (cl-fltk:draw-line cx cy cx (+ by h))))
                        (when bypassed
                          (cl-fltk:draw-color-rgb :red 165 :green 40 :blue 40)
                          (cl-fltk:draw-line bx (+ by h -1)
@@ -3369,15 +3513,22 @@ new cache entry is published."
                (cl-fltk:redraw gallery-pane)))
            (layout-inspector-pane (&optional ignored)
              (declare (ignore ignored))
-             (let ((right (cl-fltk:widget-width inspector))
-                   (main-height (cl-fltk:widget-height inspector)))
+             (let* ((right (cl-fltk:widget-width inspector))
+                    (main-height (cl-fltk:widget-height inspector))
+                    (page-height (max 150 (- main-height 108)))
+                    ;; The curves panel splits whatever the page has left
+                    ;; between the waveform and the chart, with the reset
+                    ;; button pinned to the last row.
+                    (curve-space (max 130 (- page-height 76 38)))
+                    (scope-height (max 56 (floor (* curve-space 2) 5)))
+                    (chart-height (max 70 (- curve-space scope-height 8))))
                (cl-fltk:resize-widget tabs :x 4 :y 40
                                       :width (- right 8)
                                       :height (- main-height 80))
                (dolist (page (list node-page export-page))
                  (cl-fltk:resize-widget page :x 2 :y 24
                                         :width (- right 12)
-                                        :height (- main-height 108)))
+                                        :height page-height))
                (dolist (item inspector-items)
                  (destructuring-bind
                      (widget x y width-mode item-height basis) item
@@ -3400,9 +3551,15 @@ new cache entry is published."
                               (:number (- basis-width 86))
                               (:half-right (+ 18 (floor (- right 30) 2)))
                               (otherwise x)))
-                          (item-y (if (eq y :action-row)
-                                      (- main-height 34)
-                                      y)))
+                          (item-y (case y
+                                    (:action-row (- main-height 34))
+                                    (:chart-row (+ 84 scope-height))
+                                    (:page-action-row (- page-height 30))
+                                    (otherwise y)))
+                          (item-height (case item-height
+                                         (:scope scope-height)
+                                         (:chart chart-height)
+                                         (otherwise item-height))))
                      (cl-fltk:resize-widget
                       widget :x item-x :y item-y
                       :width item-width :height item-height))))
@@ -3472,9 +3629,9 @@ new cache entry is published."
                             (max 160
                                  (if layout-initialized-p
                                      (cl-fltk:widget-height graph-pane)
-                                     (min 480
-                                          (floor (* main-height 11)
-                                                 20)))))))
+                                     (min 560
+                                          (floor (* main-height 3)
+                                                 5)))))))
                  (cl-fltk:resize-widget filmstrip-pane :x 0 :y 0
                                         :width left
                                         :height (- main-height
@@ -3523,10 +3680,15 @@ new cache entry is published."
                     (incf after-live-generation)
                     (when after-canvas (cl-fltk:redraw after-canvas))))
                  (:histogram
-                  (when (and (= (second event) preview-generation)
-                             (equal (third event) after-preview-file))
-                    (setf curve-histogram (fourth event))
-                    (when curve-canvas (cl-fltk:redraw curve-canvas))))
+                  (if (and (= (second event) preview-generation)
+                           (equal (third event) after-preview-file))
+                      (progn
+                        (release-waveform)
+                        (setf curve-histogram (fourth event)
+                              waveform-buffer (fifth event))
+                        (when curve-canvas (cl-fltk:redraw curve-canvas))
+                        (when scope-canvas (cl-fltk:redraw scope-canvas)))
+                      (cffi:foreign-free (fifth event))))
                  (:thumbnail
                   (when (and (member (third event) (project-photos project) :test #'eq)
                              (null (gethash (third event) thumbnail-files)))
@@ -4310,7 +4472,7 @@ new cache entry is published."
                    (cl-fltk:make-labeled-choice
                     :parent node-page :x 12 :y 44 :width 292 :height 26
                     :label "Channel" :label-width 88
-                    :items '("Red" "Green" "Blue")
+                    :items '("Luma" "Red" "Green" "Blue")
                     :callback
                     (lambda (widget event value)
                       (declare (ignore event value))
@@ -4321,18 +4483,32 @@ new cache entry is published."
                                   ((string-equal
                                     (cl-fltk:value widget) "Blue")
                                    :blue-points)
+                                  ((string-equal
+                                    (cl-fltk:value widget) "Luma")
+                                   :master-points)
                                   (t :red-points)))
                       (when curve-canvas
                         (cl-fltk:redraw curve-canvas))))))
              (register-field channel-field 44 :page))
+           (setf scope-canvas
+                 (register-inspector
+                  (cl-fltk:make-canvas
+                   :parent node-page :x 12 :y 76 :width 292 :height 104
+                   :callback (lambda (widget event value)
+                               (declare (ignore event value))
+                               (draw-scope widget)))
+                  12 76 :fill :scope :page))
+           (cl-fltk:set-tooltip
+            scope-canvas
+            "Waveform: highlights at the top, shadows at the bottom")
            (setf curve-canvas
                  (register-inspector
                   (cl-fltk:make-canvas
-                   :parent node-page :x 12 :y 76 :width 292 :height 160
+                   :parent node-page :x 12 :y 188 :width 292 :height 150
                    :callback (lambda (widget event value)
                                (declare (ignore event value))
                                (draw-curve-editor widget)))
-                  12 76 :fill 160 :page))
+                  12 :chart-row :fill :chart :page))
            (cl-fltk:set-tooltip
             curve-canvas
             "Drag the points to shape the channel; the histogram shows occupancy")
@@ -4342,12 +4518,12 @@ new cache entry is published."
              (cl-fltk:on curve-canvas #'handle-curve-mouse :event event))
            (register-inspector
             (cl-fltk:make-button
-             :parent node-page :x 12 :y 244 :width 292 :height 26
+             :parent node-page :x 12 :y 346 :width 292 :height 26
              :label "Reset Channel"
              :callback (lambda (&rest ignored)
                          (declare (ignore ignored))
                          (reset-curve-channel)))
-            12 244 :fill 26 :page)))
+            12 :page-action-row :fill 26 :page)))
         (register-inspector
          (cl-fltk:make-button :parent inspector :x 12 :y 674
                               :width 140 :height 26 :label "Reset selected"
@@ -4408,6 +4584,7 @@ new cache entry is published."
           (when after-live-front (cffi:foreign-free after-live-front))
           (when after-live-back (cffi:foreign-free after-live-back))
           (setf after-live-front nil after-live-back nil)
+          (release-waveform)
           (orfeus::clear-render-source-cache)
           (clear-preview-cache)
           (ignore-errors
