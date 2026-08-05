@@ -156,6 +156,18 @@ fn initialize() -> Result<Context, String> {
             }
         }
         candidates.sort_by_key(|candidate| candidate.0);
+        if std::env::var_os("ORFEUS_PROFILE").is_some() {
+            for (rank, _, queue_family, properties) in &candidates {
+                eprintln!(
+                    "orfeus-profile gpu-adapter rank={rank} queue-family={queue_family} type={:?} name={:?}",
+                    properties.device_type,
+                    properties
+                        .device_name_as_c_str()
+                        .unwrap_or(c"unnamed")
+                        .to_string_lossy()
+                );
+            }
+        }
         let (_, physical_device, queue_family, properties) = candidates
             .into_iter()
             .next()
