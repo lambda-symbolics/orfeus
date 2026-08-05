@@ -41,14 +41,25 @@
           export ORFEUS_NATIVE_LIBRARY="$CARGO_TARGET_DIR/release/liborfeus_native.so"
           export LD_LIBRARY_PATH="${pkgs.lib.makeLibraryPath [ pkgs.vulkan-loader ]}:/run/opengl-driver/lib:/usr/lib:''${LD_LIBRARY_PATH:-}"
           if [ -z "''${VK_DRIVER_FILES:-}" ]; then
-            for icd_name in nvidia_icd.json intel_icd.json radeon_icd.json intel_hasvk_icd.json; do
-              for icd_directory in /run/opengl-driver/share/vulkan/icd.d /usr/share/vulkan/icd.d /etc/vulkan/icd.d; do
-                if [ -r "$icd_directory/$icd_name" ]; then
-                  export VK_DRIVER_FILES="$icd_directory/$icd_name"
-                  break 2
+            # Expose every system ICD rather than the first one found: the
+            # renderer ranks adapters itself and prefers an integrated GPU,
+            # which measures faster than a discrete card for these
+            # transfer-bound passes. Pinning one file hid the other adapters.
+            orfeus_icd_files=""
+            for icd_directory in /run/opengl-driver/share/vulkan/icd.d /usr/share/vulkan/icd.d /etc/vulkan/icd.d; do
+              for icd_path in "$icd_directory"/*.json; do
+                if [ -r "$icd_path" ]; then
+                  case ":$orfeus_icd_files:" in
+                    *":$icd_path:"*) ;;
+                    *) orfeus_icd_files="''${orfeus_icd_files:+$orfeus_icd_files:}$icd_path" ;;
+                  esac
                 fi
               done
             done
+            if [ -n "$orfeus_icd_files" ]; then
+              export VK_DRIVER_FILES="$orfeus_icd_files"
+            fi
+            unset orfeus_icd_files
           fi
         '';
       };

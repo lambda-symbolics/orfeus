@@ -122,6 +122,28 @@ fn adapter_rank(kind: vk::PhysicalDeviceType, preference: AdapterPreference) -> 
     }
 }
 
+/// A software rasterizer such as lavapipe is slower than our own CPU path, so
+/// it only counts as an adapter when a validation run or an explicit request
+/// asks for one. Otherwise exposing every system ICD could silently downgrade
+/// a machine that has no real GPU.
+fn software_allowed() -> bool {
+    software_allowed_value(
+        std::env::var_os("ORFEUS_GPU_TEST").as_deref(),
+        std::env::var_os("ORFEUS_GPU").as_deref(),
+    )
+}
+
+fn software_allowed_value(
+    test: Option<&std::ffi::OsStr>,
+    request: Option<&std::ffi::OsStr>,
+) -> bool {
+    test.is_some_and(|value| value == "1") || request.is_some_and(|value| value == "software")
+}
+
+fn adapter_is_usable(kind: vk::PhysicalDeviceType, software_allowed: bool) -> bool {
+    kind != vk::PhysicalDeviceType::CPU || software_allowed
+}
+
 fn adapter_kind_name(kind: vk::PhysicalDeviceType) -> &'static str {
     match kind {
         vk::PhysicalDeviceType::INTEGRATED_GPU => "integrated",
@@ -134,6 +156,7 @@ fn adapter_kind_name(kind: vk::PhysicalDeviceType) -> &'static str {
 
 fn initialize() -> Result<Context, String> {
     let preference = preference();
+    let software = software_allowed();
     unsafe {
         let entry = Entry::load().map_err(|error| format!("load Vulkan loader: {error}"))?;
         let application_name = CString::new("Orfeus").unwrap();
@@ -159,6 +182,9 @@ fn initialize() -> Result<Context, String> {
                 .enumerate()
             {
                 if family.queue_flags.contains(vk::QueueFlags::COMPUTE) {
+                    if !adapter_is_usable(properties.device_type, software) {
+                        break;
+                    }
                     let rank = adapter_rank(properties.device_type, preference);
                     candidates.push((rank, physical_device, index as u32, properties));
                     break;
@@ -668,6 +694,26 @@ mod tests {
                 1.055 * value.max(0.0).powf(1.0 / 2.4) - 0.055
             };
         }
+    }
+
+    #[test]
+    fn software_rasterizers_only_count_when_asked_for() {
+        use std::ffi::OsStr;
+        assert!(!software_allowed_value(None, None));
+        assert!(!software_allowed_value(Some(OsStr::new("0")), None));
+        assert!(software_allowed_value(Some(OsStr::new("1")), None));
+        assert!(software_allowed_value(None, Some(OsStr::new("software"))));
+        // Real adapters are always usable; a CPU device needs the opt-in.
+        assert!(adapter_is_usable(
+            vk::PhysicalDeviceType::INTEGRATED_GPU,
+            false
+        ));
+        assert!(adapter_is_usable(
+            vk::PhysicalDeviceType::DISCRETE_GPU,
+            false
+        ));
+        assert!(!adapter_is_usable(vk::PhysicalDeviceType::CPU, false));
+        assert!(adapter_is_usable(vk::PhysicalDeviceType::CPU, true));
     }
 
     #[test]
