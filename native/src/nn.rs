@@ -21,11 +21,25 @@ const FEATURES: usize = 96;
 const INPUT_CHANNELS: usize = 13;
 const OUTPUT_CHANNELS: usize = 12;
 const KERNEL: usize = 3;
-/// Half-resolution output tile edge; one halo pixel per convolution layer.
+/// Fallback half-resolution output tile edge; one halo pixel per layer.
 const TILE: usize = 192;
+/// Tiles a frame should be cut into before their size is allowed to grow.
+///
+/// A machine-independent number on purpose. Choosing it from the core count
+/// would make the denoised result depend on the machine that produced it: tiles
+/// agree with an untiled reference to within 3e-6, which is invisible, but a
+/// deliverable should not vary at all with where it was rendered.
+const MIN_TILES: usize = 16;
 const HALO: usize = LAYER_COUNT;
-/// Bound simultaneous tile scratch buffers regardless of the global Rayon pool.
-const MAX_PARALLEL_TILES: usize = 4;
+/// Scratch memory allowed for tiles in flight, across all worker threads.
+///
+/// Tiles are the only parallelism in the network: `convolve_valid` is serial, so
+/// the number of tiles in flight is the number of cores doing work. It used to
+/// be pinned at four, which left twenty of this machine's twenty-four cores
+/// idle and made an 80 MP frame take five minutes. A tile is about 150 floating
+/// point operations per byte it moves, so this scales with cores nearly
+/// linearly and it is worth spending memory to get them.
+const TILE_SCRATCH_BUDGET: usize = 2 << 30;
 /// Slider position 1.0 asks the network for this training-domain sigma.
 /// Sigma 30/255 already erases the worst high-ISO Micro Four Thirds noise;
 /// larger values only smear detail on real photographs.
@@ -458,6 +472,20 @@ fn zero_outside_global_image(
     }
 }
 
+/// Bytes of ping-pong scratch one worker needs for a tile of TILE_SIZE.
+fn tile_scratch_bytes(tile_size: usize) -> usize {
+    let patch = tile_size + 2 * HALO;
+    (FEATURES.max(INPUT_CHANNELS) * patch * patch + FEATURES * (patch - 2) * (patch - 2))
+        * std::mem::size_of::<f32>()
+}
+
+/// How many tiles to keep in flight: every core Rayon offers, unless their
+/// scratch would exceed the budget.
+fn parallel_tiles(tile_size: usize) -> usize {
+    let affordable = TILE_SCRATCH_BUDGET / tile_scratch_bytes(tile_size).max(1);
+    rayon::current_num_threads().max(1).min(affordable.max(1))
+}
+
 fn infer_tiled_with_tile_size(
     net: &FfdNet,
     planes: &[f32],
@@ -472,7 +500,9 @@ fn infer_tiled_with_tile_size(
     let tiles: Vec<(usize, usize)> = (0..half_height.div_ceil(tile_size))
         .flat_map(|tile_y| (0..half_width.div_ceil(tile_size)).map(move |tile_x| (tile_x, tile_y)))
         .collect();
-    for tile_batch in tiles.chunks(MAX_PARALLEL_TILES) {
+    // Batched rather than one flat par_iter so the collected tile outputs of a
+    // whole 80 MP frame — a second copy of the result — never exist at once.
+    for tile_batch in tiles.chunks(parallel_tiles(tile_size)) {
         let tile_results: Vec<((usize, usize), Vec<f32>)> = tile_batch
             .par_iter()
             .map_init(
@@ -558,6 +588,34 @@ fn infer_tiled_with_tile_size(
     denoised
 }
 
+/// The tile edge that computes the least arithmetic for this frame.
+///
+/// A tile always convolves a square patch of `tile + 2 * HALO`, whatever share
+/// of it is inside the image, so a nominal 192 tile covering a 32-pixel sliver
+/// at the right edge still does the work of a full 216x216 patch. On a 1600px
+/// preview — 800x600 at half resolution — five columns of 192 spanned 960 for
+/// 800 useful pixels and four rows spanned 768 for 600, so barely half the
+/// arithmetic landed on real pixels. Sizes that divide the frame more evenly cut
+/// that waste; the floor on tile count keeps them from growing into one tile per
+/// core or fewer.
+fn best_tile_size(half_width: usize, half_height: usize) -> usize {
+    let candidates = (32..=320).step_by(8);
+    let cost = |tile: usize| {
+        let tiles = half_width.div_ceil(tile) * half_height.div_ceil(tile);
+        let patch = tile + 2 * HALO;
+        (tiles, tiles * patch * patch)
+    };
+    let divisible = candidates
+        .clone()
+        .map(|tile| (cost(tile), tile))
+        .filter(|((tiles, _), _)| *tiles >= MIN_TILES)
+        .min();
+    // A frame too small to cut MIN_TILES ways takes the cheapest size outright.
+    divisible
+        .or_else(|| candidates.map(|tile| (cost(tile), tile)).min())
+        .map_or(TILE, |((_, _), tile)| tile)
+}
+
 fn infer_tiled(
     net: &FfdNet,
     planes: &[f32],
@@ -565,7 +623,14 @@ fn infer_tiled(
     half_height: usize,
     sigma: f32,
 ) -> Vec<f32> {
-    infer_tiled_with_tile_size(net, planes, half_width, half_height, sigma, TILE)
+    infer_tiled_with_tile_size(
+        net,
+        planes,
+        half_width,
+        half_height,
+        sigma,
+        best_tile_size(half_width, half_height),
+    )
 }
 
 /// Applies FFDNet color denoising in place.
@@ -609,7 +674,18 @@ pub(crate) fn apply_neural_noise_reduction(
             }
         });
 
-    let denoised = infer_tiled(net, &planes, half_width, half_height, sigma);
+    let started = std::time::Instant::now();
+    let tile = best_tile_size(half_width, half_height);
+    let denoised = infer_tiled_with_tile_size(net, &planes, half_width, half_height, sigma, tile);
+    if std::env::var_os("ORFEUS_PROFILE").is_some() {
+        eprintln!(
+            "orfeus-profile stage=neural-network half={half_width}x{half_height} \
+             tile={tile} tiles={} threads={} milliseconds={:.3}",
+            half_width.div_ceil(tile) * half_height.div_ceil(tile),
+            rayon::current_num_threads(),
+            started.elapsed().as_secs_f64() * 1000.0
+        );
+    }
 
     // Pixel-shuffle back to full resolution; energy outside [0, 1] survives.
     data.par_chunks_mut(width * 3)
@@ -713,22 +789,83 @@ mod tests {
 
     #[test]
     fn tiled_inference_matches_per_layer_zero_padding_at_borders_and_seams() {
+        // Every tile size has to agree with the untiled reference, because the
+        // size is chosen per frame now: one that only worked for the old
+        // constant would denoise some frames through a different seam pattern.
         let size = 7;
-        let tile_size = 3;
         let plane = size * size;
         let planes: Vec<f32> = (0..OUTPUT_CHANNELS * plane)
             .map(|index| (index % 17) as f32 / 19.0)
             .collect();
         let sigma = 0.07;
         let net = network().unwrap();
-        let tiled = infer_tiled_with_tile_size(net, &planes, size, size, sigma, tile_size);
         let reference = infer_same_padded_reference(net, &planes, size, sigma);
-        let max_error = tiled
-            .iter()
-            .zip(&reference)
-            .map(|(actual, expected)| (actual - expected).abs())
-            .fold(0.0_f32, f32::max);
-        assert!(max_error < 3.0e-6, "maximum border error was {max_error}");
+        //
+        // The tolerance covers summation order, not padding: a different tiling
+        // accumulates the same products in a different sequence. It is two and a
+        // half orders of magnitude below one 8-bit step, so a wrongly padded
+        // seam — which shows up as a whole edge of visibly wrong pixels — cannot
+        // hide underneath it.
+        for tile_size in [1, 2, 3, 4, 6, 7, 9, 32] {
+            let tiled = infer_tiled_with_tile_size(net, &planes, size, size, sigma, tile_size);
+            let max_error = tiled
+                .iter()
+                .zip(&reference)
+                .map(|(actual, expected)| (actual - expected).abs())
+                .fold(0.0_f32, f32::max);
+            assert!(
+                max_error < 1.0e-5,
+                "tile size {tile_size} had border error {max_error}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "timing sweep, run with --ignored --nocapture"]
+    fn tile_size_timing_sweep() {
+        // 800x600 half-resolution planes: what a 1600px preview asks for.
+        let (width, height) = (800_usize, 600_usize);
+        let plane = width * height;
+        let planes: Vec<f32> = (0..OUTPUT_CHANNELS * plane)
+            .map(|index| (index % 251) as f32 / 251.0)
+            .collect();
+        let net = network().unwrap();
+        eprintln!("threads={}", rayon::current_num_threads());
+        eprintln!("chosen tile={}", best_tile_size(width, height));
+        for tile in [64, 96, 128, 160, 192, 224, 256, 320] {
+            let tiles = width.div_ceil(tile) * height.div_ceil(tile);
+            let patch = tile + 2 * HALO;
+            let started = std::time::Instant::now();
+            let _ = infer_tiled_with_tile_size(net, &planes, width, height, 0.07, tile);
+            eprintln!(
+                "tile={tile:4} tiles={tiles:4} patchpx={:9} {:8.1} ms",
+                tiles * patch * patch,
+                started.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+    }
+
+    #[test]
+    fn the_chosen_tile_size_wastes_less_than_the_old_constant() {
+        // 800x600 is a 1600px preview at half resolution, the size the panel
+        // asks for most, and the case the fixed 192 handled worst.
+        let waste = |tile: usize| {
+            let patch = tile + 2 * HALO;
+            (800_usize).div_ceil(tile) * (600_usize).div_ceil(tile) * patch * patch
+        };
+        let chosen = best_tile_size(800, 600);
+        assert!(
+            waste(chosen) < waste(TILE),
+            "chose {chosen}, which computes {} patch pixels against {} for {TILE}",
+            waste(chosen),
+            waste(TILE)
+        );
+        // Enough tiles to spread across a machine's cores, and never so many
+        // that halo dominates.
+        let tiles = 800_usize.div_ceil(chosen) * 600_usize.div_ceil(chosen);
+        assert!(tiles >= MIN_TILES, "only {tiles} tiles for {chosen}");
+        // A frame smaller than one tile still works rather than dividing by zero.
+        assert!(best_tile_size(4, 4) >= 1);
     }
 
     #[test]
