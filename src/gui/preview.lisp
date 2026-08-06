@@ -46,11 +46,12 @@
 (defun choose-photo-files (&key (title "Open RAW photographs")
                                 (filter "") (preset-path ""))
   "Return all photo pathnames selected by the canonical FLTK file chooser."
+  ;; CHOOSE-FILES already returns an empty list when nothing is picked, so
+  ;; there is nothing for an OR fallback to catch.
   (mapcar #'pathname
-          (or (lightfast:choose-files :title title
-                                    :filter filter
-                                    :preset-file preset-path)
-              '())))
+          (lightfast:choose-files :title title
+                                  :filter filter
+                                  :preset-file preset-path)))
 
 (defun forget-preview-file (pathname)
   "Evict PATHNAME from the native preview cache after it is overwritten."

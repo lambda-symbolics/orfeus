@@ -1,60 +1,8 @@
 (in-package #:orfeus)
 
-;;; Processing graphs: an ordered DAG of piped filter nodes and blend nodes.
-;;;
-;;; Node id 0 always denotes the decoded RAW source. Filter nodes carry the
-;;; parameters of exactly one pipeline stage and one input; blend nodes mix
-;;; two upstream results by opacity in scene-linear space. Film nodes work in
-;;; display space, so they may only sit on the tail of the graph: nothing but
-;;; further film nodes may consume them, and no blend may. Photographs without
-;;; a graph keep the flat settings pipeline unchanged.
-
-(defparameter *graph-source-id* 0
-  "The reserved node id of the decoded RAW source image.")
-
-(defparameter *graph-only-node-kinds* '(:blend :color-subtract :crop :curves)
-  "Node kinds that exist only in graphs, beyond the flat pipeline stages.
-
-:COLOR-SUBTRACT computes picked-color minus pixel per channel in scene-linear
-space, the film-negative inversion primitive. :CROP keeps a normalized
-rectangle given in display (oriented) coordinates, so one graph fits both
-previews and full-resolution exports. :CURVES applies a monotone spline per
-channel on the encoded signal, the per-stock decompression for inverted
-negatives.")
-
-(defparameter *color-subtract-keys* '(:red :green :blue))
-
-(defparameter *crop-keys* '(:left :top :width :height :angle))
-
-(defparameter *curve-channel-keys*
-  '(:red-points :green-points :blue-points :master-points)
-  "Curve channels in wire order: the three channels, then luma over all.")
-
-(defparameter *identity-curve-points*
-  '(0.0 0.0 0.33 0.33 0.67 0.67 1.0 1.0)
-  "Four (x y) control points along the diagonal: the do-nothing curve.")
-
-(defstruct graph-node
-  "One processing node: a stage filter, or a blend of two branches.
-
-KIND :NODE is an untyped container fresh from \"New Node\": it passes its
-branch through unchanged until the user assigns a correction type.
-POSITION, when set, is the node's (x y) spot on the graph editor canvas."
-  (id 1 :type (integer 1))
-  (kind :node)
-  (params '())
-  (opacity 1.0)
-  (inputs (list 0))
-  (bypassed-p nil)
-  (position nil)
-  ;; Previous correction configurations survive kind switching and project
-  ;; round trips.  Entries are (KIND . STATE-PLIST).
-  (kind-states '()))
-
-(defstruct processing-graph
-  "A topologically ordered processing DAG ending at OUTPUT."
-  (nodes '())
-  (output 0))
+;;; Graph operations. The node and graph structures themselves live in
+;;; graph-types.lisp, which is compiled before the files that serialize and
+;;; copy them, so their accessors can be inlined at those call sites.
 
 (defun graph-filter-kind-p (kind)
   (and (assoc kind *grade-stages*) t))
@@ -254,8 +202,6 @@ while blends stay scene-linear."
             (inputs (graph-node-inputs node)))
         (graph-node-position-validate (graph-node-position node) node)
         (graph-kind-states-validate (graph-node-kind-states node) node)
-        (unless (and (integerp id) (plusp id))
-          (graph-invalid node "node id ~S must be a positive integer" id))
         (when (member id seen)
           (graph-invalid node "node id ~S is not strictly increasing" id))
         (unless (> id (first seen))
@@ -382,9 +328,15 @@ while blends stay scene-linear."
                 sexp '(:id :kind :inputs :params :opacity :bypassed-p
                        :position :kind-states)))
     (graph-invalid sexp "expected a graph node property list"))
-  (let ((position (getf sexp :position)))
+  (let ((position (getf sexp :position))
+        (id (getf sexp :id)))
     (graph-node-position-validate position sexp)
-    (make-graph-node :id (getf sexp :id 0)
+    ;; Checked here rather than after construction: the slot is typed
+    ;; (INTEGER 1), so a bad id from a project file would signal a raw type
+    ;; error from MAKE-GRAPH-NODE instead of naming the malformed data.
+    (unless (and (integerp id) (plusp id))
+      (graph-invalid sexp "node id ~S must be a positive integer" id))
+    (make-graph-node :id id
                      :kind (getf sexp :kind)
                      :params (getf sexp :params '())
                      :opacity (getf sexp :opacity 1.0)

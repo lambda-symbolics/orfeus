@@ -1,14 +1,25 @@
+;;; Ironclad comes from the implementation, not from ASDF.
+;;;
+;;; The SBCL image this builds against already provides it. Listing it in
+;;; :DEPENDS-ON made ASDF compile a second copy and load it over the one in the
+;;; image, redefining IRONCLAD:BLOCK-LENGTH and warning on every single build.
+;;; REQUIRE uses whatever is already there, and still builds it from ASDF on an
+;;; image that does not provide it.
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (require :ironclad))
+
 (asdf:defsystem #:orfeus
   :description "Fast Olympus RAW processing core."
   :author "Lucius"
   :license "COLL-Attribution"
   :version "0.1.0"
-  :depends-on (#:cffi
-               #:ironclad
-               #:sb-posix)
+  :depends-on (#:cffi #:sb-posix)
   :serial t
   :components ((:file "src/package")
                (:file "src/conditions")
+               ;; Data definitions come before anything that serializes or
+               ;; copies them, so their accessors inline at those call sites.
+               (:file "src/types")
                (:file "src/native")
                (:file "src/metadata")
                (:file "src/project")

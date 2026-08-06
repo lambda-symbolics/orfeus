@@ -363,15 +363,17 @@ Existing positions are preserved so dragged nodes remain where the user put them
 
 (defun graph-output-box-position (nodes)
   "Return the graph-space OUT box for NODES, including an empty graph."
-  (let ((bottom
-          (loop for node in nodes
-                for place = (orfeus:graph-node-position node)
-                when place
-                  maximize (+ (round (second place)) *graph-node-height*)
-                    into maximum
-                finally (return (or maximum (+ 6 *graph-well-height*))))))
+  ;; The well hangs below the lowest placed node, and never rises above where
+  ;; it would sit in an empty graph.
+  (let ((lowest 0)
+        (empty-graph-bottom (+ 6 *graph-well-height*)))
+    (dolist (node nodes)
+      (let ((place (orfeus:graph-node-position node)))
+        (when place
+          (setf lowest (max lowest (+ (round (second place))
+                                      *graph-node-height*))))))
     (values 18
-            (+ (max bottom (+ 6 *graph-well-height*)) 28)
+            (+ (max lowest empty-graph-bottom) 28)
             *graph-node-width*
             *graph-well-height*)))
 
