@@ -3,11 +3,39 @@
 (defparameter *preview-debounce-seconds* 0.15d0
   "Delay used to coalesce interactive control changes.")
 
-(defparameter *gui-preview-max-width* 0
-  "Maximum GUI preview width; zero preserves full source resolution.")
+(defparameter *gui-preview-minimum-bound* 1024
+  "Floor on the viewport render bound, so a tiny window still zooms a little.")
 
-(defparameter *gui-preview-max-height* 0
-  "Maximum GUI preview height; zero preserves full source resolution.")
+(defparameter *gui-preview-maximum-bound* 16384
+  "Ceiling on the viewport render bound; above the sensor it has no effect.")
+
+(defun gui-preview-bound (canvas-pixels zoom)
+  "Bounding size for a viewport render of a canvas CANVAS-PIXELS wide at ZOOM.
+
+Rendering the viewport at sensor resolution is the single most expensive thing
+Orfeus used to do. An 80 MP frame shown in a 1400-pixel canvas was developed,
+lens-corrected, denoised, tone-mapped, JPEG-encoded and written to disk at
+10400 pixels wide so that 1400 of them could be displayed: fifty-five times the
+necessary work on every selection and every settled edit.
+
+What the display needs is one source pixel per screen pixel: at zoom Z the
+image is drawn `C * Z` wide, so `P = C * Z` is exactly sharp. The bound is
+rounded up to a power of two times the canvas width, so zooming inside one
+doubling reuses the render already on screen.
+
+This also keeps the zoom ceiling honest without anyone having to know the
+sensor's size. The adapter magnifies a preview pixel at most twice, so
+PREVIEW-ZOOM-LIMIT reads `2P/C` off whatever file is loaded: at fit that is 2,
+one step in the bound doubles, the limit doubles with it, and the ladder climbs
+until a render comes back smaller than its bound because the source ran out.
+From then on P is fixed at the sensor and the limit settles at `2 * sensor / C`,
+which is where it always was."
+  (let ((needed (max *gui-preview-minimum-bound*
+                     (ceiling (* canvas-pixels (max 1d0 zoom))))))
+    (min *gui-preview-maximum-bound*
+         (loop for bound = (max *gui-preview-minimum-bound* canvas-pixels)
+                 then (* 2 bound)
+               when (>= bound needed) return bound))))
 
 (defparameter *gui-draft-preview-size* 2048
   "Bounding size of the fast draft preview rendered before the full one.")
@@ -934,9 +962,6 @@ new cache entry is published."
            (capture-cache (make-hash-table :test #'eq))
            (thumbnail-files (make-hash-table :test #'eq))
            (lut-paths (make-hash-table :test #'equal))
-           (content-keys (make-hash-table :test #'equal))
-            (content-keys-lock
-              (sb-thread:make-mutex :name "Orfeus preview content keys"))
            window menu toolbar toolbar-bottom-rule main-tile root-layout left-column
            filmstrip-pane gallery-pane center-pane
            thumbnail-canvas thumbnail-scrollbar photo-selection-label
@@ -999,7 +1024,10 @@ new cache entry is published."
            (preview-center-x .5d0)
            (preview-center-y .5d0)
            preview-drag-p preview-drag-x preview-drag-y
-           preview-drag-center-x preview-drag-center-y)
+           preview-drag-center-x preview-drag-center-y
+           ;; Set only by "1:1 pixels": every other view renders a proxy sized
+           ;; for the canvas rather than for the sensor.
+           preview-native-p preview-one-to-one-pending-p)
       (labels
           ((picker-preset ()
              (namestring picker-directory))
@@ -1051,11 +1079,33 @@ new cache entry is published."
              (when before-canvas (lightfast:redraw before-canvas))
              (when after-canvas (lightfast:redraw after-canvas)))
            (reset-preview-view ()
-             (setf preview-zoom 1d0
-                   preview-center-x .5d0
-                   preview-center-y .5d0)
+             (let ((was-native preview-native-p))
+               (setf preview-zoom 1d0
+                     preview-center-x .5d0
+                     preview-center-y .5d0
+                     preview-native-p nil)
+               ;; Coming back from 1:1 drops to a canvas-sized render, which is
+               ;; a cache hit if this photo has been fitted before.
+               (when was-native
+                 (discard-gui-tasks queue :after)
+                 (enqueue-preview nil)))
              (redraw-previews)
              (set-status "Preview fitted to window"))
+           (viewport-render-bound ()
+             ;; One number for both axes: the render bounds a box, and the
+             ;; canvas can be taller than it is wide. Zero means the sensor,
+             ;; which only "1:1 pixels" asks for: it is the one view whose
+             ;; whole purpose is to show real photosites, so it is worth the
+             ;; wait that the fit view is not.
+             (if preview-native-p
+                 0
+                 (let ((canvas (or after-canvas before-canvas)))
+                   (gui-preview-bound
+                    (if canvas
+                        (max (lightfast:widget-width canvas)
+                             (lightfast:widget-height canvas))
+                        *gui-preview-minimum-bound*)
+                    preview-zoom))))
            (live-view-p (&optional canvas)
              ;; The live buffer is bounded, so its zoom ceiling is lower
              ;; than the full-resolution preview's. Showing it only at fit
@@ -1107,19 +1157,27 @@ new cache entry is published."
                              (- source-x (* (- source-x preview-center-x) ratio))
                              preview-center-y
                              (- source-y (* (- source-y preview-center-y) ratio)))))))
-               (setf preview-zoom new-zoom)
-               ;; Leaving fit hands the canvas back to the file preview, so
-               ;; a pending live edit must be settled now instead of after
-               ;; the drag timer, or the sharp image would lag behind.
-               (when (and after-live-p (> new-zoom 1.0001d0))
-                 (when live-settle-id
-                   (ignore-errors (lightfast:remove-timeout live-settle-id))
-                   (setf live-settle-id nil))
-                 (discard-gui-tasks queue :after)
-                 (enqueue-preview nil))
+               (let ((previous-bound (viewport-render-bound)))
+                 (setf preview-zoom new-zoom)
+                 ;; Leaving fit hands the canvas back to the file preview, so
+                 ;; a pending live edit must be settled now instead of after
+                 ;; the drag timer, or the sharp image would lag behind. A
+                 ;; zoom that crosses a doubling of the bound needs the same
+                 ;; render for a different reason: the proxy on screen has
+                 ;; fewer pixels than the canvas is about to ask of it.
+                 (when (or (and after-live-p (> new-zoom 1.0001d0))
+                           (/= previous-bound (viewport-render-bound)))
+                   (when live-settle-id
+                     (ignore-errors (lightfast:remove-timeout live-settle-id))
+                     (setf live-settle-id nil))
+                   (discard-gui-tasks queue :after)
+                   (enqueue-preview nil)))
                (redraw-previews)
                (set-status (format nil "Preview zoom: ~,0F%" (* 100 new-zoom)))))
-           (preview-one-to-one ()
+           (fit-preview-to-source-pixels ()
+             ;; One photosite per screen pixel, given whatever preview is
+             ;; loaded. Only meaningful once the sensor-resolution render has
+             ;; landed, so APPLY-ONE-TO-ONE calls this again from the event.
              (let ((path (or after-preview-file before-preview-file)))
                (when path
                  (multiple-value-bind (scaled-width scaled-height fit)
@@ -1130,7 +1188,20 @@ new cache entry is published."
                            preview-center-x .5d0
                            preview-center-y .5d0)
                      (redraw-previews)
-                     (set-status "Preview at 1:1 pixels"))))))
+                     t)))))
+           (preview-one-to-one ()
+             ;; The fit view is a canvas-sized proxy, so its own pixels are not
+             ;; the sensor's: 1:1 has to ask for the unbounded render and set
+             ;; the zoom again when it arrives.
+             (cond (preview-native-p
+                    (fit-preview-to-source-pixels)
+                    (set-status "Preview at 1:1 pixels"))
+                   (t
+                    (setf preview-native-p t
+                          preview-one-to-one-pending-p t)
+                    (discard-gui-tasks queue :after)
+                    (enqueue-preview nil)
+                    (set-status "Developing 1:1 preview"))))
            (crop-node-rect (node)
              (let ((params (orfeus:graph-node-params node)))
                (values (float (getf params :left 0.0) 1d0)
@@ -1994,7 +2065,10 @@ new cache entry is published."
                    preview-center-x .5d0
                    preview-center-y .5d0
                    preview-drag-p nil
-                   after-live-p nil)
+                   after-live-p nil
+                   ;; A new photograph starts fitted, so it starts on a proxy.
+                   preview-native-p nil
+                   preview-one-to-one-pending-p nil)
              (dolist (path (list before-preview-file after-preview-file))
                (when path (forget-preview-file path)))
              (setf before-preview-file nil
@@ -2015,6 +2089,9 @@ new cache entry is published."
                                after-preview-generation generation
                                after-live-p nil
                                (gethash (selected-job) thumbnail-files) path)
+                         (when preview-one-to-one-pending-p
+                           (setf preview-one-to-one-pending-p nil)
+                           (fit-preview-to-source-pixels))
                          (schedule-curve-histogram path generation)
                          (lightfast:redraw after-canvas)
                          (when curve-canvas
@@ -3326,8 +3403,7 @@ new cache entry is published."
                    pick-color-node nil)
              (gui-model-replace-project model new-project path)
              (setf (gui-model-selected-node model) nil)
-             (clrhash content-keys)
-               (refresh-gallery)
+             (refresh-gallery)
              (sync-node-tools)
              (when graph-canvas (lightfast:redraw graph-canvas))
              (sync-controls)
@@ -3489,12 +3565,11 @@ new cache entry is published."
              (let* ((settings (preview-recipe-snapshot settings))
                     (input (photo-job-input-path job))
                     (file-role (if draft-p :draft role))
-                    (max-width (if draft-p
-                                   *gui-draft-preview-size*
-                                   *gui-preview-max-width*))
-                    (max-height (if draft-p
-                                    *gui-draft-preview-size*
-                                    *gui-preview-max-height*)))
+                    (bound (if draft-p
+                               *gui-draft-preview-size*
+                               (viewport-render-bound)))
+                    (max-width bound)
+                    (max-height bound))
                (enqueue-gui-task
                 target-queue role
                 (lambda ()

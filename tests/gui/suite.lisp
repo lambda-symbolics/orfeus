@@ -263,6 +263,37 @@ moves, so a destination the user picked survives every later save."
                   (orfeus:project-output-directory project))
            "Importing without a project did not anchor to the photographs")))
 
+(defun test-viewport-render-bound ()
+  "The viewport render is sized for the canvas, and grows only with zoom.
+
+Rendering it at sensor resolution was the most expensive thing Orfeus did: an
+80 MP frame was developed, denoised and JPEG-encoded at 10368 pixels wide so a
+1400-pixel canvas could show it, which cost 3.4 seconds per interactive tick
+against 45 milliseconds for a canvas-sized render."
+  (check (= 1400 (orfeus/gui::gui-preview-bound 1400 1d0))
+         "A fitted view did not render at the canvas size")
+  ;; Zooming in is the one time the user is asking to see real detail, so any
+  ;; zoom past fit gets real pixels rather than the fit proxy stretched. The
+  ;; rungs are powers of two, so everything in (1, 2] shares one render and
+  ;; scrolling within that range costs nothing.
+  (check (= 2800 (orfeus/gui::gui-preview-bound 1400 1.4d0))
+         "Zooming past fit reused the proxy instead of rendering real pixels")
+  (check (= (orfeus/gui::gui-preview-bound 1400 1.4d0)
+            (orfeus/gui::gui-preview-bound 1400 2d0))
+         "Two zooms on the same rung did not share a render")
+  (check (= 5600 (orfeus/gui::gui-preview-bound 1400 2.1d0))
+         "Crossing a doubling did not climb to the next rung")
+  ;; Zooming out is clamped at fit, and a tiny window still leaves room to
+  ;; magnify rather than pinning the bound to a handful of pixels.
+  (check (= 1400 (orfeus/gui::gui-preview-bound 1400 0.25d0))
+         "Zooming out below fit shrank the render")
+  (check (= orfeus/gui::*gui-preview-minimum-bound*
+            (orfeus/gui::gui-preview-bound 200 1d0))
+         "A small canvas ignored the minimum bound")
+  (check (<= (orfeus/gui::gui-preview-bound 1400 10000d0)
+             orfeus/gui::*gui-preview-maximum-bound*)
+         "An extreme zoom escaped the ceiling"))
+
 (defun test-preset-bulk-application ()
   (let* ((jobs (loop for name in '("one" "two" "three")
                      collect (orfeus:make-photo-job
@@ -1269,6 +1300,7 @@ moves, so a destination the user picked survives every later save."
   (test-undo-history)
   (test-graph-node-placement)
   (test-thumbnail-context-menu)
+  (test-viewport-render-bound)
   (test-preset-bulk-application)
   (test-grade-workflow)
   (test-node-graph-model)
