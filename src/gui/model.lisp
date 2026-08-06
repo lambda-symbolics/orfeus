@@ -11,12 +11,6 @@ renumbering, so the selection stays valid across graph edits."
   (edit-target :photo :type (member :photo :defaults))
   (selected-node nil)
   project-path
-  ;; True once the export destination has been chosen deliberately — by the user
-  ;; in the export dialog, or by a project file that recorded one. Until then it
-  ;; is only a guess derived from where the photographs happen to live, which is
-  ;; often the card they were shot on, and must be re-anchored once somewhere
-  ;; better is known.
-  (output-directory-chosen-p nil)
   (undo-stack '() :type list)
   (redo-stack '() :type list))
 
@@ -164,15 +158,15 @@ Returns true when a new entry was pushed."
   (merge-pathnames #P"orfeus-exports/"
                    (uiop:pathname-directory-pathname anchor)))
 
-(defun gui-model-reanchor-export-directory (model anchor)
-  "Point an unchosen export destination at ANCHOR's directory.
+(defun gui-model-anchor-export-directory (model anchor)
+  "Put the export directory beside ANCHOR, the project's file.
 
-Called when a project is saved: until then the only anchor available was the
-photographs themselves, so a card the photographs were shot on gets proposed as
-somewhere to write to."
-  (unless (gui-model-output-directory-chosen-p model)
-    (setf (project-output-directory (gui-model-project model))
-          (anchored-export-directory anchor))))
+Called when a project moves to a new path. Before a project exists the only
+place to put exports is beside the photographs; saving the project says where
+the work actually lives, so exports follow it there. Where the user then puts
+the project is the user's business."
+  (setf (project-output-directory (gui-model-project model))
+        (anchored-export-directory anchor)))
 
 (defun gui-photos-project (pathnames)
   "Return one project containing PATHNAMES in selection order."
@@ -197,13 +191,9 @@ somewhere to write to."
           ((member type '("orf" "dng") :test #'string=) :photo))))
 
 (defun gui-model-replace-project (model project &optional project-path)
-  "Replace MODEL's project and reset its transient selection state.
-
-A project read from a file recorded its own export destination, so that counts
-as chosen; a project assembled from loose photographs did not."
+  "Replace MODEL's project and reset its transient selection state."
   (setf (gui-model-project model) project
         (gui-model-project-path model) project-path
-        (gui-model-output-directory-chosen-p model) (and project-path t)
         (gui-model-selected-index model) 0
         (gui-model-selected-indices model)
         (if (project-photos project) '(0) '())
