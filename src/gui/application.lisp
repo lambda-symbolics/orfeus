@@ -2861,20 +2861,30 @@ new cache entry is published."
                (error (condition)
                  (values nil condition))))
            (grab-still ()
-             (let ((preset (gui-model-grab-still model)))
+             (multiple-value-bind (preset intern-failure)
+                 (gui-model-grab-still model)
                (if preset
                    (multiple-value-bind (stored condition)
                        (persist-still preset)
+                     ;; The still now owns a copy of its RAW, so the sidebar
+                     ;; badge may have just become true for this photograph.
+                     (clrhash interned-photos)
                      (refresh-gallery)
+                     (redraw-thumbnails)
                      (setf (lightfast:value preset-name-input)
                            (processing-preset-name preset))
                      (sync-preset-action-label)
                      (set-status
-                      (if stored
-                          (format nil "Grabbed ~A"
-                                  (processing-preset-name preset))
-                          (format nil "Grabbed ~A in project only: ~A"
-                                  (processing-preset-name preset) condition))))
+                      (cond
+                        ((not stored)
+                         (format nil "Grabbed ~A in project only: ~A"
+                                 (processing-preset-name preset) condition))
+                        (intern-failure
+                         (format nil "Grabbed ~A, but its RAW was not copied: ~A"
+                                 (processing-preset-name preset)
+                                 intern-failure))
+                        (t (format nil "Grabbed ~A"
+                                   (processing-preset-name preset))))))
                    (set-status "No photograph selected"))))
            (still-recipe (preset)
              (or (orfeus:processing-preset-graph preset)
@@ -3149,6 +3159,39 @@ new cache entry is published."
                                                      old-name new-name)))
                              (error (condition)
                                (set-status (princ-to-string condition)))))))))))
+           (intern-still-source (still)
+             ;; Stills grabbed before interning existed still point at the card
+             ;; they were shot from. A still is a look to reuse later, so it
+             ;; should own its RAW; this repairs the older ones.
+             (let* ((preset (gallery-still-preset still))
+                    (source (orfeus:processing-preset-source-photo preset)))
+               (cond
+                 ((null source)
+                  (set-status "This still has no source photograph"))
+                 ((orfeus:photo-interned-p source)
+                  (set-status "This still already owns its source RAW"))
+                 ((not (probe-file source))
+                  (set-status
+                   (format nil "The source is not reachable: ~A"
+                           (namestring source))))
+                 (t
+                  (handler-case
+                      (let ((kept (orfeus:intern-raw-file source)))
+                        (setf (orfeus:processing-preset-source-photo preset) kept)
+                        ;; Deliberately replacing this still's stored copy;
+                        ;; PERSIST-STILL refuses an existing name because it is
+                        ;; for grabbing new ones.
+                        (orfeus:still-store-write preset :if-exists :supersede)
+                        (clrhash interned-photos)
+                        (refresh-gallery)
+                        (redraw-thumbnails)
+                        (set-status
+                         (format nil "~A now keeps its own copy of ~A"
+                                 (processing-preset-name preset)
+                                 (file-namestring source))))
+                    (error (condition)
+                      (set-status (format nil "Could not keep the source: ~A"
+                                          condition))))))))
            (gallery-context-menu (still)
              (let ((actions
                      (list (cons (format nil "Apply Graph to ~D Photo~:P"
@@ -3170,6 +3213,8 @@ new cache entry is published."
                            (cons "-" nil)
                            (cons "Rename Still..."
                                  (lambda () (rename-still still)))
+                           (cons "Keep Source RAW"
+                                 (lambda () (intern-still-source still)))
                            (cons "Delete Still"
                                  (lambda () (delete-still still))))))
                (let ((chosen (lightfast:popup-menu (mapcar #'first actions))))

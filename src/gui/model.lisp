@@ -510,19 +510,31 @@ Returns :BYPASSED, :ENABLED, or :NONE without a photograph."
   "Capture the current grade as an auto-named still preset, or NIL.
 
 The still stores the full node graph (deriving one for flat photos), so
-applying it reproduces the grade node for node."
+applying it reproduces the grade node for node.
+
+A still is meant to outlive the card it was shot from — it is a saved look, a
+film stock, a reversal recipe, kept to apply to other photographs later. So the
+source RAW is interned as part of grabbing it, and the still refers to that copy.
+Returns a second value: the condition when interning failed, in which case the
+still still exists but points at wherever the photograph currently is."
   (gui-model-checkpoint model)
   (let ((job (gui-model-selected-job model)))
     (when job
       (let* ((project (gui-model-project model))
+             (source (photo-job-input-path job))
+             (failure nil)
+             (kept (handler-case (orfeus:intern-raw-file source)
+                     (error (condition)
+                       (setf failure condition)
+                       source)))
              (preset (orfeus:make-processing-preset
                       :name (orfeus:next-still-preset-name project job)
                       :settings (orfeus:photo-render-settings project job)
-                      :source-photo (photo-job-input-path job)
+                      :source-photo kept
                       :graph (gui-model-copy-graph model))))
         (setf (project-presets project)
               (append (project-presets project) (list preset)))
-        preset))))
+        (values preset failure)))))
 
 (defun gui-model-copy-grade (model)
   "Return the selected photo's grade plist and bypass list, or NIL."
