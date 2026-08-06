@@ -2333,8 +2333,18 @@ where
     if cache_mode != CACHE_USE {
         return Ok((Arc::new(decode()?), None));
     }
-    let key = decode_cache_key(input)?;
-    let key = if draft { draft_identity(key) } else { key };
+    // Two keys, because a draft decode of a file is a different image from its
+    // full decode and must occupy its own cache entry, while the "did the file
+    // move under us" check can only compare like with like. Folding the draft
+    // marker into the key used for that check made every draft render fail:
+    // `file_content_digest` never returns a drafted digest, so the guard below
+    // always fired and the whole live-preview path errored out.
+    let content_key = decode_cache_key(input)?;
+    let key = if draft {
+        draft_identity(content_key)
+    } else {
+        content_key
+    };
     let (cache_lock, cache_changed) = decode_cache();
     loop {
         let mut cache = cache_lock
@@ -2362,7 +2372,7 @@ where
     let decode_result = catch_unwind(AssertUnwindSafe(decode));
     let result = match decode_result {
         Ok(result) => result.and_then(|decoded| {
-            if file_content_digest(input)? != key {
+            if file_content_digest(input)? != content_key {
                 return Err(Error::Render(
                     "RAW source changed while it was being decoded".into(),
                 ));
@@ -2785,6 +2795,39 @@ mod tests {
         assert_ne!(first, second);
         assert_eq!(second, file_content_digest(&path).unwrap());
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn a_draft_decode_is_cached_apart_from_the_full_one_and_still_succeeds() {
+        // The whole live-preview path asks for a draft, so a draft decode that
+        // reports "RAW source changed while it was being decoded" takes every
+        // interactive render down with it. That shipped once: the draft marker
+        // was folded into the key the freshness check compared against, and
+        // `file_content_digest` cannot ever produce a drafted digest.
+        let input = temp("draft-identity.raw");
+        fs::write(&input, b"a draft and a full decode of one file").unwrap();
+        let decodes = Arc::new(AtomicUsize::new(0));
+        let decode = || {
+            let decodes = Arc::clone(&decodes);
+            move || {
+                decodes.fetch_add(1, Ordering::SeqCst);
+                Ok(test_decoded_raw())
+            }
+        };
+        let (_, draft_key) =
+            decoded_for_render_with_identity_using(&input, CACHE_USE, true, false, decode())
+                .expect("a draft decode must not be mistaken for a changed file");
+        assert_eq!(decodes.load(Ordering::SeqCst), 1);
+        // Asking again reuses the entry rather than decoding a second time.
+        decoded_for_render_with_identity_using(&input, CACHE_USE, true, false, decode()).unwrap();
+        assert_eq!(decodes.load(Ordering::SeqCst), 1);
+        // The full decode is a different image, so it needs its own entry.
+        let (_, full_key) =
+            decoded_for_render_with_identity_using(&input, CACHE_USE, false, false, decode())
+                .expect("a full decode of the same file must succeed too");
+        assert_eq!(decodes.load(Ordering::SeqCst), 2);
+        assert_ne!(draft_key, full_key);
+        fs::remove_file(input).unwrap();
     }
 
     #[test]
