@@ -228,13 +228,22 @@
     (orfeus/gui:gui-model-set-selected-indices model '(0 2))
     (orfeus/gui:gui-model-set-setting model :exposure 1.5)
     (orfeus/gui:gui-model-toggle-stage model :film)
-    (orfeus/gui:gui-model-save-preset model "Bright")
-    (check (= 1 (length (orfeus:project-presets project)))
-           "Saving a preset did not persist it in the project")
-    (check (equal '(:film)
-                  (orfeus:processing-preset-disabled-stages
-                   (first (orfeus:project-presets project))))
-           "Saving a preset lost its bypass state")
+    ;; The gallery is global, so saving builds a preset for the store rather
+    ;; than putting it in the project.
+    (let ((saved (orfeus/gui:gui-model-save-preset model "Bright")))
+      (check (null (orfeus:project-presets project))
+             "Saving a preset wrote it into the project")
+      (check (string= "Bright" (orfeus:processing-preset-name saved))
+             "Saving a preset lost its name")
+      (check (equal '(:film)
+                    (orfeus:processing-preset-disabled-stages saved))
+             "Saving a preset lost its bypass state")
+      (check (= 1.5 (orfeus:processing-settings-exposure
+                     (orfeus:processing-preset-settings saved)))
+             "Saving a preset lost its settings")
+      ;; Applying by name still reads a project's own presets, which is how an
+      ;; older project file keeps working.
+      (setf (orfeus:project-presets project) (list saved)))
     (dolist (job jobs)
       (setf (orfeus:photo-job-disabled-stages job) '()))
     (check (= 2 (orfeus/gui:gui-model-apply-preset model "Bright"))

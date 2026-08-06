@@ -271,31 +271,25 @@ Returns true when a new entry was pushed."
         (project-defaults project))))
 
 (defun gui-model-save-preset (model name)
-  "Save selected effective settings under NAME, replacing a same-named preset."
-  (gui-model-checkpoint model)
-  (let* ((trimmed (string-trim '(#\Space #\Tab #\Newline #\Return) name))
-         (project (gui-model-project model)))
+  "Return the selected effective settings as a preset named NAME.
+
+No checkpoint is taken because nothing in the project changes: the gallery is
+global, so the caller writes the result to the still store."
+  (let ((trimmed (string-trim '(#\Space #\Tab #\Newline #\Return) name)))
     (unless (plusp (length trimmed))
       (error "Preset name cannot be empty."))
-    (let* ((source (let ((job (gui-model-selected-job model)))
-                     (and job (photo-job-input-path job))))
-           (preset (make-processing-preset
-                    :name trimmed
-                    :settings (orfeus::copy-processing-settings
-                               (gui-model-selected-settings model))
-                    :source-photo source
-                    :disabled-stages
-                    (let ((job (gui-model-selected-job model)))
-                      (if job
-                          (copy-list (photo-job-disabled-stages job))
-                          '()))))
-           (existing (project-presets project))
-           (position (position trimmed existing :test #'string-equal
-                                                :key #'processing-preset-name)))
-      (if position
-          (setf (nth position existing) preset)
-          (setf (project-presets project) (append existing (list preset))))
-      preset)))
+    ;; Returned rather than stored on the project: the gallery is global, so
+    ;; the caller writes it to the still store. A project's own presets are
+    ;; only read now, so older project files keep showing theirs.
+    (let ((job (gui-model-selected-job model)))
+      (make-processing-preset
+       :name trimmed
+       :settings (orfeus::copy-processing-settings
+                  (gui-model-selected-settings model))
+       :source-photo (and job (photo-job-input-path job))
+       :disabled-stages (if job
+                            (copy-list (photo-job-disabled-stages job))
+                            '())))))
 
 (defun gui-model-apply-preset (model name)
   "Apply named preset NAME to all selected photos and return the changed count.
@@ -512,6 +506,10 @@ Returns :BYPASSED, :ENABLED, or :NONE without a photograph."
 The still stores the full node graph (deriving one for flat photos), so
 applying it reproduces the grade node for node.
 
+The preset is returned rather than added to the project: the gallery is global,
+like a PowerGrade album, so a look grabbed while grading one shoot is there for
+the next one. The caller writes it to the still store.
+
 A still is meant to outlive the card it was shot from — it is a saved look, a
 film stock, a reversal recipe, kept to apply to other photographs later. So the
 source RAW is interned as part of grabbing it, and the still refers to that copy.
@@ -532,8 +530,6 @@ still still exists but points at wherever the photograph currently is."
                       :settings (orfeus:photo-render-settings project job)
                       :source-photo kept
                       :graph (gui-model-copy-graph model))))
-        (setf (project-presets project)
-              (append (project-presets project) (list preset)))
         (values preset failure)))))
 
 (defun gui-model-copy-grade (model)

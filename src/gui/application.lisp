@@ -2832,25 +2832,27 @@ new cache entry is published."
                (discard-gui-tasks background-queue :still)
                (clrhash gallery-thumbs)
                (setf gallery-stills
-                     (let* ((held (mapcar #'make-project-gallery-still
-                                          (project-presets project)))
-                            (names (mapcar #'gallery-still-identity held)))
+                     ;; The gallery is global, like a PowerGrade album: stills
+                     ;; live in the per-user store and are the same in every
+                     ;; project. Presets carried by an older project file are
+                     ;; still shown, after the global ones and only when the
+                     ;; store has nothing of that name, so nothing grabbed
+                     ;; before the gallery went global disappears.
+                     (let* ((global (handler-case
+                                        (mapcar #'make-local-gallery-still
+                                                (orfeus:still-store-list))
+                                      (error (condition)
+                                        (set-status (princ-to-string condition))
+                                        '())))
+                            (names (mapcar #'gallery-still-identity global)))
                        (append
-                        held
-                        ;; Grabbing writes both a project preset and a local
-                        ;; copy. The local one is the fallback for a lost
-                        ;; project or ejected media, so it earns a row only
-                        ;; when the project does not already hold that still.
+                        global
                         (remove-if
                          (lambda (still)
                            (member (gallery-still-identity still) names
                                    :test #'equal))
-                         (handler-case
-                             (mapcar #'make-local-gallery-still
-                                     (orfeus:still-store-list))
-                           (error (condition)
-                             (set-status (princ-to-string condition))
-                             '())))))
+                         (mapcar #'make-project-gallery-still
+                                 (project-presets project)))))
                      gallery-selected
                      (gallery-selection-index gallery-stills selected-key))))
            (persist-still (preset)
@@ -3263,7 +3265,14 @@ new cache entry is published."
                                 model (lightfast:value preset-name-input))))
                    (remhash (processing-preset-name preset) gallery-thumbs)
                    (multiple-value-bind (stored condition)
-                       (persist-still preset)
+                       ;; The name was typed on purpose, so saving over it is
+                       ;; the intent; PERSIST-STILL refuses, since it guards
+                       ;; auto-named grabs against clobbering a look.
+                       (handler-case
+                           (values (orfeus:still-store-write
+                                    preset :if-exists :supersede)
+                                   nil)
+                         (error (condition) (values nil condition)))
                      (refresh-gallery)
                      (setf (lightfast:value preset-name-input)
                            (processing-preset-name preset))
@@ -4527,7 +4536,10 @@ new cache entry is published."
                                (lambda (&rest ignored)
                                  (declare (ignore ignored))
                                  (lightfast:message-box
-                                  "Orfeus RAW processor\nOlympus PEN-F and OM-1")))
+                                  ;; Common Lisp does not read \n as a newline;
+                                  ;; the backslash just escapes the n.
+                                  (format nil "Orfeus RAW processor~%~
+                                               Olympus PEN-F and OM-1"))))
         (setf toolbar (lightfast:make-panel :parent window :x 0 :y 24
                                           :width 1280 :height 40 :label ""))
         (lightfast:set-box toolbar lightfast:+box-flat-box+)
