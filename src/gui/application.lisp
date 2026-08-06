@@ -433,6 +433,7 @@ from the anchor, and control-shift adds that range to the selection."
     (:copy-paths . "Copy source paths")
     (:divider . "-")
     (:select-all . "Select all photographs")
+    (:intern . "Intern selection (copy off the card)")
     (:remove . "Remove selection from project..."))
   "Actions and labels shown by the photo sidebar's context menu.")
 
@@ -447,6 +448,23 @@ from the anchor, and control-shift adds that range to the selection."
 (defun thumbnail-context-selection (selected row)
   "Preserve SELECTED when ROW is already selected, otherwise select only ROW."
   (if (member row selected) selected (list row)))
+
+(defun draw-interned-badge (x y)
+  "Draw the mark that says a photograph no longer needs its card.
+
+A filled disc with a downward arrow, in the corner of the thumbnail: the RAW
+has been pulled in. Small and quiet, because the interesting state is the
+absence of it."
+  (lightfast:draw-color-rgb :red 24 :green 26 :blue 28)
+  (lightfast:draw-filled-circle (+ x 8) (+ y 8) 9)
+  (lightfast:draw-color-rgb :red 120 :green 210 :blue 140)
+  (lightfast:draw-filled-circle (+ x 8) (+ y 8) 7)
+  (lightfast:draw-color-rgb :red 18 :green 40 :blue 24)
+  ;; A stubby arrow into a floor line: pulled down and kept.
+  (lightfast:draw-line (+ x 8) (+ y 3) (+ x 8) (+ y 9))
+  (lightfast:draw-line (+ x 5) (+ y 6) (+ x 8) (+ y 9))
+  (lightfast:draw-line (+ x 11) (+ y 6) (+ x 8) (+ y 9))
+  (lightfast:draw-line (+ x 4) (+ y 12) (+ x 12) (+ y 12)))
 
 (defun graph-view-signature (job graph selected-node)
   "Return a cheap identity of what the node graph editor should display.
@@ -945,6 +963,7 @@ new cache entry is published."
            curve-canvas curve-drag scope-canvas
            (curve-channel :master-points)
            curve-histogram waveform-buffer
+           (interned-photos (make-hash-table :test #'equal))
            status progress before-preview-file after-preview-file
            after-preview-generation
            lens-name controls inspector-items inspector-rows
@@ -1880,13 +1899,70 @@ new cache entry is published."
                                         count)
                                 :button0 "Cancel" :button1 "Remove")))
                  (remove-selected-photo))))
+           (photo-interned-cached-p (job)
+             ;; PHOTO-INTERNED-P consults the filesystem, and the filmstrip asks
+             ;; for every visible row on every repaint. Interning is the only
+             ;; thing that changes the answer, and it clears this.
+             (let* ((path (photo-job-input-path job))
+                    (known (gethash path interned-photos :unknown)))
+               (if (eq known :unknown)
+                   (setf (gethash path interned-photos)
+                         (and (ignore-errors (orfeus:photo-interned-p path)) t))
+                   known)))
+           (intern-selected-photos ()
+             ;; Copy each selected RAW into the private store and repoint the
+             ;; project at the copy, so the card is only needed once.
+             (let ((jobs (remove-if #'photo-interned-cached-p
+                                    (gui-model-acting-jobs model))))
+               (cond
+                 ((null jobs)
+                  (set-status "Every selected photograph is already interned"))
+                 (t
+                  (gui-model-checkpoint model)
+                  (let ((interned 0) (failed 0) (last-error nil))
+                    (dolist (job jobs)
+                      (handler-case
+                          (let ((was (photo-job-input-path job)))
+                            (orfeus:intern-photo-job job)
+                            ;; The preview caches key on the path, which just
+                            ;; changed under them.
+                            (remhash was interned-photos)
+                            (remhash job thumbnail-files)
+                            (forget-preview-file was)
+                            (incf interned))
+                        (error (condition)
+                          (incf failed)
+                          (setf last-error condition)
+                          (format *error-output*
+                                  "~&orfeus: interning ~A failed: ~A~%"
+                                  (photo-job-input-path job) condition))))
+                    (clrhash interned-photos)
+                    (redraw-thumbnails)
+                    (schedule-edited-preview)
+                    (set-status
+                     (if (plusp failed)
+                         (format nil "Interned ~D; ~D failed: ~A"
+                                 interned failed last-error)
+                         (format nil "Interned ~D photograph~:P into ~A"
+                                 interned
+                                 (namestring (orfeus:interned-raw-directory))))))))))
+           (select-thumbnail-context-row (row)
+             ;; Right-clicking targets a photograph without opening it: the menu
+             ;; acts on the row under the cursor while the preview keeps showing
+             ;; whatever it already had. Opening one is a left-click.
+             (let ((selection (thumbnail-context-selection
+                               (gui-model-selected-indices model) row)))
+               (unless (equal selection (gui-model-selected-indices model))
+                 (let ((anchor (gui-model-selected-index model)))
+                   (gui-model-set-selected-indices model selection)
+                   ;; SET-SELECTED-INDICES moves the anchor to the first row,
+                   ;; which is what would switch the view.
+                   (setf (gui-model-selected-index model) anchor))
+                 (sync-preset-action-label)
+                 (redraw-thumbnails))))
            (show-thumbnail-context-menu (row)
              (when (and (>= row 0) (< row (length (project-photos project))))
-               (let* ((selected (gui-model-selected-indices model))
-                      (context-selection
-                        (thumbnail-context-selection selected row)))
-                 (unless (equal selected context-selection)
-                   (select-thumbnail-row row 0)))
+               (select-thumbnail-context-row row)
                (case (thumbnail-context-action-at
                       (lightfast:popup-menu (thumbnail-context-menu-items)))
                  (:export (open-export-dialog "Selected photographs"))
@@ -1894,6 +1970,7 @@ new cache entry is published."
                  (:reset-edits (reset-selected-photo-edits))
                  (:copy-paths (copy-selected-photo-paths))
                  (:select-all (select-all-thumbnails))
+                 (:intern (intern-selected-photos))
                  (:remove (remove-selected-photo-with-confirmation)))))
            (handle-thumbnail-mouse (canvas event value)
              (multiple-value-bind (x y button dx dy state)
@@ -4506,6 +4583,8 @@ new cache entry is published."
                                       (lightfast:draw-color-rgb :red 62 :green 64 :blue 66)
                                       (lightfast:draw-filled-rect
                                        (+ x 6) (+ row-y 6) 88 (- row-height 12)))))
+                              (when (photo-interned-cached-p job)
+                                (draw-interned-badge (+ x 76) (+ row-y 8)))
                               (lightfast:draw-color-rgb :red 235 :green 235 :blue 235)
                               (lightfast:draw-text
                                (file-namestring (photo-job-input-path job))

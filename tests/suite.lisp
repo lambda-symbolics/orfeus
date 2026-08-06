@@ -79,6 +79,56 @@ the failure list, and both ON-ERROR modes without needing real RAW files."
              (error () t))
            ))))
 
+(defun interned-raw-store-behaves-p ()
+  "Interning must be idempotent, collision-safe, atomic, and repoint the job."
+  (let* ((root (merge-pathnames "orfeus-intern-check/" (uiop:temporary-directory)))
+         (store (merge-pathnames "store/" root))
+         (first-card (merge-pathnames "card-a/_6040106.ORF" root))
+         (second-card (merge-pathnames "card-b/_6040106.ORF" root)))
+    (uiop:delete-directory-tree root :validate t :if-does-not-exist :ignore)
+    (dolist (path (list first-card second-card))
+      (ensure-directories-exist path))
+    (ensure-directories-exist store)
+    (with-open-file (stream first-card :direction :output)
+      (write-string "one" stream))
+    (with-open-file (stream second-card :direction :output)
+      (write-string "another" stream))
+    (unwind-protect
+         (let ((first-interned (orfeus:intern-raw-file first-card
+                                                       :directory store))
+               (second-interned (orfeus:intern-raw-file second-card
+                                                        :directory store)))
+           (and
+            ;; Two cards hold the same filename and different photographs.
+            (not (equal first-interned second-interned))
+            (orfeus:photo-interned-p first-interned :directory store)
+            (not (orfeus:photo-interned-p first-card :directory store))
+            ;; Interning twice, or interning what is already interned, copies
+            ;; nothing further.
+            (equal first-interned
+                   (orfeus:intern-raw-file first-card :directory store))
+            (equal first-interned
+                   (orfeus:intern-raw-file first-interned :directory store))
+            (string= "one" (with-open-file (stream first-interned)
+                             (read-line stream)))
+            ;; The atomic rename must leave nothing behind.
+            (null (remove-if-not
+                   (lambda (path) (equal "tmp" (pathname-type path)))
+                   (directory (merge-pathnames "*.*" store))))
+            ;; A job follows its copy, which is the whole point.
+            (let ((job (orfeus:make-photo-job :input-path second-card)))
+              (orfeus:intern-photo-job job :directory store)
+              (and (orfeus:photo-interned-p (orfeus:photo-job-input-path job)
+                                            :directory store)
+                   (equal second-interned (orfeus:photo-job-input-path job))))
+            ;; A photograph that is not there cannot be interned.
+            (handler-case
+                (progn (orfeus:intern-raw-file
+                        (merge-pathnames "absent.ORF" root) :directory store)
+                       nil)
+              (error () t))))
+      (uiop:delete-directory-tree root :validate t :if-does-not-exist :ignore))))
+
 (defun test-temporary-pathname (suffix)
   (merge-pathnames
    (format nil "orfeus-test-~D-~D.~A"
@@ -1519,6 +1569,8 @@ the failure list, and both ON-ERROR modes without needing real RAW files."
       (check "project S-expressions round trip" (project-round-trip-p))
       (check "deep project copies share nothing an edit can reach"
              (project-deep-copy-is-independent-p))
+      (check "interning copies a RAW off its card exactly once"
+             (interned-raw-store-behaves-p))
       (check "batch renders report in project order"
              (project-render-batches-in-order-p))
       (check "project files round trip" (project-file-round-trip-p))

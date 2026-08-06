@@ -174,6 +174,50 @@
           (check (orfeus/gui::gui-model-add-node model kind)
                  (format nil "Adding a ~S node returned nothing" kind)))))))
 
+(defun test-thumbnail-context-menu ()
+  "Right-clicking must target a row without changing what is being previewed."
+  ;; The menu offers interning, and the action list and label list stay aligned.
+  (let ((actions (mapcar #'car orfeus/gui::*thumbnail-context-actions*)))
+    (check (member :intern actions) "The sidebar menu cannot intern")
+    (check (= (length actions)
+              (length (orfeus/gui::thumbnail-context-menu-items)))
+           "Sidebar menu labels and actions are different lengths")
+    (loop for action in actions
+          for index from 0
+          do (check (eq action (orfeus/gui::thumbnail-context-action-at index))
+                    (format nil "Sidebar menu index ~D maps to the wrong action"
+                            index))))
+  (check (null (orfeus/gui::thumbnail-context-action-at nil))
+         "A dismissed sidebar menu chose an action")
+  ;; An already-selected row keeps the whole selection, so a menu action still
+  ;; applies to every photograph the user had picked. An unselected row becomes
+  ;; the only target.
+  (check (equal '(1 2 3) (orfeus/gui::thumbnail-context-selection '(1 2 3) 2))
+         "Right-clicking inside a selection discarded it")
+  (check (equal '(5) (orfeus/gui::thumbnail-context-selection '(1 2 3) 5))
+         "Right-clicking outside a selection did not retarget")
+  ;; Retargeting must not move the preview anchor. GUI-MODEL-SET-SELECTED-INDICES
+  ;; does move it, which is exactly why the context path restores it.
+  (let* ((photos (loop for index below 4
+                       collect (orfeus:make-photo-job
+                                :input-path (make-pathname
+                                             :name (format nil "p~D" index)
+                                             :type "orf"))))
+         (project (orfeus:make-project :output-directory #P"exports/"
+                                       :photos photos))
+         (model (orfeus/gui:make-gui-model :project project)))
+    (orfeus/gui::gui-model-set-selected-indices model '(0))
+    (check (= 0 (orfeus/gui::gui-model-selected-index model))
+           "Selecting the first row did not anchor there")
+    (let ((anchor (orfeus/gui::gui-model-selected-index model)))
+      (orfeus/gui::gui-model-set-selected-indices model '(3))
+      (check (= 3 (orfeus/gui::gui-model-selected-index model))
+             "Setting indices no longer moves the anchor, so the context path
+              no longer needs to restore it")
+      (setf (orfeus/gui::gui-model-selected-index model) anchor)
+      (check (eq (first photos) (orfeus/gui:gui-model-selected-job model))
+             "Restoring the anchor did not keep the previewed photograph"))))
+
 (defun test-preset-bulk-application ()
   (let* ((jobs (loop for name in '("one" "two" "three")
                      collect (orfeus:make-photo-job
@@ -468,7 +512,7 @@
   (check (equal '(3) (orfeus/gui::thumbnail-context-selection '(1 4) 3))
          "Right-clicking an unselected thumbnail did not select only that row")
   (check (equal '(:export :apply-still :reset-edits :copy-paths :divider
-                  :select-all :remove)
+                  :select-all :intern :remove)
                 (loop for index below
                       (length (orfeus/gui::thumbnail-context-menu-items))
                       collect (orfeus/gui::thumbnail-context-action-at index)))
@@ -1158,6 +1202,7 @@
   (test-model-settings)
   (test-undo-history)
   (test-graph-node-placement)
+  (test-thumbnail-context-menu)
   (test-preset-bulk-application)
   (test-grade-workflow)
   (test-node-graph-model)

@@ -120,6 +120,11 @@
    #:processing-preset-name
    #:processing-preset-settings
    #:processing-preset-source-photo
+   #:interned-raw-directory
+   #:interned-raw-pathname
+   #:photo-interned-p
+   #:intern-raw-file
+   #:intern-photo-job
    #:still-store-directory
    #:still-store-identity
    #:still-store-list

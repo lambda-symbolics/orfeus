@@ -794,3 +794,96 @@ IF-EXISTS is either :SUPERSEDE or :ERROR."
                (still-store-protect new-thumbnail #o600))
              (when (probe-file old-sexp)
                (delete-file old-sexp))))))))
+
+;;; Interned RAW files.
+;;;
+;;; A project normally points straight at the card the photographs were shot on,
+;;; which stops working the moment the card comes out. Interning copies a RAW
+;;; into a per-user store and repoints the project at the copy, so the card is
+;;; only needed once. The store sits beside the still gallery for the same
+;;; reason: it must exist whether or not the project has ever been saved.
+
+(defparameter *interned-raw-directory-name* "orfeus-raw/"
+  "Leaf directory holding interned RAW files inside the per-user data store.")
+
+(defun interned-raw-directory ()
+  "Return the per-user interned RAW directory, creating it when missing."
+  (let ((directory (uiop:xdg-data-home
+                    (concatenate 'string "orfeus/"
+                                 *interned-raw-directory-name*))))
+    (ensure-directories-exist directory)
+    (still-store-protect directory #o700)
+    directory))
+
+(defun file-content-identity (pathname)
+  "Return a collision-resistant digest of PATHNAME's contents."
+  (ironclad:byte-array-to-hex-string
+   (ironclad:digest-file :sha256 pathname)))
+
+(defun interned-raw-pathname (source &key (directory (interned-raw-directory)))
+  "Return where SOURCE would live once interned.
+
+The original filename is kept so the store stays readable, with a short content
+digest ahead of it: two cards both hold an _6040106.ORF, and they are not the
+same photograph."
+  (let ((name (or (pathname-name source) "photograph"))
+        (digest (subseq (file-content-identity source) 0 12)))
+    (merge-pathnames (make-pathname :name (format nil "~A-~A" digest name)
+                                    :type (pathname-type source))
+                     directory)))
+
+(defun photo-interned-p (pathname &key (directory (interned-raw-directory)))
+  "Return true when PATHNAME already lives in the interned RAW store.
+
+Compared by directory rather than by a recorded flag, so the answer stays right
+across saves, reloads, and files removed from the store behind our back."
+  (and pathname
+       (equal (uiop:pathname-directory-pathname (truename* pathname))
+              (uiop:pathname-directory-pathname (truename* directory)))))
+
+(defun truename* (pathname)
+  "Resolve PATHNAME when it exists, else return it unchanged."
+  (or (ignore-errors (truename pathname)) pathname))
+
+(defun intern-raw-file (source &key (directory (interned-raw-directory)))
+  "Copy SOURCE into the interned RAW store and return the interned pathname.
+
+Idempotent: a photograph already in the store, or already copied by an earlier
+intern, is returned without being copied again. The copy lands through a
+temporary file in the same directory and an atomic rename, so an interrupted
+intern never leaves a half-written RAW that looks complete."
+  (let ((source (pathname source)))
+    (unless (probe-file source)
+      (error 'invalid-project-data
+             :datum source
+             :reason "the photograph to intern does not exist"))
+    (if (photo-interned-p source :directory directory)
+        source
+        (let* ((target (interned-raw-pathname source :directory directory))
+               (temporary (merge-pathnames
+                           (make-pathname
+                            :name (format nil ".~A-~36R"
+                                          (pathname-name target)
+                                          (random most-positive-fixnum))
+                            :type "tmp")
+                           directory)))
+          (when (probe-file target)
+            (return-from intern-raw-file target))
+          (unwind-protect
+               (progn
+                 (uiop:copy-file source temporary)
+                 (still-store-protect temporary #o600)
+                 (rename-file temporary target)
+                 target)
+            (when (probe-file temporary)
+              (ignore-errors (delete-file temporary))))))))
+
+(defun intern-photo-job (job &key (directory (interned-raw-directory)))
+  "Intern JOB's input and repoint it at the copy. Returns the new pathname.
+
+Repointing is the point: leaving the job on the card would mean the intern
+bought nothing."
+  (let ((interned (intern-raw-file (photo-job-input-path job)
+                                   :directory directory)))
+    (setf (photo-job-input-path job) interned)
+    interned))
