@@ -408,7 +408,7 @@ The output is published atomically and INPUT-PATHNAME is never modified."
 
 (defun render-native-photo-graph (input-pathname output-pathname graph
                                   &key max-width max-height jpeg-quality
-                                    grain-seed cache-p
+                                    grain-seed cache-p draft-p
                                     (report-input-pathname input-pathname))
   (multiple-value-bind (lens-profile focal-reducer lens-crop-factor)
       (resolve-lens-profile-alias
@@ -417,6 +417,7 @@ The output is published atomically and INPUT-PATHNAME is never modified."
              (native-raw-render-graph
               input-pathname output-pathname effective-graph
               :cache-p cache-p
+              :draft-p draft-p
               :output-format (render-output-format output-pathname)
               :lens-profile-model lens-profile
               :focal-reducer focal-reducer
@@ -441,7 +442,7 @@ The output is published atomically and INPUT-PATHNAME is never modified."
                      &key (if-exists :error)
                        (max-width 0) (max-height 0)
                        (jpeg-quality 92) (grain-seed 0)
-                       (preserve-metadata-p t) cache-p graph)
+                       (preserve-metadata-p t) cache-p graph draft-p)
   "Render INPUT-PATHNAME to JPEG or TIFF using PROCESSING-SETTINGS.
 
 This frontend-independent operation is shared by the CLI and GUI. It renders
@@ -491,7 +492,11 @@ which may then be NIL."
                      :max-width (or max-width 0)
                      :max-height (or max-height 0)
                      :jpeg-quality jpeg-quality
-                     :cache-p cache-p)
+                     :cache-p cache-p
+                     ;; Only the graph path can draft; a photograph still on
+                     ;; flat settings goes through the older settings struct,
+                     ;; which has no room to ask.
+                     :draft-p draft-p)
                     (render-native-photo
                      render-input-pathname temporary settings
                      :report-input-pathname input-pathname
@@ -510,9 +515,15 @@ which may then be NIL."
 (defun render-preview (input-pathname output-pathname settings
                        &key (if-exists :error)
                          (max-width 1600) (max-height 1200)
-                         (jpeg-quality 88) (grain-seed 0) cache-p graph)
-  "Render a bounded JPEG preview without metadata-copy overhead."
+                         (jpeg-quality 88) (grain-seed 0) cache-p graph
+                         (draft-p t))
+  "Render a bounded JPEG preview without metadata-copy overhead.
+
+Develops a draft by default: this is what the editor looks at, not what it
+delivers, and the bridge ignores the request when the bound is large enough that
+binning would drop detail the downscale would have kept."
   (render-photo input-pathname output-pathname settings
+                :draft-p draft-p
                 :max-width max-width
                 :max-height max-height
                 :jpeg-quality jpeg-quality
@@ -539,6 +550,7 @@ Returns the oriented image width and height as two values."
                 (native-raw-render-graph-rgb
                  render-input-pathname effective-graph rgb-buffer capacity
                  :cache-p cache-p
+                 :draft-p t
                  :lens-profile-model lens-profile
                  :focal-reducer focal-reducer
                  :lens-crop-factor lens-crop-factor

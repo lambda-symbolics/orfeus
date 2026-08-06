@@ -77,7 +77,11 @@
   (grain-seed :uint64)
   (focal-reducer :float)
   (lens-crop-factor :float)
-  (lens-profile-model :pointer))
+  (lens-profile-model :pointer)
+  ;; Bit 0 asks the bridge to develop a draft: half resolution, binning each
+  ;; sensor quad rather than interpolating every photosite. Set for previews,
+  ;; never for anything the user keeps.
+  (flags :uint32))
 
 (defcfun ("orfeus_raw_render_v3" %raw-render-v3) :int32
   (input-path :string)
@@ -101,6 +105,9 @@
   (cache-mode :uint32)
   (error-buffer :pointer)
   (error-capacity :size))
+
+(defparameter +frame-flag-draft+ 1
+  "RENDER-FRAME-V1 flag asking the bridge to develop at half resolution.")
 
 (defparameter *native-error-buffer-size* 1024
   "Bytes reserved for a diagnostic returned by the Rust bridge.")
@@ -486,8 +493,11 @@ the straightening angle in degrees for a crop node."
                                 &key lens-profile-model focal-reducer
                                   lens-crop-factor (grain-seed 0)
                                   (max-width 0) (max-height 0)
-                                  (jpeg-quality 92) output-format cache-p)
-  "Render INPUT-PATHNAME through the node GRAPH via the version 3 bridge."
+                                  (jpeg-quality 92) output-format cache-p
+                                  draft-p)
+  "Render INPUT-PATHNAME through the node GRAPH via the version 3 bridge.
+
+DRAFT-P asks the bridge to develop at half resolution. Only a preview may."
   (native-library-load)
   (native-render-require-compatible)
   (unless (>= (native-bridge-version) 3)
@@ -513,7 +523,8 @@ the straightening angle in degrees for a crop node."
                  (setting 'focal-reducer (float (or focal-reducer 1.0) 0.0))
                  (setting 'lens-crop-factor
                           (float (or lens-crop-factor 0.0) 0.0))
-                 (setting 'lens-profile-model lens-pointer))
+                 (setting 'lens-profile-model lens-pointer)
+                 (setting 'flags (if draft-p +frame-flag-draft+ 0)))
                (with-foreign-pointer (buffer (length program))
                  (loop for octet across program
                        for index from 0
@@ -555,7 +566,8 @@ the straightening angle in degrees for a crop node."
 (defun native-raw-render-graph-rgb (input-pathname graph rgb-buffer capacity
                                     &key lens-profile-model focal-reducer
                                       lens-crop-factor (grain-seed 0)
-                                      (max-width 0) (max-height 0) cache-p)
+                                      (max-width 0) (max-height 0) cache-p
+                                      draft-p)
   "Render INPUT-PATHNAME through GRAPH into the foreign RGB-BUFFER.
 
 The live-preview hot path: no JPEG encode and no file. Returns the oriented
@@ -583,7 +595,8 @@ image width and height as two values."
                  (setting 'focal-reducer (float (or focal-reducer 1.0) 0.0))
                  (setting 'lens-crop-factor
                           (float (or lens-crop-factor 0.0) 0.0))
-                 (setting 'lens-profile-model lens-pointer))
+                 (setting 'lens-profile-model lens-pointer)
+                 (setting 'flags (if draft-p +frame-flag-draft+ 0)))
                (with-foreign-pointer (program-buffer (length program))
                  (loop for octet across program
                        for index from 0

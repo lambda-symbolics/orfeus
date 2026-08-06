@@ -46,7 +46,18 @@ pub struct RenderFrameV1 {
     pub focal_reducer: f32,
     pub lens_crop_factor: f32,
     pub lens_profile_model: *const c_char,
+    /// See `FRAME_FLAG_DRAFT`. Appended, so `struct_size` keeps older callers
+    /// working; anything that does not set it gets full-quality development.
+    pub flags: u32,
 }
+
+/// Develop at half resolution, binning each sensor quad instead of
+/// interpolating a colour for every photosite.
+///
+/// Set by the caller rather than inferred from which entry point was used: a
+/// preview is a preview whether it lands in a buffer or in a cache file, and an
+/// export is an export even when it asks for a small image.
+pub const FRAME_FLAG_DRAFT: u32 = 1;
 
 impl RenderFrameV1 {
     fn validate(&self) -> Result<(), Error> {
@@ -1117,13 +1128,7 @@ pub fn render_graph(
             "input and output refer to the same file",
         ));
     }
-    let image = render_graph_image(
-        input,
-        frame,
-        graph_bytes,
-        cache_mode,
-        RenderPurpose::Deliverable,
-    )?;
+    let image = render_graph_image(input, frame, graph_bytes, cache_mode)?;
     render::atomic_encode(
         input,
         output,
@@ -1142,13 +1147,7 @@ pub fn render_graph_rgb(
     buffer: &mut [u8],
     cache_mode: u32,
 ) -> Result<(usize, usize), Error> {
-    let image = render_graph_image(
-        input,
-        frame,
-        graph_bytes,
-        cache_mode,
-        RenderPurpose::Preview,
-    )?;
+    let image = render_graph_image(input, frame, graph_bytes, cache_mode)?;
     let needed = image.width * image.height * 3;
     if buffer.len() < needed {
         return Err(Error::InvalidArgument("preview buffer is too small"));
@@ -1164,21 +1163,15 @@ pub fn render_graph_rgb(
     Ok((image.width, image.height))
 }
 
-/// Whether this render is a live display preview rather than a deliverable.
+/// Whether a render develops a draft: only when the caller asked for one, and
+/// only when the requested size is small enough that binning cannot upsample.
 ///
-/// Only a preview develops a draft. Deciding on the requested size alone would
-/// silently soften an export that asked for, say, 2048 pixels — legitimate for
-/// the web, and not something to quietly halve the resolution of.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum RenderPurpose {
-    Preview,
-    Deliverable,
-}
-
-/// Whether a render develops a draft: only a live preview, and only when the
-/// requested size is small enough that binning cannot upsample.
-fn develops_draft(purpose: RenderPurpose, max_width: u32, max_height: u32) -> bool {
-    purpose == RenderPurpose::Preview && render::draft_requested(max_width, max_height)
+/// Both halves matter. Inferring from size alone would silently soften an export
+/// that asked for 2048 pixels, legitimate for the web. Trusting the flag alone
+/// would halve the resolution of a 1:1 preview, where nothing downstream
+/// resamples the detail away.
+fn develops_draft(flags: u32, max_width: u32, max_height: u32) -> bool {
+    flags & FRAME_FLAG_DRAFT != 0 && render::draft_requested(max_width, max_height)
 }
 
 fn render_graph_image(
@@ -1186,7 +1179,6 @@ fn render_graph_image(
     frame: &RenderFrameV1,
     graph_bytes: &[u8],
     cache_mode: u32,
-    purpose: RenderPurpose,
 ) -> Result<RgbImage, Error> {
     frame.validate()?;
     let ops = parse_graph(graph_bytes)?;
@@ -1208,7 +1200,7 @@ fn render_graph_image(
     };
     // A live preview develops a draft: each sensor quad becomes one pixel
     // rather than interpolating a colour for every photosite.
-    let draft = develops_draft(purpose, frame.max_width, frame.max_height);
+    let draft = develops_draft(frame.flags, frame.max_width, frame.max_height);
     let (decoded, source_identity): (Arc<DecodedRaw>, Option<render::DecodeCacheKey>) =
         render::decoded_for_render_with_identity(input, cache_mode, draft, profiling)?;
     let (native_max_width, native_max_height) =
@@ -1261,20 +1253,22 @@ fn render_graph_image(
 #[cfg(test)]
 mod tests {
     #[test]
-    fn only_a_live_preview_develops_a_draft() {
+    fn only_a_render_that_asked_for_it_develops_a_draft() {
         // An export at a web-sized bound is still an export: halving its
         // resolution to save time would quietly ship a softer image.
         for (width, height) in [(0, 0), (1600, 1200), (2048, 2048), (6000, 4000)] {
             assert!(
-                !develops_draft(RenderPurpose::Deliverable, width, height),
-                "{width}x{height} drafted a deliverable"
+                !develops_draft(0, width, height),
+                "{width}x{height} drafted without being asked"
             );
         }
-        assert!(develops_draft(RenderPurpose::Preview, 1600, 1200));
+        assert!(develops_draft(FRAME_FLAG_DRAFT, 1600, 1200));
         // A preview asking for full resolution — a 1:1 zoom — wants the real
         // demosaic, since nothing downstream will resample the detail away.
-        assert!(!develops_draft(RenderPurpose::Preview, 0, 0));
-        assert!(!develops_draft(RenderPurpose::Preview, 6000, 4000));
+        assert!(!develops_draft(FRAME_FLAG_DRAFT, 0, 0));
+        assert!(!develops_draft(FRAME_FLAG_DRAFT, 6000, 4000));
+        // Unknown flags must not turn drafting on.
+        assert!(!develops_draft(FRAME_FLAG_DRAFT << 1, 1600, 1200));
     }
 
     use super::*;
