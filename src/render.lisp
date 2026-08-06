@@ -109,8 +109,12 @@
   nil)
 
 (defun acquire-render-source (input-pathname)
-  (let ((key (file-content-key input-pathname))
-        (extension (render-source-extension input-pathname)))
+  ;; The extension names a freshly extracted file, so it is only wanted on the
+  ;; miss path. Reading it eagerly cost 93 ms of every interactive tick on a
+  ;; DNG: it parses the container's directories to find the embedded original's
+  ;; name, and a cache hit then threw the answer away. At 80 MP that was two
+  ;; thirds of the whole tick, dwarfing the 20 ms of grading it guarded.
+  (let ((key (file-content-key input-pathname)))
     (loop
       (let (entry builder-p)
         (sb-thread:with-mutex (*render-source-cache-lock*)
@@ -130,7 +134,9 @@
             (t
              (setf entry
                    (make-render-source-cache-entry
-                    :pathname (render-source-cache-pathname key extension))
+                    :pathname
+                    (render-source-cache-pathname
+                     key (render-source-extension input-pathname)))
                    (gethash key *render-source-cache-entries*) entry
                    builder-p t))))
         (when builder-p

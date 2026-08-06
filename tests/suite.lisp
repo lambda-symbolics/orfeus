@@ -1410,6 +1410,7 @@ the failure list, and both ON-ERROR modes without needing real RAW files."
 (defun dng-render-source-cache-reuses-content-p ()
   (let ((input (test-temporary-pathname "dng"))
         (extract-count 0)
+        (name-count 0)
         first-path second-path changed-path cache-directory result)
     (unwind-protect
          (setf result
@@ -1419,6 +1420,7 @@ the failure list, and both ON-ERROR modes without needing real RAW files."
            (let ((orfeus::*render-source-name-reader*
                    (lambda (ignored)
                      (declare (ignore ignored))
+                     (incf name-count)
                      "embedded.orf"))
                  (orfeus::*render-source-extractor*
                    (lambda (source output)
@@ -1439,6 +1441,11 @@ the failure list, and both ON-ERROR modes without needing real RAW files."
                       (and (probe-file source) t)))
              (setf cache-directory orfeus::*render-source-cache-directory*)
              (and (= extract-count 2)
+                  ;; Naming the embedded original means reading the container's
+                  ;; directories, which is only wanted when an entry is about
+                  ;; to be built. Doing it on every acquire cost 93 ms of every
+                  ;; interactive tick on an 80 MP DNG, against 20 ms of grading.
+                  (= name-count 2)
                   (equal first-path second-path)
                   (not (equal first-path changed-path))
                   (probe-file first-path)
