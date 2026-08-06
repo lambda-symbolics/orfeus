@@ -72,30 +72,87 @@ one-based suffix. Explicit :output paths are never rewritten."
      :max-height (export-settings-max-height export)
      :preserve-metadata-p (export-settings-preserve-metadata-p export))))
 
+(defparameter *render-concurrency* 2
+  "Photographs rendered at once by PROJECT-RENDER.
+
+One photograph already saturates every core through the middle of the pipeline,
+but its decode and its JPEG encode are largely serial, so a second render
+overlapping those raises throughput. Kept low deliberately: each render in
+flight holds whole-image float buffers, hundreds of megabytes at export size.")
+
+(defun render-concurrency (count)
+  "Workers to use for COUNT photographs, never more than there is work for."
+  (max 1 (min count *render-concurrency*)))
+
 (defun project-render (project &key (if-exists :error) (on-error :abort)
                                   progress-callback)
   "Render every photo in PROJECT through the shared processing pipeline.
 
 Returns two values: completed output pathnames and `(PHOTO . CONDITION)`
-failures. ON-ERROR accepts :ABORT or :CONTINUE. PROGRESS-CALLBACK, when
-provided, receives index, total, photo job, and output pathname before each
-render starts."
+failures, both in project order. ON-ERROR accepts :ABORT or :CONTINUE.
+PROGRESS-CALLBACK, when provided, receives index, total, photo job, and output
+pathname before each render starts.
+
+Renders run *RENDER-CONCURRENCY* at a time, so progress callbacks may arrive
+out of order and more than one photograph may be in flight when a failure
+aborts the batch."
   (check-type project project)
   (check-type on-error (member :abort :continue))
-  (let ((completed '())
-        (failures '())
-        (photos (project-photos project)))
+  (let* ((photos (project-photos project))
+         (total (length photos))
+         (outputs (make-array total))
+         (results (make-array total :initial-element nil))
+         (next 0)
+         (aborted nil)
+         (lock (sb-thread:make-mutex :name "orfeus project render"))
+         (workers (render-concurrency total)))
     (loop for photo in photos
-          for index from 1
-          for output = (photo-job-render-output project photo)
-          do (when progress-callback
-               (funcall progress-callback index (length photos) photo output))
-             (handler-case
-                 (progn
-                   (render-photo-job project photo :if-exists if-exists)
-                   (push output completed))
-               (error (condition)
-                 (push (cons photo condition) failures)
-                 (when (eq on-error :abort)
-                   (error condition)))))
-    (values (nreverse completed) (nreverse failures))))
+          for index from 0
+          do (setf (aref outputs index) (photo-job-render-output project photo)))
+    (labels ((claim ()
+               ;; One queue, taken under a lock, so a worker that finishes early
+               ;; picks up the next photograph rather than idling.
+               (sb-thread:with-mutex (lock)
+                 (unless (or aborted (>= next total))
+                   (prog1 next (incf next)))))
+             (report (index)
+               (when progress-callback
+                 (sb-thread:with-mutex (lock)
+                   (funcall progress-callback (1+ index) total
+                            (nth index photos) (aref outputs index)))))
+             (work ()
+               (loop for index = (claim)
+                     while index
+                     do (report index)
+                        (handler-case
+                            (progn
+                              (render-photo-job project (nth index photos)
+                                                :if-exists if-exists)
+                              (setf (aref results index)
+                                    (cons :done (aref outputs index))))
+                          (error (condition)
+                            (setf (aref results index) (cons :failed condition))
+                            (when (eq on-error :abort)
+                              (sb-thread:with-mutex (lock)
+                                (setf aborted t))))))))
+      (if (= workers 1)
+          (work)
+          (let ((threads
+                  (loop repeat workers
+                        collect (sb-thread:make-thread
+                                 #'work :name "orfeus render worker"))))
+            (mapc #'sb-thread:join-thread threads))))
+    (let ((completed '())
+          (failures '())
+          (first-failure nil))
+      (loop for photo in photos
+            for index from 0
+            for result = (aref results index)
+            do (case (car result)
+                 (:done (push (cdr result) completed))
+                 (:failed (push (cons photo (cdr result)) failures)
+                          (unless first-failure
+                            (setf first-failure (cdr result))))))
+      (when (and first-failure (eq on-error :abort))
+        (error first-failure))
+      (values (nreverse completed) (nreverse failures)))))

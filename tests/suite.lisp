@@ -44,6 +44,44 @@
                    (orfeus:processing-graph-nodes
                     (orfeus:processing-preset-graph copied-preset)))))))
 
+(defun project-render-batches-in-order-p ()
+  "PROJECT-RENDER must aggregate in project order despite rendering in parallel.
+
+Every photograph here is missing, so each render fails: that exercises ordering,
+the failure list, and both ON-ERROR modes without needing real RAW files."
+  (let* ((photos (loop for index below 7
+                       collect (orfeus:make-photo-job
+                                :input-path (make-pathname
+                                             :name (format nil "absent-~D" index)
+                                             :type "orf"))))
+         (project (orfeus:make-project
+                   :output-directory (merge-pathnames
+                                      "orfeus-render-order/"
+                                      (uiop:temporary-directory))
+                   :photos photos))
+         (seen '()))
+    (multiple-value-bind (completed failures)
+        (orfeus:project-render project :on-error :continue
+                                       :progress-callback
+                                       (lambda (index total photo output)
+                                         (declare (ignore total output))
+                                         (push (cons index photo) seen)))
+      (and (null completed)
+           ;; Every photograph attempted exactly once, and reported in order.
+           (= (length photos) (length failures))
+           (equal photos (mapcar #'car failures))
+           (= (length photos) (length seen))
+           (equal (loop for index from 1 to (length photos) collect index)
+                  (sort (mapcar #'car seen) #'<))
+           ;; Aborting still signals, and never reports a completion.
+           (handler-case
+               (progn (orfeus:project-render project :on-error :abort) nil)
+             (error () t))
+           ;; Concurrency is bounded by the work available.
+           (= 1 (orfeus::render-concurrency 1))
+           (= 1 (orfeus::render-concurrency 0))
+           (<= (orfeus::render-concurrency 100) orfeus::*render-concurrency*)))))
+
 (defun test-temporary-pathname (suffix)
   (merge-pathnames
    (format nil "orfeus-test-~D-~D.~A"
@@ -1484,6 +1522,8 @@
       (check "project S-expressions round trip" (project-round-trip-p))
       (check "deep project copies share nothing an edit can reach"
              (project-deep-copy-is-independent-p))
+      (check "parallel batch renders report in project order"
+             (project-render-batches-in-order-p))
       (check "project files round trip" (project-file-round-trip-p))
       (check "export settings round trip" (export-settings-round-trip-p))
       (check "processing presets round trip" (processing-presets-round-trip-p))
