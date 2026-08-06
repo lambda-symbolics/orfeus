@@ -45,7 +45,7 @@
                     (orfeus:processing-preset-graph copied-preset)))))))
 
 (defun project-render-batches-in-order-p ()
-  "PROJECT-RENDER must aggregate in project order despite rendering in parallel.
+  "PROJECT-RENDER must report completions and failures in project order.
 
 Every photograph here is missing, so each render fails: that exercises ordering,
 the failure list, and both ON-ERROR modes without needing real RAW files."
@@ -77,10 +77,7 @@ the failure list, and both ON-ERROR modes without needing real RAW files."
            (handler-case
                (progn (orfeus:project-render project :on-error :abort) nil)
              (error () t))
-           ;; Concurrency is bounded by the work available.
-           (= 1 (orfeus::render-concurrency 1))
-           (= 1 (orfeus::render-concurrency 0))
-           (<= (orfeus::render-concurrency 100) orfeus::*render-concurrency*)))))
+           ))))
 
 (defun test-temporary-pathname (suffix)
   (merge-pathnames
@@ -1522,7 +1519,7 @@ the failure list, and both ON-ERROR modes without needing real RAW files."
       (check "project S-expressions round trip" (project-round-trip-p))
       (check "deep project copies share nothing an edit can reach"
              (project-deep-copy-is-independent-p))
-      (check "parallel batch renders report in project order"
+      (check "batch renders report in project order"
              (project-render-batches-in-order-p))
       (check "project files round trip" (project-file-round-trip-p))
       (check "export settings round trip" (export-settings-round-trip-p))
