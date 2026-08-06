@@ -11,6 +11,23 @@ const STAGES: [&str; 5] = [
 ];
 
 fn main() {
+    let libraw = pkg_config::Config::new()
+        .probe("libraw")
+        .expect("LibRaw is required; enter the Nix development shell");
+    let mut bridge = cc::Build::new();
+    bridge
+        .cpp(true)
+        .file("src/libraw_bridge.cpp")
+        .flag_if_supported("-std=c++17");
+    for include_path in &libraw.include_paths {
+        bridge.include(include_path);
+    }
+    bridge.opt_level(2).compile("orfeus_libraw_bridge");
+    for link_path in &libraw.link_paths {
+        println!("cargo:rustc-link-arg=-Wl,-rpath,{}", link_path.display());
+    }
+    println!("cargo:rerun-if-changed=src/libraw_bridge.cpp");
+
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR"));
     // Every stage includes the shared layout header, so changing it recompiles
     // all of them.

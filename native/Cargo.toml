@@ -21,6 +21,10 @@ rawler = "=0.7.2"
 rayon = "=1.12.0"
 sha2 = "=0.10.9"
 
+[build-dependencies]
+cc = "=1.4.0"
+pkg-config = "=0.3.33"
+
 [features]
 # Both measured on a 13700H at 20 MP, medians of three full exports: system
 # 1316 ms, mimalloc 1323 ms, rpmalloc 1487 ms. Neither helps and rpmalloc hurts,

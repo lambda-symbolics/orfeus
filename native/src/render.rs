@@ -2129,6 +2129,77 @@ pub(crate) fn draft_identity(key: DecodeCacheKey) -> DecodeCacheKey {
     hasher.finalize().into()
 }
 
+// Rawler 0.7.2 treats the PEN-F's eight-shot 80 MP composite as an ordinary
+// Bayer frame, producing a periodic magenta chroma grid. LibRaw develops this
+// exact sensor mode correctly; keep the fallback narrow so ordinary files retain
+// Orfeus's unclipped rawler pipeline.
+fn requires_libraw_high_resolution(make: &str, model: &str, width: usize, height: usize) -> bool {
+    make.to_ascii_uppercase().contains("OLYMPUS")
+        && model.trim().eq_ignore_ascii_case("PEN-F")
+        && (width, height) == (10400, 7796)
+}
+
+fn crop_linear_srgb(
+    image: super::color::LinearSrgbImage,
+    crop: Rect,
+) -> Result<super::color::LinearSrgbImage, Error> {
+    let end_x = crop
+        .p
+        .x
+        .checked_add(crop.d.w)
+        .ok_or_else(|| Error::Render("LibRaw crop width overflow".to_string()))?;
+    let end_y = crop
+        .p
+        .y
+        .checked_add(crop.d.h)
+        .ok_or_else(|| Error::Render("LibRaw crop height overflow".to_string()))?;
+    if crop.d.w == 0 || crop.d.h == 0 || end_x > image.width || end_y > image.height {
+        return Err(Error::Render(format!(
+            "LibRaw output {}x{} does not contain RAW crop {}x{}+{}+{}",
+            image.width, image.height, crop.d.w, crop.d.h, crop.p.x, crop.p.y
+        )));
+    }
+    if crop.p.x == 0 && crop.p.y == 0 && crop.d.w == image.width && crop.d.h == image.height {
+        return Ok(image);
+    }
+
+    let source_stride = image.width * 3;
+    let row_samples = crop.d.w * 3;
+    let mut data = vec![0.0; crop.d.w * crop.d.h * 3];
+    data.par_chunks_mut(row_samples)
+        .enumerate()
+        .for_each(|(output_y, output_row)| {
+            let source_y = crop.p.y + output_y;
+            let source_start = source_y * source_stride + crop.p.x * 3;
+            output_row.copy_from_slice(&image.data[source_start..source_start + row_samples]);
+        });
+    Ok(super::color::LinearSrgbImage {
+        width: crop.d.w,
+        height: crop.d.h,
+        data,
+    })
+}
+
+fn libraw_default_crop(
+    raw: &RawImage,
+    half_size: bool,
+    image: super::color::LinearSrgbImage,
+) -> Result<super::color::LinearSrgbImage, Error> {
+    let full = Rect::new(
+        rawler::imgop::Point::new(0, 0),
+        rawler::imgop::Dim2::new(raw.width, raw.height),
+    );
+    let active = raw.active_area.unwrap_or(full);
+    let Some(mut crop) = raw.crop_area else {
+        return Ok(image);
+    };
+    crop = crop.adapt(&active);
+    if half_size {
+        crop.scale(0.5);
+    }
+    crop_linear_srgb(image, crop)
+}
+
 fn develop_half_resolution(raw: &RawImage) -> Option<Intermediate> {
     let RawPhotometricInterpretation::Cfa(config) = &raw.photometric else {
         return None;
@@ -2207,19 +2278,27 @@ fn decode_linear_srgb(input: &Path, draft: bool, profiling: bool) -> Result<Deco
     ];
     // A draft preview bins each sensor quad instead of interpolating every
     // photosite; anything it cannot handle falls back to the full demosaic.
-    let developed = match draft.then(|| develop_half_resolution(&raw)).flatten() {
-        Some(binned) => binned,
-        None => RawDevelop { steps }
-            .develop_intermediate(&raw)
-            .map_err(|e| Error::Render(format!("RAW development: {e}")))?,
+    let high_resolution =
+        requires_libraw_high_resolution(&metadata.make, &metadata.model, raw.width, raw.height);
+    let linear_srgb = if high_resolution {
+        let image = super::libraw::decode_linear_srgb(input, draft)?;
+        profile_stage!("develop");
+        libraw_default_crop(&raw, draft, image)?
+    } else {
+        let developed = match draft.then(|| develop_half_resolution(&raw)).flatten() {
+            Some(binned) => binned,
+            None => RawDevelop { steps }
+                .develop_intermediate(&raw)
+                .map_err(|e| Error::Render(format!("RAW development: {e}")))?,
+        };
+        profile_stage!("develop");
+        // Start from the camera's neutral rendering for both as-shot and custom
+        // temperature. Custom Kelvin is a relative chromatic adaptation around D65;
+        // dropping the sensor WB coefficients leaves Bayer green dominant.
+        let white_balance = raw.wb_coeffs;
+        intermediate_to_linear_srgb(developed, &raw.color_matrix, white_balance)
+            .map_err(Error::Color)?
     };
-    profile_stage!("develop");
-    // Start from the camera's neutral rendering for both as-shot and custom
-    // temperature. Custom Kelvin is a relative chromatic adaptation around D65;
-    // dropping the sensor WB coefficients leaves Bayer green dominant.
-    let white_balance = raw.wb_coeffs;
-    let linear_srgb = intermediate_to_linear_srgb(developed, &raw.color_matrix, white_balance)
-        .map_err(Error::Color)?;
     profile_stage!("camera-to-srgb");
     let _ = stage_started;
     Ok(DecodedRaw {
@@ -2524,6 +2603,66 @@ mod tests {
         assert_ne!(draft_identity(key), draft_identity(other));
         // Stable, so a second preview of the same file hits the cache.
         assert_eq!(draft_identity(key), draft_identity(key));
+    }
+
+    #[test]
+    fn only_pen_f_high_resolution_frames_use_libraw() {
+        assert!(requires_libraw_high_resolution(
+            "OLYMPUS CORPORATION",
+            "PEN-F",
+            10400,
+            7796
+        ));
+        assert!(requires_libraw_high_resolution(
+            "Olympus Imaging Corp.",
+            "pen-f",
+            10400,
+            7796
+        ));
+        assert!(!requires_libraw_high_resolution(
+            "OLYMPUS CORPORATION",
+            "PEN-F",
+            5184,
+            3888
+        ));
+        assert!(!requires_libraw_high_resolution(
+            "OM Digital Solutions",
+            "OM-1",
+            10400,
+            7796
+        ));
+    }
+
+    #[test]
+    fn linear_srgb_crop_copies_exact_rgb_rows_and_checks_bounds() {
+        let source = crate::color::LinearSrgbImage {
+            width: 4,
+            height: 3,
+            data: (0..36).map(|value| value as f32).collect(),
+        };
+        let crop = Rect::new(
+            rawler::imgop::Point::new(1, 1),
+            rawler::imgop::Dim2::new(2, 2),
+        );
+        let cropped = crop_linear_srgb(source, crop).unwrap();
+        assert_eq!((cropped.width, cropped.height), (2, 2));
+        assert_eq!(
+            cropped.data,
+            vec![
+                15.0, 16.0, 17.0, 18.0, 19.0, 20.0, 27.0, 28.0, 29.0, 30.0, 31.0, 32.0
+            ]
+        );
+
+        let source = crate::color::LinearSrgbImage {
+            width: 2,
+            height: 2,
+            data: vec![0.0; 12],
+        };
+        let outside = Rect::new(
+            rawler::imgop::Point::new(1, 1),
+            rawler::imgop::Dim2::new(2, 2),
+        );
+        assert!(crop_linear_srgb(source, outside).is_err());
     }
 
     /// Times the noise reduction at export resolution, isolating it from decode

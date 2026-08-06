@@ -32,6 +32,7 @@ mod analyze;
 mod color;
 mod gpu;
 mod graphex;
+mod libraw;
 mod nn;
 mod render;
 mod tone;
