@@ -23,13 +23,13 @@
             (,value (progn ,@body)))
        (values ,value (milliseconds ,start (get-internal-real-time))))))
 
-(defun curve-graph (white)
-  "A graph ending in a curves node whose red white point sits at WHITE."
+(defun curve-graph (lift)
+  "A graph ending in a curves node whose red shadow point sits at LIFT."
   (let* ((graph (orfeus:settings->graph (orfeus:make-processing-settings)))
          (node (orfeus:graph-insert-node
                 graph (orfeus:processing-graph-output graph) :curves
                 :params (list :red-points
-                              (list 0.0 0.0 0.33 0.33 0.67 0.67 white 1.0)))))
+                              (list 0.0 0.0 0.33 lift 0.67 0.67 1.0 1.0)))))
     (declare (ignore node))
     graph))
 
@@ -45,22 +45,22 @@
              (multiple-value-bind (size cold)
                  (timing (multiple-value-list
                           (orfeus:render-preview-rgb
-                           path (curve-graph 1.0) buffer capacity
+                           path (curve-graph 0.33) buffer capacity
                            :max-width bound :max-height bound)))
                (format t "    cold        ~,1F ms  -> ~{~A~^x~}~%" cold size))
              (multiple-value-bind (size warm)
                  (timing (multiple-value-list
                           (orfeus:render-preview-rgb
-                           path (curve-graph 1.0) buffer capacity
+                           path (curve-graph 0.33) buffer capacity
                            :max-width bound :max-height bound)))
                (declare (ignore size))
                (format t "    same again  ~,1F ms~%" warm))
-             (loop for white in '(0.9 0.8 0.7 0.6)
+             (loop for lift in '(0.30 0.36 0.40 0.44 0.48)
                    for index from 1
                    do (multiple-value-bind (size drag)
                           (timing (multiple-value-list
                                    (orfeus:render-preview-rgb
-                                    path (curve-graph white) buffer capacity
+                                    path (curve-graph lift) buffer capacity
                                     :max-width bound :max-height bound)))
                         (declare (ignore size))
                         (format t "    drag tick ~D ~,1F ms~%" index drag))))
