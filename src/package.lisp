@@ -26,6 +26,10 @@
    #:dng-original-error
    #:dng-original-filename
    #:export-settings
+   #:file-content-key
+   #:forget-content-key
+   #:file-fast-digest
+   #:file-stat-identity
    #:export-format-extension
    #:export-settings-format
    #:export-settings-jpeg-quality

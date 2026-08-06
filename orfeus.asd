@@ -20,6 +20,7 @@
                ;; Data definitions come before anything that serializes or
                ;; copies them, so their accessors inline at those call sites.
                (:file "src/types")
+               (:file "src/digest")
                (:file "src/native")
                (:file "src/metadata")
                (:file "src/project")

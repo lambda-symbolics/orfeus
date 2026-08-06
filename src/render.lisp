@@ -60,10 +60,6 @@
 (defvar *render-source-cache-entries* (make-hash-table :test #'equal))
 (defvar *render-source-cache-clock* 0)
 
-(defun file-sha256-string (pathname)
-  (ironclad:byte-array-to-hex-string
-   (ironclad:digest-file :sha256 pathname)))
-
 (defun render-source-cache-directory ()
   (or *render-source-cache-directory*
       (setf *render-source-cache-directory*
@@ -113,7 +109,7 @@
   nil)
 
 (defun acquire-render-source (input-pathname)
-  (let ((key (file-sha256-string input-pathname))
+  (let ((key (file-content-key input-pathname))
         (extension (render-source-extension input-pathname)))
     (loop
       (let (entry builder-p)
@@ -143,7 +139,7 @@
                 (funcall *render-source-extractor*
                          input-pathname
                          (render-source-cache-entry-pathname entry))
-                (unless (string= key (file-sha256-string input-pathname))
+                (unless (string= key (file-content-key input-pathname))
                   (error 'raw-render-error
                          :input-pathname input-pathname
                          :output-pathname

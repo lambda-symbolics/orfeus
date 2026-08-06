@@ -426,7 +426,14 @@
              (rename-file original renamed)
              (check (string= key (orfeus/gui::photo-content-key renamed))
                     "Renaming a photo changed its content key")
-             (check (= 64 (length key)) "Content key is not full SHA-256")
+             (check (= 32 (length key)) "Content key is not a 128-bit digest")
+             ;; A copy of a photograph must key the same, or interning it off a
+             ;; card would throw away every preview already rendered for it.
+             (let ((copied (merge-pathnames "copied.orf" directory)))
+               (uiop:copy-file renamed copied)
+               (check (string= key (orfeus/gui::photo-content-key copied))
+                      "A copy of a photograph keyed differently")
+               (delete-file copied))
              ;; A middle-only edit defeated the former head/tail sampler.
              (with-open-file (stream renamed :direction :io
                                              :if-exists :overwrite
@@ -532,11 +539,16 @@
 (defun test-bundled-film-lut-menu ()
   (let ((names (mapcar #'file-namestring (orfeus/gui::gui-bundled-lut-paths))))
     (check (equal names
+                  ;; Sorted case-insensitively, so the IWLTBAP stocks land
+                  ;; between the Agfa and Kodak ones.
                   '("agfa_apx_100.cube"
                     "agfa_apx_25.cube"
                     "agfa_precisa_100.cube"
                     "agfa_ultra_color_100.cube"
                     "agfa_vista_200.cube"
+                    "IWLTBAP K25.cube"
+                    "IWLTBAP K64.cube"
+                    "IWLTBAP K99.cube"
                     "kodak_kodachrome_200.cube"
                     "kodak_kodachrome_25.cube"
                     "kodak_kodachrome_64.cube"

@@ -546,19 +546,9 @@ removed, or replaced photograph can never leave a stale graph on screen."
         (uiop:temporary-directory)))
       (error "Cannot create a secure preview cache directory.")))
 
-(defun file-sha256 (pathname)
-  "Return the complete SHA-256 hex digest of PATHNAME."
-  (with-open-file (stream pathname :element-type '(unsigned-byte 8))
-    (let ((digest (ironclad:make-digest :sha256))
-          (buffer (make-array 1048576 :element-type '(unsigned-byte 8))))
-      (loop for count = (read-sequence buffer stream)
-            while (plusp count)
-            do (ironclad:update-digest digest buffer :end count))
-      (ironclad:byte-array-to-hex-string (ironclad:produce-digest digest)))))
-
 (defun photo-content-key (pathname)
-  "Return a full content digest, invalidating every in-process replacement."
-  (file-sha256 pathname))
+  "Return the shared content key for PATHNAME. See ORFEUS:FILE-CONTENT-KEY."
+  (orfeus:file-content-key pathname))
 
 (defun preview-cache-hit-p (pathname)
   (when (probe-file pathname)
@@ -655,7 +645,7 @@ best effort housekeeping."
   (let* ((dependencies
            (loop for path in (active-preview-lut-paths recipe)
                  collect (list (namestring (pathname path))
-                               (handler-case (file-sha256 path)
+                               (handler-case (photo-content-key path)
                                  (error (condition)
                                    (list :unreadable (princ-to-string condition)))))))
          (identity
@@ -1775,14 +1765,15 @@ new cache entry is published."
            (selected-job ()
              (gui-model-selected-job model))
            (photo-content-key-for (job generation &optional refresh-p)
-             ;; Called only by render workers. Holding the mutex through hashing
-             ;; coalesces duplicate selected/background requests in a generation.
-             (let ((key (list job generation)))
-               (sb-thread:with-mutex (content-keys-lock)
-                 (when refresh-p (remhash key content-keys))
-                 (or (gethash key content-keys)
-                     (setf (gethash key content-keys)
-                           (photo-content-key (photo-job-input-path job)))))))
+             ;; PHOTO-CONTENT-KEY memoizes on the file's stat, so this no longer
+             ;; keeps a per-generation table of its own: keying that table by
+             ;; the generation counter, which advances on every click, meant a
+             ;; full digest of the RAW on every click and never a reuse.
+             (declare (ignore generation))
+             (let ((path (photo-job-input-path job)))
+               (when refresh-p
+                 (orfeus:forget-content-key path))
+               (photo-content-key path)))
            (thumbnail-row-height () 104)
            (thumbnail-scroll-limit ()
              (if thumbnail-canvas
@@ -1926,11 +1917,12 @@ new cache entry is published."
                       (handler-case
                           (let ((was (photo-job-input-path job)))
                             (orfeus:intern-photo-job job)
-                            ;; The preview caches key on the path, which just
-                            ;; changed under them.
                             (remhash was interned-photos)
-                            (remhash job thumbnail-files)
-                            (forget-preview-file was)
+                            ;; Nothing else is invalidated: the copy holds the
+                            ;; same bytes, so it has the same content key, and
+                            ;; every preview and thumbnail already rendered for
+                            ;; this photograph stays valid. Discarding them here
+                            ;; made interning redevelop both.
                             (incf interned))
                         (error (condition)
                           (incf failed)
@@ -1940,7 +1932,6 @@ new cache entry is published."
                                   (photo-job-input-path job) condition))))
                     (clrhash interned-photos)
                     (redraw-thumbnails)
-                    (schedule-edited-preview)
                     (set-status
                      (if (plusp failed)
                          (format nil "Interned ~D; ~D failed: ~A"

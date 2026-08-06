@@ -1520,7 +1520,10 @@ the failure list, and both ON-ERROR modes without needing real RAW files."
 (defun bundled-film-luts-match-pinned-digests-p ()
   (let* ((directory (asdf:system-relative-pathname "orfeus" #P"data/luts/"))
          (expected
-           '(("agfa_apx_100.cube" . "61f692f928d3809a77af2249035f771e47150964ac7243e9a217438cd2ca2858")
+           '(("IWLTBAP K25.cube" . "4065c4c9cdbe1df5e37f43538710ae340e877879ccf31875f91e0702d2bc03c4")
+             ("IWLTBAP K64.cube" . "da2e5731e0bff919d56fe188b78dcde963034dd1f9ba76d23a1f0cbefc49c852")
+             ("IWLTBAP K99.cube" . "2ad878a5611621f9f5748a3d58e14b8832ccf2d23d788bab3f904c56f1b804f6")
+             ("agfa_apx_100.cube" . "61f692f928d3809a77af2249035f771e47150964ac7243e9a217438cd2ca2858")
              ("agfa_apx_25.cube" . "5779cd44a2ea912085653054f12ae270343b87e918e27c63113afc52cebbb2cd")
              ("agfa_precisa_100.cube" . "712dd96ca82535164751ee432548ea4f619218d3025ffcbd2411eb1fbd10c2bb")
              ("agfa_ultra_color_100.cube" . "5c15b98ef31e836ce371a7725f1740ba7ecbe1e8aef6aaba89024b1d3b00e17b")
