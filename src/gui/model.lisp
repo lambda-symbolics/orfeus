@@ -541,6 +541,29 @@ applying it reproduces the grade node for node."
 
 ;;; Node graph editing.
 
+(defun swap-graph-node-positions (one other)
+  "Exchange two nodes' editor positions.
+
+Reordering the chain rewires it and renumbers ids, but the boxes are drawn from
+a position stored on each node. Without this the wires move and the nodes do
+not, which reads as the command having done nothing at all."
+  (let ((one-place (orfeus:graph-node-position one))
+        (other-place (orfeus:graph-node-position other)))
+    (setf (orfeus:graph-node-position one) other-place
+          (orfeus:graph-node-position other) one-place)))
+
+(defun reflow-graph-node-positions (graph from)
+  "Drop stored positions from node FROM onwards so the column re-derives them.
+
+A node inserted mid-chain arrives with no position and is placed by its index,
+which is the slot the node after it already occupies — so the two would be drawn
+on top of one another. Nodes above the insertion keep where they were put."
+  (let* ((nodes (orfeus:processing-graph-nodes graph))
+         (start (position from nodes)))
+    (when start
+      (dolist (node (nthcdr start nodes))
+        (setf (orfeus:graph-node-position node) nil)))))
+
 (defun gui-model-display-graph (model)
   "Return the graph to draw for the selected photo, without converting it.
 
@@ -608,6 +631,7 @@ placement breaks the film-domain rules."
                                (orfeus:graph-tail-linear-node-id graph))))
              (node (orfeus:graph-insert-node graph after-id kind
                                              :params params)))
+        (reflow-graph-node-positions graph node)
         (setf (gui-model-selected-node model) node)
         node))))
 
@@ -627,17 +651,29 @@ placement breaks the film-domain rules."
   (gui-model-checkpoint model)
   (let ((job (gui-model-selected-job model)))
     (when (and job (photo-job-graph job))
-      (let ((graph (photo-job-graph job)))
-        (ecase direction
-          (:earlier (orfeus:graph-swap-with-upstream
-                     graph (orfeus:graph-node-id node)))
-          (:later
-           (let ((consumers (orfeus:graph-consumers
-                             graph (orfeus:graph-node-id node))))
-             (when (and (= 1 (length consumers))
-                        (not (orfeus:graph-node-blend-p (first consumers))))
-               (orfeus:graph-swap-with-upstream
-                graph (orfeus:graph-node-id (first consumers)))))))))))
+      (let* ((graph (photo-job-graph job))
+             ;; The partner has to be found before the swap, which renumbers.
+             (partner
+               (ecase direction
+                 (:earlier
+                  (let ((upstream (first (orfeus:graph-node-inputs node))))
+                    (and upstream (orfeus:graph-find-node graph upstream))))
+                 (:later
+                  (let ((consumers (orfeus:graph-consumers
+                                    graph (orfeus:graph-node-id node))))
+                    (when (and (= 1 (length consumers))
+                               (not (orfeus:graph-node-blend-p
+                                     (first consumers))))
+                      (first consumers)))))))
+        (when partner
+          (let ((moved (orfeus:graph-swap-with-upstream
+                        graph
+                        (orfeus:graph-node-id (if (eq direction :earlier)
+                                                  node
+                                                  partner)))))
+            (when moved
+              (swap-graph-node-positions node partner)
+              t)))))))
 
 (defun gui-model-set-node-kind (model node kind)
   "Assign a correction KIND to NODE on the selected photo's graph."
