@@ -240,7 +240,28 @@ moves, so a destination the user picked survives every later save."
     (setf (orfeus:project-output-directory project) #P"/home/lukas/deliver/")
     (check (equal #P"/home/lukas/deliver/"
                   (orfeus:project-output-directory project))
-           "A chosen destination did not stick")))
+           "A chosen destination did not stick"))
+  ;; Importing into a named project must leave its exports where they are: the
+  ;; point of making an empty project first is to settle that before importing.
+  (let* ((project (orfeus/gui::gui-empty-project))
+         (model (orfeus/gui:make-gui-model :project project)))
+    (orfeus/gui::gui-model-replace-project model project
+                                           #P"/home/lukas/june/project.sexp")
+    (orfeus/gui::gui-model-anchor-export-directory
+     model #P"/home/lukas/june/project.sexp")
+    (orfeus/gui::gui-model-add-photos model (list #P"/shoots/incoming/a.orf"))
+    (check (= 1 (length (orfeus:project-photos project)))
+           "Importing into an empty named project added nothing")
+    (check (equal #P"/home/lukas/june/orfeus-exports/"
+                  (orfeus:project-output-directory project))
+           "Importing dragged a named project's exports to the photographs"))
+  ;; With no project, the photographs are the only anchor there is.
+  (let* ((project (orfeus/gui::gui-empty-project))
+         (model (orfeus/gui:make-gui-model :project project)))
+    (orfeus/gui::gui-model-add-photos model (list #P"/shoots/incoming/a.orf"))
+    (check (equal #P"/shoots/incoming/orfeus-exports/"
+                  (orfeus:project-output-directory project))
+           "Importing without a project did not anchor to the photographs")))
 
 (defun test-preset-bulk-application ()
   (let* ((jobs (loop for name in '("one" "two" "three")

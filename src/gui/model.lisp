@@ -234,7 +234,10 @@ the project is the user's business."
                                 inputs))
          (first-index (length photos)))
     (when new-inputs
-      (when (null photos)
+      ;; Only guess from the photographs when there is no project to anchor to.
+      ;; A saved project already says where its exports go, and importing into it
+      ;; must not drag them back to wherever the photographs happen to sit.
+      (when (and (null photos) (null (gui-model-project-path model)))
         (setf (project-output-directory project)
               (anchored-export-directory (first new-inputs))))
       (setf (project-photos project)

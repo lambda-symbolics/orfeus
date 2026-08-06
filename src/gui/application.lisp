@@ -3390,6 +3390,42 @@ new cache entry is published."
                (when path
                  (remember-picked-path path)
                  (replace-project (project-read path) (pathname path)))))
+           (new-project ()
+             ;; An empty project to import into, named up front so its export
+             ;; destination is settled before any photograph arrives.
+             (when (or (null (project-photos project))
+                       (= 1 (lightfast:choice-box
+                             (format nil
+                                     "Start a new project? ~D photograph~:P and any unsaved edits will be closed."
+                                     (length (project-photos project)))
+                             :button0 "Cancel" :button1 "New Project")))
+               (let ((path (lightfast:choose-save-file
+                            :title "New Orfeus project"
+                            :filter (fltk-file-filter "Orfeus project" "*.sexp")
+                            :preset-file
+                            (namestring
+                             (merge-pathnames "project.sexp" picker-directory)))))
+                 (replace-project (gui-empty-project))
+                 (cond
+                   (path
+                    (remember-picked-path path)
+                    (gui-model-anchor-export-directory model (pathname path))
+                    (handler-case
+                        (progn
+                          (project-write project (pathname path))
+                          (setf (gui-model-project-path model) (pathname path))
+                          (sync-export-controls)
+                          (set-status
+                           (format nil "New project at ~A; exports go to ~A"
+                                   (file-namestring path)
+                                   (namestring
+                                    (project-output-directory project)))))
+                      (error (condition)
+                        (set-status (format nil "Could not write the project: ~A"
+                                            condition)))))
+                   (t
+                    ;; Unnamed is still usable; exports settle when it is saved.
+                    (set-status "New project"))))))
            (save-project (&optional choose-p)
              (let ((path (or (and (not choose-p) (gui-model-project-path model))
                              (lightfast:choose-save-file
@@ -4444,6 +4480,11 @@ new cache entry is published."
         (lightfast:set-size-range window :min-width 960 :min-height 700)
         (setf menu (lightfast:make-menu-bar :parent window :x 0 :y 0
                                           :width 1280 :height 24))
+        (lightfast:add-menu-item menu "File/New Project"
+                               (lambda (&rest ignored)
+                                 (declare (ignore ignored))
+                                 (new-project))
+                               :shortcut (logior +menu-ctrl+ (char-code #\n)))
         (lightfast:add-menu-item menu "File/Open Photo" (lambda (&rest ignored)
                                                           (declare (ignore ignored))
                                                           (open-photo))
