@@ -1,7 +1,7 @@
 (asdf:defsystem #:orfeus
   :description "Fast Olympus RAW processing core."
   :author "Lucius"
-  :license "GPL-3.0-or-later"
+  :license "COLL-Attribution"
   :version "0.1.0"
   :depends-on (#:cffi
                #:ironclad
