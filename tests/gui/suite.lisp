@@ -218,6 +218,45 @@
       (check (eq (first photos) (orfeus/gui:gui-model-selected-job model))
              "Restoring the anchor did not keep the previewed photograph"))))
 
+(defun test-export-destination-anchor ()
+  "An unchosen export destination must follow the project, not the card.
+
+Opening photographs off a card is the only time Orfeus has to guess, and the
+guess is the card itself. Saving a project gives it somewhere better, and a
+destination the user picked must never be moved."
+  (let* ((card #P"/media/card/DCIM/100OLYMP/_6040106.ORF")
+         (project (orfeus/gui::gui-photos-project (list card)))
+         (model (orfeus/gui:make-gui-model :project project)))
+    (check (not (orfeus/gui::gui-model-output-directory-chosen-p model))
+           "A project built from loose photographs claimed a chosen destination")
+    (check (equal #P"/media/card/DCIM/100OLYMP/orfeus-exports/"
+                 (orfeus:project-output-directory project))
+           "The initial guess is not beside the photographs")
+    ;; Saving re-anchors the guess.
+    (orfeus/gui::gui-model-reanchor-export-directory
+     model #P"/home/lukas/shoots/june/project.sexp")
+    (check (equal #P"/home/lukas/shoots/june/orfeus-exports/"
+                 (orfeus:project-output-directory project))
+           "Saving a project did not move the guessed destination")
+    ;; A chosen destination is left alone.
+    (setf (orfeus:project-output-directory project) #P"/home/lukas/deliver/"
+          (orfeus/gui::gui-model-output-directory-chosen-p model) t)
+    (orfeus/gui::gui-model-reanchor-export-directory
+     model #P"/home/lukas/elsewhere/other.sexp")
+    (check (equal #P"/home/lukas/deliver/"
+                 (orfeus:project-output-directory project))
+           "Saving a project overrode a chosen destination"))
+  ;; A project read from a file recorded its own destination deliberately.
+  (let* ((project (orfeus:make-project :output-directory #P"/home/lukas/out/"))
+         (model (orfeus/gui:make-gui-model)))
+    (orfeus/gui::gui-model-replace-project model project #P"/home/lukas/p.sexp")
+    (check (orfeus/gui::gui-model-output-directory-chosen-p model)
+           "A loaded project's saved destination was treated as a guess")
+    (orfeus/gui::gui-model-replace-project
+     model (orfeus/gui::gui-photos-project (list #P"/media/card/x.orf")))
+    (check (not (orfeus/gui::gui-model-output-directory-chosen-p model))
+           "Opening loose photographs kept the previous chosen flag")))
+
 (defun test-preset-bulk-application ()
   (let* ((jobs (loop for name in '("one" "two" "three")
                      collect (orfeus:make-photo-job

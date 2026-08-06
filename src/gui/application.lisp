@@ -3401,9 +3401,15 @@ new cache entry is published."
                                                 picker-directory))))))
                (when path
                  (remember-picked-path path)
+                 ;; Re-anchor before writing, so the saved project records the
+                 ;; destination it will propose when reopened.
+                 (gui-model-reanchor-export-directory model (pathname path))
                  (project-write project path)
                  (setf (gui-model-project-path model) (pathname path))
-                 (set-status "Project saved"))))
+                 (sync-export-controls)
+                 (set-status
+                  (format nil "Project saved; exports go to ~A"
+                          (namestring (project-output-directory project)))))))
            (neutral-preview-settings ()
              (make-processing-settings
               :noise-reduction 0.0
@@ -3789,6 +3795,7 @@ new cache entry is published."
              ;; project, so the caller may start the export.
              (handler-case
                  (progn
+                   (setf (gui-model-output-directory-chosen-p model) t)
                    (update-project-export-settings
                     project
                     (lightfast:value export-dialog-destination)
@@ -3820,7 +3827,8 @@ new cache entry is published."
                             :preset-path (lightfast:value
                                           export-dialog-destination))))
                (when (and chosen (plusp (length chosen)))
-                 (setf (lightfast:value export-dialog-destination) chosen))))
+                 (setf (gui-model-output-directory-chosen-p model) t
+                       (lightfast:value export-dialog-destination) chosen))))
            (build-export-dialog ()
              ;; Laid out by Lightfast's flex engine: rows of label, control and
              ;; trailing button, with the destination field taking the slack.
@@ -3955,6 +3963,13 @@ new cache entry is published."
                          (if (selected-job)
                              "Current photograph"
                              "All photographs"))))
+             (unless (gui-model-output-directory-chosen-p model)
+               ;; Nobody has chosen a destination, so this one was guessed from
+               ;; where the photographs are — which may be the card they came
+               ;; off. Say so rather than let it be exported to silently.
+               (set-status
+                (format nil "Destination not chosen yet; proposing ~A beside the photographs"
+                        (namestring (project-output-directory project)))))
              (lightfast:show export-dialog))
            (choose-lut ()
              (let ((path (lightfast:choose-file

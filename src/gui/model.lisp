@@ -11,6 +11,12 @@ renumbering, so the selection stays valid across graph edits."
   (edit-target :photo :type (member :photo :defaults))
   (selected-node nil)
   project-path
+  ;; True once the export destination has been chosen deliberately — by the user
+  ;; in the export dialog, or by a project file that recorded one. Until then it
+  ;; is only a guess derived from where the photographs happen to live, which is
+  ;; often the card they were shot on, and must be re-anchored once somewhere
+  ;; better is known.
+  (output-directory-chosen-p nil)
   (undo-stack '() :type list)
   (redo-stack '() :type list))
 
@@ -153,13 +159,27 @@ Returns true when a new entry was pushed."
                 :defaults (gui-default-processing-settings)
                 :photos '()))
 
+(defun anchored-export-directory (anchor)
+  "Return the export directory Orfeus proposes beside ANCHOR."
+  (merge-pathnames #P"orfeus-exports/"
+                   (uiop:pathname-directory-pathname anchor)))
+
+(defun gui-model-reanchor-export-directory (model anchor)
+  "Point an unchosen export destination at ANCHOR's directory.
+
+Called when a project is saved: until then the only anchor available was the
+photographs themselves, so a card the photographs were shot on gets proposed as
+somewhere to write to."
+  (unless (gui-model-output-directory-chosen-p model)
+    (setf (project-output-directory (gui-model-project model))
+          (anchored-export-directory anchor))))
+
 (defun gui-photos-project (pathnames)
   "Return one project containing PATHNAMES in selection order."
   (let* ((inputs (mapcar #'pathname pathnames))
          (first-input (or (first inputs)
                           (error "At least one photograph is required.")))
-         (directory (uiop:pathname-directory-pathname first-input))
-         (output-directory (merge-pathnames #P"orfeus-exports/" directory)))
+         (output-directory (anchored-export-directory first-input)))
     (make-project :output-directory output-directory
                   :defaults (gui-default-processing-settings)
                   :photos (mapcar (lambda (input)
@@ -177,9 +197,13 @@ Returns true when a new entry was pushed."
           ((member type '("orf" "dng") :test #'string=) :photo))))
 
 (defun gui-model-replace-project (model project &optional project-path)
-  "Replace MODEL's project and reset its transient selection state."
+  "Replace MODEL's project and reset its transient selection state.
+
+A project read from a file recorded its own export destination, so that counts
+as chosen; a project assembled from loose photographs did not."
   (setf (gui-model-project model) project
         (gui-model-project-path model) project-path
+        (gui-model-output-directory-chosen-p model) (and project-path t)
         (gui-model-selected-index model) 0
         (gui-model-selected-indices model)
         (if (project-photos project) '(0) '())
@@ -222,9 +246,7 @@ Returns true when a new entry was pushed."
     (when new-inputs
       (when (null photos)
         (setf (project-output-directory project)
-              (merge-pathnames #P"orfeus-exports/"
-                               (uiop:pathname-directory-pathname
-                                (first new-inputs)))))
+              (anchored-export-directory (first new-inputs))))
       (setf (project-photos project)
             (append photos
                     (mapcar (lambda (input)
