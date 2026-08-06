@@ -1178,7 +1178,9 @@ new cache entry is published."
                    (discard-gui-tasks queue :after)
                    (enqueue-preview nil)))
                (redraw-previews)
-               (set-status (format nil "Preview zoom: ~,0F%" (* 100 new-zoom)))))
+               ;; ~,0F leaves the decimal point behind: "125.%".
+               (set-status (format nil "Preview zoom: ~D%"
+                                   (round (* 100 new-zoom))))))
            (fit-preview-to-source-pixels ()
              ;; One photosite per screen pixel, given whatever preview is
              ;; loaded. Only meaningful once the sensor-resolution render has
