@@ -558,19 +558,26 @@ the failure list, and both ON-ERROR modes without needing real RAW files."
                                   :curves
                                   :params (list :red-points points))))
     (and (graph-validate graph)
-         ;; The wire format flattens the three channels and the luma curve,
-         ;; filling unset ones with the identity diagonal.
+         ;; The wire format leads with one point count per channel, then the
+         ;; points, so a shaped red can sit beside three untouched channels
+         ;; that each cost only their two endpoints.
          (let ((params (orfeus::graph-node-program-parameters node)))
-           (and (= 32 (length params))
-                (= 0.05 (second params))
-                (= 0.33 (nth 10 params))
-                (= 0.33 (nth 26 params))))
+           (and (= 24 (length params))
+                (equal '(4.0 2.0 2.0 2.0) (subseq params 0 4))
+                (= 0.05 (nth 5 params))
+                (equal '(0.0 0.0 1.0 1.0) (subseq params 12 16))
+                (equal '(0.0 0.0 1.0 1.0) (subseq params 20 24))))
          (eql 10 (rest (assoc :curves orfeus::*graph-node-kind-codes*)))
          ;; Points survive the project S-expression round trip.
          (let* ((decoded (sexp->graph (graph->sexp graph)))
                 (twin (find :curves (processing-graph-nodes decoded)
                             :key #'graph-node-kind)))
            (equal points (getf (graph-node-params twin) :red-points)))
+         ;; A channel may be as short as its two endpoints: four channels of
+         ;; two points is sixteen floats behind the four counts.
+         (let ((two (graph-insert-node (default-processing-graph) 2 :curves
+                                       :params '(:blue-points (0.0 0.0 0.4 1.0)))))
+           (= 20 (length (orfeus::graph-node-program-parameters two))))
          ;; Descending positions are rejected.
          (handler-case
              (progn
@@ -578,6 +585,22 @@ the failure list, and both ON-ERROR modes without needing real RAW files."
                 (default-processing-graph) 2 :curves
                 :params '(:green-points
                           (0.0 0.0 0.6 0.5 0.3 0.7 1.0 1.0)))
+               nil)
+           (invalid-project-data () t))
+         ;; So is a lone point, and so is a channel past the native ceiling.
+         (handler-case
+             (progn (graph-insert-node (default-processing-graph) 2 :curves
+                                       :params '(:red-points (0.5 0.5)))
+                    nil)
+           (invalid-project-data () t))
+         (handler-case
+             (let ((over (1+ *maximum-curve-points*)))
+               (graph-insert-node
+                (default-processing-graph) 2 :curves
+                :params (list :red-points
+                              (loop for index below over
+                                    append (list (/ index (float over))
+                                                 (/ index (float over))))))
                nil)
            (invalid-project-data () t)))))
 
@@ -1207,9 +1230,9 @@ the failure list, and both ON-ERROR modes without needing real RAW files."
                  :output 1))
          (bytes (orfeus::graph->program-bytes graph)))
     (equalp bytes
-            ;; magic "ORFG", version 2, one node: exposure(2), input 0,
+            ;; magic "ORFG", version 3, one node: exposure(2), input 0,
             ;; no second input, one parameter 0.5f0, no string.
-            (coerce #(#x4F #x52 #x46 #x47  2 0 0 0  1 0 0 0
+            (coerce #(#x4F #x52 #x46 #x47  3 0 0 0  1 0 0 0
                       2 0 0 0  0 0 0 0  #xFF #xFF #xFF #xFF
                       1 0 0 0  0 0 0 #x3F  0 0 0 0)
                     '(simple-array (unsigned-byte 8) (*))))))

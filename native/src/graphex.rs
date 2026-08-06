@@ -19,7 +19,8 @@ use super::Error;
 use super::render::{self, DecodedRaw, LensCorrectionOptions, RgbImage};
 
 const GRAPH_MAGIC: u32 = 0x4746_524F; // "ORFG" little-endian
-const GRAPH_VERSION: u32 = 2;
+// 3 made each curves channel variable length behind a count header.
+const GRAPH_VERSION: u32 = 3;
 const MAX_GRAPH_NODES: usize = 64;
 
 pub const NODE_WHITE_BALANCE: u32 = 1;
@@ -144,26 +145,81 @@ impl<'a> GraphReader<'a> {
     }
 }
 
-fn expected_param_count(kind: u32) -> Result<usize, Error> {
+/// How many parameters a node kind carries.
+///
+/// Every kind but one has a fixed count. A curves node's channels each hold
+/// between two and MAX_CURVE_POINTS control points, so its length is only known
+/// from the counts in its own header.
+enum ParamArity {
+    Exact(usize),
+    Curves,
+}
+
+/// Control points per curve channel, at least the two endpoints.
+const MIN_CURVE_POINTS: usize = 2;
+const MAX_CURVE_POINTS: usize = 16;
+const CURVE_CHANNELS: usize = 4;
+const MAX_CURVE_PARAMS: usize = CURVE_CHANNELS + CURVE_CHANNELS * MAX_CURVE_POINTS * 2;
+
+fn param_arity(kind: u32) -> Result<ParamArity, Error> {
     Ok(match kind {
-        NODE_WHITE_BALANCE => 2,   // kelvin (0 = as shot), tint
-        NODE_EXPOSURE => 1,        // ev
-        NODE_NOISE_REDUCTION => 2, // edge-aware, neural
-        NODE_TONE => 7,            // blacks..whites
-        NODE_OPTICS => 3,          // distortion?, strength, tca?
-        NODE_FILM => 3,            // lut strength, grain amount, grain size
-        NODE_BLEND => 1,           // opacity toward input B
-        NODE_COLOR_SUBTRACT => 3,  // picked color, subtracted per channel
-        NODE_CROP => 5,            // left, top, width, height, angle (degrees)
-        NODE_CURVES => 32,         // red, green, blue, luma x four (x, y) points
+        NODE_WHITE_BALANCE => ParamArity::Exact(2), // kelvin (0 = as shot), tint
+        NODE_EXPOSURE => ParamArity::Exact(1),      // ev
+        NODE_NOISE_REDUCTION => ParamArity::Exact(2), // edge-aware, neural
+        NODE_TONE => ParamArity::Exact(7),          // blacks..whites
+        NODE_OPTICS => ParamArity::Exact(3),        // distortion?, strength, tca?
+        NODE_FILM => ParamArity::Exact(3),          // lut strength, grain amount, size
+        NODE_BLEND => ParamArity::Exact(1),         // opacity toward input B
+        NODE_COLOR_SUBTRACT => ParamArity::Exact(3), // picked colour, per channel
+        NODE_CROP => ParamArity::Exact(5),          // left, top, width, height, angle
+        NODE_CURVES => ParamArity::Curves,          // four counts, then their points
         _ => return Err(Error::InvalidArgument("unknown graph node kind")),
     })
 }
 
+/// Where each channel's (x, y) pairs begin, and how many points it holds.
+///
+/// A curves node's parameters are four point counts followed by the points
+/// themselves, red green blue luma, so that one channel can carry a film-stock
+/// shape while the others stay on their two endpoints.
+fn curve_channel_spans(params: &[f32]) -> Result<[(usize, usize); CURVE_CHANNELS], Error> {
+    if params.len() < CURVE_CHANNELS {
+        return Err(Error::InvalidArgument("curves node is missing its header"));
+    }
+    let mut spans = [(0_usize, 0_usize); CURVE_CHANNELS];
+    let mut offset = CURVE_CHANNELS;
+    for (channel, span) in spans.iter_mut().enumerate() {
+        let count = params[channel];
+        if count.fract() != 0.0
+            || count < MIN_CURVE_POINTS as f32
+            || count > MAX_CURVE_POINTS as f32
+        {
+            return Err(Error::InvalidArgument("curve channel point count"));
+        }
+        let count = count as usize;
+        *span = (offset, count);
+        offset += count * 2;
+    }
+    if offset != params.len() {
+        return Err(Error::InvalidArgument(
+            "curves node parameters do not match its header",
+        ));
+    }
+    Ok(spans)
+}
+
+fn curve_channel_points(params: &[f32], channel: usize) -> &[f32] {
+    // Spans were validated when the program was parsed.
+    let spans = curve_channel_spans(params).expect("curves parameters were validated");
+    let (offset, count) = spans[channel];
+    &params[offset..offset + count * 2]
+}
+
 fn validate_curve_points(params: &[f32]) -> Result<(), Error> {
-    for channel in 0..4 {
-        let points = &params[channel * 8..channel * 8 + 8];
-        for segment in 0..3 {
+    let spans = curve_channel_spans(params)?;
+    for (offset, count) in spans {
+        let points = &params[offset..offset + count * 2];
+        for segment in 0..count - 1 {
             if points[segment * 2] + 1.0e-3 > points[segment * 2 + 2] {
                 return Err(Error::InvalidArgument(
                     "curve points must have ascending positions",
@@ -192,17 +248,18 @@ fn srgb_decode_value(value: f32) -> f32 {
     }
 }
 
-/// Monotone cubic tangents (Fritsch-Carlson) for four ascending points.
-fn curve_tangents(xs: &[f32; 4], ys: &[f32; 4]) -> [f32; 4] {
-    let mut slopes = [0.0f32; 3];
-    for segment in 0..3 {
-        slopes[segment] =
-            (ys[segment + 1] - ys[segment]) / (xs[segment + 1] - xs[segment]).max(1.0e-4);
-    }
-    let mut tangents = [0.0f32; 4];
+/// Monotone cubic tangents (Fritsch-Carlson) for ascending points.
+fn curve_tangents(xs: &[f32], ys: &[f32]) -> Vec<f32> {
+    let last = xs.len() - 1;
+    let slopes: Vec<f32> = (0..last)
+        .map(|segment| {
+            (ys[segment + 1] - ys[segment]) / (xs[segment + 1] - xs[segment]).max(1.0e-4)
+        })
+        .collect();
+    let mut tangents = vec![0.0f32; xs.len()];
     tangents[0] = slopes[0];
-    tangents[3] = slopes[2];
-    for point in 1..3 {
+    tangents[last] = slopes[last - 1];
+    for point in 1..last {
         tangents[point] = if slopes[point - 1] * slopes[point] <= 0.0 {
             0.0
         } else {
@@ -216,20 +273,24 @@ fn curve_tangents(xs: &[f32; 4], ys: &[f32; 4]) -> [f32; 4] {
     tangents
 }
 
-fn eval_curve(xs: &[f32; 4], ys: &[f32; 4], tangents: &[f32; 4], x: f32) -> f32 {
+/// The curve at X, held flat outside its control points.
+///
+/// Flat extrapolation is the whole point of the endpoint handles: pulling a
+/// channel's white point left from (1, 1) to (0.4, 1) means everything above
+/// 0.4 reads as full scale, which is the per-channel gain move that inverts a
+/// negative. Interpolating past the last point instead would keep climbing.
+fn eval_curve(xs: &[f32], ys: &[f32], tangents: &[f32], x: f32) -> f32 {
+    let last = xs.len() - 1;
     if x <= xs[0] {
         return ys[0];
     }
-    if x >= xs[3] {
-        return ys[3];
+    if x >= xs[last] {
+        return ys[last];
     }
-    let segment = if x < xs[1] {
-        0
-    } else if x < xs[2] {
-        1
-    } else {
-        2
-    };
+    let segment = xs[..last]
+        .iter()
+        .rposition(|start| x >= *start)
+        .unwrap_or(0);
     let width = (xs[segment + 1] - xs[segment]).max(1.0e-4);
     let t = (x - xs[segment]) / width;
     let t2 = t * t;
@@ -249,8 +310,8 @@ fn eval_curve(xs: &[f32; 4], ys: &[f32; 4], tangents: &[f32; 4], x: f32) -> f32 
 /// value (i / (N-1))^2 through encode -> curve -> decode, so pixels avoid the
 /// per-value transfer powf.
 fn curve_lut(points: &[f32]) -> Vec<f32> {
-    let xs = [points[0], points[2], points[4], points[6]];
-    let ys = [points[1], points[3], points[5], points[7]];
+    let xs: Vec<f32> = points.iter().step_by(2).copied().collect();
+    let ys: Vec<f32> = points.iter().skip(1).step_by(2).copied().collect();
     let tangents = curve_tangents(&xs, &ys);
     (0..CURVE_LUT_SIZE)
         .map(|index| {
@@ -261,11 +322,18 @@ fn curve_lut(points: &[f32]) -> Vec<f32> {
         .collect()
 }
 
-/// The do-nothing curve: every control point sits on the diagonal.
+/// The do-nothing curve: control points on the diagonal, spanning the range.
+///
+/// Spanning matters because the curve is held flat outside its points. Two
+/// points at (0, 0) and (0.5, 0.5) all sit on the diagonal, yet everything
+/// above 0.5 is clamped to 0.5, which is very much doing something.
 fn is_identity_curve(points: &[f32]) -> bool {
-    points
-        .chunks_exact(2)
-        .all(|point| (point[0] - point[1]).abs() < 1.0e-6)
+    let last = points.len() - 2;
+    points[0].abs() < 1.0e-6
+        && (points[last] - 1.0).abs() < 1.0e-6
+        && points
+            .chunks_exact(2)
+            .all(|point| (point[0] - point[1]).abs() < 1.0e-6)
 }
 
 /// One channel's LUT with the luma curve, when it is not the identity, folded
@@ -318,6 +386,10 @@ fn validate_param(kind: u32, index: usize, value: f32) -> Result<(), Error> {
         (NODE_CROP, 0) | (NODE_CROP, 1) => (0.0..=1.0).contains(&value),
         (NODE_CROP, 2) | (NODE_CROP, 3) => (0.05..=1.0).contains(&value),
         (NODE_CROP, 4) => (-45.0..=45.0).contains(&value),
+        // The four leading parameters are point counts, not signal levels.
+        (NODE_CURVES, index) if index < CURVE_CHANNELS => {
+            (MIN_CURVE_POINTS as f32..=MAX_CURVE_POINTS as f32).contains(&value)
+        }
         (NODE_CURVES, _) => (0.0..=1.0).contains(&value),
         _ => false,
     };
@@ -354,8 +426,16 @@ pub(crate) fn parse_graph(bytes: &[u8]) -> Result<Vec<GraphOp>, Error> {
         let input_a = reader.i32()?;
         let input_b = reader.i32()?;
         let param_count = reader.u32()? as usize;
-        if param_count != expected_param_count(kind)? {
-            return Err(Error::InvalidArgument("graph node parameter count"));
+        match param_arity(kind)? {
+            ParamArity::Exact(expected) if param_count != expected => {
+                return Err(Error::InvalidArgument("graph node parameter count"));
+            }
+            // The header inside the parameters is what fixes a curves node's
+            // length, so only the ceiling can be checked before reading them.
+            ParamArity::Curves if param_count > MAX_CURVE_PARAMS => {
+                return Err(Error::InvalidArgument("curves node has too many points"));
+            }
+            _ => {}
         }
         let mut params = Vec::with_capacity(param_count);
         for parameter in 0..param_count {
@@ -984,12 +1064,12 @@ pub(crate) fn execute_graph_cached(
                 // Per-channel monotone curves on the encoded signal, then the
                 // luma curve over all three: the film-stock "decompression"
                 // for inverted negatives.
-                let luma =
-                    (!is_identity_curve(&op.params[24..32])).then(|| curve_lut(&op.params[24..32]));
+                let luma_points = curve_channel_points(&op.params, 3);
+                let luma = (!is_identity_curve(luma_points)).then(|| curve_lut(luma_points));
                 let luts = [
-                    channel_lut(&op.params[0..8], luma.as_deref()),
-                    channel_lut(&op.params[8..16], luma.as_deref()),
-                    channel_lut(&op.params[16..24], luma.as_deref()),
+                    channel_lut(curve_channel_points(&op.params, 0), luma.as_deref()),
+                    channel_lut(curve_channel_points(&op.params, 1), luma.as_deref()),
+                    channel_lut(curve_channel_points(&op.params, 2), luma.as_deref()),
                 ];
                 image.data.par_chunks_exact_mut(3).for_each(|pixel| {
                     for (value, lut) in pixel.iter_mut().zip(&luts) {
@@ -1767,19 +1847,22 @@ mod tests {
         1.0,
     ];
 
-    fn curves_params(red: &[f32; 8], green: &[f32; 8], blue: &[f32; 8]) -> Vec<f32> {
+    /// The two-point identity the panel now starts every channel on.
+    const ENDPOINTS_CURVE: [f32; 4] = [0.0, 0.0, 1.0, 1.0];
+
+    fn curves_params(red: &[f32], green: &[f32], blue: &[f32]) -> Vec<f32> {
         luma_curves_params(red, green, blue, &IDENTITY_CURVE)
     }
 
-    fn luma_curves_params(
-        red: &[f32; 8],
-        green: &[f32; 8],
-        blue: &[f32; 8],
-        luma: &[f32; 8],
-    ) -> Vec<f32> {
-        let mut params = Vec::with_capacity(32);
-        for channel in [red, green, blue, luma] {
-            params.extend_from_slice(channel);
+    /// Pack four channels, each any length, behind the count header.
+    fn luma_curves_params(red: &[f32], green: &[f32], blue: &[f32], luma: &[f32]) -> Vec<f32> {
+        let channels = [red, green, blue, luma];
+        let mut params: Vec<f32> = channels
+            .iter()
+            .map(|points| (points.len() / 2) as f32)
+            .collect();
+        for points in channels {
+            params.extend_from_slice(points);
         }
         params
     }
@@ -1882,6 +1965,88 @@ mod tests {
             "input above the white point stays clipped"
         );
         assert!(apply_curve_value(&lut, srgb_decode_value(0.2)) > srgb_decode_value(0.2));
+    }
+
+    #[test]
+    fn two_endpoints_are_the_identity_and_channels_may_differ_in_length() {
+        // The panel starts every channel on its two endpoints, the way Resolve's
+        // custom curves do, and only the channel being shaped grows points. A
+        // program mixing lengths is therefore the normal case, not an edge one.
+        assert!(is_identity_curve(&ENDPOINTS_CURVE));
+        let shaped = [0.0, 0.0, 0.3, 0.45, 0.62, 0.7, 1.0, 1.0];
+        let params = luma_curves_params(
+            &shaped,
+            &ENDPOINTS_CURVE,
+            &ENDPOINTS_CURVE,
+            &ENDPOINTS_CURVE,
+        );
+        let ops = parse_graph(
+            &GraphBuilder::new()
+                .node(NODE_CURVES, 0, -1, &params, None)
+                .build(),
+        )
+        .expect("channels of different lengths are a legal program");
+        assert_eq!(curve_channel_points(&ops[0].params, 0), shaped);
+        assert_eq!(curve_channel_points(&ops[0].params, 2), ENDPOINTS_CURVE);
+        // Channel independence belongs to the node, not to the frame: the
+        // display transform downstream maps a shared luminance and desaturates
+        // what would clip, so lifting red legitimately moves green on screen.
+        // The property worth pinning is that the untouched channels' lookups
+        // stay the identity while the shaped one lifts.
+        let shaped_lut = channel_lut(curve_channel_points(&ops[0].params, 0), None);
+        let flat_lut = channel_lut(curve_channel_points(&ops[0].params, 1), None);
+        assert!(apply_curve_value(&shaped_lut, srgb_decode_value(0.3)) > srgb_decode_value(0.3));
+        for encoded in [0.1, 0.25, 0.5, 0.75, 0.9] {
+            let value = srgb_decode_value(encoded);
+            assert!(
+                (apply_curve_value(&flat_lut, value) - value).abs() < 3.0e-3,
+                "an endpoints-only channel did not pass its input through"
+            );
+        }
+        // And the shaped channel does reach the pixels.
+        let source = gradient_image();
+        let curved = execute_graph(&ops, source.clone(), &context(7)).unwrap();
+        let mut reference = source;
+        to_display(&mut reference);
+        assert!(max_difference(&curved, &reference) > 1.0e-2);
+    }
+
+    #[test]
+    fn a_two_point_white_drag_gains_the_channel_without_touching_the_shadows() {
+        // Exactly the gesture the reference panel is built around: grab the
+        // top-right handle and pull it left. Nothing else about the curve moves,
+        // so the shadows must stay put while the highlights reach full scale.
+        let gained = [0.0, 0.0, 0.55, 1.0];
+        let lut = curve_lut(&gained);
+        assert!(apply_curve_value(&lut, srgb_decode_value(0.55)) > 0.98);
+        assert!(apply_curve_value(&lut, srgb_decode_value(0.8)) >= 1.0);
+        assert!(apply_curve_value(&lut, 0.0).abs() < 1.0e-6);
+        let midtone = apply_curve_value(&lut, srgb_decode_value(0.3));
+        assert!(
+            midtone > srgb_decode_value(0.3),
+            "pulling the white point in has to raise everything below it"
+        );
+    }
+
+    #[test]
+    fn curves_headers_that_do_not_match_their_points_are_rejected() {
+        // The header is the only thing that says where a channel's points end,
+        // so a program whose counts disagree with its length has to be refused
+        // rather than read off the end of one channel into the next.
+        let mut params = luma_curves_params(
+            &ENDPOINTS_CURVE,
+            &ENDPOINTS_CURVE,
+            &ENDPOINTS_CURVE,
+            &ENDPOINTS_CURVE,
+        );
+        params[0] = 3.0;
+        assert!(curve_channel_spans(&params).is_err());
+        params[0] = 1.0; // Fewer than the two endpoints.
+        assert!(curve_channel_spans(&params).is_err());
+        params[0] = 2.5; // Not a whole number of points.
+        assert!(curve_channel_spans(&params).is_err());
+        params[0] = (MAX_CURVE_POINTS + 1) as f32;
+        assert!(curve_channel_spans(&params).is_err());
     }
 
     fn tone_program(shadows: f32) -> Vec<u8> {

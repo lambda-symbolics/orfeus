@@ -250,28 +250,32 @@ sliders and nothing else has to be recomputed."
   (or (rest (assoc kind *node-kind-labels*)) (string kind)))
 
 (defun curve-spline-value (points x)
-  "Evaluate the monotone cubic through POINTS (four x y pairs) at X.
+  "Evaluate the monotone cubic through POINTS (x y pairs) at X.
 
-Mirrors the native executor's Fritsch-Carlson spline so the editor draws
-exactly the curve the render applies."
-  (let ((xs (make-array 4)) (ys (make-array 4)))
-    (dotimes (index 4)
+Mirrors the native executor's Fritsch-Carlson spline, held flat outside the
+control points, so the editor draws exactly the curve the render applies. A
+channel carries anywhere from its two endpoints to a full film-stock shape."
+  (let* ((count (floor (length points) 2))
+         (xs (make-array count))
+         (ys (make-array count))
+         (last (1- count)))
+    (dotimes (index count)
       (setf (aref xs index) (float (nth (* index 2) points) 1d0)
             (aref ys index) (float (nth (1+ (* index 2)) points) 1d0)))
     (cond
       ((<= x (aref xs 0)) (aref ys 0))
-      ((>= x (aref xs 3)) (aref ys 3))
+      ((>= x (aref xs last)) (aref ys last))
       (t
-       (let ((slopes (make-array 3))
-             (tangents (make-array 4)))
-         (dotimes (segment 3)
+       (let ((slopes (make-array last))
+             (tangents (make-array count)))
+         (dotimes (segment last)
            (setf (aref slopes segment)
                  (/ (- (aref ys (1+ segment)) (aref ys segment))
                     (max 1.0d-4 (- (aref xs (1+ segment))
                                    (aref xs segment))))))
          (setf (aref tangents 0) (aref slopes 0)
-               (aref tangents 3) (aref slopes 2))
-         (loop for point from 1 to 2
+               (aref tangents last) (aref slopes (1- last)))
+         (loop for point from 1 below last
                do (setf (aref tangents point)
                         (let ((before (aref slopes (1- point)))
                               (after (aref slopes point)))
@@ -284,9 +288,9 @@ exactly the curve the render applies."
                                 (/ (* 3 (+ left right))
                                    (+ (/ (+ (* 2 right) left) before)
                                       (/ (+ right (* 2 left)) after))))))))
-         (let* ((segment (cond ((< x (aref xs 1)) 0)
-                               ((< x (aref xs 2)) 1)
-                               (t 2)))
+         (let* ((segment (or (loop for index from (1- last) downto 0
+                                   when (>= x (aref xs index)) return index)
+                             0))
                 (width (max 1.0d-4 (- (aref xs (1+ segment))
                                       (aref xs segment))))
                 (v (/ (- x (aref xs segment)) width))
@@ -979,6 +983,7 @@ new cache entry is published."
            blend-opacity-input crop-angle-input
            curve-canvas curve-drag scope-canvas
            (curve-channel :master-points)
+           (curve-channel-buttons '())
            curve-histogram waveform-buffer
            (interned-photos (make-hash-table :test #'equal))
            status progress before-preview-file after-preview-file
@@ -1488,6 +1493,24 @@ new cache entry is published."
                (:green-points "Green")
                (:blue-points "Blue")
                (:master-points "Luma")))
+           (curve-channel-button-label (key)
+             (ecase key
+               (:red-points "R")
+               (:green-points "G")
+               (:blue-points "B")
+               (:master-points "Y")))
+           (sync-curve-channel-buttons ()
+             ;; The selected channel's button carries that channel's colour,
+             ;; the rest stay the panel's grey.
+             (dolist (entry curve-channel-buttons)
+               (if (eq (first entry) curve-channel)
+                   (multiple-value-bind (red green blue)
+                       (curve-channel-color (first entry) t)
+                     (lightfast:set-color-rgb (rest entry) :red red
+                                                           :green green
+                                                           :blue blue))
+                   (lightfast:set-color-rgb (rest entry) :red 58 :green 58
+                                                         :blue 64))))
            (release-waveform ()
              (when waveform-buffer
                (cffi:foreign-free waveform-buffer)
@@ -1591,6 +1614,106 @@ new cache entry is published."
                   (lightfast:draw-font :size 12)))
                (lightfast:draw-color-rgb :red 72 :green 72 :blue 80)
                (lightfast:draw-rect x y width height)))
+           (curve-point-position (points index left top chart-w chart-h)
+             ;; Where one control point lands on screen, in absolute pixels.
+             (values (+ left (round (* (nth (* index 2) points)
+                                       (1- chart-w))))
+                     (+ top (round (* (- 1 (nth (1+ (* index 2)) points))
+                                      (1- chart-h))))))
+           (curve-handle-at (node x y)
+             ;; The control point under the pointer, in the widget-relative
+             ;; coordinates the event carries. The active channel is searched
+             ;; first, so the stack of untouched white points at the top right
+             ;; hands over the one the user is already editing.
+             (multiple-value-bind (chart-x chart-y chart-w chart-h)
+                 (curve-chart-geometry)
+               (dolist (key (cons curve-channel
+                                  (remove curve-channel
+                                          orfeus:*curve-channel-keys*)))
+                 (let ((points (curve-node-points node key)))
+                   (loop for index below (floor (length points) 2)
+                         do (multiple-value-bind (point-x point-y)
+                                (curve-point-position points index
+                                                      chart-x chart-y
+                                                      chart-w chart-h)
+                              (when (and (<= (abs (- x point-x)) 8)
+                                         (<= (abs (- y point-y)) 8))
+                                (return-from curve-handle-at
+                                  (values key index)))))))))
+           (curve-chart-position (x y)
+             ;; Pointer position as curve coordinates, or NIL outside the chart.
+             (multiple-value-bind (chart-x chart-y chart-w chart-h)
+                 (curve-chart-geometry)
+               (let ((fx (/ (- x chart-x) (float (1- chart-w))))
+                     (fy (- 1 (/ (- y chart-y) (float (1- chart-h))))))
+                 (when (and (<= -0.05 fx 1.05) (<= -0.05 fy 1.05))
+                   (values (max 0.0 (min 1.0 fx)) (max 0.0 (min 1.0 fy)))))))
+           (insert-curve-point (node at-x at-y)
+             ;; Clicking empty chart adds a point to the active curve, the way
+             ;; the reference panel does, so a film stock's shape costs points
+             ;; only where it actually bends.
+             (let* ((points (curve-node-points node curve-channel))
+                    (count (floor (length points) 2)))
+               (cond
+                 ((>= count orfeus:*maximum-curve-points*)
+                  (set-status (format nil "A curve holds at most ~D points"
+                                      orfeus:*maximum-curve-points*)))
+                 ;; A new point has to fall strictly between two existing ones,
+                 ;; with room for the ascending-position rule on both sides.
+                 ((let ((before (loop for index below count
+                                      when (< (nth (* index 2) points) at-x)
+                                        maximize index)))
+                    (and before
+                         (< before (1- count))
+                         (> at-x (+ (nth (* before 2) points) 0.02))
+                         (< at-x (- (nth (* (1+ before) 2) points) 0.02))
+                         (let ((updated (append (subseq points 0
+                                                        (* 2 (1+ before)))
+                                                (list (float at-x 1.0)
+                                                      (float at-y 1.0))
+                                                (subseq points
+                                                        (* 2 (1+ before))))))
+                           (handler-case
+                               (progn
+                                 (gui-model-set-node-params
+                                  model node (list curve-channel updated))
+                                 (setf curve-drag (1+ before))
+                                 (lightfast:redraw curve-canvas)
+                                 (schedule-edited-preview)
+                                 (set-status
+                                  (format nil "~A point added"
+                                          (curve-channel-label curve-channel)))
+                                 t)
+                             (error (condition)
+                               (set-status (princ-to-string condition))
+                               t))))))
+                 (t (set-status "No room for a point there")))))
+           (delete-curve-point (node index)
+             ;; The endpoints are the channel's black and white points, so they
+             ;; stay: without them the curve would have nothing to hold flat.
+             (let* ((points (curve-node-points node curve-channel))
+                    (count (floor (length points) 2)))
+               (cond
+                 ((or (zerop index) (= index (1- count)))
+                  (set-status "The black and white points cannot be removed"))
+                 ((<= count orfeus:*minimum-curve-points*)
+                  (set-status "A curve keeps its two endpoints"))
+                 (t
+                  (handler-case
+                      (progn
+                        (gui-model-set-node-params
+                         model node
+                         (list curve-channel
+                               (append (subseq points 0 (* 2 index))
+                                       (subseq points (* 2 (1+ index))))))
+                        (setf curve-drag nil)
+                        (lightfast:redraw curve-canvas)
+                        (schedule-edited-preview)
+                        (set-status
+                         (format nil "~A point removed"
+                                 (curve-channel-label curve-channel))))
+                    (error (condition)
+                      (set-status (princ-to-string condition))))))))
            (draw-curve-editor (widget)
              (let* ((x (lightfast:widget-x widget))
                     (y (lightfast:widget-y widget))
@@ -1660,18 +1783,21 @@ new cache entry is published."
                                             (+ left 14) (+ top 42))
                          (lightfast:draw-font :size 12))
                        (progn
-                         ;; Draw the two inactive curves, then the active
-                         ;; channel on top with its control points.
+                         ;; Every channel is drawn, inactive ones first so the
+                         ;; active curve sits on top, and every channel keeps
+                         ;; its own handles: the reference panel lets you grab
+                         ;; any of the four white points directly rather than
+                         ;; selecting a channel first.
                          (dolist (key (append (remove curve-channel
                                                       orfeus:*curve-channel-keys*)
                                               (list curve-channel)))
-                           (let ((points (curve-node-points node key)))
+                           (let ((points (curve-node-points node key))
+                                 (active (eq key curve-channel)))
                              (multiple-value-bind (red green blue)
-                                 (curve-channel-color
-                                  key (eq key curve-channel))
+                                 (curve-channel-color key active)
                                (lightfast:draw-color-rgb :red red :green green
                                                        :blue blue))
-                             (loop with steps = 48
+                             (loop with steps = 96
                                    for step from 0 below steps
                                    for x0 = (/ step (float steps))
                                    for x1 = (/ (1+ step) (float steps))
@@ -1683,35 +1809,29 @@ new cache entry is published."
                                                         (1- chart-h))))
                                        (+ left (round (* x1 (1- chart-w))))
                                        (+ top (round (* (- 1 y1)
-                                                        (1- chart-h))))))))
-                         (let ((points (curve-node-points node
-                                                          curve-channel)))
-                           (dotimes (index 4)
-                             (let ((point-x
-                                     (+ left
-                                        (round (* (nth (* index 2) points)
-                                                  (1- chart-w)))))
-                                   (point-y
-                                     (+ top
-                                        (round (* (- 1 (nth (1+ (* index 2))
-                                                            points))
-                                                  (1- chart-h))))))
-                               (lightfast:draw-color-rgb :red 20 :green 20
-                                                       :blue 24)
-                               (lightfast:draw-filled-circle point-x point-y 5)
-                               (multiple-value-bind (red green blue)
-                                   (curve-channel-color curve-channel t)
-                                 (lightfast:draw-color-rgb :red red
-                                                         :green green
-                                                         :blue blue))
-                               (lightfast:draw-filled-circle point-x point-y
-                                                           4))))))))))
+                                                        (1- chart-h))))))
+                             (loop for index below (floor (length points) 2)
+                                   do (multiple-value-bind (point-x point-y)
+                                          (curve-point-position points index
+                                                                left top
+                                                                chart-w chart-h)
+                                        (lightfast:draw-color-rgb
+                                         :red 16 :green 16 :blue 20)
+                                        (lightfast:draw-filled-circle
+                                         point-x point-y (if active 5 4))
+                                        (multiple-value-bind (red green blue)
+                                            (curve-channel-color key active)
+                                          (lightfast:draw-color-rgb
+                                           :red red :green green :blue blue))
+                                        (lightfast:draw-filled-circle
+                                         point-x point-y (if active 4 3))))))))))))
            (update-curve-drag (node x y)
              (multiple-value-bind (chart-x chart-y chart-w chart-h)
                  (curve-chart-geometry)
                (let* ((points (copy-list (curve-node-points node
                                                             curve-channel)))
                       (index curve-drag)
+                      (last (1- (floor (length points) 2)))
                       (raw-x (/ (- x chart-x) (float (1- chart-w))))
                       (raw-y (- 1 (/ (- y chart-y) (float (1- chart-h)))))
                       (new-y (max 0.0 (min 1.0 raw-y)))
@@ -1721,7 +1841,7 @@ new cache entry is published."
                       (lower (if (zerop index)
                                  0.0
                                  (+ (nth (* 2 (1- index)) points) 0.02)))
-                      (upper (if (= index 3)
+                      (upper (if (= index last)
                                  1.0
                                  (- (nth (* 2 (1+ index)) points) 0.02)))
                       (new-x (max lower (min upper raw-x))))
@@ -1741,32 +1861,32 @@ new cache entry is published."
                      (set-status (princ-to-string condition)))))))
            (handle-curve-mouse (widget event value)
              (declare (ignore widget))
-             (multiple-value-bind (x y) (parse-preview-event value)
+             (multiple-value-bind (x y button) (parse-preview-event value)
                (when x
                  (let ((node (curves-editing-node)))
                    (when node
                      (case event
                        (#.lightfast:+event-push+
-                        (multiple-value-bind (chart-x chart-y chart-w
-                                              chart-h)
-                            (curve-chart-geometry)
-                          (let ((points (curve-node-points node
-                                                           curve-channel)))
-                            (setf curve-drag nil)
-                            (dotimes (index 4)
-                              (let ((point-x
-                                      (+ chart-x
-                                         (round (* (nth (* index 2) points)
-                                                   (1- chart-w)))))
-                                    (point-y
-                                      (+ chart-y
-                                         (round (* (- 1
-                                                      (nth (1+ (* index 2))
-                                                           points))
-                                                   (1- chart-h))))))
-                                (when (and (<= (abs (- x point-x)) 8)
-                                           (<= (abs (- y point-y)) 8))
-                                  (setf curve-drag index)))))))
+                        (setf curve-drag nil)
+                        (multiple-value-bind (key index)
+                            (curve-handle-at node x y)
+                          (cond
+                            ;; Grabbing a handle selects its channel, so the
+                            ;; four white points are all directly reachable
+                            ;; without visiting the selector first.
+                            (key
+                             (unless (eq key curve-channel)
+                               (setf curve-channel key)
+                               (sync-curve-channel-buttons))
+                             (if (= button 3)
+                                 (delete-curve-point node index)
+                                 (setf curve-drag index)))
+                            ((= button 3) nil)
+                            (t
+                             (multiple-value-bind (at-x at-y)
+                                 (curve-chart-position x y)
+                               (when at-x
+                                 (insert-curve-point node at-x at-y)))))))
                        (#.lightfast:+event-drag+
                         (when curve-drag
                           (update-curve-drag node x y)))
@@ -5302,28 +5422,41 @@ new cache entry is published."
         (build-group
          :curves
          (lambda ()
-           (let ((channel-field
-                   (lightfast:make-labeled-choice
-                    :parent node-page :x 12 :y 44 :width 292 :height 26
-                    :label "Channel" :label-width 88
-                    :items '("Luma" "Red" "Green" "Blue")
-                    :callback
-                    (lambda (widget event value)
-                      (declare (ignore event value))
-                      (setf curve-channel
-                            (cond ((string-equal
-                                    (lightfast:value widget) "Green")
-                                   :green-points)
-                                  ((string-equal
-                                    (lightfast:value widget) "Blue")
-                                   :blue-points)
-                                  ((string-equal
-                                    (lightfast:value widget) "Luma")
-                                   :master-points)
-                                  (t :red-points)))
-                      (when curve-canvas
-                        (lightfast:redraw curve-canvas))))))
-             (register-field channel-field 44 :page))
+           ;; Y R G B as four lit buttons, the way the reference panel selects
+           ;; a channel: the chart shows all four curves at once, so this only
+           ;; says which one a click on empty chart adds a point to and which
+           ;; one is drawn on top.
+           (let ((buttons
+                   (loop for key in '(:master-points :red-points
+                                      :green-points :blue-points)
+                         for column from 0
+                         collect
+                         (let ((key key))
+                           (cons
+                            key
+                            (lightfast:make-button
+                             :parent node-page
+                             :x (+ 12 (* column 74)) :y 44
+                             :width 70 :height 26
+                             :label (curve-channel-button-label key)
+                             :callback
+                             (lambda (&rest ignored)
+                               (declare (ignore ignored))
+                               (setf curve-channel key)
+                               (sync-curve-channel-buttons)
+                               (when curve-canvas
+                                 (lightfast:redraw curve-canvas)))))))))
+             (setf curve-channel-buttons buttons)
+             (register-inspector-row
+              (lightfast:make-layout-row
+               :gap 4
+               :children (mapcar (lambda (entry)
+                                   (lightfast:make-layout-item (rest entry)
+                                                               :basis 0 :grow 1))
+                                 buttons))
+              (mapcar #'rest buttons)
+              node-page 12 44 26 :page)
+             (sync-curve-channel-buttons))
            (setf scope-canvas
                  (register-inspector
                   (lightfast:make-canvas
@@ -5345,7 +5478,7 @@ new cache entry is published."
                   12 :chart-row :fill :chart :page))
            (lightfast:set-tooltip
             curve-canvas
-            "Drag the points to shape the channel; the histogram shows occupancy")
+            "Drag a point to shape its channel, click the chart to add one, right-click a point to remove it")
            (dolist (event (list lightfast:+event-push+
                                 lightfast:+event-drag+
                                 lightfast:+event-release+))

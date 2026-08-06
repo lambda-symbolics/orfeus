@@ -108,6 +108,8 @@
    #:*graph-source-id*
    #:*curve-channel-keys*
    #:*identity-curve-points*
+   #:*minimum-curve-points*
+   #:*maximum-curve-points*
    #:graph-insert-node
    #:graph-delete-node
    #:graph-swap-with-upstream

@@ -104,8 +104,19 @@ negatives.")
   "Curve channels in wire order: the three channels, then luma over all.")
 
 (defparameter *identity-curve-points*
-  '(0.0 0.0 0.33 0.33 0.67 0.67 1.0 1.0)
-  "Four (x y) control points along the diagonal: the do-nothing curve.")
+  '(0.0 0.0 1.0 1.0)
+  "The do-nothing curve: a black point at the origin and a white point at full.
+
+Two points, not four along the diagonal. A channel starts with exactly the
+handles Resolve's custom curves start with, and pulling the white point left is
+the per-channel gain that reverses a negative. Interior points are added by
+clicking the curve, so a stock's shape costs points only where it needs them.")
+
+(defparameter *minimum-curve-points* 2
+  "A curve always keeps its two endpoints.")
+
+(defparameter *maximum-curve-points* 16
+  "Point ceiling per channel, matching MAX_CURVE_POINTS in the native executor.")
 
 (defstruct graph-node
   "One processing node: a stage filter, or a blend of two branches.

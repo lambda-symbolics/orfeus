@@ -381,8 +381,11 @@ the straightening angle in degrees for a crop node."
 (defconstant +graph-program-magic+ #x4746524F
   "Little-endian magic of a serialized graph program, spelling ORFG.")
 
-(defconstant +graph-program-version+ 2
-  "Serialized graph program version; 2 added the curves node's luma channel.")
+(defconstant +graph-program-version+ 3
+  "Serialized graph program version.
+
+2 added the curves node's luma channel; 3 made each curve channel variable
+length behind a header of four point counts.")
 
 (defun graph-boolean-parameter (value)
   (if value 1.0 0.0))
@@ -439,11 +442,18 @@ the straightening angle in degrees for a crop node."
                        (getf params :angle 0.0))
                  nil)))
       (:curves
-       (let ((params (graph-node-params node)))
-         (values (loop for key in *curve-channel-keys*
-                       append (copy-list
-                               (or (getf params key)
-                                   *identity-curve-points*)))
+       ;; Four point counts, then the points themselves. Channels are variable
+       ;; length, so the header is the only thing that says where one ends.
+       (let* ((params (graph-node-params node))
+              (channels (loop for key in *curve-channel-keys*
+                              collect (or (getf params key)
+                                          *identity-curve-points*))))
+         (values (append (mapcar (lambda (points)
+                                   (float (floor (length points) 2) 1.0))
+                                 channels)
+                         (loop for points in channels
+                               append (mapcar (lambda (value) (float value 1.0))
+                                              points)))
                  nil))))))
 
 (defun graph->program-bytes (graph)

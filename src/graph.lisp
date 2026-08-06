@@ -28,10 +28,15 @@
   params)
 
 (defun curve-points-validate (points key)
-  (unless (and (listp points) (= 8 (length points))
+  (unless (and (listp points)
+               (evenp (length points))
+               (<= (* 2 *minimum-curve-points*)
+                   (length points)
+                   (* 2 *maximum-curve-points*))
                (every (lambda (value) (and (realp value) (<= 0 value 1)))
                       points))
-    (graph-invalid points "~S must hold four (x y) points within 0..1" key))
+    (graph-invalid points "~S must hold ~D to ~D (x y) points within 0..1"
+                   key *minimum-curve-points* *maximum-curve-points*))
   (loop for (x nil next-x) on points by #'cddr
         while next-x
         unless (< (+ x 0.001) next-x)

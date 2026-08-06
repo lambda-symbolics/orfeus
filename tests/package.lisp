@@ -30,6 +30,7 @@
                 #:still-store-list
                 #:still-store-rename
                 #:still-store-delete
+                #:*maximum-curve-points*
                 #:default-processing-graph
                 #:grade-stage-keys
                 #:grade-stages

@@ -263,6 +263,43 @@ moves, so a destination the user picked survives every later save."
                   (orfeus:project-output-directory project))
            "Importing without a project did not anchor to the photographs")))
 
+(defun test-curve-spline-shapes ()
+  "The editor's spline matches the executor's, for any number of points.
+
+The panel draws with this function and the render evaluates its own copy, so a
+disagreement means the curve on screen is not the curve applied. Both are held
+flat outside the control points, which is what makes dragging a white point
+inward a gain rather than an extrapolation."
+  (let ((endpoints orfeus:*identity-curve-points*))
+    (check (= 2 (floor (length endpoints) 2))
+           "A fresh channel did not start on its two endpoints")
+    (dolist (x '(0.0 0.25 0.5 0.75 1.0))
+      (check (< (abs (- x (orfeus/gui::curve-spline-value endpoints x))) 1.0d-6)
+             "The two-point identity did not pass its input through")))
+  ;; A white point pulled in to 0.6 gains everything below it and holds every
+  ;; input above it at full output.
+  (let ((gained '(0.0 0.0 0.6 1.0)))
+    (check (< (abs (- 1.0 (orfeus/gui::curve-spline-value gained 0.6))) 1.0d-6)
+           "The moved white point did not reach full output")
+    (check (< (abs (- 1.0 (orfeus/gui::curve-spline-value gained 0.85))) 1.0d-6)
+           "Input above the white point was not held flat")
+    (check (> (orfeus/gui::curve-spline-value gained 0.3) 0.3)
+           "Pulling the white point in did not lift the midtones"))
+  ;; A black point pulled up lifts the shadows and holds below itself.
+  (let ((lifted '(0.2 0.15 1.0 1.0)))
+    (check (< (abs (- 0.15 (orfeus/gui::curve-spline-value lifted 0.0))) 1.0d-6)
+           "Input below the black point was not held flat"))
+  ;; Interior points stay monotone rather than overshooting between them.
+  (let ((shaped '(0.0 0.0 0.3 0.5 0.62 0.55 1.0 1.0)))
+    (loop for step below 40
+          for x = (/ step 39.0)
+          for y = (orfeus/gui::curve-spline-value shaped x)
+          do (check (<= 0.0 y 1.0) "The spline left the unit range")))
+  (let ((many (loop for index below 8
+                    append (list (/ index 7.0) (/ index 7.0)))))
+    (check (< (abs (- 0.5 (orfeus/gui::curve-spline-value many 0.5))) 1.0d-3)
+           "An eight-point diagonal was not the identity")))
+
 (defun test-viewport-render-bound ()
   "The viewport render is sized for the canvas, and grows only with zoom.
 
@@ -1301,6 +1338,7 @@ against 45 milliseconds for a canvas-sized render."
   (test-graph-node-placement)
   (test-thumbnail-context-menu)
   (test-viewport-render-bound)
+  (test-curve-spline-shapes)
   (test-preset-bulk-application)
   (test-grade-workflow)
   (test-node-graph-model)
