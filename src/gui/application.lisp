@@ -3861,17 +3861,21 @@ new cache entry is published."
                                 &optional (basis :root))
              (push (list widget x y width-mode height basis) inspector-items)
              widget)
-           (register-inspector-row (layout x y height &optional (basis :root))
+           (register-inspector-row (layout parent x y height
+                                    &optional (basis :root))
              ;; A row laid out by the flex engine rather than by per-widget
              ;; coordinates. Only its origin and height are fixed here; the
-             ;; engine divides the width.
-             (push (list layout x y height basis) inspector-rows)
+             ;; engine divides the width. PARENT must be the widgets' actual
+             ;; FLTK parent: the flex engine places children relative to it and
+             ;; refuses a mismatch, and :PAGE covers two different tab pages.
+             (push (list layout parent x y height basis) inspector-rows)
              layout)
            (register-field (field y &optional (basis :root))
              (register-inspector-row
               (labeled-field-layout (lightfast:field-label field)
                                     (lightfast:field-control field)
                                     (if (eq basis :page) 88 96))
+              (lightfast:widget-parent (lightfast:field-label field))
               (if (eq basis :page) 12 8) y 26 basis)
              field)
            (build-group (kind builder)
@@ -3924,7 +3928,8 @@ new cache entry is published."
                  (lightfast:set-step widget step)
                  (push (list key widget) controls))
                (register-inspector-row
-                (number-field-layout label-widget slider spinner) 12 y 26 :page)
+                (number-field-layout label-widget slider spinner)
+                parent 12 y 26 :page)
                spinner))
            (make-tone-band (key short-label full-label)
              (let* ((callback (lambda (widget event value)
@@ -4097,7 +4102,7 @@ new cache entry is published."
                       widget :x item-x :y item-y
                       :width item-width :height item-height))))
                (dolist (row inspector-rows)
-                 (destructuring-bind (layout x y height basis) row
+                 (destructuring-bind (layout parent x y height basis) row
                    (let ((width (if (eq basis :page) (- right 12) right)))
                      (lightfast:apply-layout
                       layout
@@ -4109,7 +4114,7 @@ new cache entry is published."
                                                 (otherwise y))
                                            :width (max 120 (- width x 8))
                                            :height height)
-                      :parent (if (eq basis :page) node-page inspector)))))
+                      :parent parent))))
                (when tone-items
                  (lightfast:apply-layout
                   (tone-bands-layout (reverse tone-items))
@@ -5095,7 +5100,7 @@ new cache entry is published."
                               (declare (ignore ignored))
                               (render-selected)))
                  :basis 0 :grow 1)))
-         12 :action-row 26)
+         inspector 12 :action-row 26)
         (setf progress (lightfast:make-progress :parent window :x 0 :y 772
                                               :width 180 :height 28 :value "0")
               status (lightfast:make-status-bar :parent window :x 180 :y 772
