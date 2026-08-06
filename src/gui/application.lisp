@@ -19,17 +19,17 @@ buffer, with no JPEG or file on the path.")
 (defparameter *thumbnail-preview-size* 320
   "Maximum width and height for orientation-correct thumbnail renders.")
 
-(defun available-processor-count ()
-  "Return the number of logical processors reported by Linux, or one."
-  (handler-case
-      (with-open-file (stream #P"/proc/cpuinfo" :direction :input)
-        (max 1 (loop for line = (read-line stream nil)
-                     while line
-                     count (uiop:string-prefix-p "processor" line))))
-    (error () 1)))
+(defparameter *background-preview-workers* 1
+  "Workers rendering speculative thumbnails and neighbouring previews.
 
-(defparameter *background-preview-workers* (available-processor-count)
-  "Concurrent thumbnail and full-project preview workers, one per CPU.")
+One, not one per CPU. Every render is already rayon-parallel across the whole
+machine, so a worker per core meant clicking a photograph started as many
+concurrent full renders of *other* photographs as there are cores, each spawning
+its own parallel pass: hundreds of threads over twenty cores, all competing for
+the memory bandwidth this pipeline is actually limited by, while the user waited
+on the one photograph they had asked for. Measured elsewhere in this codebase,
+rendering two photographs at once is slower than rendering them in sequence, for
+the same reason.")
 
 (defconstant +thumbnail-shift-mask+ #x00010000
   "FLTK's FL_SHIFT bit in the raw event state the bridge forwards.")
@@ -1764,6 +1764,10 @@ new cache entry is published."
              (setf (lightfast:value status) text))
            (selected-job ()
              (gui-model-selected-job model))
+           (thumbnail-preview-for (job)
+             ;; The rendered sidebar thumbnail for JOB, when one exists. Used as
+             ;; the stand-in while the full preview develops.
+             (and job (gethash job thumbnail-files)))
            (photo-content-key-for (job generation &optional refresh-p)
              ;; PHOTO-CONTENT-KEY memoizes on the file's stat, so this no longer
              ;; keeps a per-generation table of its own: keying that table by
@@ -4715,6 +4719,21 @@ new cache entry is published."
                                             :center-y preview-center-y)
                          (when (eq role :after)
                            (draw-crop-overlay widget)))
+                        ;; Nothing developed yet. The sidebar has already
+                        ;; rendered this photograph small, so show that scaled up
+                        ;; rather than an empty panel: it is the right image, a
+                        ;; moment early, and it costs nothing to draw. The full
+                        ;; preview replaces it in place when it arrives.
+                        ((thumbnail-preview-for (selected-job))
+                         (draw-preview-file
+                          widget (thumbnail-preview-for (selected-job))
+                          :zoom preview-zoom
+                          :center-x preview-center-x
+                          :center-y preview-center-y)
+                         (lightfast:draw-color-rgb :red 235 :green 200 :blue 120)
+                         (lightfast:draw-text "Developing..."
+                                              (+ (lightfast:widget-x widget) 20)
+                                              (+ (lightfast:widget-y widget) 36)))
                         (t
                          (lightfast:draw-color-rgb :red 205 :green 208 :blue 210)
                          (lightfast:draw-text "Developing RAW preview..."
