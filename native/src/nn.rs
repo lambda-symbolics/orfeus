@@ -540,6 +540,69 @@ fn parallel_tiles(tile_size: usize) -> usize {
     rayon::current_num_threads().max(1).min(affordable.max(1))
 }
 
+/// Runs every tile's twelve layers on the GPU, one submission per tile.
+///
+/// Sequential on purpose. The renderer holds one command buffer behind a
+/// try-lock, so that a second render falls back to the CPU rather than waiting;
+/// dispatching from inside the parallel tile loop meant nineteen of twenty
+/// workers were told the device was busy and quietly went back to the CPU. With
+/// the arithmetic on the GPU there is nothing for those workers to do anyway.
+///
+/// Returns an error rather than a partial result, so the caller can fall back to
+/// the CPU with the input untouched.
+fn infer_tiled_on_gpu(
+    gpu: &GpuNetwork,
+    planes: &[f32],
+    half_width: usize,
+    half_height: usize,
+    sigma: f32,
+    tile_size: usize,
+) -> Result<Vec<f32>, String> {
+    let half_plane = half_width * half_height;
+    let patch_size = tile_size + 2 * HALO;
+    let inputs = INPUT_CHANNELS * patch_size * patch_size;
+    let mut denoised = vec![0.0_f32; OUTPUT_CHANNELS * half_plane];
+    let mut patch = vec![0.0_f32; inputs];
+    for tile_y in 0..half_height.div_ceil(tile_size) {
+        for tile_x in 0..half_width.div_ceil(tile_size) {
+            let origin_x = tile_x * tile_size;
+            let origin_y = tile_y * tile_size;
+            gather_patch(
+                planes,
+                half_width,
+                half_height,
+                origin_x,
+                origin_y,
+                sigma,
+                &mut patch,
+                patch_size,
+            );
+            crate::gpu::convolve_network(
+                &mut patch,
+                patch_size,
+                (origin_x as isize, origin_y as isize),
+                (half_width, half_height),
+                &gpu.blob,
+                &gpu.layers,
+            )?;
+            // The result arrives as OUTPUT_CHANNELS planes of TILE_SIZE edge at
+            // the front of the patch.
+            let tile_width = tile_size.min(half_width.saturating_sub(origin_x));
+            let tile_height = tile_size.min(half_height.saturating_sub(origin_y));
+            for channel in 0..OUTPUT_CHANNELS {
+                for row in 0..tile_height {
+                    let source = channel * tile_size * tile_size + row * tile_size;
+                    let target =
+                        channel * half_plane + (origin_y + row) * half_width + origin_x;
+                    denoised[target..target + tile_width]
+                        .copy_from_slice(&patch[source..source + tile_width]);
+                }
+            }
+        }
+    }
+    Ok(denoised)
+}
+
 fn infer_tiled_with_tile_size(
     net: &FfdNet,
     planes: &[f32],
@@ -548,11 +611,14 @@ fn infer_tiled_with_tile_size(
     sigma: f32,
     tile_size: usize,
 ) -> Vec<f32> {
-    let gpu = if gpu_requested() {
-        gpu_network().ok()
-    } else {
-        None
-    };
+    if gpu_requested()
+        && let Ok(gpu) = gpu_network()
+    {
+        match infer_tiled_on_gpu(gpu, planes, half_width, half_height, sigma, tile_size) {
+            Ok(denoised) => return denoised,
+            Err(error) => report_gpu_neural_fallback(&error),
+        }
+    }
     let half_plane = half_width * half_height;
     let mut denoised = vec![0.0_f32; OUTPUT_CHANNELS * half_plane];
     let patch_size = tile_size + 2 * HALO;
@@ -579,47 +645,6 @@ fn infer_tiled_with_tile_size(
                         &mut scratch.ping,
                         patch_size,
                     );
-                    // The GPU runs all twelve layers over this patch in one
-                    // submission and hands back the twelve output planes at the
-                    // front of the same buffer, so the copy-out below is shared.
-                    if let Some(gpu) = gpu {
-                        let inputs = INPUT_CHANNELS * patch_size * patch_size;
-                        match super::gpu::convolve_network(
-                            &mut scratch.ping[..inputs],
-                            patch_size,
-                            (origin_x as isize, origin_y as isize),
-                            (half_width, half_height),
-                            &gpu.blob,
-                            &gpu.layers,
-                        ) {
-                            Ok(_) => {
-                                let size = tile_size;
-                                let tile_width =
-                                    tile_size.min(half_width.saturating_sub(origin_x));
-                                let tile_height =
-                                    tile_size.min(half_height.saturating_sub(origin_y));
-                                let mut tile_output =
-                                    vec![0.0_f32; OUTPUT_CHANNELS * tile_width * tile_height];
-                                for channel in 0..OUTPUT_CHANNELS {
-                                    for row in 0..tile_height {
-                                        let source = channel * size * size + row * size;
-                                        let target = channel * tile_width * tile_height
-                                            + row * tile_width;
-                                        tile_output[target..target + tile_width]
-                                            .copy_from_slice(
-                                                &scratch.ping[source..source + tile_width],
-                                            );
-                                    }
-                                }
-                                return ((tile_x, tile_y), tile_output);
-                            }
-                            Err(error) => {
-                                report_gpu_neural_fallback(&error);
-                                // Fall through to the CPU below. GATHER_PATCH
-                                // left the input intact, so nothing is lost.
-                            }
-                        }
-                    }
                     let mut size = patch_size;
                     let mut source_is_ping = true;
                     for (index, layer) in net.layers.iter().enumerate() {

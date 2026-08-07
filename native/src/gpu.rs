@@ -1638,7 +1638,7 @@ pub(crate) fn convolve_network(
         }
     }
     bind_input(&context);
-    unsafe { begin_recording(&mut context) }?;
+    unsafe { begin_recording(&context) }?;
 
     // Weights are re-sent per patch. It is 3.4 MB against several hundred
     // milliseconds of arithmetic, so keeping them resident would buy nothing
@@ -1764,8 +1764,8 @@ pub(crate) fn convolve_network(
         .output_channels
         .checked_mul(result_edge * result_edge)
         .ok_or_else(|| "GPU network result overflow".to_string())?;
-    unsafe { finish_recording(&mut context, byte_size(result)?) }?;
-    unsafe { submit_and_wait(&mut context) }?;
+    unsafe { finish_recording(&context, byte_size(result)?) }?;
+    unsafe { submit_and_wait(&context) }?;
     unsafe { context.input.download(&mut patch[..result]) };
     Ok(DispatchProfile {
         adapter_name: context.adapter_name.clone(),
