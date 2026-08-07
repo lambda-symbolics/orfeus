@@ -300,6 +300,91 @@ inward a gain rather than an extrapolation."
     (check (< (abs (- 0.5 (orfeus/gui::curve-spline-value many 0.5))) 1.0d-3)
            "An eight-point diagonal was not the identity")))
 
+(defun film-tail-model ()
+  "A model whose selected photo is graded like a negative scan: the grade chain
+runs into a film node at the output, which is where the domain rules bite."
+  (let* ((job (orfeus:make-photo-job :input-path #P"/scans/_3040001.dng"))
+         (project (orfeus:make-project :output-directory #P"/out/"
+                                       :photos (list job)))
+         (graph (orfeus:settings->graph (orfeus:make-processing-settings))))
+    (orfeus:graph-insert-node graph (orfeus:processing-graph-output graph)
+                              :noise-reduction
+                              :params '(:noise-reduction 0.35
+                                        :neural-noise-reduction 0.0))
+    (orfeus:graph-insert-node graph (orfeus:processing-graph-output graph) :film
+                              :params '(:lut-path nil :lut-strength 0.0
+                                        :grain-amount 0.2 :grain-size 1.0))
+    (setf (orfeus/gui::photo-job-graph job) graph)
+    (values (orfeus/gui:make-gui-model :project project) job)))
+
+(defun selected-graph (model)
+  (orfeus/gui::photo-job-graph (orfeus/gui:gui-model-selected-job model)))
+
+(defun test-node-adds-land-where-they-are-legal ()
+  "Every correction can be added while a film node is selected.
+
+Scene-linear corrections cannot read a film node's output, so asking for one
+after the film tail failed validation: the node never appeared and the reason
+went to the status bar, which reads as a menu entry that does nothing. Only Crop
+and Film — the two kinds that may live in display space — worked. Now the
+insertion point is clamped to the last position the kind is legal."
+  (dolist (kind (orfeus:graph-node-kinds))
+    (let* ((model (film-tail-model))
+           (film (orfeus:processing-graph-output (selected-graph model))))
+      (check (orfeus/gui:gui-model-add-node model kind :after film)
+             (format nil "adding ~A after a film node produced nothing" kind))
+      ;; Whatever the placement, the graph has to remain valid.
+      (check (orfeus:graph-validate (selected-graph model))
+             (format nil "the graph was left invalid after adding ~A" kind))))
+  ;; A scene-linear correction goes in front of the film tail, which stays the
+  ;; output; a crop legitimately keeps its place behind it.
+  (let* ((model (film-tail-model))
+         (film (orfeus:processing-graph-output (selected-graph model))))
+    (orfeus/gui:gui-model-add-node model :curves :after film)
+    (let* ((graph (selected-graph model))
+           (output (orfeus:graph-find-node graph
+                                           (orfeus:processing-graph-output graph)))
+           (curves (find :curves (orfeus:processing-graph-nodes graph)
+                         :key #'orfeus:graph-node-kind)))
+      (check (eq :film (orfeus:graph-node-kind output))
+             "a curves node displaced the film node from the output")
+      (check (eql (orfeus:graph-node-id curves)
+                  (first (orfeus:graph-node-inputs output)))
+             "the curves node did not land directly before the film tail")))
+  (let* ((model (film-tail-model))
+         (film (orfeus:processing-graph-output (selected-graph model))))
+    (orfeus/gui:gui-model-add-node model :crop :after film)
+    (let* ((graph (selected-graph model))
+           (output (orfeus:graph-find-node graph
+                                           (orfeus:processing-graph-output graph))))
+      (check (eq :crop (orfeus:graph-node-kind output))
+             "a crop was moved off the tail although display space allows it")
+      (check (eql film (first (orfeus:graph-node-inputs output)))
+             "the crop stopped reading the film node"))))
+
+(defun test-retyping-moves-a-node-into-its-domain ()
+  "Assigning a correction to an untyped node after the film tail moves it.
+
+An untyped node is legal anywhere, so one added while the film node was selected
+sits in display space; the kind the user then picks from the Correction dropdown
+usually is not legal there. Refusing looked like the dropdown doing nothing."
+  (dolist (kind (orfeus:graph-node-kinds))
+    (let* ((model (film-tail-model))
+           (film (orfeus:processing-graph-output (selected-graph model)))
+           (node (orfeus/gui:gui-model-add-node model :node :after film)))
+      (multiple-value-bind (changed moved)
+          (orfeus/gui::gui-model-set-node-kind model node kind)
+        (check changed
+               (format nil "retyping an untyped node to ~A did nothing" kind))
+        (check (orfeus:graph-validate (selected-graph model))
+               (format nil "retyping to ~A left the graph invalid" kind))
+        ;; Crop and Film belong in display space, so they must not be moved.
+        (if (member kind '(:crop :film))
+            (check (null moved)
+                   (format nil "~A was moved although it may follow film" kind))
+            (check moved
+                   (format nil "~A was left reading film output" kind)))))))
+
 (defun test-viewport-render-bound ()
   "The viewport render is sized for the canvas, and grows only with zoom.
 
@@ -1337,6 +1422,8 @@ against 45 milliseconds for a canvas-sized render."
   (test-undo-history)
   (test-graph-node-placement)
   (test-thumbnail-context-menu)
+  (test-node-adds-land-where-they-are-legal)
+  (test-retyping-moves-a-node-into-its-domain)
   (test-viewport-render-bound)
   (test-curve-spline-shapes)
   (test-preset-bulk-application)

@@ -651,6 +651,47 @@ mixes in each word's index within its chunk and the tail is folded separately."
                nil)
            (invalid-project-data () t)))))
 
+(defun graph-domain-placement-p ()
+  "Display-space tracking, and the insertion point derived from it.
+
+A film node converts its branch to display space; only crops, further film
+nodes, and untyped containers may read that. Placement has to know the same rule
+GRAPH-VALIDATE enforces, or it puts nodes where validation then refuses them."
+  (let* ((graph (default-processing-graph))
+         (linear (processing-graph-output graph))
+         (film (graph-node-id
+                (graph-insert-node graph linear :film
+                                   :params '(:lut-path nil :lut-strength 0.0
+                                             :grain-amount 0.2
+                                             :grain-size 1.0))))
+         (crop (graph-node-id
+                (graph-insert-node graph film :crop
+                                   :params '(:left 0.1 :top 0.1 :width 0.8
+                                             :height 0.8 :angle 0.0)))))
+    (and
+     ;; The source and the grade chain are scene-linear; film and anything
+     ;; downstream that keeps its domain are not.
+     (not (graph-display-domain-p graph *graph-source-id*))
+     (not (graph-display-domain-p graph linear))
+     (graph-display-domain-p graph film)
+     (graph-display-domain-p graph crop)
+     ;; Kinds that may live in display space keep the position asked for.
+     (graph-kind-accepts-display-p :crop)
+     (graph-kind-accepts-display-p :film)
+     (graph-kind-accepts-display-p :node)
+     (not (graph-kind-accepts-display-p :curves))
+     (not (graph-kind-accepts-display-p :exposure))
+     (eql crop (graph-insertion-point graph crop :crop))
+     (eql crop (graph-insertion-point graph crop :film))
+     ;; A scene-linear kind walks upstream past the crop and the film node to
+     ;; the last position it is legal, rather than failing where it was asked.
+     (eql linear (graph-insertion-point graph crop :curves))
+     (eql linear (graph-insertion-point graph film :exposure))
+     ;; Already legal positions are left alone.
+     (eql linear (graph-insertion-point graph linear :tone))
+     (eql *graph-source-id*
+          (graph-insertion-point graph *graph-source-id* :white-balance)))))
+
 (defun graph-node-workflow-p ()
   ;; The Resolve-style flow: New Node (untyped) -> assign a correction.
   (let* ((graph (default-processing-graph))
@@ -1682,6 +1723,8 @@ mixes in each word's index within its chunk and the tail is folded separately."
              (graph-editing-p))
       (check "nodes splice anywhere and invalid wires roll back"
              (graph-rewire-p))
+      (check "display-space tracking places nodes where they are legal"
+             (graph-domain-placement-p))
       (check "untyped nodes pass through until a correction is assigned"
              (graph-node-workflow-p))
       (check "graph positions validate before portable serialization"

@@ -42,6 +42,10 @@
                 #:graph-effective-nodes
                 #:graph-find-node
                 #:graph-insert-node
+                #:graph-insertion-point
+                #:graph-display-domain-p
+                #:graph-kind-accepts-display-p
+                #:*graph-source-id*
                 #:graph-node-bypassed-p
                 #:graph-node-inputs
                 #:graph-node-kind

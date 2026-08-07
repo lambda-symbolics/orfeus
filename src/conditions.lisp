@@ -27,9 +27,21 @@
     :reader invalid-project-data-reason))
   (:report
    (lambda (condition stream)
-     (format stream "Invalid Orfeus project data ~S: ~A"
-             (invalid-project-data-datum condition)
-             (invalid-project-data-reason condition))))
+     ;; The reason first, because this text lands in the GUI status bar: with the
+     ;; datum leading, a rejected graph node printed its whole structure and
+     ;; pushed the explanation off the end of the bar, so a refused edit looked
+     ;; like a button that did nothing. The datum follows only when it is short
+     ;; enough to still leave the reason visible.
+     (format stream "~A" (invalid-project-data-reason condition))
+     (let ((datum (let ((*print-length* 6)
+                        (*print-level* 2)
+                        (*print-pretty* nil)
+                        (*print-circle* t))
+                    (ignore-errors
+                      (prin1-to-string
+                       (invalid-project-data-datum condition))))))
+       (when (and datum (<= (length datum) 90))
+         (format stream " (~A)" datum)))))
   (:documentation "Signalled when project S-expression data fails validation."))
 
 (define-condition dng-original-error (orfeus-error)

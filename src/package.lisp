@@ -111,6 +111,9 @@
    #:*minimum-curve-points*
    #:*maximum-curve-points*
    #:graph-insert-node
+   #:graph-insertion-point
+   #:graph-display-domain-p
+   #:graph-kind-accepts-display-p
    #:graph-delete-node
    #:graph-swap-with-upstream
    #:graph-tail-linear-node-id

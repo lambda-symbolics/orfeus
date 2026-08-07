@@ -3,6 +3,29 @@
 (defvar *native-library* nil
   "The loaded CFFI library handle for the Orfeus Rust bridge.")
 
+(defmacro with-native-float-traps (&body body)
+  "Run BODY with the floating-point traps SBCL arms by default disabled.
+
+Required around every call into the render library, and not only around the ones
+that obviously compute: Rust reaches for infinities and NaNs routinely, and a
+trap raised in foreign code is not something SBCL can recover from — the process
+dies with SIGFPE.
+
+The subtle part is that the trap state leaks past the call. Rayon builds its
+global thread pool lazily, on first use, and those workers inherit the
+floating-point control word of whichever thread happened to create them. So one
+unmasked entry point that reaches Rayon arms the traps for every worker in the
+process, and the crash then surfaces in some unrelated render later on. That is
+exactly what happened when the DNG extractor started inflating its blocks in
+parallel: extraction ran unmasked, it became the first Rayon user in a GUI
+session, and the next render died in a thread SBCL did not even know about."
+  #+sbcl
+  `(sb-int:with-float-traps-masked (:invalid :divide-by-zero :overflow
+                                    :underflow :inexact)
+     ,@body)
+  #-sbcl
+  `(progn ,@body))
+
 (defcfun ("orfeus_bridge_abi_version" %native-bridge-abi-version) :uint32)
 
 (defcfun ("orfeus_dng_original_filename" %dng-original-filename) :int32
@@ -656,10 +679,11 @@ image width and height as two values."
   (native-library-load)
   (with-foreign-pointer (filename-buffer *native-filename-buffer-size*)
     (with-foreign-pointer (error-buffer *native-error-buffer-size*)
-      (let ((status (%dng-original-filename
-                     (namestring pathname)
-                     filename-buffer *native-filename-buffer-size*
-                     error-buffer *native-error-buffer-size*)))
+      (let ((status (with-native-float-traps
+                      (%dng-original-filename
+                       (namestring pathname)
+                       filename-buffer *native-filename-buffer-size*
+                       error-buffer *native-error-buffer-size*))))
         (unless (zerop status)
           (error 'dng-original-error
                  :pathname pathname
@@ -683,10 +707,11 @@ verification by the Rust bridge."
       (:supersede nil)))
   (native-library-load)
   (with-foreign-pointer (error-buffer *native-error-buffer-size*)
-    (let ((status (%dng-extract-original
-                   (namestring dng-pathname)
-                   (namestring output-pathname)
-                   error-buffer *native-error-buffer-size*)))
+    (let ((status (with-native-float-traps
+                    (%dng-extract-original
+                     (namestring dng-pathname)
+                     (namestring output-pathname)
+                     error-buffer *native-error-buffer-size*))))
       (unless (zerop status)
         (error 'dng-original-error
                :pathname dng-pathname

@@ -758,6 +758,41 @@ rolls the graph back and re-signals."
           (graph-normalize graph)
           t))))))
 
+(defun graph-kind-accepts-display-p (kind)
+  "True when KIND may read a branch that has already passed through film."
+  (and (member kind '(:film :crop :node)) t))
+
+(defun graph-display-domain-p (graph id)
+  "True when the branch ending at ID has passed through a film node.
+
+Mirrors the rule GRAPH-VALIDATE enforces: a film node converts its branch to
+display space, a crop or an untyped node keeps whatever domain it was handed,
+and nothing else may consume display output at all. The source is scene-linear."
+  (let ((node (graph-find-node graph id)))
+    (and node
+         (case (graph-node-kind node)
+           (:film t)
+           ((:crop :node)
+            (graph-display-domain-p graph (first (graph-node-inputs node))))
+           (t nil)))))
+
+(defun graph-insertion-point (graph after-id kind)
+  "The furthest downstream position at or above AFTER-ID that KIND may occupy.
+
+A scene-linear correction cannot read a film node's output, so asking for one
+after the film tail used to fail outright: the node did not appear and the
+reason went to the status bar, which read as the button doing nothing. Walking
+upstream to the last position where the kind is legal puts it where the user
+can only have meant, since a grade node placed after the film transform would
+have nothing sensible to do there anyway."
+  (cond ((graph-kind-accepts-display-p kind) after-id)
+        ((not (graph-display-domain-p graph after-id)) after-id)
+        (t (let ((node (graph-find-node graph after-id)))
+             (if node
+                 (graph-insertion-point graph (first (graph-node-inputs node))
+                                        kind)
+                 after-id)))))
+
 (defun graph-tail-linear-node-id (graph)
   "Return the last node id on the output path before any film tail."
   (let ((id (processing-graph-output graph)))

@@ -5169,10 +5169,17 @@ new cache entry is published."
                                              node))))
                           (handler-case
                               (progn
-                                (gui-model-set-node-kind model node kind)
-                                (after-graph-edit
-                                 (format nil "Correction set to ~A"
-                                         (node-kind-label kind))))
+                                (multiple-value-bind (changed moved)
+                                    (gui-model-set-node-kind model node kind)
+                                  (declare (ignore changed))
+                                  (after-graph-edit
+                                   (if moved
+                                       ;; Say so, or the node appearing further
+                                       ;; up the chain looks like a glitch.
+                                       (format nil "~A moved before the film tail"
+                                               (node-kind-label kind))
+                                       (format nil "Correction set to ~A"
+                                               (node-kind-label kind))))))
                             (error (condition)
                               (sync-node-tools)
                               (set-status

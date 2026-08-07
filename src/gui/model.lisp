@@ -648,10 +648,14 @@ placement breaks the film-domain rules."
   (let ((graph (let ((*inside-model-edit* t))
                  (gui-model-ensure-graph model))))
     (when graph
-      (let* ((after-id (or after
-                           (if (eq kind :film)
-                               (orfeus:processing-graph-output graph)
-                               (orfeus:graph-tail-linear-node-id graph))))
+      (let* ((requested (or after
+                            (if (eq kind :film)
+                                (orfeus:processing-graph-output graph)
+                                (orfeus:graph-tail-linear-node-id graph))))
+             ;; Clamped to where the kind is legal: right-clicking the film node
+             ;; and asking for a grade correction used to fail validation and
+             ;; look like the menu entry did nothing.
+             (after-id (orfeus:graph-insertion-point graph requested kind))
              (node (orfeus:graph-insert-node graph after-id kind
                                              :params params)))
         (reflow-graph-node-positions graph node)
@@ -699,13 +703,30 @@ placement breaks the film-domain rules."
               t)))))))
 
 (defun gui-model-set-node-kind (model node kind)
-  "Assign a correction KIND to NODE on the selected photo's graph."
+  "Assign a correction KIND to NODE on the selected photo's graph.
+
+An untyped node is legal anywhere, including after the film tail, so the kind it
+is given may not be. Rather than refuse — which looked like the Correction
+dropdown doing nothing — the node moves upstream to the last position that kind
+can occupy. Returns a second value: the node's new upstream neighbour when it
+had to move."
   (gui-model-checkpoint model)
   (let* ((job (gui-model-selected-job model))
          (graph (and job (photo-job-graph job))))
     (when (and graph
                (member node (orfeus:processing-graph-nodes graph)))
-      (orfeus:graph-set-node-kind graph (orfeus:graph-node-id node) kind))))
+      (let* ((id (orfeus:graph-node-id node))
+             (upstream (first (orfeus:graph-node-inputs node)))
+             (legal (orfeus:graph-insertion-point graph upstream kind))
+             (moved (and (/= legal upstream)
+                         (let ((*inside-model-edit* t))
+                           (orfeus:graph-move-node-after graph id legal)
+                           t))))
+        (values (let ((*inside-model-edit* t))
+                  (orfeus:graph-set-node-kind graph
+                                              (orfeus:graph-node-id node)
+                                              kind))
+                (and moved legal))))))
 
 (defun gui-model-set-primary-input (model node input-id)
   "Point NODE's primary input at INPUT-ID on the selected photo's graph."
