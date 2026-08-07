@@ -4,7 +4,6 @@
 #include <FL/Fl_Native_File_Chooser.H>
 #include <FL/Fl_RGB_Image.H>
 #include <FL/Fl_Widget.H>
-#include <FL/Fl_Window.H>
 #include <FL/fl_draw.H>
 #include <algorithm>
 #include <cmath>
@@ -378,22 +377,6 @@ extern "C" int orfeus_gui_preview_size(const char *path, int *width, int *height
 extern "C" void orfeus_gui_preview_forget(const char *path) {
     std::lock_guard<std::mutex> lock(images_mutex);
     if (path && *path) images.erase(path);
-}
-
-// Set the mouse cursor over a widget's window.
-//
-// Sampling the film base turns the pointer into a crosshair, because at that
-// moment the preview is a colour target rather than an image to pan: the cursor
-// is the only thing that says the next click will be read rather than acted on.
-// FLTK scopes a cursor to a window, so the widget is resolved to its own.
-extern "C" int orfeus_gui_preview_set_cursor(long long widget_id, int cursor) {
-    Fl_Widget *widget = clfl_bridge::find_widget(widget_id);
-    if (!widget) return 0;
-    Fl_Window *window = widget->window();
-    if (!window) window = widget->as_window();
-    if (!window) return 0;
-    window->cursor(static_cast<Fl_Cursor>(cursor));
-    return 1;
 }
 
 extern "C" void orfeus_gui_preview_clear(void) {

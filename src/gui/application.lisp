@@ -3225,7 +3225,7 @@ new cache entry is published."
              ;; A crosshair while a click on the preview will be read as a
              ;; colour rather than acted on as a pan or a crop drag.
              (when after-canvas
-               (ignore-errors (set-widget-cursor after-canvas shape))))
+               (ignore-errors (lightfast:set-cursor after-canvas shape))))
            (set-base-channel (node key percent)
              ;; The fields read in encoded percent, which is how the colour
              ;; looks; the node keeps it scene-linear, which is where the
