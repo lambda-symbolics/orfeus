@@ -1529,8 +1529,9 @@ pub(crate) struct LayerSpec {
 
 /// Output channels one `nr_conv` workgroup accumulates; must match GROUP there.
 const CONV_CHANNEL_GROUP: u32 = 8;
-/// Output pixels per workgroup edge; must match `local_size` in `nr_conv`.
-const CONV_TILE: u32 = 16;
+/// Output pixels one `nr_conv` workgroup covers per axis; must match SPAN there,
+/// which is its thread count times the square each thread computes.
+const CONV_SPAN: u32 = 32;
 
 /// Where each region of the network's working buffer starts, in floats.
 ///
@@ -1587,8 +1588,8 @@ struct ConvGroups {
 
 fn conv_groups(output_edge: usize, output_channels: usize) -> ConvGroups {
     ConvGroups {
-        x: (output_edge as u32).div_ceil(CONV_TILE),
-        y: (output_edge as u32).div_ceil(CONV_TILE),
+        x: (output_edge as u32).div_ceil(CONV_SPAN),
+        y: (output_edge as u32).div_ceil(CONV_SPAN),
         z: (output_channels as u32).div_ceil(CONV_CHANNEL_GROUP),
     }
 }

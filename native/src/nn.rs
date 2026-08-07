@@ -935,95 +935,103 @@ mod tests {
         //   VK_DRIVER_FILES=$(nix build --no-link --print-out-paths nixpkgs#mesa)\
         //     /share/vulkan/icd.d/lvp_icd.x86_64.json \
         //   ORFEUS_GPU_TEST=1 cargo test --release gpu_convolutions -- --test-threads=1
-        if std::env::var_os("ORFEUS_GPU_TEST").as_deref()
-            != Some(std::ffi::OsStr::new("1"))
-        {
+        if std::env::var_os("ORFEUS_GPU_TEST").as_deref() != Some(std::ffi::OsStr::new("1")) {
             eprintln!("skipping: set ORFEUS_GPU_TEST=1 with a Vulkan driver");
             return;
         }
         let gpu = gpu_network().expect("the packed network");
         let net = network().unwrap();
-        // A patch wide enough that the twelve valid convolutions leave real
-        // output, and an origin far enough inside that no border clamping
-        // applies, so this isolates the arithmetic from the zeroing.
-        let tile = 8_usize;
-        let patch_size = tile + 2 * HALO;
-        let image = (256_usize, 256_usize);
-        let origin = (64_isize, 64_isize);
-        let inputs = INPUT_CHANNELS * patch_size * patch_size;
-        let patch: Vec<f32> = (0..inputs)
-            .map(|index| ((index % 97) as f32 / 97.0 - 0.5) * 0.7)
-            .collect();
+        // Three shapes, because the shader masks work three different ways and a
+        // single full workgroup in the middle of an image exercises none of them:
+        //   - a tile smaller than one workgroup's output span,
+        //   - a tile spanning several workgroups with a partial one at the edge,
+        //   - a tile at the image corner, where the halo falls outside the real
+        //     feature map and has to come back zeroed.
+        for (tile, origin, image) in [
+            (8_usize, (64_isize, 64_isize), (256_usize, 256_usize)),
+            (40, (64, 64), (256, 256)),
+            (40, (0, 0), (48, 48)),
+        ] {
+            let patch_size = tile + 2 * HALO;
+            let inputs = INPUT_CHANNELS * patch_size * patch_size;
+            let patch: Vec<f32> = (0..inputs)
+                .map(|index| ((index % 97) as f32 / 97.0 - 0.5) * 0.7)
+                .collect();
 
-        let mut on_gpu = patch.clone();
-        crate::gpu::convolve_network(
-            &mut on_gpu[..inputs],
-            patch_size,
-            origin,
-            image,
-            &gpu.blob,
-            &gpu.layers,
-        )
-        .expect("the network dispatches");
+            let mut on_gpu = patch.clone();
+            crate::gpu::convolve_network(
+                &mut on_gpu[..inputs],
+                patch_size,
+                origin,
+                image,
+                &gpu.blob,
+                &gpu.layers,
+            )
+            .expect("the network dispatches");
 
-        // The CPU reference, layer by layer over the same patch.
-        let mut scratch = TileScratch::new(tile);
-        scratch.ping[..inputs].copy_from_slice(&patch);
-        let mut size = patch_size;
-        let mut source_is_ping = true;
-        for (index, layer) in net.layers.iter().enumerate() {
-            let relu = index + 1 < net.layers.len();
-            let (input, output) = if source_is_ping {
-                (&scratch.ping, &mut scratch.pong)
+            // The CPU reference, layer by layer over the same patch.
+            let mut scratch = TileScratch::new(tile);
+            scratch.ping[..inputs].copy_from_slice(&patch);
+            let mut size = patch_size;
+            let mut source_is_ping = true;
+            for (index, layer) in net.layers.iter().enumerate() {
+                let relu = index + 1 < net.layers.len();
+                let (input, output) = if source_is_ping {
+                    (&scratch.ping, &mut scratch.pong)
+                } else {
+                    (&scratch.pong, &mut scratch.ping)
+                };
+                convolve_valid(
+                    layer,
+                    input,
+                    size,
+                    output,
+                    &mut scratch.row_accumulators,
+                    relu,
+                );
+                size -= 2;
+                zero_outside_global_image(
+                    output,
+                    layer.output_channels,
+                    size,
+                    origin.0 as usize,
+                    origin.1 as usize,
+                    HALO - index - 1,
+                    image.0,
+                    image.1,
+                );
+                source_is_ping = !source_is_ping;
+            }
+            let reference = if source_is_ping {
+                &scratch.ping
             } else {
-                (&scratch.pong, &mut scratch.ping)
+                &scratch.pong
             };
-            convolve_valid(
-                layer,
-                input,
-                size,
-                output,
-                &mut scratch.row_accumulators,
-                relu,
+            let count = OUTPUT_CHANNELS * size * size;
+            let worst = on_gpu[..count]
+                .iter()
+                .zip(&reference[..count])
+                .map(|(actual, expected)| (actual - expected).abs())
+                .fold(0.0_f32, f32::max);
+            // Two buffers of zeros would agree perfectly, so the reference has to
+            // be shown to carry signal before its agreement means anything. The
+            // corner case zeroes most of its output, hence only a nonzero check.
+            let magnitude = reference[..count]
+                .iter()
+                .map(|value| value.abs())
+                .fold(0.0_f32, f32::max);
+            assert!(
+                magnitude > 1.0e-3,
+                "tile {tile} at {origin:?} produced nothing to compare ({magnitude})"
             );
-            size -= 2;
-            zero_outside_global_image(
-                output,
-                layer.output_channels,
-                size,
-                origin.0 as usize,
-                origin.1 as usize,
-                HALO - index - 1,
-                image.0,
-                image.1,
+            eprintln!("tile {tile} at {origin:?}: worst {worst}, magnitude {magnitude}");
+            // Twelve layers of accumulation in a different order, so exact
+            // equality is not on offer; this is far below one 8-bit step.
+            assert!(
+                worst < 2.0e-4,
+                "tile {tile} at {origin:?} differed by {worst}"
             );
-            source_is_ping = !source_is_ping;
         }
-        let reference = if source_is_ping {
-            &scratch.ping
-        } else {
-            &scratch.pong
-        };
-        let count = OUTPUT_CHANNELS * size * size;
-        let worst = on_gpu[..count]
-            .iter()
-            .zip(&reference[..count])
-            .map(|(actual, expected)| (actual - expected).abs())
-            .fold(0.0_f32, f32::max);
-        // Two buffers of zeros would agree perfectly, so the reference has to
-        // be shown to carry signal before its agreement means anything.
-        let magnitude = reference[..count]
-            .iter()
-            .map(|value| value.abs())
-            .fold(0.0_f32, f32::max);
-        assert!(
-            magnitude > 1.0e-3,
-            "the reference produced nothing to compare against ({magnitude})"
-        );
-        eprintln!("worst difference {worst}, reference magnitude {magnitude}");
-        // Twelve layers of accumulation in a different order, so exact equality
-        // is not on offer; this is still far below one 8-bit step.
-        assert!(worst < 2.0e-4, "worst channel difference was {worst}");
     }
 
     #[test]
