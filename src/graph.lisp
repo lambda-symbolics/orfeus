@@ -793,6 +793,25 @@ have nothing sensible to do there anyway."
                                         kind)
                  after-id)))))
 
+(defun graph-can-insert-p (graph after-id kind)
+  "True when a KIND node inserted directly after AFTER-ID would be well formed.
+
+Decided by trying it on a copy rather than by restating the rules, so this
+cannot drift from GRAPH-VALIDATE as the rules grow. It already answers for more
+than the film domain: an optics node may not read a cropped branch either, and
+a blend may not consume film output.
+
+Copying a graph per candidate kind is only worth it because the caller is a
+context menu being opened by hand."
+  (handler-case
+      (progn (graph-insert-node (graph-copy graph) after-id kind) t)
+    (invalid-project-data () nil)))
+
+(defun graph-insertable-kinds (graph after-id)
+  "The node kinds that may be inserted directly after AFTER-ID, in menu order."
+  (remove-if-not (lambda (kind) (graph-can-insert-p graph after-id kind))
+                 (graph-node-kinds)))
+
 (defun graph-tail-linear-node-id (graph)
   "Return the last node id on the output path before any film tail."
   (let ((id (processing-graph-output graph)))

@@ -692,6 +692,56 @@ GRAPH-VALIDATE enforces, or it puts nodes where validation then refuses them."
      (eql *graph-source-id*
           (graph-insertion-point graph *graph-source-id* :white-balance)))))
 
+(defun graph-insertable-kinds-p ()
+  "The kinds a position will accept, which is what the context menu offers.
+
+Decided by trial insertion rather than by restating the rules, so it tracks all
+of them at once: the film domain, optics refusing a cropped branch, and a blend
+whose two branches would disagree about geometry. A menu that offered the rest
+and then quietly relocated them would be lying about where a click puts things."
+  (let* ((graph (default-processing-graph))
+         (linear (processing-graph-output graph))
+         (film (graph-node-id
+                (graph-insert-node graph linear :film
+                                   :params '(:lut-path nil :lut-strength 0.0
+                                             :grain-amount 0.2
+                                             :grain-size 1.0))))
+         (display-crop (graph-node-id
+                        (graph-insert-node graph film :crop
+                                           :params '(:left 0.1 :top 0.1
+                                                     :width 0.8 :height 0.8
+                                                     :angle 0.0))))
+         (all (graph-node-kinds)))
+    (and
+     ;; A scene-linear, uncropped position accepts everything.
+     (null (set-difference all (graph-insertable-kinds graph linear)))
+     ;; Below the film transform only the two display-space kinds remain.
+     (equal '(:film :crop)
+            (remove-if-not (lambda (kind) (member kind '(:film :crop)))
+                           (graph-insertable-kinds graph film)))
+     (null (set-difference (graph-insertable-kinds graph film) '(:film :crop)))
+     (null (set-difference (graph-insertable-kinds graph display-crop)
+                           '(:film :crop)))
+     ;; Every offered kind really does insert, and every withheld one really
+     ;; does not: the menu and the validator must not disagree either way.
+     (every (lambda (kind) (graph-can-insert-p graph film kind))
+            (graph-insertable-kinds graph film))
+     (notany (lambda (kind) (graph-can-insert-p graph film kind))
+             (set-difference all (graph-insertable-kinds graph film)))
+     ;; On a scene-linear branch a crop still excludes optics, which cannot read
+     ;; a cropped input, and a blend, whose other branch would be uncropped.
+     (let* ((plain (default-processing-graph))
+            (crop (graph-node-id
+                   (graph-insert-node plain (processing-graph-output plain)
+                                      :crop
+                                      :params '(:left 0.1 :top 0.1 :width 0.8
+                                                :height 0.8 :angle 0.0))))
+            (offered (graph-insertable-kinds plain crop)))
+       (and (not (member :optics offered))
+            (not (member :blend offered))
+            (member :curves offered)
+            (member :exposure offered))))))
+
 (defun graph-node-workflow-p ()
   ;; The Resolve-style flow: New Node (untyped) -> assign a correction.
   (let* ((graph (default-processing-graph))
@@ -1723,6 +1773,8 @@ GRAPH-VALIDATE enforces, or it puts nodes where validation then refuses them."
              (graph-editing-p))
       (check "nodes splice anywhere and invalid wires roll back"
              (graph-rewire-p))
+      (check "a position offers exactly the kinds it accepts"
+             (graph-insertable-kinds-p))
       (check "display-space tracking places nodes where they are legal"
              (graph-domain-placement-p))
       (check "untyped nodes pass through until a correction is assigned"

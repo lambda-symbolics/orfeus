@@ -112,6 +112,8 @@
    #:*maximum-curve-points*
    #:graph-insert-node
    #:graph-insertion-point
+   #:graph-can-insert-p
+   #:graph-insertable-kinds
    #:graph-display-domain-p
    #:graph-kind-accepts-display-p
    #:graph-delete-node

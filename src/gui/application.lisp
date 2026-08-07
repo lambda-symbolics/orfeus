@@ -2691,43 +2691,73 @@ new cache entry is published."
                             (lambda ()
                               (gui-model-delete-node model node)
                               (after-graph-edit "Node deleted")))))))
+           (insertable-kinds-after (after-node)
+             ;; Only the kinds that would actually be well formed in that spot.
+             ;; Below a film node that is Crop and Film alone, and below a crop
+             ;; it excludes Optics, which may not read a cropped branch. Offering
+             ;; the rest there and quietly relocating them would make the menu
+             ;; lie about where a click puts things.
+             (let ((graph (gui-model-display-graph model)))
+               (if (null graph)
+                   (orfeus:graph-node-kinds)
+                   (orfeus:graph-insertable-kinds
+                    graph
+                    (if after-node
+                        (orfeus:graph-node-id after-node)
+                        (orfeus:graph-tail-linear-node-id graph))))))
            (add-node-menu-actions (after-node)
              ;; The Resolve flow first: New Node makes an untyped container
              ;; the Node panel then assigns a correction to. The direct
              ;; per-kind entries remain as shortcuts.
-             (append
-              (list (cons "New Node"
-                          (lambda ()
-                            (handler-case
-                                (progn
-                                  (gui-model-add-node
-                                   model :node
-                                   :after (and after-node
-                                               (orfeus:graph-node-id
-                                                after-node)))
-                                  (after-graph-edit
-                                   "New node: pick a correction type"))
-                              (error (condition)
-                                (set-status
-                                 (princ-to-string condition))))))
-                    (cons "-" nil))
-              (mapcar
-               (lambda (kind)
-                 (cons (format nil "Add ~A" (node-kind-label kind))
-                       (lambda ()
-                         (handler-case
-                             (progn
-                               (gui-model-add-node
-                                model kind
-                                :after (and after-node
-                                            (orfeus:graph-node-id
-                                             after-node)))
-                               (after-graph-edit
-                                (format nil "Added ~A node"
-                                        (node-kind-label kind))))
-                           (error (condition)
-                             (set-status (princ-to-string condition)))))))
-               (orfeus:graph-node-kinds))))
+             (let ((kinds (insertable-kinds-after after-node)))
+               (append
+                (list (cons "New Node"
+                            (lambda ()
+                              (handler-case
+                                  (progn
+                                    (gui-model-add-node
+                                     model :node
+                                     :after (and after-node
+                                                 (orfeus:graph-node-id
+                                                  after-node)))
+                                    (after-graph-edit
+                                     "New node: pick a correction type"))
+                                (error (condition)
+                                  (set-status
+                                   (princ-to-string condition))))))
+                      (cons "-" nil))
+                (mapcar
+                 (lambda (kind)
+                   (cons (format nil "Add ~A" (node-kind-label kind))
+                         (lambda ()
+                           (handler-case
+                               (progn
+                                 (gui-model-add-node
+                                  model kind
+                                  :after (and after-node
+                                              (orfeus:graph-node-id
+                                               after-node)))
+                                 (after-graph-edit
+                                  (format nil "Added ~A node"
+                                          (node-kind-label kind))))
+                             (error (condition)
+                               (set-status (princ-to-string condition)))))))
+                 kinds)
+                ;; Say why the list is short rather than leaving the missing
+                ;; entries to be puzzled over. The label carries no action, and
+                ;; SHOW-NODE-MENU ignores entries that have none.
+                (when (< (length kinds) (length (orfeus:graph-node-kinds)))
+                  (list (cons "-" nil)
+                        (cons (omitted-kinds-reason after-node) nil))))))
+           (omitted-kinds-reason (after-node)
+             ;; Two rules narrow the list, and they read very differently: below
+             ;; a film node almost nothing scene-linear is legal, while below a
+             ;; crop it is only optics and blends that drop out.
+             (let* ((graph (gui-model-display-graph model))
+                    (id (and after-node (orfeus:graph-node-id after-node))))
+               (if (and graph id (orfeus:graph-display-domain-p graph id))
+                   "grades go above the film transform"
+                   "optics and blends go above a crop")))
            (show-node-menu (actions)
              (let ((chosen (lightfast:popup-menu (mapcar #'first actions))))
                (when chosen
