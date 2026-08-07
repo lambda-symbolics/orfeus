@@ -2,12 +2,13 @@ use std::env;
 use std::path::PathBuf;
 use std::process::Command;
 
-const STAGES: [&str; 5] = [
+const STAGES: [&str; 6] = [
     "tone_transfer",
     "nr_ycbcr",
     "nr_bilateral",
     "nr_median",
     "nr_combine",
+    "nr_conv",
 ];
 
 fn main() {

@@ -27,6 +27,7 @@ const NR_YCBCR_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/nr_ycbc
 const NR_BILATERAL_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/nr_bilateral.spv"));
 const NR_MEDIAN_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/nr_median.spv"));
 const NR_COMBINE_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/nr_combine.spv"));
+const NR_CONV_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/nr_conv.spv"));
 
 /// The push-constant block declared in `shaders/stage.glsl`.
 ///
@@ -87,6 +88,7 @@ struct Context {
     nr_bilateral: vk::Pipeline,
     nr_median: vk::Pipeline,
     nr_combine: vk::Pipeline,
+    nr_conv: vk::Pipeline,
     descriptor_pool: vk::DescriptorPool,
     descriptor_set: vk::DescriptorSet,
     command: vk::CommandBuffer,
@@ -332,6 +334,7 @@ fn initialize() -> Result<Context, String> {
         let nr_bilateral = create_pipeline(&device, pipeline_layout, NR_BILATERAL_SHADER)?;
         let nr_median = create_pipeline(&device, pipeline_layout, NR_MEDIAN_SHADER)?;
         let nr_combine = create_pipeline(&device, pipeline_layout, NR_COMBINE_SHADER)?;
+        let nr_conv = create_pipeline(&device, pipeline_layout, NR_CONV_SHADER)?;
         let pool_size = [vk::DescriptorPoolSize::default()
             .ty(vk::DescriptorType::STORAGE_BUFFER)
             .descriptor_count(bindings.len() as u32)];
@@ -375,6 +378,7 @@ fn initialize() -> Result<Context, String> {
             nr_bilateral,
             nr_median,
             nr_combine,
+            nr_conv,
             descriptor_pool,
             descriptor_set,
             command,
@@ -611,6 +615,17 @@ impl Slot {
             std::ptr::copy_nonoverlapping(
                 values.as_ptr().cast::<u8>(),
                 self.mapped as *mut u8,
+                std::mem::size_of_val(values),
+            );
+        }
+    }
+
+    /// Writes `values` into the host-visible buffer starting at `offset` floats.
+    unsafe fn upload_at(&self, offset: usize, values: &[f32]) {
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                values.as_ptr().cast::<u8>(),
+                (self.mapped + offset * std::mem::size_of::<f32>()) as *mut u8,
                 std::mem::size_of_val(values),
             );
         }
@@ -1189,6 +1204,7 @@ impl Drop for Context {
                 self.nr_bilateral,
                 self.nr_median,
                 self.nr_combine,
+                self.nr_conv,
             ] {
                 self.device.destroy_pipeline(pipeline, None);
             }
@@ -1498,4 +1514,261 @@ mod tests {
         );
         assert!(max_error <= 2.0e-5, "GPU maximum error {max_error}");
     }
+}
+
+/// One convolution layer's shape and where its parameters sit in the blob.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LayerSpec {
+    pub(crate) input_channels: usize,
+    pub(crate) output_channels: usize,
+    /// Offset of this layer's weights within the blob, in floats.
+    pub(crate) weights: usize,
+    /// Offset of this layer's biases within the blob, in floats.
+    pub(crate) biases: usize,
+}
+
+/// Output channels one `nr_conv` workgroup accumulates; must match GROUP there.
+const CONV_CHANNEL_GROUP: u32 = 8;
+/// Output pixels per workgroup edge; must match `local_size` in `nr_conv`.
+const CONV_TILE: u32 = 16;
+
+/// Where each region of the network's working buffer starts, in floats.
+///
+/// One allocation, because the renderer binds exactly one storage buffer and
+/// addresses everything through push-constant offsets. The input patch and the
+/// final output share the front of it: the last layer writes twelve planes back
+/// over the thirteen it started from, so the download reads from offset zero and
+/// no separate result region is needed.
+struct NetworkLayout {
+    ping: usize,
+    pong: usize,
+    weights: usize,
+    total: usize,
+}
+
+impl NetworkLayout {
+    fn new(patch_edge: usize, features: usize, blob: usize) -> Result<Self, String> {
+        let patch = patch_edge
+            .checked_mul(patch_edge)
+            .ok_or_else(|| format!("GPU network patch {patch_edge} is too large"))?;
+        let stack = features
+            .checked_mul(patch)
+            .ok_or_else(|| "GPU network feature stack overflow".to_string())?;
+        // The front holds the input patch, which is narrower than a feature
+        // stack, so a stack's worth of room covers both it and the result.
+        let ping = stack;
+        let pong = ping
+            .checked_add(stack)
+            .ok_or_else(|| "GPU network scratch overflow".to_string())?;
+        let weights = pong
+            .checked_add(stack)
+            .ok_or_else(|| "GPU network scratch overflow".to_string())?;
+        let total = weights
+            .checked_add(blob)
+            .ok_or_else(|| "GPU network buffer overflow".to_string())?;
+        Ok(Self {
+            ping,
+            pong,
+            weights,
+            total,
+        })
+    }
+}
+
+/// The conv dispatch is genuinely three-dimensional — two spatial axes and one
+/// over groups of output channels — where every other stage walks a flat pixel
+/// index and so needs only a pair.
+#[derive(Debug, Eq, PartialEq)]
+struct ConvGroups {
+    x: u32,
+    y: u32,
+    z: u32,
+}
+
+fn conv_groups(output_edge: usize, output_channels: usize) -> ConvGroups {
+    ConvGroups {
+        x: (output_edge as u32).div_ceil(CONV_TILE),
+        y: (output_edge as u32).div_ceil(CONV_TILE),
+        z: (output_channels as u32).div_ceil(CONV_CHANNEL_GROUP),
+    }
+}
+
+/// Runs every convolution layer over one patch in a single submission.
+///
+/// `patch` arrives holding the layer-one input planes and leaves holding the
+/// final output planes, both at its front. `origin` is the patch's top-left
+/// corner in the global feature map, which goes negative while halo remains, and
+/// `image` is that map's extent: together they tell the shader which activations
+/// lie outside the real image and must return to zero, exactly as the CPU
+/// reference re-zeroes them between layers.
+pub(crate) fn convolve_network(
+    patch: &mut [f32],
+    patch_edge: usize,
+    origin: (isize, isize),
+    image: (usize, usize),
+    blob: &[f32],
+    layers: &[LayerSpec],
+) -> Result<DispatchProfile, String> {
+    if layers.is_empty() {
+        return Err("GPU network has no layers".to_string());
+    }
+    let features = layers
+        .iter()
+        .map(|layer| layer.output_channels.max(layer.input_channels))
+        .max()
+        .unwrap_or(0);
+    if patch_edge < 2 * layers.len() + 1 {
+        return Err(format!(
+            "GPU network needs a patch wider than {} halo pixels, got {patch_edge}",
+            2 * layers.len()
+        ));
+    }
+    let layout = NetworkLayout::new(patch_edge, features, blob.len())?;
+    let bytes = byte_size(layout.total)?;
+    let mut context = locked()?;
+    let started = Instant::now();
+    let properties = context.memory_properties;
+    let limit = context.max_storage_buffer_range;
+    {
+        let Context { device, input, .. } = &mut *context;
+        unsafe { input.ensure(device, &properties, bytes, limit) }?;
+        unsafe {
+            input.upload(patch);
+            input.upload_at(layout.weights, blob);
+        }
+    }
+    bind_input(&context);
+    unsafe { begin_recording(&mut context) }?;
+
+    // Weights are re-sent per patch. It is 3.4 MB against several hundred
+    // milliseconds of arithmetic, so keeping them resident would buy nothing
+    // and would need invalidating whenever the buffer grows.
+    let uploaded = byte_size(layout.weights + blob.len())?;
+    if !context.input.unified {
+        let copy = [vk::BufferCopy::default().size(uploaded)];
+        let barrier = [buffer_barrier(
+            context.input.storage(),
+            bytes,
+            vk::AccessFlags::TRANSFER_WRITE,
+            vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+        )];
+        unsafe {
+            context.device.cmd_copy_buffer(
+                context.command,
+                context.input.host,
+                context.input.device,
+                &copy,
+            );
+            context.device.cmd_pipeline_barrier(
+                context.command,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &barrier,
+                &[],
+            );
+        }
+    }
+    unsafe {
+        context.device.cmd_bind_descriptor_sets(
+            context.command,
+            vk::PipelineBindPoint::COMPUTE,
+            context.pipeline_layout,
+            0,
+            &[context.descriptor_set],
+            &[],
+        );
+        context.device.cmd_bind_pipeline(
+            context.command,
+            vk::PipelineBindPoint::COMPUTE,
+            context.nr_conv,
+        );
+    }
+    let between = [buffer_barrier(
+        context.input.storage(),
+        bytes,
+        vk::AccessFlags::SHADER_WRITE,
+        vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+    )];
+    let mut input_edge = patch_edge;
+    let mut source = 0_usize;
+    let last = layers.len() - 1;
+    for (index, layer) in layers.iter().enumerate() {
+        let output_edge = input_edge - 2;
+        // Alternate between the two scratch stacks, except that the final layer
+        // lands back at the front where the download expects it.
+        let target = if index == last {
+            0
+        } else if index % 2 == 0 {
+            layout.ping
+        } else {
+            layout.pong
+        };
+        let remaining_halo = (last - index) as f32;
+        let parameters = Parameters {
+            counts: [
+                input_edge as u32,
+                output_edge as u32,
+                layer.input_channels as u32,
+                layer.output_channels as u32,
+            ],
+            offsets: [
+                (layout.weights + layer.weights) as u32,
+                (layout.weights + layer.biases) as u32,
+                source as u32,
+                target as u32,
+            ],
+            scalars: [
+                origin.0 as f32 - remaining_halo,
+                origin.1 as f32 - remaining_halo,
+                0.0,
+                0.0,
+            ],
+            flags: [
+                u32::from(index < last),
+                image.0 as u32,
+                image.1 as u32,
+                0,
+            ],
+        };
+        let groups = conv_groups(output_edge, layer.output_channels);
+        unsafe {
+            if index > 0 {
+                context.device.cmd_pipeline_barrier(
+                    context.command,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &between,
+                    &[],
+                );
+            }
+            context.device.cmd_push_constants(
+                context.command,
+                context.pipeline_layout,
+                vk::ShaderStageFlags::COMPUTE,
+                0,
+                parameters.bytes(),
+            );
+            context
+                .device
+                .cmd_dispatch(context.command, groups.x, groups.y, groups.z);
+        }
+        input_edge = output_edge;
+        source = target;
+    }
+    let result_edge = input_edge;
+    let result = layers[last]
+        .output_channels
+        .checked_mul(result_edge * result_edge)
+        .ok_or_else(|| "GPU network result overflow".to_string())?;
+    unsafe { finish_recording(&mut context, byte_size(result)?) }?;
+    unsafe { submit_and_wait(&mut context) }?;
+    unsafe { context.input.download(&mut patch[..result]) };
+    Ok(DispatchProfile {
+        adapter_name: context.adapter_name.clone(),
+        milliseconds: started.elapsed().as_secs_f64() * 1000.0,
+    })
 }

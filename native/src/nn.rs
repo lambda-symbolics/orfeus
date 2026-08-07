@@ -472,6 +472,60 @@ fn zero_outside_global_image(
     }
 }
 
+/// The network's parameters packed for the GPU, with each layer's shape and the
+/// offsets of its weights and biases inside the blob.
+///
+/// Built once. The CPU keeps its weights split per layer because its kernel
+/// walks one layer at a time; the shader addresses everything through one
+/// storage buffer, so the blob has to be contiguous.
+struct GpuNetwork {
+    blob: Vec<f32>,
+    layers: Vec<super::gpu::LayerSpec>,
+}
+
+fn gpu_network() -> Result<&'static GpuNetwork, Error> {
+    static PACKED: OnceLock<Result<GpuNetwork, String>> = OnceLock::new();
+    PACKED
+        .get_or_init(|| {
+            let net = network().map_err(|error| error.to_string())?;
+            let mut blob = Vec::new();
+            let mut layers = Vec::with_capacity(net.layers.len());
+            for layer in &net.layers {
+                let weights = blob.len();
+                blob.extend_from_slice(&layer.weights);
+                let biases = blob.len();
+                blob.extend_from_slice(&layer.bias);
+                layers.push(super::gpu::LayerSpec {
+                    input_channels: layer.input_channels,
+                    output_channels: layer.output_channels,
+                    weights,
+                    biases,
+                });
+            }
+            Ok(GpuNetwork { blob, layers })
+        })
+        .as_ref()
+        .map_err(|error| Error::Render(error.clone()))
+}
+
+/// Whether to run the network's convolutions on the GPU.
+///
+/// Off by default until it has been validated on the machines that matter. Every
+/// other stage Orfeus offloaded lost to the CPU because it moved as many bytes as
+/// it did arithmetic; this one should not, but "should not" is not a measurement.
+fn report_gpu_neural_fallback(error: &str) {
+    static REPORTED: OnceLock<()> = OnceLock::new();
+    REPORTED.get_or_init(|| {
+        eprintln!(
+            "orfeus: WARNING neural noise reduction fell back to the CPU: {error}"
+        );
+    });
+}
+
+fn gpu_requested() -> bool {
+    super::gpu::requested() && std::env::var_os("ORFEUS_GPU_NEURAL").is_some()
+}
+
 /// Bytes of ping-pong scratch one worker needs for a tile of TILE_SIZE.
 fn tile_scratch_bytes(tile_size: usize) -> usize {
     let patch = tile_size + 2 * HALO;
@@ -494,6 +548,11 @@ fn infer_tiled_with_tile_size(
     sigma: f32,
     tile_size: usize,
 ) -> Vec<f32> {
+    let gpu = if gpu_requested() {
+        gpu_network().ok()
+    } else {
+        None
+    };
     let half_plane = half_width * half_height;
     let mut denoised = vec![0.0_f32; OUTPUT_CHANNELS * half_plane];
     let patch_size = tile_size + 2 * HALO;
@@ -520,6 +579,47 @@ fn infer_tiled_with_tile_size(
                         &mut scratch.ping,
                         patch_size,
                     );
+                    // The GPU runs all twelve layers over this patch in one
+                    // submission and hands back the twelve output planes at the
+                    // front of the same buffer, so the copy-out below is shared.
+                    if let Some(gpu) = gpu {
+                        let inputs = INPUT_CHANNELS * patch_size * patch_size;
+                        match super::gpu::convolve_network(
+                            &mut scratch.ping[..inputs],
+                            patch_size,
+                            (origin_x as isize, origin_y as isize),
+                            (half_width, half_height),
+                            &gpu.blob,
+                            &gpu.layers,
+                        ) {
+                            Ok(_) => {
+                                let size = tile_size;
+                                let tile_width =
+                                    tile_size.min(half_width.saturating_sub(origin_x));
+                                let tile_height =
+                                    tile_size.min(half_height.saturating_sub(origin_y));
+                                let mut tile_output =
+                                    vec![0.0_f32; OUTPUT_CHANNELS * tile_width * tile_height];
+                                for channel in 0..OUTPUT_CHANNELS {
+                                    for row in 0..tile_height {
+                                        let source = channel * size * size + row * size;
+                                        let target = channel * tile_width * tile_height
+                                            + row * tile_width;
+                                        tile_output[target..target + tile_width]
+                                            .copy_from_slice(
+                                                &scratch.ping[source..source + tile_width],
+                                            );
+                                    }
+                                }
+                                return ((tile_x, tile_y), tile_output);
+                            }
+                            Err(error) => {
+                                report_gpu_neural_fallback(&error);
+                                // Fall through to the CPU below. GATHER_PATCH
+                                // left the input intact, so nothing is lost.
+                            }
+                        }
+                    }
                     let mut size = patch_size;
                     let mut source_is_ping = true;
                     for (index, layer) in net.layers.iter().enumerate() {
@@ -801,6 +901,104 @@ mod tests {
                 "tile size {tile_size} had border error {max_error}"
             );
         }
+    }
+
+    #[test]
+    fn gpu_convolutions_match_the_cpu_reference() {
+        // Skipped unless a Vulkan device is available. Mesa's lavapipe provides
+        // one on machines with no real driver:
+        //   VK_DRIVER_FILES=$(nix build --no-link --print-out-paths nixpkgs#mesa)\
+        //     /share/vulkan/icd.d/lvp_icd.x86_64.json \
+        //   ORFEUS_GPU_TEST=1 cargo test --release gpu_convolutions -- --test-threads=1
+        if std::env::var_os("ORFEUS_GPU_TEST").as_deref()
+            != Some(std::ffi::OsStr::new("1"))
+        {
+            eprintln!("skipping: set ORFEUS_GPU_TEST=1 with a Vulkan driver");
+            return;
+        }
+        let gpu = gpu_network().expect("the packed network");
+        let net = network().unwrap();
+        // A patch wide enough that the twelve valid convolutions leave real
+        // output, and an origin far enough inside that no border clamping
+        // applies, so this isolates the arithmetic from the zeroing.
+        let tile = 8_usize;
+        let patch_size = tile + 2 * HALO;
+        let image = (256_usize, 256_usize);
+        let origin = (64_isize, 64_isize);
+        let inputs = INPUT_CHANNELS * patch_size * patch_size;
+        let patch: Vec<f32> = (0..inputs)
+            .map(|index| ((index % 97) as f32 / 97.0 - 0.5) * 0.7)
+            .collect();
+
+        let mut on_gpu = patch.clone();
+        crate::gpu::convolve_network(
+            &mut on_gpu[..inputs],
+            patch_size,
+            origin,
+            image,
+            &gpu.blob,
+            &gpu.layers,
+        )
+        .expect("the network dispatches");
+
+        // The CPU reference, layer by layer over the same patch.
+        let mut scratch = TileScratch::new(tile);
+        scratch.ping[..inputs].copy_from_slice(&patch);
+        let mut size = patch_size;
+        let mut source_is_ping = true;
+        for (index, layer) in net.layers.iter().enumerate() {
+            let relu = index + 1 < net.layers.len();
+            let (input, output) = if source_is_ping {
+                (&scratch.ping, &mut scratch.pong)
+            } else {
+                (&scratch.pong, &mut scratch.ping)
+            };
+            convolve_valid(
+                layer,
+                input,
+                size,
+                output,
+                &mut scratch.row_accumulators,
+                relu,
+            );
+            size -= 2;
+            zero_outside_global_image(
+                output,
+                layer.output_channels,
+                size,
+                origin.0 as usize,
+                origin.1 as usize,
+                HALO - index - 1,
+                image.0,
+                image.1,
+            );
+            source_is_ping = !source_is_ping;
+        }
+        let reference = if source_is_ping {
+            &scratch.ping
+        } else {
+            &scratch.pong
+        };
+        let count = OUTPUT_CHANNELS * size * size;
+        let worst = on_gpu[..count]
+            .iter()
+            .zip(&reference[..count])
+            .map(|(actual, expected)| (actual - expected).abs())
+            .fold(0.0_f32, f32::max);
+        // Two buffers of zeros would agree perfectly, so the reference has to
+        // be shown to carry signal before its agreement means anything.
+        let magnitude = reference[..count]
+            .iter()
+            .map(|value| value.abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            magnitude > 1.0e-3,
+            "the reference produced nothing to compare against ({magnitude})"
+        );
+        eprintln!("worst difference {worst}, reference magnitude {magnitude}");
+        // Twelve layers of accumulation in a different order, so exact equality
+        // is not on offer; this is still far below one 8-bit step.
+        assert!(worst < 2.0e-4, "worst channel difference was {worst}");
     }
 
     #[test]

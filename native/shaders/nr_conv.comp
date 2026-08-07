@@ -1,0 +1,112 @@
+#version 450
+
+// One 3x3 valid convolution of a feature stack, optionally followed by ReLU:
+// the single operation FFDNet is twelve of.
+//
+// The network is why a GPU pays here at all. Every other stage Orfeus tried to
+// offload moved about as many bytes as it did arithmetic, so the host round trip
+// ate the win; this one does roughly 850 thousand multiply-adds per output pixel
+// of the half-resolution grid, which is four orders of magnitude more arithmetic
+// per byte than the bilateral filter next door.
+//
+// counts:  x = input edge, y = output edge (input - 2),
+//          z = input channels, w = output channels
+// offsets: x = weights, y = biases, z = input planes, w = output planes
+// scalars: x, y = this patch's top-left corner in the global feature map, as a
+//          float because it goes negative while halo remains
+// flags:   x = 1 to apply ReLU, y, z = global feature map width and height
+//
+// Activations outside the real feature map return to zero on the way out, which
+// is what makes a tiled run agree with an untiled one: the network's
+// convolutions are zero-padded, so a patch's halo must read as zero at a true
+// image border rather than as whatever the neighbouring tile held. Folding it
+// into the output write costs nothing, where a separate clearing pass would cost
+// a barrier and a full sweep of the feature stack per layer.
+//
+// A workgroup covers a 16x16 patch of output pixels for one group of output
+// channels. The nine input values a thread reads for an input channel are then
+// reused across every output channel in the group, which is what keeps the
+// kernel arithmetic-bound: without that reuse each output element would cost
+// nine global reads for nine multiply-adds.
+
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(set = 0, binding = 0, std430) buffer Planes {
+    float plane[];
+};
+
+#include "stage.glsl"
+
+// Output channels one workgroup accumulates at once. Eight fits comfortably in
+// registers and amortises each input read eight ways.
+#define GROUP 8u
+
+void main() {
+    uint input_edge = parameters.counts.x;
+    uint output_edge = parameters.counts.y;
+    uint input_channels = parameters.counts.z;
+    uint output_channels = parameters.counts.w;
+    uint weights = parameters.offsets.x;
+    uint biases = parameters.offsets.y;
+    uint source = parameters.offsets.z;
+    uint target = parameters.offsets.w;
+
+    uint x = gl_GlobalInvocationID.x;
+    uint y = gl_GlobalInvocationID.y;
+    uint first_channel = gl_GlobalInvocationID.z * GROUP;
+    if (x >= output_edge || y >= output_edge || first_channel >= output_channels) {
+        return;
+    }
+
+    uint group = min(GROUP, output_channels - first_channel);
+    float accumulator[GROUP];
+    for (uint index = 0u; index < GROUP; ++index) {
+        accumulator[index] = index < group
+            ? plane[biases + first_channel + index]
+            : 0.0;
+    }
+
+    // Weights are [output channel][input channel][3][3], the same order the CPU
+    // reference packs them in, so one channel's taps are nine contiguous floats.
+    uint per_output = input_channels * 9u;
+    uint input_plane = input_edge * input_edge;
+    for (uint in_channel = 0u; in_channel < input_channels; ++in_channel) {
+        uint row = source + in_channel * input_plane + y * input_edge + x;
+        float v00 = plane[row];
+        float v01 = plane[row + 1u];
+        float v02 = plane[row + 2u];
+        row += input_edge;
+        float v10 = plane[row];
+        float v11 = plane[row + 1u];
+        float v12 = plane[row + 2u];
+        row += input_edge;
+        float v20 = plane[row];
+        float v21 = plane[row + 1u];
+        float v22 = plane[row + 2u];
+
+        uint tap = weights + first_channel * per_output + in_channel * 9u;
+        for (uint index = 0u; index < group; ++index) {
+            uint w = tap + index * per_output;
+            accumulator[index] += plane[w] * v00 + plane[w + 1u] * v01
+                + plane[w + 2u] * v02
+                + plane[w + 3u] * v10 + plane[w + 4u] * v11
+                + plane[w + 5u] * v12
+                + plane[w + 6u] * v20 + plane[w + 7u] * v21
+                + plane[w + 8u] * v22;
+        }
+    }
+
+    // The patch has shed one halo pixel per layer, so its corner has moved in.
+    float global_x = parameters.scalars.x + float(x);
+    float global_y = parameters.scalars.y + float(y);
+    bool inside = global_x >= 0.0 && global_y >= 0.0
+        && global_x < float(parameters.flags.y) && global_y < float(parameters.flags.z);
+
+    uint output_plane = output_edge * output_edge;
+    uint position = target + y * output_edge + x;
+    bool relu = parameters.flags.x != 0u;
+    for (uint index = 0u; index < group; ++index) {
+        float value = inside ? accumulator[index] : 0.0;
+        plane[position + (first_channel + index) * output_plane] =
+            relu ? max(value, 0.0) : value;
+    }
+}
