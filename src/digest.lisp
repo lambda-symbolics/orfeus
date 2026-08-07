@@ -9,43 +9,63 @@
 (defconstant +fnv-prime+ 1099511628211
   "The 64-bit FNV-1a multiplier.")
 
+(defconstant +digest-chunk-words+ 131072
+  "Words per read. Part of the digest: the second lane mixes in each word's
+index within its chunk, so changing this changes every key.")
+
 (defun file-fast-digest (pathname)
   "Return a 128-bit hex digest of every byte of PATHNAME.
 
 FNV-1a over 64-bit words rather than SHA-256, because this keys a preview cache
 and is not a signature. Measured in SBCL: ironclad's SHA-256 manages 91 MB/s, so
 one 20 MB frame costs 220 ms and an 80 MP high-resolution frame nearly a second.
-This runs at ~300 MB/s, which is where reading the file through a stream tops out
-— four independent lanes measured no faster, so the arithmetic is not the limit.
+
+Words come out of a byte buffer through a pinned SAP rather than from a stream of
+`(unsigned-byte 64)`. That is not a micro-optimization: reading a 116 MB DNG as
+words cost 330 ms while reading the same file as bytes cost 10 ms, so SBCL's
+word-element `read-sequence` was doing the work an element at a time and the
+digest was almost entirely stream overhead. The arithmetic was never the limit.
 
 Still every byte, not a sample: a sampled key once let an edit in the middle of a
 file go unnoticed. Two lanes give 128 bits, which is far more than a cache of
 preview files needs."
   (let ((low 14695981039346656037)
         (high 1099511628211)
-        (buffer (make-array 131072 :element-type '(unsigned-byte 64))))
+        (buffer (make-array (* 8 +digest-chunk-words+)
+                            :element-type '(unsigned-byte 8)))
+        (total 0))
     (declare (type (unsigned-byte 64) low high)
-             (type (simple-array (unsigned-byte 64) (*)) buffer)
+             (type (simple-array (unsigned-byte 8) (*)) buffer)
+             (type unsigned-byte total)
              (optimize (speed 3)))
-    (with-open-file (stream pathname :element-type '(unsigned-byte 64))
-      (loop for count of-type fixnum = (read-sequence buffer stream)
-            while (plusp count)
-            do (loop for index of-type fixnum below count
-                     do (let ((word (aref buffer index)))
-                          (setf low (ldb (byte 64 0)
-                                         (* (logxor low word) +fnv-prime+))
-                                high (ldb (byte 64 0)
-                                          (* (logxor high (logxor word index))
-                                             +fnv-prime+)))))))
-    ;; A word stream drops any bytes past the last whole word, so fold in the
-    ;; tail and the exact byte length.
     (with-open-file (stream pathname :element-type '(unsigned-byte 8))
-      (let ((bytes (file-length stream)))
-        (file-position stream (* 8 (floor bytes 8)))
-        (loop for byte = (read-byte stream nil nil)
-              while byte
-              do (setf low (ldb (byte 64 0) (* (logxor low byte) +fnv-prime+))))
-        (setf high (ldb (byte 64 0) (* (logxor high bytes) +fnv-prime+)))))
+      (loop
+        (let ((count (read-sequence buffer stream)))
+          (declare (type fixnum count))
+          (when (zerop count) (return))
+          (incf total count)
+          (let ((words (ash count -3)))
+            (declare (type fixnum words))
+            (sb-sys:with-pinned-objects (buffer)
+              (let ((sap (sb-sys:vector-sap buffer)))
+                (loop for index of-type fixnum below words
+                      do (let ((word (sb-sys:sap-ref-64 sap (ash index 3))))
+                           (declare (type (unsigned-byte 64) word))
+                           (setf low (ldb (byte 64 0)
+                                          (* (logxor low word) +fnv-prime+))
+                                 high (ldb (byte 64 0)
+                                           (* (logxor high (logxor word index))
+                                              +fnv-prime+)))))))
+            ;; Bytes past the last whole word exist only at end of file, so the
+            ;; tail is folded here in the same order a separate pass would.
+            (loop for offset of-type fixnum from (ash words 3) below count
+                  do (setf low (ldb (byte 64 0)
+                                    (* (logxor low (aref buffer offset))
+                                       +fnv-prime+)))))
+          ;; A short read means end of file, and only whole chunks may mix
+          ;; indices 0..CHUNK-1, so stopping here keeps the key stable.
+          (when (< count (length buffer)) (return)))))
+    (setf high (ldb (byte 64 0) (* (logxor high total) +fnv-prime+)))
     (format nil "~16,'0x~16,'0x" low high)))
 
 (defvar *content-key-memo* (make-hash-table :test #'equal)

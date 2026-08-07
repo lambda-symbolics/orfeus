@@ -31,6 +31,8 @@
                 #:still-store-rename
                 #:still-store-delete
                 #:*maximum-curve-points*
+                #:file-content-key
+                #:forget-content-key
                 #:default-processing-graph
                 #:grade-stage-keys
                 #:grade-stages

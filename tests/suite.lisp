@@ -551,6 +551,53 @@ the failure list, and both ON-ERROR modes without needing real RAW files."
            (= 3 (length (graph-effective-nodes graph)))
            (progn (graph-validate graph) t)))))
 
+(defun content-digest-is-stable-and-complete-p ()
+  "Content keys are pinned, and every byte still reaches them.
+
+The key names cached previews and interned originals on disk, so a change to the
+algorithm silently orphans every artefact a user already has. These values were
+captured from the implementation that shipped them; a mismatch here is a
+deliberate decision to invalidate caches, not a passing detail. The lengths
+straddle the chunk boundary and whole-word alignment, because the second lane
+mixes in each word's index within its chunk and the tail is folded separately."
+  (let ((pinned '((7 . "5C4123D7FEAD98FC000367000002E4DC")
+                  (8 . "8B09C3E001C270DF86385708DAD08C13")
+                  (9 . "0408CCA2FD65F3B586385608DAD08A60")
+                  (1048576 . "C1C8FDAE075223251B42222ECCDEE329")
+                  (1048583 . "D6848E6898BD98FC1B42232ECCDEE4DC")
+                  (3145731 . "DE8E80DBACCCA74C180179F9A4D6DE10"))))
+    (flet ((write-pattern (path length &key (edit-at nil))
+             (with-open-file (stream path :direction :output
+                                          :element-type '(unsigned-byte 8)
+                                          :if-exists :supersede)
+               (dotimes (index length)
+                 (write-byte (if (eql index edit-at)
+                                 (mod (1+ (* index 37)) 256)
+                                 (mod (* index 37) 256))
+                             stream)))
+             path))
+      (and
+       (loop for (length . digest) in pinned
+             always (let ((path (test-temporary-pathname "bin")))
+                      (unwind-protect
+                           (progn (write-pattern path length)
+                                  (forget-content-key path)
+                                  (string= digest (file-content-key path)))
+                        (when (probe-file path) (delete-file path)))))
+       ;; A single byte changed in the middle has to move the key: a sampled
+       ;; digest once let exactly this through.
+       (let ((path (test-temporary-pathname "bin")))
+         (unwind-protect
+              (let (before after)
+                (write-pattern path 3145731)
+                (forget-content-key path)
+                (setf before (file-content-key path))
+                (write-pattern path 3145731 :edit-at 1572866)
+                (forget-content-key path)
+                (setf after (file-content-key path))
+                (not (string= before after)))
+           (when (probe-file path) (delete-file path))))))))
+
 (defun graph-curves-p ()
   (let* ((graph (default-processing-graph))
          (points (list 0.0 0.05 0.3 0.5 0.7 0.9 1.0 1.0))
@@ -1651,6 +1698,8 @@ the failure list, and both ON-ERROR modes without needing real RAW files."
              (graph-edit-rollback-and-copy-p))
       (check "blends require compatible crop geometry on both branches"
              (graph-crop-branch-compatibility-p))
+      (check "content digests are pinned and cover every byte"
+             (content-digest-is-stable-and-complete-p))
       (check "curves nodes validate, serialize, and round trip"
              (graph-curves-p))
       (check "photo graphs round trip as project version 4"
