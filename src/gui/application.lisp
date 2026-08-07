@@ -2280,6 +2280,14 @@ new cache entry is published."
            (editor-nodes ()
              (let ((graph (gui-model-display-graph model)))
                (if graph (orfeus:processing-graph-nodes graph) '())))
+           (node-in-display-domain-p (node)
+             ;; Where the node sits, not merely what kind it is: a crop is
+             ;; scene-linear above the film transform and display-space below
+             ;; it, and showing the position is what makes the boundary legible.
+             (let ((graph (gui-model-display-graph model)))
+               (and graph
+                    (orfeus:graph-display-domain-p
+                     graph (orfeus:graph-node-id node)))))
            (crop-editing-node ()
              (let ((node (gui-model-selected-graph-node model)))
                (and node (eq :crop (orfeus:graph-node-kind node)) node)))
@@ -2353,15 +2361,26 @@ new cache entry is published."
                    (return-from graph-editor-hit (values :output nil))))
                (values nil nil)))
            (draw-editor-box (x y w h label style selected)
-             ;; STYLE :terminal draws the darker RAW/OUT wells, :blend the
-             ;; bluish body that marks a node with a second branch.
+             ;; Body colour carries the one ordering rule the graph enforces:
+             ;; a film node converts its branch from scene-linear to display
+             ;; space, and nothing but another film node, a crop, or an untyped
+             ;; container may read that. So the cool bodies are the corrections
+             ;; that have to sit above the film transform and the warm ones are
+             ;; the branch after it, which puts the boundary on screen instead
+             ;; of leaving it to be discovered by a refused edit.
+             ;;
+             ;; :terminal is the darker RAW and OUT wells; :blend keeps its own
+             ;; stronger blue, a saturated member of the same cool family, since
+             ;; a blend is always scene-linear and already carries A and B marks.
              (ecase style
                (:terminal (lightfast:draw-color-rgb :red 78 :green 80 :blue 86))
                (:bypassed (lightfast:draw-color-rgb :red 148 :green 148
                                                   :blue 148))
                (:blend (lightfast:draw-color-rgb :red 176 :green 190 :blue 224))
-               (:normal (lightfast:draw-color-rgb :red 208 :green 208
-                                                :blue 208)))
+               (:display (lightfast:draw-color-rgb :red 226 :green 205
+                                                 :blue 168))
+               (:linear (lightfast:draw-color-rgb :red 196 :green 205
+                                                :blue 216)))
              (lightfast:draw-filled-rect x y w h)
              (lightfast:draw-color-rgb :red 240 :green 240 :blue 244)
              (lightfast:draw-filled-rect x y w 1)
@@ -2521,7 +2540,9 @@ new cache entry is published."
                                          (orfeus:graph-node-kind node))
                                         (cond (bypassed :bypassed)
                                               (blend-p :blend)
-                                              (t :normal))
+                                              ((node-in-display-domain-p node)
+                                               :display)
+                                              (t :linear))
                                         (eq node selected))
                        (if (graph-node-active-p node)
                            (lightfast:draw-color-rgb :red 40 :green 150
@@ -5046,7 +5067,7 @@ new cache entry is published."
         (lightfast:set-box graph-canvas lightfast:+box-flat-box+)
         (lightfast:set-tooltip
          graph-canvas
-         "Drag nodes to arrange; drag a port to rewire; right-click to add")
+         "Cool nodes grade in scene-linear, warm ones after the film transform; drag to arrange, drag a port to rewire, right-click to add")
         (dolist (event (list lightfast:+event-push+
                              lightfast:+event-drag+
                              lightfast:+event-release+
