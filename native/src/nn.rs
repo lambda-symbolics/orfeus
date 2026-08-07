@@ -616,23 +616,6 @@ fn best_tile_size(half_width: usize, half_height: usize) -> usize {
         .map_or(TILE, |((_, _), tile)| tile)
 }
 
-fn infer_tiled(
-    net: &FfdNet,
-    planes: &[f32],
-    half_width: usize,
-    half_height: usize,
-    sigma: f32,
-) -> Vec<f32> {
-    infer_tiled_with_tile_size(
-        net,
-        planes,
-        half_width,
-        half_height,
-        sigma,
-        best_tile_size(half_width, half_height),
-    )
-}
-
 /// Applies FFDNet color denoising in place.
 ///
 /// `strength` in (0, 1] maps linearly to the network's training-domain noise

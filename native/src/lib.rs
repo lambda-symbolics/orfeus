@@ -26,6 +26,7 @@ use std::path::Path;
 use std::ptr;
 
 use flate2::read::ZlibDecoder;
+use rayon::prelude::*;
 use md5::{Digest, Md5};
 
 mod analyze;
@@ -310,35 +311,46 @@ fn decode_slot_zero(container: &[u8]) -> Result<Vec<u8>, Error> {
         ));
     }
 
-    let mut decoded = Vec::with_capacity(decoded_size);
-    for index in 0..block_count {
-        let start = offsets[index];
-        let end = offsets[index + 1];
-        if start >= end {
-            return Err(Error::InvalidDng(
-                "compressed block offsets are not increasing",
-            ));
-        }
-        let compressed = checked_slice(container, start, end - start)?;
-        let expected = (decoded_size - decoded.len()).min(65_536);
-        let mut decoder = ZlibDecoder::new(compressed);
-        let before = decoded.len();
-        decoder
-            .by_ref()
-            .take(65_537)
-            .read_to_end(&mut decoded)
-            .map_err(|_| Error::Decompression("failed to inflate embedded original block"))?;
-        if decoded.len() - before != expected || decoder.total_in() as usize != compressed.len() {
-            return Err(Error::Decompression(
-                "embedded original block has an invalid decoded size or trailing data",
-            ));
-        }
-    }
-    if decoded.len() != decoded_size {
-        return Err(Error::Decompression(
-            "decoded original size does not match container",
-        ));
-    }
+    // Each block inflates independently into its own 64 KB slot, so the whole
+    // container decompresses in parallel. Sequentially this was the larger half
+    // of the 779 ms it took to unwrap a 116 MB DNG on Lukas's laptop, and that
+    // cost lands on the first view of every high-resolution scan.
+    let mut decoded = vec![0_u8; decoded_size];
+    let blocks: Vec<&[u8]> = (0..block_count)
+        .map(|index| {
+            let start = offsets[index];
+            let end = offsets[index + 1];
+            if start >= end {
+                return Err(Error::InvalidDng(
+                    "compressed block offsets are not increasing",
+                ));
+            }
+            checked_slice(container, start, end - start)
+        })
+        .collect::<Result<Vec<_>, Error>>()?;
+    // BLOCK_COUNT is decoded_size rounded up to whole blocks, so the chunks and
+    // the blocks pair off one to one and the last slot carries the remainder.
+    decoded
+        .par_chunks_mut(65_536)
+        .zip(blocks.into_par_iter())
+        .try_for_each(|(slot, compressed)| {
+            let mut decoder = ZlibDecoder::new(compressed);
+            let mut inflated = Vec::with_capacity(slot.len() + 1);
+            decoder
+                .by_ref()
+                // One byte past the slot, so a block that decodes too much is
+                // caught by the length check rather than silently truncated.
+                .take(slot.len() as u64 + 1)
+                .read_to_end(&mut inflated)
+                .map_err(|_| Error::Decompression("failed to inflate embedded original block"))?;
+            if inflated.len() != slot.len() || decoder.total_in() as usize != compressed.len() {
+                return Err(Error::Decompression(
+                    "embedded original block has an invalid decoded size or trailing data",
+                ));
+            }
+            slot.copy_from_slice(&inflated);
+            Ok(())
+        })?;
     Ok(decoded)
 }
 
@@ -877,6 +889,32 @@ mod tests {
         let dng = synthetic_dng(&original, digest);
         assert_eq!(original_filename(&dng).unwrap(), b"sample.ORF");
         assert_eq!(decode_and_verify(&dng).unwrap(), original);
+    }
+
+    #[test]
+    fn decodes_every_block_count_and_remainder_exactly() {
+        // Blocks now inflate in parallel, paired off against 64 KB slots of the
+        // output. If the slot count and the block count ever disagreed, the zip
+        // would silently drop the tail rather than fail, so the sizes that sit
+        // on the boundary are worth naming: empty remainder, one byte over, one
+        // byte under, and a single short block.
+        for size in [
+            1_usize,
+            65_535,
+            65_536,
+            65_537,
+            131_072,
+            131_073,
+            140_000,
+            262_144,
+        ] {
+            let original: Vec<u8> = (0..size).map(|value| (value % 251) as u8).collect();
+            let digest = original_data_digest(&original);
+            let dng = synthetic_dng(&original, digest);
+            let decoded = decode_and_verify(&dng).expect("a well-formed container decodes");
+            assert_eq!(decoded.len(), size, "wrong length for {size} bytes");
+            assert_eq!(decoded, original, "wrong contents for {size} bytes");
+        }
     }
 
     #[test]
