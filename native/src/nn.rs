@@ -522,8 +522,22 @@ fn report_gpu_neural_fallback(error: &str) {
     });
 }
 
+/// Whether to run the network's convolutions on the GPU.
+///
+/// Only on an adapter with its own memory. Measured on Lukas's laptop at a
+/// 1600px preview, interleaved so thermal drift shows as spread: CPU 2143, 2199,
+/// 2210 ms against an RTX 2000 Ada's 893, 901, 922 ms — 2.4x. The same shader on
+/// the Iris Xe measured 2270 ms against the CPU's 2044, because an integrated
+/// adapter shares the memory bus it is competing for. The renderer prefers
+/// integrated adapters for every other stage, all of which are transfer-bound,
+/// so in practice this engages when `ORFEUS_GPU=discrete` asks for the other one.
+///
+/// `ORFEUS_GPU_NEURAL=1` forces it on regardless, which is how the software
+/// rasterizer runs it under test.
 fn gpu_requested() -> bool {
-    super::gpu::requested() && std::env::var_os("ORFEUS_GPU_NEURAL").is_some()
+    super::gpu::requested()
+        && (std::env::var_os("ORFEUS_GPU_NEURAL").is_some()
+            || super::gpu::adapter_is_discrete())
 }
 
 /// Bytes of ping-pong scratch one worker needs for a tile of TILE_SIZE.

@@ -96,6 +96,8 @@ struct Context {
     input: Slot,
     max_storage_buffer_range: vk::DeviceSize,
     adapter_name: String,
+    /// True when the adapter does not share the host's memory bus.
+    discrete: bool,
 }
 
 // Queue submission and command-pool allocation require external synchronization.
@@ -104,6 +106,17 @@ static CONTEXT: OnceLock<Result<Mutex<Context>, String>> = OnceLock::new();
 pub(crate) struct DispatchProfile {
     pub(crate) adapter_name: String,
     pub(crate) milliseconds: f64,
+}
+
+/// Whether the active adapter has its own memory rather than the host's.
+///
+/// Initializes the context if it is not up yet, which the GUI has already done
+/// from its warm-up thread by the time any render asks.
+pub(crate) fn adapter_is_discrete() -> bool {
+    context()
+        .ok()
+        .and_then(|context| context.try_lock().ok().map(|context| context.discrete))
+        .unwrap_or(false)
 }
 
 pub(crate) fn requested() -> bool {
@@ -386,6 +399,7 @@ fn initialize() -> Result<Context, String> {
             input: Slot::default(),
             max_storage_buffer_range: properties.limits.max_storage_buffer_range.into(),
             adapter_name,
+            discrete: properties.device_type == vk::PhysicalDeviceType::DISCRETE_GPU,
         })
     }
 }
