@@ -21,6 +21,7 @@
                 #:render-photo-job #:render-preview
                 #:render-preview-rgb)
   (:export #:gui-model #:gui-model-add-photos #:gui-model-add-node
+           #:*default-crop-inset* #:default-crop-params
            #:gui-model-apply-preset #:gui-model-apply-preset-graph
            #:gui-model-copy-grade #:gui-model-copy-graph
            #:gui-model-delete-node #:gui-model-display-graph

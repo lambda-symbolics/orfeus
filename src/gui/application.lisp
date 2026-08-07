@@ -44,6 +44,64 @@ which is where it always was."
   "Bounding size of live drag previews rendered straight into the canvas
 buffer, with no JPEG or file on the path.")
 
+(defparameter *crop-aspect-choices*
+  '(("Free" . nil)
+    ("Original" . :original)
+    ("1:1" . (1 . 1))
+    ("5:4" . (5 . 4))
+    ("4:5" . (4 . 5))
+    ("4:3" . (4 . 3))
+    ("3:4" . (3 . 4))
+    ("3:2" . (3 . 2))
+    ("2:3" . (2 . 3))
+    ("16:9" . (16 . 9))
+    ("9:16" . (9 . 16))
+    ("2:1" . (2 . 1))
+    ("1:2" . (1 . 2)))
+  "Crop aspect ratios offered in the Node panel, as width to height.
+
+Both orientations of each ratio are listed rather than offering a swap: a
+portrait crop of a landscape frame is a normal thing to want, and picking 2:3
+from a list says exactly what you get. :ORIGINAL follows the photograph's own
+proportions, whatever they are.")
+
+(defun crop-aspect-label (aspect)
+  (car (rassoc aspect *crop-aspect-choices* :test #'equal)))
+
+(defun crop-aspect-for-label (label)
+  (cdr (assoc label *crop-aspect-choices* :test #'string=)))
+
+(defun crop-aspect-ratio (aspect frame-width frame-height)
+  "The width-to-height ratio ASPECT asks for, in FRAME pixels, or NIL for free.
+
+The frame is the whole uncropped photograph as drawn, so its pixels are
+proportional to the sensor's: a crop whose on-screen spans are in ratio R has
+photosites in ratio R too, and no conversion through the image's dimensions is
+needed anywhere."
+  (cond ((null aspect) nil)
+        ((eq aspect :original)
+         (and (plusp frame-height) (/ frame-width (float frame-height 1d0))))
+        (t (/ (car aspect) (float (cdr aspect) 1d0)))))
+
+(defun crop-rect-for-ratio (left top width height frame-width frame-height
+                            ratio)
+  "Reshape the normalized rectangle to RATIO about its own centre.
+
+RATIO is a width-to-height proportion in frame pixels. The result shrinks to fit
+inside the rectangle it started from rather than growing to fill the frame, so
+choosing a ratio never pulls back in a part of the picture that had been cropped
+away: a crop only tightens until the user widens it again. Returns left, top,
+width and height, clamped into the frame."
+  (let* ((span-x (min (* width frame-width) (* height frame-height ratio)))
+         (span-y (/ span-x ratio))
+         (new-width (/ span-x frame-width))
+         (new-height (/ span-y frame-height))
+         (new-left (- (+ left (/ width 2)) (/ new-width 2)))
+         (new-top (- (+ top (/ height 2)) (/ new-height 2))))
+    (values (min (- 1 new-width) (max 0 new-left))
+            (min (- 1 new-height) (max 0 new-top))
+            new-width new-height)))
+
 (defparameter *thumbnail-preview-size* 320
   "Maximum width and height for orientation-correct thumbnail renders.")
 
@@ -981,6 +1039,12 @@ new cache entry is published."
            kind-choice
            (node-panel-groups '())
            blend-opacity-input crop-angle-input
+           crop-aspect-input crop-width-input crop-height-input
+           ;; NIL is a free crop; otherwise an entry from
+           ;; *CROP-ASPECT-CHOICES*. An editing mode, not a render parameter:
+           ;; the rectangle itself is what the graph stores and what the render
+           ;; needs, and the lock only governs how a drag reshapes it.
+           (crop-aspect nil)
            curve-canvas curve-drag scope-canvas
            (curve-channel :master-points)
            (curve-channel-buttons '())
@@ -1312,6 +1376,64 @@ new cache entry is published."
                               left top width height)))
                  (error (condition)
                    (set-status (princ-to-string condition))))))
+           (crop-frame-size ()
+             ;; The whole uncropped photograph as drawn. The crop stage is
+             ;; bypassed while its node is selected, so this really is the full
+             ;; frame and its proportions are the sensor's.
+             (let ((path (and after-canvas
+                              (preview-path-for-canvas after-canvas))))
+               (when path
+                 (multiple-value-bind (frame-x frame-y frame-width frame-height)
+                     (preview-image-frame after-canvas path)
+                   (declare (ignore frame-x frame-y))
+                   (when (and frame-width (plusp frame-width)
+                              (plusp frame-height))
+                     (values frame-width frame-height))))))
+           (active-crop-ratio ()
+             (multiple-value-bind (frame-width frame-height) (crop-frame-size)
+               (and frame-width
+                    (crop-aspect-ratio crop-aspect frame-width frame-height))))
+           (reshape-crop-to-aspect (node)
+             ;; Shrink the current rectangle to the locked proportions about its
+             ;; own centre. Shrinking rather than growing, so choosing a ratio
+             ;; never pulls back in a part of the frame that had been cropped
+             ;; away — the crop only ever tightens until the user widens it.
+             (multiple-value-bind (frame-width frame-height) (crop-frame-size)
+               (let ((ratio (and frame-width
+                                 (crop-aspect-ratio crop-aspect frame-width
+                                                    frame-height))))
+                 (when ratio
+                   (multiple-value-bind (left top width height)
+                       (crop-node-rect node)
+                     (multiple-value-call #'apply-crop-rect node
+                       (crop-rect-for-ratio left top width height
+                                            frame-width frame-height
+                                            ratio)))))))
+           (set-crop-size-fraction (node axis fraction)
+             ;; Size one axis as a share of the frame, keeping the centre. Under
+             ;; a locked ratio the other axis follows, so the two fields stay
+             ;; consistent with the lock instead of fighting it.
+             (multiple-value-bind (frame-width frame-height) (crop-frame-size)
+               (let ((ratio (and frame-width
+                                 (crop-aspect-ratio crop-aspect frame-width
+                                                    frame-height))))
+                 (multiple-value-bind (left top width height)
+                     (crop-node-rect node)
+                   (let* ((fraction (min 1.0d0 (max 0.05d0 fraction)))
+                          (new-width (if (eq axis :width) fraction width))
+                          (new-height (if (eq axis :height) fraction height)))
+                     (when ratio
+                       (if (eq axis :width)
+                           (setf new-height (/ (* new-width frame-width)
+                                               ratio frame-height))
+                           (setf new-width (/ (* new-height frame-height ratio)
+                                              frame-width))))
+                     (let ((center-u (+ left (/ width 2)))
+                           (center-v (+ top (/ height 2))))
+                       (apply-crop-rect node
+                                        (- center-u (/ new-width 2))
+                                        (- center-v (/ new-height 2))
+                                        new-width new-height))))))) 
            (set-crop-node-angle (node angle)
              ;; The crop stage is bypassed while its node is selected, so
              ;; an angle change only moves the overlay; no re-render.
@@ -1388,12 +1510,35 @@ new cache entry is published."
                              ;; measured from the fixed opposite corner.
                              (local-x (- (* cosine dx) (* sine dy)))
                              (local-y (+ (* sine dx) (* cosine dy)))
-                             (span-x (min frame-width
-                                          (max (* frame-width 0.05)
-                                               (* sign-x local-x))))
-                             (span-y (min frame-height
-                                          (max (* frame-height 0.05)
-                                               (* sign-y local-y))))
+                             (raw-span-x (min frame-width
+                                              (max (* frame-width 0.05)
+                                                   (* sign-x local-x))))
+                             (raw-span-y (min frame-height
+                                              (max (* frame-height 0.05)
+                                                   (* sign-y local-y))))
+                             (ratio (crop-aspect-ratio crop-aspect
+                                                       frame-width
+                                                       frame-height))
+                             ;; Constrained here rather than in
+                             ;; APPLY-CROP-RECT because this is where the
+                             ;; opposite corner is known: deriving one span
+                             ;; from the other keeps that corner pinned while
+                             ;; the handle follows the pointer. The larger of
+                             ;; the two candidate sizes wins, so the rectangle
+                             ;; grows towards the pointer on whichever axis it
+                             ;; moved furthest.
+                             (span-x (if ratio
+                                         (max raw-span-x (* raw-span-y ratio))
+                                         raw-span-x))
+                             (span-y (if ratio
+                                         (/ (max raw-span-x (* raw-span-y ratio))
+                                            ratio)
+                                         raw-span-y))
+                             (overflow (max 1.0d0
+                                            (/ span-x frame-width)
+                                            (/ span-y frame-height)))
+                             (span-x (/ span-x overflow))
+                             (span-y (/ span-y overflow))
                              (center-dx (* sign-x span-x 0.5))
                              (center-dy (* sign-y span-y 0.5))
                              (center-x (+ anchor-x
@@ -2315,11 +2460,24 @@ new cache entry is published."
                  (setf (lightfast:value blend-opacity-input)
                        (format nil "~,2F"
                                (orfeus:graph-node-opacity node))))
-               (when (and node crop-angle-input (eq kind :crop))
-                 (setf (lightfast:value crop-angle-input)
-                       (format nil "~,1F"
-                               (getf (orfeus:graph-node-params node)
-                                     :angle 0.0))))))
+               (when (and node (eq kind :crop))
+                 (when crop-angle-input
+                   (setf (lightfast:value crop-angle-input)
+                         (format nil "~,1F"
+                                 (getf (orfeus:graph-node-params node)
+                                       :angle 0.0))))
+                 (multiple-value-bind (left top width height)
+                     (crop-node-rect node)
+                   (declare (ignore left top))
+                   (when crop-width-input
+                     (setf (lightfast:value crop-width-input)
+                           (format nil "~,1F" (* 100 width))))
+                   (when crop-height-input
+                     (setf (lightfast:value crop-height-input)
+                           (format nil "~,1F" (* 100 height)))))
+                 (when crop-aspect-input
+                   (setf (lightfast:value crop-aspect-input)
+                         (or (crop-aspect-label crop-aspect) "Free"))))))
            (graph-node-box (node)
              (let ((place (orfeus:graph-node-position node)))
                (values (round (first place)) (round (second place))
@@ -2671,10 +2829,9 @@ new cache entry is published."
                         (cons "Reset Crop"
                               (lambda ()
                                 (gui-model-set-node-params
-                                 model node '(:left 0.0 :top 0.0
-                                              :width 1.0 :height 1.0
-                                              :angle 0.0))
-                                (after-graph-edit "Crop reset to full frame")))))
+                                 model node (default-crop-params))
+                                (setf crop-aspect nil)
+                                (after-graph-edit "Crop reset")))))
                 (when (eq kind :color-subtract)
                   (list (cons "-" nil)
                         (cons "Pick Base Color..."
@@ -2759,10 +2916,21 @@ new cache entry is published."
                    "grades go above the film transform"
                    "optics and blends go above a crop")))
            (show-node-menu (actions)
+             ;; Every entry is guarded here rather than one at a time. A graph
+             ;; edit that the validator refuses signals, and an unhandled signal
+             ;; out of an FLTK callback takes the whole application down — moving
+             ;; a crop above an optics node did exactly that, because optics may
+             ;; not read a cropped branch. Guarding the one place that invokes
+             ;; these means an entry added later cannot reintroduce it.
              (let ((chosen (lightfast:popup-menu (mapcar #'first actions))))
                (when chosen
                  (let ((action (rest (nth chosen actions))))
-                   (when action (funcall action))))))
+                   (when action
+                     (handler-case (funcall action)
+                       (error (condition)
+                         (sync-node-tools)
+                         (when graph-canvas (lightfast:redraw graph-canvas))
+                         (set-status (princ-to-string condition)))))))))
            (graph-content-extent ()
              ;; (values right bottom) of everything drawn, in graph space.
              (let ((nodes (ensure-graph-node-positions (editor-nodes))))
@@ -5450,35 +5618,93 @@ new cache entry is published."
                   110 44 84 26 :page))
            (lightfast:set-range crop-angle-input -45 45)
            (lightfast:set-step crop-angle-input 0.1)
+           (let ((aspect-field
+                   (lightfast:make-labeled-choice
+                    :parent node-page :x 12 :y 76 :width 292 :height 26
+                    :label "Aspect" :label-width 88
+                    :items (mapcar #'first *crop-aspect-choices*)
+                    :callback
+                    (lambda (widget event value)
+                      (declare (ignore event value))
+                      (setf crop-aspect
+                            (crop-aspect-for-label (lightfast:value widget)))
+                      (let ((node (crop-editing-node)))
+                        (when node
+                          (reshape-crop-to-aspect node)
+                          (sync-node-tools)
+                          (schedule-edited-preview)))
+                      (set-status
+                       (if crop-aspect
+                           (format nil "Crop locked to ~A"
+                                   (crop-aspect-label crop-aspect))
+                           "Crop proportions free"))))))
+             (setf crop-aspect-input (lightfast:field-control aspect-field))
+             (register-field aspect-field 76 :page))
+           ;; Sizes as a percentage of the frame, so a crop can be set to an
+           ;; exact amount rather than only dragged to it.
+           (flet ((size-field (axis label y)
+                    (register-inspector
+                     (lightfast:make-label :parent node-page :x 12 :y y
+                                         :width 88 :height 26 :label label)
+                     12 y 88 26 :page)
+                    (let ((spinner
+                            (register-inspector
+                             (lightfast:make-spinner
+                              :parent node-page :x 110 :y y
+                              :width 84 :height 26
+                              :callback
+                              (lambda (widget event value)
+                                (declare (ignore event value))
+                                (let ((node (crop-editing-node)))
+                                  (when node
+                                    (handler-case
+                                        (let ((percent
+                                                (parse-number
+                                                 (lightfast:value widget))))
+                                          (set-crop-size-fraction
+                                           node axis (/ percent 100.0d0))
+                                          (sync-node-tools)
+                                          (schedule-edited-preview))
+                                      (error (condition)
+                                        (set-status
+                                         (princ-to-string condition))))))))
+                             110 y 84 26 :page)))
+                      (lightfast:set-range spinner 5 100)
+                      (lightfast:set-step spinner 0.5)
+                      spinner)))
+             (setf crop-width-input (size-field :width "Width %" 108)
+                   crop-height-input (size-field :height "Height %" 140)))
            (register-inspector
             (lightfast:make-button
-             :parent node-page :x 12 :y 76 :width 292 :height 26
+             :parent node-page :x 12 :y 172 :width 292 :height 26
              :label "Autocrop Negative"
              :callback (lambda (&rest ignored)
                          (declare (ignore ignored))
                          (let ((node (crop-editing-node)))
                            (when node (autocrop-negative node)))))
-            12 76 :fill 26 :page)
+            12 172 :fill 26 :page)
            (register-inspector
             (lightfast:make-button
-             :parent node-page :x 12 :y 108 :width 292 :height 26
+             :parent node-page :x 12 :y 204 :width 292 :height 26
              :label "Reset Crop"
              :callback (lambda (&rest ignored)
                          (declare (ignore ignored))
                          (let ((node (crop-editing-node)))
                            (when node
+                             ;; Back to the inset a fresh crop starts on, not to
+                             ;; the frame edge: resetting is for starting over,
+                             ;; and a rectangle whose handles sit on the edge of
+                             ;; the picture cannot be grabbed to start with.
                              (gui-model-set-node-params
-                              model node '(:left 0.0 :top 0.0
-                                           :width 1.0 :height 1.0
-                                           :angle 0.0))
-                             (after-graph-edit
-                              "Crop reset to full frame")))))
-            12 108 :fill 26 :page)
+                              model node (default-crop-params))
+                             (setf crop-aspect nil)
+                             (after-graph-edit "Crop reset")))))
+            12 204 :fill 26 :page)
            (register-inspector
             (lightfast:make-label
-             :parent node-page :x 12 :y 140 :width 292 :height 26
+             :parent node-page :x 12 :y 236 :width 292 :height 26
              :label "Drag the rectangle on the preview")
-            12 140 :fill 26 :page)))
+            12 236 :fill 26 :page)))
         (build-group
          :curves
          (lambda ()

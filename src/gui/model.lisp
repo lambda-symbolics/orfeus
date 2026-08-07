@@ -638,6 +638,23 @@ downstream node of that stage."
             selected
             (orfeus:graph-last-node-covering-key (photo-job-graph job) key))))))
 
+(defparameter *default-crop-inset* 0.04
+  "How far a fresh crop sits inside the frame, as a fraction of each edge.
+
+Not zero, because a crop that starts on the frame edge puts its handles exactly
+where the image ends and there is nothing to grab: the pointer is either on the
+handle's outermost pixel or outside the picture. An inset costs a little of the
+frame and makes the rectangle usable immediately, and typing 100 into the size
+fields gets the whole frame back.")
+
+(defun default-crop-params ()
+  "The parameters a crop node starts with."
+  (let ((inset *default-crop-inset*))
+    (list :left (float inset 1.0) :top (float inset 1.0)
+          :width (float (- 1.0 (* 2 inset)) 1.0)
+          :height (float (- 1.0 (* 2 inset)) 1.0)
+          :angle 0.0)))
+
 (defun gui-model-add-node (model kind &key after params)
   "Insert a KIND node into the selected photo's graph and select it.
 
@@ -656,8 +673,10 @@ placement breaks the film-domain rules."
              ;; and asking for a grade correction used to fail validation and
              ;; look like the menu entry did nothing.
              (after-id (orfeus:graph-insertion-point graph requested kind))
-             (node (orfeus:graph-insert-node graph after-id kind
-                                             :params params)))
+             (node (orfeus:graph-insert-node
+                    graph after-id kind
+                    :params (or params
+                                (and (eq kind :crop) (default-crop-params))))))
         (reflow-graph-node-positions graph node)
         (setf (gui-model-selected-node model) node)
         node))))
@@ -674,7 +693,16 @@ placement breaks the film-domain rules."
       t)))
 
 (defun gui-model-move-node (model node direction)
-  "Move NODE one step :EARLIER or :LATER along its chain; true on success."
+  "Move NODE one step :EARLIER or :LATER along its chain; true on success.
+
+A move the graph will not accept is an answer, not a failure: swapping a crop
+above an optics node is refused because optics cannot read a cropped branch, and
+the caller wants to say so plainly rather than show the validator's report. The
+swap rolls itself back before signalling, so the graph is untouched either way."
+  (handler-case (gui-model-move-node-1 model node direction)
+    (orfeus:invalid-project-data () nil)))
+
+(defun gui-model-move-node-1 (model node direction)
   (gui-model-checkpoint model)
   (let ((job (gui-model-selected-job model)))
     (when (and job (photo-job-graph job))

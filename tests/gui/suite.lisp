@@ -385,6 +385,72 @@ usually is not legal there. Refusing looked like the dropdown doing nothing."
             (check moved
                    (format nil "~A was left reading film output" kind)))))))
 
+(defun test-crop-aspect-and-default ()
+  "Crop starts grabbable, and the ratio list reshapes it correctly.
+
+A crop that began on the frame edge put its handles exactly where the picture
+ended, with nothing to grab. It now starts inset, and typing 100 into the size
+fields still gets the whole frame back."
+  (let ((params (orfeus/gui::default-crop-params)))
+    (check (< 0 (getf params :left) 0.2)
+           "A fresh crop still starts on the frame edge")
+    (check (= (getf params :left) (getf params :top))
+           "The starting inset is not symmetric")
+    ;; Centred: the inset on the right matches the one on the left.
+    (check (< (abs (- 1.0 (+ (getf params :left) (getf params :width)
+                             (getf params :left))))
+              1.0d-6)
+           "The starting crop is not centred in the frame")
+    ;; It has to be a rectangle the core will accept.
+    (check (orfeus:graph-insert-node (orfeus:default-processing-graph) 1 :crop
+                                     :params params)
+           "The starting crop is not a valid rectangle"))
+  ;; Ratios are width to height, and Original follows the frame.
+  (let ((frame-width 1200d0) (frame-height 900d0))
+    (check (null (orfeus/gui::crop-aspect-ratio nil frame-width frame-height))
+           "Free returned a ratio")
+    (check (< (abs (- 4/3 (orfeus/gui::crop-aspect-ratio
+                           :original frame-width frame-height)))
+              1.0d-6)
+           "Original did not follow the frame")
+    (check (< (abs (- 1.5 (orfeus/gui::crop-aspect-ratio
+                           (orfeus/gui::crop-aspect-for-label "3:2")
+                           frame-width frame-height)))
+              1.0d-6)
+           "3:2 was not one and a half")
+    (check (string= "3:2" (orfeus/gui::crop-aspect-label
+                           (orfeus/gui::crop-aspect-for-label "3:2")))
+           "A ratio did not round trip through its label")
+    ;; Reshaping keeps the centre, hits the ratio exactly, and never grows.
+    (dolist (label '("Original" "1:1" "3:2" "2:3" "16:9"))
+      (let ((ratio (orfeus/gui::crop-aspect-ratio
+                    (orfeus/gui::crop-aspect-for-label label)
+                    frame-width frame-height)))
+        (multiple-value-bind (left top width height)
+            (orfeus/gui::crop-rect-for-ratio 0.04d0 0.04d0 0.92d0 0.92d0
+                                             frame-width frame-height ratio)
+          (check (< (abs (- ratio (/ (* width frame-width)
+                                     (* height frame-height))))
+                    1.0d-6)
+                 (format nil "~A did not reach its ratio" label))
+          (check (and (<= width 0.92d0) (<= height 0.92d0))
+                 (format nil "~A grew the crop instead of shrinking it" label))
+          (check (and (<= -1.0d-9 left) (<= -1.0d-9 top)
+                      (<= (+ left width) 1.0000001d0)
+                      (<= (+ top height) 1.0000001d0))
+                 (format nil "~A left the frame" label))
+          (check (< (abs (- 0.5d0 (+ left (/ width 2)))) 1.0d-6)
+                 (format nil "~A moved the crop off centre" label)))))
+    ;; Original on a crop already matching the frame changes nothing.
+    (multiple-value-bind (left top width height)
+        (orfeus/gui::crop-rect-for-ratio 0.04d0 0.04d0 0.92d0 0.92d0
+                                         frame-width frame-height
+                                         (/ frame-width frame-height))
+      (declare (ignore left top))
+      (check (and (< (abs (- 0.92d0 width)) 1.0d-6)
+                  (< (abs (- 0.92d0 height)) 1.0d-6))
+             "Original resized a crop that already matched the frame"))))
+
 (defun test-viewport-render-bound ()
   "The viewport render is sized for the canvas, and grows only with zoom.
 
@@ -1424,6 +1490,7 @@ against 45 milliseconds for a canvas-sized render."
   (test-thumbnail-context-menu)
   (test-node-adds-land-where-they-are-legal)
   (test-retyping-moves-a-node-into-its-domain)
+  (test-crop-aspect-and-default)
   (test-viewport-render-bound)
   (test-curve-spline-shapes)
   (test-preset-bulk-application)
