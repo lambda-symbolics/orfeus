@@ -700,7 +700,11 @@ above an optics node is refused because optics cannot read a cropped branch, and
 the caller wants to say so plainly rather than show the validator's report. The
 swap rolls itself back before signalling, so the graph is untouched either way."
   (handler-case (gui-model-move-node-1 model node direction)
-    (orfeus:invalid-project-data () nil)))
+    (orfeus:invalid-project-data (condition)
+      ;; The reason comes back as a second value so the caller can say why
+      ;; rather than only that it did not happen. Guessing at the rule from a
+      ;; refusal is not something a user should have to do.
+      (values nil (orfeus:invalid-project-data-reason condition)))))
 
 (defun gui-model-move-node-1 (model node direction)
   (gui-model-checkpoint model)

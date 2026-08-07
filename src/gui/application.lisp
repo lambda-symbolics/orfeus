@@ -83,6 +83,27 @@ needed anywhere."
          (and (plusp frame-height) (/ frame-width (float frame-height 1d0))))
         (t (/ (car aspect) (float (cdr aspect) 1d0)))))
 
+(defun graph-node-body-style (node display-domain-p)
+  "The body colour NODE is drawn with, which encodes where it may sit.
+
+Three tiers, in pipeline order:
+
+  :OPTICS  lens correction, which resamples against the full frame's geometry
+           and so may not read a branch that has already been cropped. It has to
+           come before every crop, which makes it the one correction with an
+           ordering constraint of its own.
+  :LINEAR  the scene-linear grade, indifferent to cropping, anywhere above film.
+  :DISPLAY the film transform and everything after it.
+
+:BYPASSED and :BLEND win over the tier, because a node that is switched off or
+that merges two branches is a more important thing to notice about it. A blend
+is always scene-linear anyway, and its blue belongs to the same cool family."
+  (cond ((orfeus:graph-node-bypassed-p node) :bypassed)
+        ((orfeus:graph-node-blend-p node) :blend)
+        ((eq :optics (orfeus:graph-node-kind node)) :optics)
+        (display-domain-p :display)
+        (t :linear)))
+
 (defun crop-rect-for-ratio (left top width height frame-width frame-height
                             ratio)
   "Reshape the normalized rectangle to RATIO about its own centre.
@@ -2519,13 +2540,12 @@ new cache entry is published."
                    (return-from graph-editor-hit (values :output nil))))
                (values nil nil)))
            (draw-editor-box (x y w h label style selected)
-             ;; Body colour carries the one ordering rule the graph enforces:
-             ;; a film node converts its branch from scene-linear to display
-             ;; space, and nothing but another film node, a crop, or an untyped
-             ;; container may read that. So the cool bodies are the corrections
-             ;; that have to sit above the film transform and the warm ones are
-             ;; the branch after it, which puts the boundary on screen instead
-             ;; of leaving it to be discovered by a refused edit.
+             ;; Body colour carries the pipeline order the graph enforces, in
+             ;; three tiers: green optics, which must precede every crop; cool
+             ;; scene-linear corrections; and warm display space, from the film
+             ;; transform down. GRAPH-NODE-BODY-STYLE explains why each tier
+             ;; exists. Showing them puts the ordering rules on screen instead
+             ;; of leaving them to be discovered by a refused edit.
              ;;
              ;; :terminal is the darker RAW and OUT wells; :blend keeps its own
              ;; stronger blue, a saturated member of the same cool family, since
@@ -2535,6 +2555,8 @@ new cache entry is published."
                (:bypassed (lightfast:draw-color-rgb :red 148 :green 148
                                                   :blue 148))
                (:blend (lightfast:draw-color-rgb :red 176 :green 190 :blue 224))
+               (:optics (lightfast:draw-color-rgb :red 182 :green 212
+                                                :blue 188))
                (:display (lightfast:draw-color-rgb :red 226 :green 205
                                                  :blue 168))
                (:linear (lightfast:draw-color-rgb :red 196 :green 205
@@ -2696,11 +2718,9 @@ new cache entry is published."
                        (draw-editor-box bx by w h
                                         (node-kind-label
                                          (orfeus:graph-node-kind node))
-                                        (cond (bypassed :bypassed)
-                                              (blend-p :blend)
-                                              ((node-in-display-domain-p node)
-                                               :display)
-                                              (t :linear))
+                                        (graph-node-body-style
+                                         node
+                                         (node-in-display-domain-p node))
                                         (eq node selected))
                        (if (graph-node-active-p node)
                            (lightfast:draw-color-rgb :red 40 :green 150
@@ -2812,16 +2832,8 @@ new cache entry is published."
                                              "Bypassed"
                                              "Enabled")
                                          (node-kind-label kind))))))
-                      (cons "Move Earlier"
-                            (lambda ()
-                              (if (gui-model-move-node model node :earlier)
-                                  (after-graph-edit "Node moved earlier")
-                                  (set-status "This node cannot move earlier"))))
-                      (cons "Move Later"
-                            (lambda ()
-                              (if (gui-model-move-node model node :later)
-                                  (after-graph-edit "Node moved later")
-                                  (set-status "This node cannot move later")))))
+                      (cons "Move Earlier" (move-node-action node :earlier))
+                      (cons "Move Later" (move-node-action node :later)))
                 (when (eq kind :crop)
                   (list (cons "-" nil)
                         (cons "Autocrop Negative"
@@ -2848,6 +2860,21 @@ new cache entry is published."
                             (lambda ()
                               (gui-model-delete-node model node)
                               (after-graph-edit "Node deleted")))))))
+           (move-node-action (node direction)
+             (lambda ()
+               (multiple-value-bind (moved reason)
+                   (gui-model-move-node model node direction)
+                 (if moved
+                     (after-graph-edit (format nil "Node moved ~(~A~)"
+                                               direction))
+                     ;; The validator's reason when there is one: a crop that
+                     ;; will not move up is being stopped by an optics node,
+                     ;; which cannot resample a branch that has been cropped.
+                     (set-status
+                      (if reason
+                          (format nil "Cannot move ~(~A~): ~A" direction reason)
+                          (format nil "This node cannot move ~(~A~)"
+                                  direction)))))))
            (insertable-kinds-after (after-node)
              ;; Only the kinds that would actually be well formed in that spot.
              ;; Below a film node that is Crop and Film alone, and below a crop
@@ -5005,8 +5032,13 @@ new cache entry is published."
                                  (lightfast:message-box
                                   ;; Common Lisp does not read \n as a newline;
                                   ;; the backslash just escapes the n.
-                                  (format nil "Orfeus RAW processor~%~
-                                               Olympus PEN-F and OM-1"))))
+                                  (format nil "Orfeus ~A~%~
+                                               RAW processor for the Olympus ~
+                                               PEN-F and OM-1~%~%~
+                                               Built from ~A"
+                                          (orfeus:orfeus-version)
+                                          (or (orfeus:orfeus-build-commit)
+                                              "an unknown revision")))))
         (setf toolbar (lightfast:make-panel :parent window :x 0 :y 24
                                           :width 1280 :height 40 :label ""))
         (lightfast:set-box toolbar lightfast:+box-flat-box+)
@@ -5265,7 +5297,7 @@ new cache entry is published."
         (lightfast:set-box graph-canvas lightfast:+box-flat-box+)
         (lightfast:set-tooltip
          graph-canvas
-         "Cool nodes grade in scene-linear, warm ones after the film transform; drag to arrange, drag a port to rewire, right-click to add")
+         "Green optics comes before any crop, cool nodes grade in scene-linear, warm ones follow the film transform; drag to arrange, drag a port to rewire, right-click to add")
         (dolist (event (list lightfast:+event-push+
                              lightfast:+event-drag+
                              lightfast:+event-release+

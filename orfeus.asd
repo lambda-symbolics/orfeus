@@ -12,7 +12,7 @@
   :description "Fast Olympus RAW processing core."
   :author "Lucius"
   :license "COLL-Attribution"
-  :version "0.1.0"
+  :version "1.0.0"
   :depends-on (#:cffi #:sb-posix)
   :serial t
   :components ((:file "src/package")

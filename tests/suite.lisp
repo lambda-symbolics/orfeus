@@ -1717,7 +1717,17 @@ and then quietly relocated them would be lying about where a click puts things."
                          :output-stream output
                          :error-stream errors))
          (search (orfeus-version) (get-output-stream-string output))
-         (string= "" (get-output-stream-string errors)))))
+         (string= "" (get-output-stream-string errors))
+         ;; The release number is declared once, in the system definition, and
+         ;; everything that reports a build starts from it.
+         (let ((version (orfeus-version))
+               (description (orfeus-build-description)))
+           (and (not (string= "unknown" version))
+                (eql 0 (search version description))
+                ;; A revision, when one can be found, is named after the version
+                ;; rather than instead of it.
+                (or (null (orfeus-build-commit))
+                    (search (orfeus-build-commit) description)))))))
 
 (defun cli-rejects-unknown-command-p ()
   (let ((output (make-string-output-stream))

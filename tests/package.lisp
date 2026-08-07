@@ -2,6 +2,9 @@
   (:use #:cl)
   (:import-from #:orfeus
                 #:cli-run
+                #:orfeus-version
+                #:orfeus-build-commit
+                #:orfeus-build-description
                 #:export-settings-jpeg-quality
                 #:export-settings-max-height
                 #:export-settings-max-width

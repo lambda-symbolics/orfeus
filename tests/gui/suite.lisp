@@ -385,6 +385,35 @@ usually is not legal there. Refusing looked like the dropdown doing nothing."
             (check moved
                    (format nil "~A was left reading film output" kind)))))))
 
+(defun test-node-body-tiers ()
+  "Node colour encodes the ordering rules, so the tiers are asserted not eyeballed.
+
+Optics is its own tier because it is the one correction with an ordering
+constraint of its own: it resamples against the full frame and cannot read a
+branch that has already been cropped, so it has to precede every crop."
+  (flet ((node (kind &key bypassed blend)
+           (orfeus:make-graph-node :id 1 :kind kind :inputs (if blend '(0 0) '(0))
+                                   :bypassed-p bypassed)))
+    (check (eq :optics (orfeus/gui::graph-node-body-style (node :optics) nil))
+           "Optics did not get its own tier")
+    (check (eq :linear (orfeus/gui::graph-node-body-style (node :curves) nil))
+           "A scene-linear correction was not in the linear tier")
+    (check (eq :display (orfeus/gui::graph-node-body-style (node :film) t))
+           "The film transform was not in the display tier")
+    ;; A crop takes the tier of where it sits, since that is what governs what
+    ;; may follow it.
+    (check (eq :linear (orfeus/gui::graph-node-body-style (node :crop) nil))
+           "A crop above the film transform was not cool")
+    (check (eq :display (orfeus/gui::graph-node-body-style (node :crop) t))
+           "A crop below the film transform was not warm")
+    ;; Switched off, or merging two branches, outranks the tier.
+    (check (eq :bypassed
+               (orfeus/gui::graph-node-body-style (node :optics :bypassed t) nil))
+           "A bypassed node did not read as bypassed")
+    (check (eq :blend
+               (orfeus/gui::graph-node-body-style (node :blend :blend t) nil))
+           "A blend did not read as a blend")))
+
 (defun test-crop-aspect-and-default ()
   "Crop starts grabbable, and the ratio list reshapes it correctly.
 
@@ -1490,6 +1519,7 @@ against 45 milliseconds for a canvas-sized render."
   (test-thumbnail-context-menu)
   (test-node-adds-land-where-they-are-legal)
   (test-retyping-moves-a-node-into-its-domain)
+  (test-node-body-tiers)
   (test-crop-aspect-and-default)
   (test-viewport-render-bound)
   (test-curve-spline-shapes)

@@ -93,7 +93,7 @@
               (cli-print-help output-stream)
               0)
              ((equal arguments '("--version"))
-              (format output-stream "~A~%" (orfeus-version))
+              (format output-stream "~A~%" (orfeus-build-description))
               0)
              ((string= (first arguments) "extract")
               (cli-extract (rest arguments) output-stream))

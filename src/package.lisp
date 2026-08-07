@@ -38,6 +38,7 @@
    #:export-settings-preserve-metadata-p
    #:export-settings-timestamp-filenames-p
    #:invalid-project-data
+   #:invalid-project-data-reason
    #:lens-profile-aliases-pathname
    #:lens-profile-aliases-read
    #:resolve-lens-profile-alias
@@ -54,6 +55,8 @@
    #:native-library-unavailable
    #:orfeus-error
    #:orfeus-version
+   #:orfeus-build-commit
+   #:orfeus-build-description
    #:output-file-exists
    #:photo-capture-description
    #:photo-extract-embedded-preview
