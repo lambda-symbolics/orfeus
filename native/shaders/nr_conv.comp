@@ -23,22 +23,31 @@
 // into the output write costs nothing, where a separate clearing pass would cost
 // a barrier and a full sweep of the feature stack per layer.
 //
-// A workgroup covers a 16x16 patch of output pixels for one group of output
-// channels. The nine input values a thread reads for an input channel are then
-// reused across every output channel in the group, which is what keeps the
-// kernel arithmetic-bound: without that reuse each output element would cost
-// nine global reads for nine multiply-adds.
+// A workgroup covers a TILE x TILE patch of output pixels for one group of
+// output channels, and stages its input through shared memory. Reading straight
+// from the buffer instead measured 1.5x the CPU on an RTX 2000 Ada where the
+// arithmetic alone should have been several times that: every thread fetched its
+// own nine taps, so a workgroup pulled 256 x 9 values per input channel where
+// the window it actually covers holds (TILE + 2)^2. Staging cuts that traffic
+// sevenfold and is what turns the kernel arithmetic-bound.
 
-layout(local_size_x = 16, local_size_y = 16) in;
+#define TILE 16
+#define HALO_TILE (TILE + 2)
+// Input channels staged per round. Four keeps the barrier count down without
+// spending much shared memory: 4 x 18 x 18 floats is a little over five KiB.
+#define CHUNK 4
+// Output channels one workgroup accumulates at once. Eight fits comfortably in
+// registers and amortises each staged value eight ways.
+#define GROUP 8u
+
+layout(local_size_x = TILE, local_size_y = TILE) in;
 layout(set = 0, binding = 0, std430) buffer Planes {
     float plane[];
 };
 
 #include "stage.glsl"
 
-// Output channels one workgroup accumulates at once. Eight fits comfortably in
-// registers and amortises each input read eight ways.
-#define GROUP 8u
+shared float staged[CHUNK][HALO_TILE][HALO_TILE];
 
 void main() {
     uint input_edge = parameters.counts.x;
@@ -52,12 +61,14 @@ void main() {
 
     uint x = gl_GlobalInvocationID.x;
     uint y = gl_GlobalInvocationID.y;
-    uint first_channel = gl_GlobalInvocationID.z * GROUP;
-    if (x >= output_edge || y >= output_edge || first_channel >= output_channels) {
-        return;
-    }
+    uint first_channel = gl_WorkGroupID.z * GROUP;
 
-    uint group = min(GROUP, output_channels - first_channel);
+    // Threads outside the output must still reach every barrier below, so this
+    // is a flag rather than an early return: a workgroup that loses part of its
+    // membership at a barrier has undefined behaviour.
+    bool writes_output = x < output_edge && y < output_edge && first_channel < output_channels;
+    uint group = min(GROUP, output_channels - min(first_channel, output_channels));
+
     float accumulator[GROUP];
     for (uint index = 0u; index < GROUP; ++index) {
         accumulator[index] = index < group
@@ -65,34 +76,66 @@ void main() {
             : 0.0;
     }
 
+    // The window this workgroup stages, in patch coordinates.
+    uint base_x = gl_WorkGroupID.x * uint(TILE);
+    uint base_y = gl_WorkGroupID.y * uint(TILE);
+    uint local = gl_LocalInvocationID.y * uint(TILE) + gl_LocalInvocationID.x;
+    uint threads = uint(TILE) * uint(TILE);
+    uint window = uint(HALO_TILE) * uint(HALO_TILE);
+    uint last_input = input_edge - 1u;
+
     // Weights are [output channel][input channel][3][3], the same order the CPU
     // reference packs them in, so one channel's taps are nine contiguous floats.
     uint per_output = input_channels * 9u;
     uint input_plane = input_edge * input_edge;
-    for (uint in_channel = 0u; in_channel < input_channels; ++in_channel) {
-        uint row = source + in_channel * input_plane + y * input_edge + x;
-        float v00 = plane[row];
-        float v01 = plane[row + 1u];
-        float v02 = plane[row + 2u];
-        row += input_edge;
-        float v10 = plane[row];
-        float v11 = plane[row + 1u];
-        float v12 = plane[row + 2u];
-        row += input_edge;
-        float v20 = plane[row];
-        float v21 = plane[row + 1u];
-        float v22 = plane[row + 2u];
 
-        uint tap = weights + first_channel * per_output + in_channel * 9u;
-        for (uint index = 0u; index < group; ++index) {
-            uint w = tap + index * per_output;
-            accumulator[index] += plane[w] * v00 + plane[w + 1u] * v01
-                + plane[w + 2u] * v02
-                + plane[w + 3u] * v10 + plane[w + 4u] * v11
-                + plane[w + 5u] * v12
-                + plane[w + 6u] * v20 + plane[w + 7u] * v21
-                + plane[w + 8u] * v22;
+    for (uint first_input = 0u; first_input < input_channels; first_input += uint(CHUNK)) {
+        uint staged_count = min(uint(CHUNK), input_channels - first_input);
+        barrier();
+        for (uint slot = 0u; slot < staged_count; ++slot) {
+            uint channel_base = source + (first_input + slot) * input_plane;
+            for (uint index = local; index < window; index += threads) {
+                uint row = index / uint(HALO_TILE);
+                uint column = index % uint(HALO_TILE);
+                // Clamped so a partial workgroup reads inside the patch. Those
+                // values reach no contributing thread; they only have to be legal.
+                uint sample_y = min(base_y + row, last_input);
+                uint sample_x = min(base_x + column, last_input);
+                staged[slot][row][column] =
+                    plane[channel_base + sample_y * input_edge + sample_x];
+            }
         }
+        barrier();
+        if (writes_output) {
+            for (uint slot = 0u; slot < staged_count; ++slot) {
+                uint row = gl_LocalInvocationID.y;
+                uint column = gl_LocalInvocationID.x;
+                float v00 = staged[slot][row][column];
+                float v01 = staged[slot][row][column + 1u];
+                float v02 = staged[slot][row][column + 2u];
+                float v10 = staged[slot][row + 1u][column];
+                float v11 = staged[slot][row + 1u][column + 1u];
+                float v12 = staged[slot][row + 1u][column + 2u];
+                float v20 = staged[slot][row + 2u][column];
+                float v21 = staged[slot][row + 2u][column + 1u];
+                float v22 = staged[slot][row + 2u][column + 2u];
+                uint tap = weights + first_channel * per_output
+                    + (first_input + slot) * 9u;
+                for (uint index = 0u; index < group; ++index) {
+                    uint w = tap + index * per_output;
+                    accumulator[index] += plane[w] * v00 + plane[w + 1u] * v01
+                        + plane[w + 2u] * v02
+                        + plane[w + 3u] * v10 + plane[w + 4u] * v11
+                        + plane[w + 5u] * v12
+                        + plane[w + 6u] * v20 + plane[w + 7u] * v21
+                        + plane[w + 8u] * v22;
+                }
+            }
+        }
+    }
+
+    if (!writes_output) {
+        return;
     }
 
     // The patch has shed one halo pixel per layer, so its corner has moved in.
