@@ -65,6 +65,12 @@ portrait crop of a landscape frame is a normal thing to want, and picking 2:3
 from a list says exactly what you get. :ORIGINAL follows the photograph's own
 proportions, whatever they are.")
 
+(defun quarter-turn-label (turns)
+  (or (rest (assoc turns orfeus:*quarter-turn-labels*)) "None"))
+
+(defun quarter-turns-for-label (label)
+  (car (rassoc label orfeus:*quarter-turn-labels* :test #'string=)))
+
 (defun crop-aspect-label (aspect)
   (car (rassoc aspect *crop-aspect-choices* :test #'equal)))
 
@@ -169,6 +175,7 @@ the same reason.")
     (:blend . "Blend")
     (:color-subtract . "Subtr")
     (:crop . "Crop")
+    (:rotate . "Rotate")
     (:curves . "Curves")
     (:node . "Node"))
   "Short node captions for the graph panel, in menu order.")
@@ -184,6 +191,7 @@ the same reason.")
     ("Blend" . :blend)
     ("Color Subtract" . :color-subtract)
     ("Crop" . :crop)
+    ("Rotate" . :rotate)
     ("Curves" . :curves))
   "Correction picker entries for the Node panel, in menu order.")
 
@@ -1059,7 +1067,8 @@ new cache entry is published."
            inspector tabs node-page export-page
            kind-choice
            (node-panel-groups '())
-           blend-opacity-input crop-angle-input
+           blend-opacity-input crop-angle-input rotate-turn-input
+           base-red-input base-green-input base-blue-input base-swatch
            crop-aspect-input crop-width-input crop-height-input
            ;; NIL is a free crop; otherwise an entry from
            ;; *CROP-ASPECT-CHOICES*. An editing mode, not a render parameter:
@@ -2167,6 +2176,7 @@ new cache entry is published."
                    (setf (gui-model-selected-index model) row))
                  (setf (gui-model-selected-node model) nil
                        pick-color-node nil)
+                 (set-preview-cursor :default)
                  (clear-previews)
                  (sync-controls)
                  (sync-node-tools)
@@ -2498,7 +2508,23 @@ new cache entry is published."
                            (format nil "~,1F" (* 100 height)))))
                  (when crop-aspect-input
                    (setf (lightfast:value crop-aspect-input)
-                         (or (crop-aspect-label crop-aspect) "Free"))))))
+                         (or (crop-aspect-label crop-aspect) "Free"))))
+               (when (and node (eq kind :rotate) rotate-turn-input)
+                 (setf (lightfast:value rotate-turn-input)
+                       (quarter-turn-label
+                        (getf (orfeus:graph-node-params node)
+                              :quarter-turns 0))))
+               (when (and node (eq kind :color-subtract))
+                 (let ((params (orfeus:graph-node-params node)))
+                   (loop for (key input) in (list (list :red base-red-input)
+                                                  (list :green base-green-input)
+                                                  (list :blue base-blue-input))
+                         do (when input
+                              (setf (lightfast:value input)
+                                    (format nil "~,1F"
+                                            (* 100 (srgb-encode-component
+                                                    (getf params key 1.0))))))))
+                 (sync-base-swatch node))))
            (graph-node-box (node)
              (let ((place (orfeus:graph-node-position node)))
                (values (round (first place)) (round (second place))
@@ -2846,11 +2872,10 @@ new cache entry is published."
                                 (after-graph-edit "Crop reset")))))
                 (when (eq kind :color-subtract)
                   (list (cons "-" nil)
-                        (cons "Pick Base Color..."
-                              (lambda () (pick-base-color node)))
                         (cons "Sample Base From Photo"
                               (lambda ()
                                 (setf pick-color-node node)
+                                (set-preview-cursor :cross)
                                 (set-status
                                  "Click the preview to sample the film base")))
                         (cons "Auto Base From Border"
@@ -3196,21 +3221,40 @@ new cache entry is published."
                                 (first base) (second base) (third base))))
                    (error (condition)
                      (set-status (princ-to-string condition)))))))
-           (pick-base-color (node)
-             (let ((params (orfeus:graph-node-params node)))
-               (multiple-value-bind (red green blue)
-                   (lightfast:choose-color
-                    :title "Film base color"
-                    :red (srgb-encode-component (getf params :red 1.0))
-                    :green (srgb-encode-component (getf params :green 1.0))
-                    :blue (srgb-encode-component (getf params :blue 1.0)))
-                 (when red
-                   (gui-model-set-node-params
-                    model node
-                    (list :red (srgb-decode-component red)
-                          :green (srgb-decode-component green)
-                          :blue (srgb-decode-component blue)))
-                   (after-graph-edit "Film base color set")))))
+           (set-preview-cursor (shape)
+             ;; A crosshair while a click on the preview will be read as a
+             ;; colour rather than acted on as a pan or a crop drag.
+             (when after-canvas
+               (ignore-errors (set-widget-cursor after-canvas shape))))
+           (set-base-channel (node key percent)
+             ;; The fields read in encoded percent, which is how the colour
+             ;; looks; the node keeps it scene-linear, which is where the
+             ;; subtraction happens.
+             (let* ((params (orfeus:graph-node-params node))
+                    (value (srgb-decode-component
+                            (max 0.0 (min 1.0 (/ percent 100.0))))))
+               (handler-case
+                   (progn
+                     (gui-model-set-node-params
+                      model node
+                      (list :red (getf params :red 1.0)
+                            :green (getf params :green 1.0)
+                            :blue (getf params :blue 1.0)
+                            key value))
+                     (sync-node-tools)
+                     (schedule-edited-preview))
+                 (error (condition) (set-status (princ-to-string condition))))))
+           (sync-base-swatch (node)
+             (when base-swatch
+               (let ((params (orfeus:graph-node-params node)))
+                 (flet ((channel (key)
+                          (round (* 255 (srgb-encode-component
+                                         (getf params key 1.0))))))
+                   (lightfast:set-color-rgb base-swatch
+                                            :red (channel :red)
+                                            :green (channel :green)
+                                            :blue (channel :blue))
+                   (lightfast:redraw base-swatch)))))
            (sample-base-at (canvas x y)
              ;; The eyedropper: map the click through the current fit and pan
              ;; to normalized image coordinates, then sample linear color.
@@ -3218,6 +3262,7 @@ new cache entry is published."
                    (job (selected-job))
                    (path (preview-path-for-canvas canvas)))
                (setf pick-color-node nil)
+               (set-preview-cursor :default)
                (when (and node job path)
                  (multiple-value-bind (scaled-width scaled-height)
                      (preview-scaled-size canvas path preview-zoom)
@@ -3769,6 +3814,7 @@ new cache entry is published."
              (setf gallery-selected nil
                    gallery-scroll 0
                    pick-color-node nil)
+             (set-preview-cursor :default)
              (gui-model-replace-project model new-project path)
              (setf (gui-model-selected-node model) nil)
              (refresh-gallery)
@@ -5602,7 +5648,40 @@ new cache entry is published."
         (build-group
          :color-subtract
          (lambda ()
-           (flet ((subtract-button (y label action)
+           ;; The base colour as three editable channels rather than behind a
+           ;; modal chooser: it is the value being graded, so it belongs on the
+           ;; panel where it can be nudged and read at a glance.
+           (flet ((channel-field (key label y)
+                    (register-inspector
+                     (lightfast:make-label :parent node-page :x 12 :y y
+                                         :width 88 :height 26 :label label)
+                     12 y 88 26 :page)
+                    (let ((spinner
+                            (register-inspector
+                             (lightfast:make-spinner
+                              :parent node-page :x 110 :y y
+                              :width 84 :height 26
+                              :callback
+                              (lambda (widget event value)
+                                (declare (ignore event value))
+                                (let ((node (gui-model-selected-graph-node
+                                             model)))
+                                  (when node
+                                    (handler-case
+                                        (set-base-channel
+                                         node key
+                                         (parse-number
+                                          (lightfast:value widget)))
+                                      (error (condition)
+                                        (set-status
+                                         (princ-to-string condition))))))))
+                             110 y 84 26 :page)))
+                      ;; Displayed encoded, the way the colour reads to the eye,
+                      ;; while the node stores it scene-linear.
+                      (lightfast:set-range spinner 0 100)
+                      (lightfast:set-step spinner 0.5)
+                      spinner))
+                  (subtract-button (y label action)
                     (register-inspector
                      (lightfast:make-button
                       :parent node-page :x 12 :y y :width 292 :height 26
@@ -5614,14 +5693,55 @@ new cache entry is published."
                                      model)))
                           (when node (funcall action node)))))
                      12 y :fill 26 :page)))
-             (subtract-button 44 "Pick Base Color..." #'pick-base-color)
-             (subtract-button 76 "Sample Base From Photo"
+             (setf base-red-input (channel-field :red "Base red %" 44)
+                   base-green-input (channel-field :green "Base green %" 76)
+                   base-blue-input (channel-field :blue "Base blue %" 108))
+             (setf base-swatch
+                   (register-inspector
+                    (lightfast:make-box :parent node-page :x 204 :y 44
+                                      :width 100 :height 90 :label "")
+                    204 44 100 90 :page))
+             (lightfast:set-box base-swatch lightfast:+box-flat-box+)
+             (lightfast:set-tooltip base-swatch "The film base being subtracted")
+             (subtract-button 140 "Sample Base From Photo"
                               (lambda (node)
                                 (setf pick-color-node node)
+                                (set-preview-cursor :cross)
                                 (set-status
                                  "Click the preview to sample the film base")))
-             (subtract-button 108 "Auto Base From Border"
+             (subtract-button 172 "Auto Base From Border"
                               #'auto-base-from-border))))
+        (build-group
+         :rotate
+         (lambda ()
+           (let ((field
+                   (lightfast:make-labeled-choice
+                    :parent node-page :x 12 :y 44 :width 292 :height 26
+                    :label "Turn" :label-width 88
+                    :items (mapcar #'rest orfeus:*quarter-turn-labels*)
+                    :callback
+                    (lambda (widget event value)
+                      (declare (ignore event value))
+                      (let ((node (gui-model-selected-graph-node model))
+                            (turns (quarter-turns-for-label
+                                    (lightfast:value widget))))
+                        (when (and node turns)
+                          (handler-case
+                              (progn
+                                (gui-model-set-node-params
+                                 model node (list :quarter-turns turns))
+                                (after-graph-edit
+                                 (format nil "Rotated ~A"
+                                         (quarter-turn-label turns))))
+                            (error (condition)
+                              (set-status (princ-to-string condition))))))))))
+             (setf rotate-turn-input (lightfast:field-control field))
+             (register-field field 44 :page))
+           (register-inspector
+            (lightfast:make-label
+             :parent node-page :x 12 :y 76 :width 292 :height 26
+             :label "Whole turns keep every photosite")
+            12 76 :fill 26 :page)))
         (build-group
          :crop
          (lambda ()

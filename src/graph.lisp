@@ -54,6 +54,14 @@
         (curve-points-validate points key))))
   params)
 
+(defun rotate-params-validate (params)
+  (unless (and (listp params) (plist-known-keys-p params *rotate-keys*))
+    (graph-invalid params "expected a :quarter-turns parameter"))
+  (let ((turns (getf params :quarter-turns 0)))
+    (unless (and (integerp turns) (<= 0 turns 3))
+      (graph-invalid params "rotation must be 0, 1, 2, or 3 quarter turns")))
+  params)
+
 (defun crop-params-validate (params)
   (unless (and (listp params)
                (plist-known-keys-p params *crop-keys*))
@@ -127,14 +135,20 @@
      (namestring (still-store-canonical-pathname lut-path)))))
 
 (defun graph-crop-geometry (upstream node)
-  "Return NODE's canonical crop history appended to UPSTREAM geometry."
+  "Return NODE's canonical geometry history with NODE's own reframing appended.
+
+Crops and rotations both belong here. Two branches of a blend must have been
+reframed identically to be mixed, and an optics node cannot resample a branch
+whose frame has already moved, whichever of the two moved it."
   (let ((params (graph-node-params node)))
-    (append upstream
-            (list (list (getf params :left 0.0)
-                        (getf params :top 0.0)
-                        (getf params :width 1.0)
-                        (getf params :height 1.0)
-                        (getf params :angle 0.0))))))
+    (if (eq :rotate (graph-node-kind node))
+        (append upstream (list (list :rotate (getf params :quarter-turns 0))))
+        (append upstream
+                (list (list (getf params :left 0.0)
+                            (getf params :top 0.0)
+                            (getf params :width 1.0)
+                            (getf params :height 1.0)
+                            (getf params :angle 0.0)))))))
 
 (defun graph-node-position-validate (position node)
   (unless (or (null position)
@@ -154,6 +168,7 @@
        (graph-invalid datum "node kind ~S cannot carry parameters" kind)))
     ((eq kind :color-subtract) (color-subtract-params-validate params))
     ((eq kind :crop) (crop-params-validate params))
+    ((eq kind :rotate) (rotate-params-validate params))
     ((eq kind :curves) (curves-params-validate params))
     ((graph-filter-kind-p kind)
      (graph-node-params-validate
@@ -239,6 +254,13 @@ while blends stay scene-linear."
            ;; Crops keep their branch's domain.
            (when (member (first inputs) display)
              (push id display)))
+          ((eq kind :rotate)
+           (unless (= 1 (length inputs))
+             (graph-invalid node "filter node ~S needs exactly one input" id))
+           (rotate-params-validate (graph-node-params node))
+           ;; A rotation is indifferent to which domain it turns, like a crop.
+           (when (member (first inputs) display)
+             (push id display)))
           ((eq kind :curves)
            (unless (= 1 (length inputs))
              (graph-invalid node "filter node ~S needs exactly one input" id))
@@ -284,7 +306,7 @@ while blends stay scene-linear."
                                     "blend node ~S inputs have incompatible crop geometry"
                                     id))
                    (copy-tree first-geometry)))
-                ((eq kind :crop)
+                ((member kind '(:crop :rotate))
                  (graph-crop-geometry
                   (copy-tree (gethash (first inputs) geometry)) node))
                 (t

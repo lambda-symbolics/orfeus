@@ -19,8 +19,9 @@ use super::Error;
 use super::render::{self, DecodedRaw, LensCorrectionOptions, RgbImage};
 
 const GRAPH_MAGIC: u32 = 0x4746_524F; // "ORFG" little-endian
-// 3 made each curves channel variable length behind a count header.
-const GRAPH_VERSION: u32 = 3;
+// 3 made each curves channel variable length behind a count header;
+// 4 added the rotate node.
+const GRAPH_VERSION: u32 = 4;
 const MAX_GRAPH_NODES: usize = 64;
 
 pub const NODE_WHITE_BALANCE: u32 = 1;
@@ -33,6 +34,7 @@ pub const NODE_BLEND: u32 = 7;
 pub const NODE_COLOR_SUBTRACT: u32 = 8;
 pub const NODE_CROP: u32 = 9;
 pub const NODE_CURVES: u32 = 10;
+pub const NODE_ROTATE: u32 = 11;
 
 /// Frame-level settings shared by every node of one graph render.
 #[repr(C)]
@@ -173,6 +175,7 @@ fn param_arity(kind: u32) -> Result<ParamArity, Error> {
         NODE_COLOR_SUBTRACT => ParamArity::Exact(3), // picked colour, per channel
         NODE_CROP => ParamArity::Exact(5),          // left, top, width, height, angle
         NODE_CURVES => ParamArity::Curves,          // four counts, then their points
+        NODE_ROTATE => ParamArity::Exact(1),        // quarter turns clockwise
         _ => return Err(Error::InvalidArgument("unknown graph node kind")),
     })
 }
@@ -386,6 +389,7 @@ fn validate_param(kind: u32, index: usize, value: f32) -> Result<(), Error> {
         (NODE_CROP, 0) | (NODE_CROP, 1) => (0.0..=1.0).contains(&value),
         (NODE_CROP, 2) | (NODE_CROP, 3) => (0.05..=1.0).contains(&value),
         (NODE_CROP, 4) => (-45.0..=45.0).contains(&value),
+        (NODE_ROTATE, 0) => value == 0.0 || value == 1.0 || value == 2.0 || value == 3.0,
         // The four leading parameters are point counts, not signal levels.
         (NODE_CURVES, index) if index < CURVE_CHANNELS => {
             (MIN_CURVE_POINTS as f32..=MAX_CURVE_POINTS as f32).contains(&value)
@@ -494,6 +498,13 @@ pub(crate) fn parse_graph(bytes: &[u8]) -> Result<Vec<GraphOp>, Error> {
                     return Err(Error::InvalidArgument("crop rectangle leaves the frame"));
                 }
             }
+            NODE_ROTATE => {
+                // A rotation is indifferent to the domain it turns, and counts
+                // as reframing for the same reason a crop does: optics maps
+                // against the frame it was measured on.
+                display[index] = display[input_a];
+                cropped[index] = true;
+            }
             _ => {
                 if display[input_a] {
                     return Err(Error::InvalidArgument(
@@ -569,6 +580,48 @@ pub(crate) fn map_oriented_rect(orientation: u16, rect: [f32; 4]) -> [f32; 4] {
         8 => [1.0 - top - height, left, height, width],
         _ => rect,
     }
+}
+
+/// Turns the image by whole quarter turns clockwise, losing nothing.
+///
+/// The part of orientation a crop's -45..45 degree angle cannot reach. Whole
+/// turns are a pure permutation of the pixels, so unlike the crop node's
+/// arbitrary angle this resamples nothing and every photosite survives.
+fn quarter_turn_image(image: &RgbImage, turns: u32) -> RgbImage {
+    let turns = turns % 4;
+    if turns == 0 {
+        return image.clone();
+    }
+    let swaps = turns % 2 == 1;
+    let (width, height) = if swaps {
+        (image.height, image.width)
+    } else {
+        (image.width, image.height)
+    };
+    let mut output = RgbImage {
+        width,
+        height,
+        data: vec![0.0; width * height * 3],
+    };
+    output
+        .data
+        .par_chunks_mut(width * 3)
+        .enumerate()
+        .for_each(|(y, row)| {
+            for (x, pixel) in row.as_chunks_mut::<3>().0.iter_mut().enumerate() {
+                // Source of the output pixel at (x, y), reading the rotation
+                // backwards: one turn clockwise sends source (sx, sy) to
+                // (height - 1 - sy, sx), so the inverse is what is needed here.
+                let (source_x, source_y) = match turns {
+                    1 => (y, image.height - 1 - x),
+                    2 => (image.width - 1 - x, image.height - 1 - y),
+                    _ => (image.width - 1 - y, x),
+                };
+                let source = (source_y * image.width + source_x) * 3;
+                pixel.copy_from_slice(&image.data[source..source + 3]);
+            }
+        });
+    output
 }
 
 fn crop_image(image: &RgbImage, rect: [f32; 4]) -> Result<RgbImage, Error> {
@@ -944,6 +997,7 @@ pub(crate) fn execute_graph_cached(
                     | NODE_FILM
                     | NODE_COLOR_SUBTRACT
                     | NODE_CROP
+                    | NODE_ROTATE
                     | NODE_CURVES
             )
             && !oriented[slot]
@@ -1085,6 +1139,9 @@ pub(crate) fn execute_graph_cached(
                 } else {
                     image = rotate_crop_image(&image, rect, angle)?;
                 }
+            }
+            NODE_ROTATE => {
+                image = quarter_turn_image(&image, op.params[0] as u32);
             }
             _ => unreachable!("kinds were validated during parsing"),
         }
@@ -1965,6 +2022,78 @@ mod tests {
             "input above the white point stays clipped"
         );
         assert!(apply_curve_value(&lut, srgb_decode_value(0.2)) > srgb_decode_value(0.2));
+    }
+
+    #[test]
+    fn quarter_turns_rotate_clockwise_and_lose_nothing() {
+        // A 3x2 frame whose pixels carry their own coordinates, so the
+        // permutation can be read off rather than inferred.
+        let source = RgbImage {
+            width: 3,
+            height: 2,
+            data: (0..6)
+                .flat_map(|index| {
+                    let (x, y) = (index % 3, index / 3);
+                    [x as f32, y as f32, 0.0]
+                })
+                .collect(),
+        };
+        let at = |image: &RgbImage, x: usize, y: usize| {
+            let base = (y * image.width + x) * 3;
+            (image.data[base], image.data[base + 1])
+        };
+        assert_eq!(quarter_turn_image(&source, 0).data, source.data);
+
+        let once = quarter_turn_image(&source, 1);
+        assert_eq!((once.width, once.height), (2, 3));
+        // One turn clockwise sends the top-left corner to the top-right.
+        assert_eq!(at(&once, once.width - 1, 0), (0.0, 0.0));
+        assert_eq!(at(&once, 0, 0), (0.0, 1.0));
+        assert_eq!(at(&once, 0, once.height - 1), (2.0, 1.0));
+
+        let twice = quarter_turn_image(&source, 2);
+        assert_eq!((twice.width, twice.height), (3, 2));
+        assert_eq!(at(&twice, 0, 0), (2.0, 1.0));
+
+        // Four turns are the identity, and three undo one.
+        let mut round = source.clone();
+        for _ in 0..4 {
+            round = quarter_turn_image(&round, 1);
+        }
+        assert_eq!(round.data, source.data);
+        assert_eq!(quarter_turn_image(&once, 3).data, source.data);
+        // Whole turns permute rather than resample: every pixel survives.
+        let mut sorted: Vec<u32> = once.data.iter().map(|v| v.to_bits()).collect();
+        let mut expected: Vec<u32> = source.data.iter().map(|v| v.to_bits()).collect();
+        sorted.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(sorted, expected);
+    }
+
+    #[test]
+    fn a_rotate_node_may_follow_film_but_optics_may_not_follow_it() {
+        // Rotation reframes, so it counts as geometry: optics maps against the
+        // frame it was measured on. It is domain-agnostic like a crop.
+        let program = GraphBuilder::new()
+            .node(NODE_FILM, 0, -1, &[0.0, 0.0, 1.0], None)
+            .node(NODE_ROTATE, 1, -1, &[1.0], None)
+            .build();
+        assert!(parse_graph(&program).is_ok(), "rotate may follow film");
+        let refused = GraphBuilder::new()
+            .node(NODE_ROTATE, 0, -1, &[1.0], None)
+            .node(NODE_OPTICS, 1, -1, &[1.0, 1.0, 0.0], None)
+            .build();
+        assert!(
+            parse_graph(&refused).is_err(),
+            "optics must not follow a rotation"
+        );
+        // Only whole quarter turns are legal.
+        for turns in [-1.0_f32, 0.5, 4.0] {
+            let program = GraphBuilder::new()
+                .node(NODE_ROTATE, 0, -1, &[turns], None)
+                .build();
+            assert!(parse_graph(&program).is_err(), "accepted {turns} turns");
+        }
     }
 
     #[test]

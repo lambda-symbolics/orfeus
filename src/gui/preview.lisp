@@ -43,6 +43,8 @@
 (cffi:defcfun ("orfeus_gui_preview_forget" %gui-preview-forget) :void
   (path :string))
 (cffi:defcfun ("orfeus_gui_preview_clear" %gui-preview-clear) :void)
+(cffi:defcfun ("orfeus_gui_preview_set_cursor" %gui-preview-set-cursor) :int
+  (widget-id :long-long) (cursor :int))
 (defmacro with-preview-float-traps (&body body)
   "Run BODY with the float traps SBCL arms by default disabled.
 
@@ -163,6 +165,19 @@ contents change."
            (%gui-preview-draw-buffer (lightfast:widget-id canvas) pointer
                                      width height generation
                                      zoom center-x center-y))))
+
+(defparameter *cursor-codes*
+  ;; FLTK's Fl_Cursor values; only the two this application switches between.
+  '((:default . 0) (:cross . 66))
+  "Mouse cursor shapes, by FLTK's own numbering.")
+
+(defun set-widget-cursor (widget shape)
+  "Set the mouse cursor over WIDGET's window to SHAPE; true when it took."
+  (load-gui-preview-library)
+  (let ((code (rest (assoc shape *cursor-codes*))))
+    (when code
+      (plusp (with-preview-float-traps
+               (%gui-preview-set-cursor (lightfast:widget-id widget) code))))))
 
 (defun draw-thumbnail-file (canvas pathname x y width height)
   "Draw PATHNAME fitted inside the absolute rectangle in CANVAS."

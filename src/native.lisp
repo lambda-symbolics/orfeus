@@ -398,17 +398,17 @@ the straightening angle in degrees for a crop node."
 (defparameter *graph-node-kind-codes*
   '((:white-balance . 1) (:exposure . 2) (:noise-reduction . 3)
     (:tone . 4) (:optics . 5) (:film . 6) (:blend . 7)
-    (:color-subtract . 8) (:crop . 9) (:curves . 10))
+    (:color-subtract . 8) (:crop . 9) (:curves . 10) (:rotate . 11))
   "Wire codes of graph node kinds in the native program format.")
 
 (defconstant +graph-program-magic+ #x4746524F
   "Little-endian magic of a serialized graph program, spelling ORFG.")
 
-(defconstant +graph-program-version+ 3
+(defconstant +graph-program-version+ 4
   "Serialized graph program version.
 
 2 added the curves node's luma channel; 3 made each curve channel variable
-length behind a header of four point counts.")
+length behind a header of four point counts; 4 added the rotate node.")
 
 (defun graph-boolean-parameter (value)
   (if value 1.0 0.0))
@@ -464,6 +464,10 @@ length behind a header of four point counts.")
                        (getf params :height 1.0)
                        (getf params :angle 0.0))
                  nil)))
+      (:rotate
+       (values (list (float (getf (graph-node-params node) :quarter-turns 0)
+                           1.0))
+               nil))
       (:curves
        ;; Four point counts, then the points themselves. Channels are variable
        ;; length, so the header is the only thing that says where one ends.

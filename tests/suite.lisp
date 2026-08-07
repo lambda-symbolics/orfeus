@@ -715,13 +715,15 @@ and then quietly relocated them would be lying about where a click puts things."
     (and
      ;; A scene-linear, uncropped position accepts everything.
      (null (set-difference all (graph-insertable-kinds graph linear)))
-     ;; Below the film transform only the two display-space kinds remain.
-     (equal '(:film :crop)
-            (remove-if-not (lambda (kind) (member kind '(:film :crop)))
+     ;; Below the film transform only the display-space kinds remain: another
+     ;; film node, a crop, and a rotation, all of which are indifferent to which
+     ;; domain they reframe.
+     (null (set-difference (graph-insertable-kinds graph film)
+                           '(:film :crop :rotate)))
+     (null (set-difference '(:film :crop :rotate)
                            (graph-insertable-kinds graph film)))
-     (null (set-difference (graph-insertable-kinds graph film) '(:film :crop)))
      (null (set-difference (graph-insertable-kinds graph display-crop)
-                           '(:film :crop)))
+                           '(:film :crop :rotate)))
      ;; Every offered kind really does insert, and every withheld one really
      ;; does not: the menu and the validator must not disagree either way.
      (every (lambda (kind) (graph-can-insert-p graph film kind))
@@ -740,7 +742,18 @@ and then quietly relocated them would be lying about where a click puts things."
        (and (not (member :optics offered))
             (not (member :blend offered))
             (member :curves offered)
-            (member :exposure offered))))))
+            (member :exposure offered)))
+     ;; A rotation reframes for the same reason, so it excludes the same two.
+     (let* ((turned (default-processing-graph))
+            (rotate (graph-node-id
+                     (graph-insert-node turned (processing-graph-output turned)
+                                        :rotate
+                                        :params '(:quarter-turns 1))))
+            (offered (graph-insertable-kinds turned rotate)))
+       (and (not (member :optics offered))
+            (not (member :blend offered))
+            (member :curves offered)
+            (member :crop offered))))))
 
 (defun graph-node-workflow-p ()
   ;; The Resolve-style flow: New Node (untyped) -> assign a correction.
@@ -1368,9 +1381,9 @@ and then quietly relocated them would be lying about where a click puts things."
                  :output 1))
          (bytes (orfeus::graph->program-bytes graph)))
     (equalp bytes
-            ;; magic "ORFG", version 3, one node: exposure(2), input 0,
+            ;; magic "ORFG", version 4, one node: exposure(2), input 0,
             ;; no second input, one parameter 0.5f0, no string.
-            (coerce #(#x4F #x52 #x46 #x47  3 0 0 0  1 0 0 0
+            (coerce #(#x4F #x52 #x46 #x47  4 0 0 0  1 0 0 0
                       2 0 0 0  0 0 0 0  #xFF #xFF #xFF #xFF
                       1 0 0 0  0 0 0 #x3F  0 0 0 0)
                     '(simple-array (unsigned-byte 8) (*))))))

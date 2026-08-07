@@ -110,6 +110,8 @@
    #:graph-node-position
    #:*graph-source-id*
    #:*curve-channel-keys*
+   #:*quarter-turn-labels*
+   #:*rotate-keys*
    #:*identity-curve-points*
    #:*minimum-curve-points*
    #:*maximum-curve-points*

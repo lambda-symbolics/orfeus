@@ -85,15 +85,23 @@ them as a copyable node chain.")
 (defparameter *graph-source-id* 0
   "The reserved node id of the decoded RAW source image.")
 
-(defparameter *graph-only-node-kinds* '(:blend :color-subtract :crop :curves)
+(defparameter *rotate-keys* '(:quarter-turns))
+
+(defparameter *quarter-turn-labels*
+  '((0 . "None") (1 . "90 clockwise") (2 . "180") (3 . "270 clockwise"))
+  "Rotation amounts a rotate node offers, as quarter turns clockwise.")
+
+(defparameter *graph-only-node-kinds*
+  '(:blend :color-subtract :crop :rotate :curves)
   "Node kinds that exist only in graphs, beyond the flat pipeline stages.
 
 :COLOR-SUBTRACT computes picked-color minus pixel per channel in scene-linear
 space, the film-negative inversion primitive. :CROP keeps a normalized
 rectangle given in display (oriented) coordinates, so one graph fits both
-previews and full-resolution exports. :CURVES applies a monotone spline per
-channel on the encoded signal, the per-stock decompression for inverted
-negatives.")
+previews and full-resolution exports. :ROTATE turns the frame by whole quarter
+turns, which is the part of orientation a crop's -45..45 degree angle cannot
+reach. :CURVES applies a monotone spline per channel on the encoded signal, the
+per-stock decompression for inverted negatives.")
 
 (defparameter *color-subtract-keys* '(:red :green :blue))
 
