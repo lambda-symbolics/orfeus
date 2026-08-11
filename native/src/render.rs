@@ -14,10 +14,8 @@ use lensfun::{Camera, Database, Lens, Modifier};
 use rawler::decoders::{RawDecodeParams, RawLoader};
 use rawler::imgop::Rect;
 use rawler::imgop::develop::{Intermediate, ProcessingStep, RawDevelop};
-use rawler::imgop::sensor::bayer::Demosaic;
-use rawler::imgop::sensor::bayer::superpixel::Superpixel3Channel;
-use rawler::pixarray::PixF32;
-use rawler::rawimage::{RawImage, RawPhotometricInterpretation};
+use rawler::pixarray::Color2D;
+use rawler::rawimage::{CFAConfig, RawImage, RawImageData, RawPhotometricInterpretation};
 use rawler::rawsource::RawSource;
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
@@ -2080,22 +2078,6 @@ pub(crate) fn file_content_digest(input: &Path) -> Result<DecodeCacheKey, Error>
     Ok(hasher.finalize().into())
 }
 
-/// Develops a Bayer frame at half its linear resolution.
-///
-/// Each 2x2 sensor quad becomes one RGB pixel — red, the mean of the two greens,
-/// and blue — instead of interpolating a full-resolution colour value for every
-/// photosite. That is a quarter of the output pixels for a small fraction of the
-/// arithmetic, and every later stage then works on a quarter of the data.
-///
-/// A preview is downscaled to well under half resolution anyway, so the detail
-/// this drops is detail that was about to be thrown away. Exports never use it.
-///
-/// This mirrors `RawDevelop::develop_intermediate` with rawler's superpixel
-/// demosaic substituted for its PPG one, because that entry point hard-codes
-/// PPG. The crop handling is copied from it exactly: the default crop is
-/// expressed in full-resolution coordinates, so it has to be adapted to the
-/// active area and then halved, or a draft preview would frame differently from
-/// the export it is previewing.
 /// Requested output size at or below which a preview develops at half
 /// resolution.
 ///
@@ -2129,114 +2111,213 @@ pub(crate) fn draft_identity(key: DecodeCacheKey) -> DecodeCacheKey {
     hasher.finalize().into()
 }
 
-// Rawler 0.7.2 treats the PEN-F's eight-shot 80 MP composite as an ordinary
-// Bayer frame, producing a periodic magenta chroma grid. LibRaw develops this
-// exact sensor mode correctly; keep the fallback narrow so ordinary files retain
-// Orfeus's unclipped rawler pipeline.
-fn requires_libraw_high_resolution(make: &str, model: &str, width: usize, height: usize) -> bool {
+/// Whether this frame is Olympus's eight-shot high-resolution composite.
+fn olympus_high_resolution(make: &str, model: &str, width: usize, height: usize) -> bool {
     make.to_ascii_uppercase().contains("OLYMPUS")
         && model.trim().eq_ignore_ascii_case("PEN-F")
         && (width, height) == (10400, 7796)
 }
 
-fn crop_linear_srgb(
-    image: super::color::LinearSrgbImage,
-    crop: Rect,
-) -> Result<super::color::LinearSrgbImage, Error> {
-    let end_x = crop
-        .p
-        .x
-        .checked_add(crop.d.w)
-        .ok_or_else(|| Error::Render("LibRaw crop width overflow".to_string()))?;
-    let end_y = crop
-        .p
-        .y
-        .checked_add(crop.d.h)
-        .ok_or_else(|| Error::Render("LibRaw crop height overflow".to_string()))?;
-    if crop.d.w == 0 || crop.d.h == 0 || end_x > image.width || end_y > image.height {
-        return Err(Error::Render(format!(
-            "LibRaw output {}x{} does not contain RAW crop {}x{}+{}+{}",
-            image.width, image.height, crop.d.w, crop.d.h, crop.p.x, crop.p.y
-        )));
+/// Corrects the colour filter phase rawler reports for a pixel-shift composite.
+///
+/// Rawler 0.7.2 names the PEN-F's 80 MP composite RGGB, but the frame is really
+/// GRBG: every 2x2 quad then reads its red and its blue from a green photosite,
+/// and the image develops magenta. Adobe's converter writes GRBG in the DNG it
+/// makes from the same ORF, and shifting rawler's pattern one column reproduces
+/// that decode — so this is a wrong tag, not a different pixel layout.
+///
+/// Orfeus used to sidestep it by developing this one sensor mode through
+/// LibRaw, which decoded the whole 116 MB container a second time for 1.7 s.
+fn correct_pixel_shift_cfa(make: &str, model: &str, raw: &mut RawImage) {
+    if !olympus_high_resolution(make, model, raw.width, raw.height) {
+        return;
     }
-    if crop.p.x == 0 && crop.p.y == 0 && crop.d.w == image.width && crop.d.h == image.height {
-        return Ok(image);
+    let RawPhotometricInterpretation::Cfa(config) = &raw.photometric else {
+        return;
+    };
+    if !config.cfa.name.eq_ignore_ascii_case("RGGB") {
+        return;
     }
-
-    let source_stride = image.width * 3;
-    let row_samples = crop.d.w * 3;
-    let mut data = vec![0.0; crop.d.w * crop.d.h * 3];
-    data.par_chunks_mut(row_samples)
-        .enumerate()
-        .for_each(|(output_y, output_row)| {
-            let source_y = crop.p.y + output_y;
-            let source_start = source_y * source_stride + crop.p.x * 3;
-            output_row.copy_from_slice(&image.data[source_start..source_start + row_samples]);
-        });
-    Ok(super::color::LinearSrgbImage {
-        width: crop.d.w,
-        height: crop.d.h,
-        data,
-    })
+    let corrected = CFAConfig::new(&config.cfa.shift(1, 0), &config.colors);
+    raw.photometric = RawPhotometricInterpretation::Cfa(corrected);
 }
 
-fn libraw_default_crop(
-    raw: &RawImage,
-    half_size: bool,
-    image: super::color::LinearSrgbImage,
-) -> Result<super::color::LinearSrgbImage, Error> {
+/// How many sensor quads a draft averages into one output pixel.
+///
+/// The largest power of two that still leaves the long edge able to serve the
+/// biggest preview a draft is ever asked for. A power of two so that one cached
+/// decode covers every draft-sized request for a file — a factor tuned to each
+/// requested width would re-develop the RAW whenever the window was resized.
+///
+/// A 20 MP frame bins 2x2 and stops there; the PEN-F's 80 MP composite bins 4x4,
+/// which is the same 2592x1944 draft from four times the photosites.
+fn draft_bin_factor(quad_width: usize, quad_height: usize) -> usize {
+    let mut factor = 1;
+    while quad_width.max(quad_height) / (factor * 2) >= DRAFT_MAX_DIMENSION as usize {
+        factor *= 2;
+    }
+    factor
+}
+
+/// The photosite rectangle a develop covers: the camera's default crop, or the
+/// active area when the file names no usable crop.
+///
+/// The default crop is expressed in sensor coordinates, the same frame the
+/// active area is in — get this wrong and a draft preview frames differently
+/// from the export it is previewing.
+fn develop_roi(width: usize, height: usize, active: Option<Rect>, crop: Option<Rect>) -> Rect {
     let full = Rect::new(
         rawler::imgop::Point::new(0, 0),
-        rawler::imgop::Dim2::new(raw.width, raw.height),
+        rawler::imgop::Dim2::new(width, height),
     );
-    let active = raw.active_area.unwrap_or(full);
-    let Some(mut crop) = raw.crop_area else {
-        return Ok(image);
-    };
-    crop = crop.adapt(&active);
-    if half_size {
-        crop.scale(0.5);
+    let active = active.unwrap_or(full);
+    match crop {
+        Some(crop)
+            if crop.p.x >= active.p.x
+                && crop.p.y >= active.p.y
+                && crop.p.x + crop.d.w <= active.p.x + active.d.w
+                && crop.p.y + crop.d.h <= active.p.y + active.d.h =>
+        {
+            crop
+        }
+        _ => active,
     }
-    crop_linear_srgb(image, crop)
 }
 
-fn develop_half_resolution(raw: &RawImage) -> Option<Intermediate> {
+/// What one sensor quad contributes: the channel each of its four corners
+/// feeds, the black level subtracted there, and the reciprocal of the span to
+/// the white level.
+type QuadCorners = [(usize, f32, f32); 4];
+
+/// Everything `bin_quads` needs that does not vary across the frame.
+struct BinPlan {
+    roi: Rect,
+    quads_wide: usize,
+    quads_high: usize,
+    factor: usize,
+    corners: QuadCorners,
+    width: usize,
+    height: usize,
+}
+
+/// Averages FACTOR x FACTOR sensor quads into each output pixel.
+///
+/// Reading the sensor's own integers rather than a widened copy of them is most
+/// of the point: at 80 MP, `as_f32` alone allocates and fills 324 MB before any
+/// arithmetic happens.
+fn bin_quads<T: Copy + Into<f32> + Sync>(
+    data: &[T],
+    stride: usize,
+    plan: &BinPlan,
+) -> Vec<[f32; 3]> {
+    let BinPlan {
+        roi,
+        quads_wide,
+        quads_high,
+        factor,
+        corners,
+        width,
+        height,
+    } = *plan;
+    let mut output = vec![[0.0_f32; 3]; width * height];
+    output
+        .par_chunks_mut(width)
+        .enumerate()
+        .for_each(|(out_y, row)| {
+            let first_quad_y = out_y * factor;
+            let last_quad_y = ((out_y + 1) * factor).min(quads_high);
+            for (out_x, pixel) in row.iter_mut().enumerate() {
+                let first_quad_x = out_x * factor;
+                let last_quad_x = ((out_x + 1) * factor).min(quads_wide);
+                let mut sum = [0.0_f32; 3];
+                for quad_y in first_quad_y..last_quad_y {
+                    let top = (roi.p.y + quad_y * 2) * stride + roi.p.x;
+                    for quad_x in first_quad_x..last_quad_x {
+                        let left = top + quad_x * 2;
+                        let quad = [
+                            data[left],
+                            data[left + 1],
+                            data[left + stride],
+                            data[left + stride + 1],
+                        ];
+                        for (corner, value) in quad.iter().enumerate() {
+                            let (channel, black, scale) = corners[corner];
+                            let level = ((*value).into() - black).max(0.0) * scale;
+                            // The two greens of a quad average into one.
+                            sum[channel] += if channel == 1 { level * 0.5 } else { level };
+                        }
+                    }
+                }
+                let quads = ((last_quad_y - first_quad_y) * (last_quad_x - first_quad_x)) as f32;
+                let weight = if quads > 0.0 { 1.0 / quads } else { 0.0 };
+                *pixel = [sum[0] * weight, sum[1] * weight, sum[2] * weight];
+            }
+        });
+    output
+}
+
+/// Develops a Bayer frame straight to a binned RGB image.
+///
+/// Each output pixel averages FACTOR x FACTOR sensor quads, and each quad
+/// contributes red, the mean of its two greens, and blue — no colour is
+/// interpolated across quads. Black level, white level and the crop are applied
+/// in the same pass, so one traversal of the frame replaces four: rawler's
+/// `as_f32` widening, its `apply_scaling`, its superpixel demosaic, and the
+/// downscale that followed them. At FACTOR 4 it also writes a sixteenth of the
+/// pixels the old half-resolution draft handed to every later stage.
+///
+/// A preview is downscaled well past this anyway, so the detail dropped was
+/// about to be resampled away. Exports never use it.
+fn develop_binned(raw: &RawImage, factor: usize) -> Option<Intermediate> {
     let RawPhotometricInterpretation::Cfa(config) = &raw.photometric else {
         return None;
     };
-    if !config.cfa.is_rgb() || raw.cpp != 1 {
+    if !config.cfa.is_rgb() || raw.cpp != 1 || factor == 0 {
         return None;
     }
-    let mut scaled = raw.clone();
-    scaled.apply_scaling().ok()?;
-    let pixels = PixF32::new_with(
-        scaled.data.as_f32().into_owned(),
-        scaled.width,
-        scaled.height,
-    );
-    let active = scaled.active_area.unwrap_or(pixels.rect());
-    let binned = Superpixel3Channel::new().demosaic(&pixels, &config.cfa, &config.colors, active);
-    let Some(mut crop) = scaled.crop_area.or(scaled.active_area) else {
-        return Some(Intermediate::ThreeColor(binned));
+    let roi = develop_roi(raw.width, raw.height, raw.active_area, raw.crop_area);
+    let quads_wide = roi.d.w / 2;
+    let quads_high = roi.d.h / 2;
+    if quads_wide == 0 || quads_high == 0 {
+        return None;
+    }
+    // Which channel each corner of a quad carries, and the levels that scale
+    // it. Both are fixed for the whole frame: the pattern is shifted once by
+    // the crop origin, and the levels repeat on the sensor's own 2x2 grid,
+    // which that origin's parity locks to.
+    let cfa = config.cfa.shift(roi.p.x, roi.p.y);
+    let black = raw.blacklevel.as_bayer_array();
+    let white = raw.whitelevel.as_bayer_array();
+    let mut corners: QuadCorners = [(0, 0.0, 1.0); 4];
+    for row in 0..2 {
+        for column in 0..2 {
+            let level = ((roi.p.y + row) & 1) * 2 + ((roi.p.x + column) & 1);
+            let span = white[level] - black[level];
+            corners[row * 2 + column] = (
+                cfa.color_at(row, column),
+                black[level],
+                if span > 0.0 { 1.0 / span } else { 0.0 },
+            );
+        }
+    }
+    let plan = BinPlan {
+        roi,
+        quads_wide,
+        quads_high,
+        factor,
+        corners,
+        width: quads_wide.div_ceil(factor),
+        height: quads_high.div_ceil(factor),
     };
-    crop = crop.adapt(&scaled.active_area.unwrap_or(crop));
-    crop.scale(0.5);
-    // The superpixel pass rounds an odd ROI down, so a crop may now exceed the
-    // binned image by a pixel; clamp rather than panic inside rawler's crop.
-    let dimensions = binned.dim();
-    if crop.p.x >= dimensions.w || crop.p.y >= dimensions.h {
-        return Some(Intermediate::ThreeColor(binned));
-    }
-    let width = crop.d.w.min(dimensions.w - crop.p.x);
-    let height = crop.d.h.min(dimensions.h - crop.p.y);
-    if width == 0 || height == 0 {
-        return Some(Intermediate::ThreeColor(binned));
-    }
-    let crop = Rect::new(crop.p, rawler::imgop::Dim2::new(width, height));
-    if crop.d == dimensions {
-        return Some(Intermediate::ThreeColor(binned));
-    }
-    Some(Intermediate::ThreeColor(binned.crop(crop)))
+    let binned = match &raw.data {
+        RawImageData::Integer(data) => bin_quads(data, raw.width, &plan),
+        RawImageData::Float(data) => bin_quads(data, raw.width, &plan),
+    };
+    Some(Intermediate::ThreeColor(Color2D::new_with(
+        binned,
+        plan.width,
+        plan.height,
+    )))
 }
 
 fn decode_linear_srgb(input: &Path, draft: bool, profiling: bool) -> Result<DecodedRaw, Error> {
@@ -2263,10 +2344,11 @@ fn decode_linear_srgb(input: &Path, draft: bool, profiling: bool) -> Result<Deco
     let metadata = decoder
         .raw_metadata(&source, &params)
         .map_err(|e| Error::Render(format!("RAW metadata: {e}")))?;
-    let raw = decoder
+    let mut raw = decoder
         .raw_image(&source, &params, false)
         .map_err(|e| Error::Render(format!("RAW decode: {e}")))?;
     profile_stage!("decode");
+    correct_pixel_shift_cfa(&metadata.make, &metadata.model, &mut raw);
     // Rawler performs scaling, demosaic, and cropping. Orfeus owns white
     // balance and the camera-to-sRGB transform so scene-linear highlights remain
     // unclipped through white adaptation and exposure.
@@ -2276,29 +2358,33 @@ fn decode_linear_srgb(input: &Path, draft: bool, profiling: bool) -> Result<Deco
         ProcessingStep::CropActiveArea,
         ProcessingStep::CropDefault,
     ];
-    // A draft preview bins each sensor quad instead of interpolating every
+    // A draft preview bins whole sensor quads instead of interpolating every
     // photosite; anything it cannot handle falls back to the full demosaic.
-    let high_resolution =
-        requires_libraw_high_resolution(&metadata.make, &metadata.model, raw.width, raw.height);
-    let linear_srgb = if high_resolution {
-        let image = super::libraw::decode_linear_srgb(input, draft)?;
-        profile_stage!("develop");
-        libraw_default_crop(&raw, draft, image)?
-    } else {
-        let developed = match draft.then(|| develop_half_resolution(&raw)).flatten() {
-            Some(binned) => binned,
-            None => RawDevelop { steps }
+    let roi = develop_roi(raw.width, raw.height, raw.active_area, raw.crop_area);
+    let factor = draft_bin_factor(roi.d.w / 2, roi.d.h / 2);
+    let developed = match draft.then(|| develop_binned(&raw, factor)).flatten() {
+        Some(binned) => {
+            if profiling {
+                eprintln!("orfeus-profile develop-path=binned factor={factor}");
+            }
+            binned
+        }
+        None => {
+            if profiling {
+                eprintln!("orfeus-profile develop-path=demosaic draft={draft}");
+            }
+            RawDevelop { steps }
                 .develop_intermediate(&raw)
-                .map_err(|e| Error::Render(format!("RAW development: {e}")))?,
-        };
-        profile_stage!("develop");
-        // Start from the camera's neutral rendering for both as-shot and custom
-        // temperature. Custom Kelvin is a relative chromatic adaptation around D65;
-        // dropping the sensor WB coefficients leaves Bayer green dominant.
-        let white_balance = raw.wb_coeffs;
-        intermediate_to_linear_srgb(developed, &raw.color_matrix, white_balance)
-            .map_err(Error::Color)?
+                .map_err(|e| Error::Render(format!("RAW development: {e}")))?
+        }
     };
+    profile_stage!("develop");
+    // Start from the camera's neutral rendering for both as-shot and custom
+    // temperature. Custom Kelvin is a relative chromatic adaptation around D65;
+    // dropping the sensor WB coefficients leaves Bayer green dominant.
+    let white_balance = raw.wb_coeffs;
+    let linear_srgb = intermediate_to_linear_srgb(developed, &raw.color_matrix, white_balance)
+        .map_err(Error::Color)?;
     profile_stage!("camera-to-srgb");
     let _ = stage_started;
     Ok(DecodedRaw {
@@ -2616,63 +2702,177 @@ mod tests {
     }
 
     #[test]
-    fn only_pen_f_high_resolution_frames_use_libraw() {
-        assert!(requires_libraw_high_resolution(
+    fn only_the_pixel_shift_composite_has_its_colour_filter_phase_corrected() {
+        assert!(olympus_high_resolution(
             "OLYMPUS CORPORATION",
             "PEN-F",
             10400,
             7796
         ));
-        assert!(requires_libraw_high_resolution(
+        assert!(olympus_high_resolution(
             "Olympus Imaging Corp.",
             "pen-f",
             10400,
             7796
         ));
-        assert!(!requires_libraw_high_resolution(
+        // An ordinary frame from the same camera is tagged correctly, and
+        // shifting it would be the very bug this corrects.
+        assert!(!olympus_high_resolution(
             "OLYMPUS CORPORATION",
             "PEN-F",
             5184,
             3888
         ));
-        assert!(!requires_libraw_high_resolution(
-            "OM Digital Solutions",
-            "OM-1",
-            10400,
-            7796
-        ));
+        assert!(!olympus_high_resolution("Canon", "EOS R5", 10400, 7796));
     }
 
     #[test]
-    fn linear_srgb_crop_copies_exact_rgb_rows_and_checks_bounds() {
-        let source = crate::color::LinearSrgbImage {
-            width: 4,
-            height: 3,
-            data: (0..36).map(|value| value as f32).collect(),
-        };
-        let crop = Rect::new(
-            rawler::imgop::Point::new(1, 1),
-            rawler::imgop::Dim2::new(2, 2),
-        );
-        let cropped = crop_linear_srgb(source, crop).unwrap();
-        assert_eq!((cropped.width, cropped.height), (2, 2));
-        assert_eq!(
-            cropped.data,
-            vec![
-                15.0, 16.0, 17.0, 18.0, 19.0, 20.0, 27.0, 28.0, 29.0, 30.0, 31.0, 32.0
-            ]
-        );
+    fn shifting_the_pattern_one_column_turns_rggb_into_grbg() {
+        // The correction rests on this: what rawler calls RGGB in the 80 MP
+        // composite is the same grid one column into a GRBG frame. Adobe's
+        // converter writes GRBG for the same photosites.
+        let rggb = rawler::CFA::new("RGGB");
+        assert_eq!(rggb.shift(1, 0).name, "GRBG");
+        for row in 0..2 {
+            for column in 0..2 {
+                assert_eq!(
+                    rggb.shift(1, 0).color_at(row, column),
+                    rggb.color_at(row, column + 1)
+                );
+            }
+        }
+    }
 
-        let source = crate::color::LinearSrgbImage {
-            width: 2,
-            height: 2,
-            data: vec![0.0; 12],
+    #[test]
+    fn a_draft_bins_down_to_the_largest_preview_it_will_be_asked_for() {
+        // 20 MP: 2592 quads across, and halving that would no longer cover a
+        // 2048 px preview, so it bins each quad on its own.
+        assert_eq!(draft_bin_factor(2592, 1944), 1);
+        // 80 MP: 5184 quads across bins in pairs, landing on the same 2592.
+        assert_eq!(draft_bin_factor(5184, 3888), 2);
+        // A hypothetical 320 MP frame keeps halving.
+        assert_eq!(draft_bin_factor(10368, 7776), 4);
+        // The long edge decides, so a panorama is not binned past its height.
+        assert_eq!(draft_bin_factor(8192, 512), 4);
+        assert_eq!(draft_bin_factor(1, 1), 1);
+    }
+
+    #[test]
+    fn the_develop_area_prefers_the_default_crop_and_rejects_one_outside_it() {
+        let rect = |x, y, w, h| {
+            Rect::new(
+                rawler::imgop::Point::new(x, y),
+                rawler::imgop::Dim2::new(w, h),
+            )
         };
-        let outside = Rect::new(
-            rawler::imgop::Point::new(1, 1),
-            rawler::imgop::Dim2::new(2, 2),
+        let active = rect(0, 0, 100, 80);
+        let crop = rect(10, 10, 80, 60);
+        assert_eq!(develop_roi(100, 80, Some(active), Some(crop)), crop);
+        assert_eq!(develop_roi(100, 80, Some(active), None), active);
+        assert_eq!(develop_roi(100, 80, None, None), rect(0, 0, 100, 80));
+        // A crop reaching past the active area would read masked photosites.
+        assert_eq!(
+            develop_roi(100, 80, Some(rect(10, 10, 80, 60)), Some(rect(0, 0, 100, 80))),
+            rect(10, 10, 80, 60)
         );
-        assert!(crop_linear_srgb(source, outside).is_err());
+    }
+
+    /// One quad per output pixel, so the arithmetic is visible by hand.
+    #[test]
+    fn binning_reads_each_quad_corner_as_the_channel_its_pattern_names() {
+        let data: Vec<u16> = vec![
+            100, 200, //
+            300, 400, //
+        ];
+        // RGGB: red 100, greens 200 and 300, blue 400, black 0, white 1000.
+        let corners: QuadCorners = [
+            (0, 0.0, 0.001),
+            (1, 0.0, 0.001),
+            (1, 0.0, 0.001),
+            (2, 0.0, 0.001),
+        ];
+        let plan = BinPlan {
+            roi: Rect::new(
+                rawler::imgop::Point::new(0, 0),
+                rawler::imgop::Dim2::new(2, 2),
+            ),
+            quads_wide: 1,
+            quads_high: 1,
+            factor: 1,
+            corners,
+            width: 1,
+            height: 1,
+        };
+        let binned = bin_quads(&data, 2, &plan);
+        assert_eq!(binned, vec![[0.1, 0.25, 0.4]]);
+    }
+
+    #[test]
+    fn binning_averages_whole_quads_and_clips_below_the_black_level() {
+        // Four quads in a row, values 0, 1000, 2000, 3000 in every corner, with
+        // a black level of 1000: the first quad clips to zero and the mean of
+        // the four is (0 + 0 + 1000 + 2000) / 4 / 2000.
+        let mut data = vec![0_u16; 8 * 2];
+        for quad in 0..4 {
+            for corner in 0..4 {
+                let (row, column) = (corner / 2, corner % 2);
+                data[row * 8 + quad * 2 + column] = (quad as u16) * 1000;
+            }
+        }
+        let corners: QuadCorners = [
+            (0, 1000.0, 1.0 / 2000.0),
+            (1, 1000.0, 1.0 / 2000.0),
+            (1, 1000.0, 1.0 / 2000.0),
+            (2, 1000.0, 1.0 / 2000.0),
+        ];
+        let plan = BinPlan {
+            roi: Rect::new(
+                rawler::imgop::Point::new(0, 0),
+                rawler::imgop::Dim2::new(8, 2),
+            ),
+            quads_wide: 4,
+            quads_high: 1,
+            factor: 4,
+            corners,
+            width: 1,
+            height: 1,
+        };
+        let binned = bin_quads(&data, 8, &plan);
+        for channel in binned[0] {
+            assert!(
+                (channel - 0.375).abs() < 1.0e-6,
+                "expected 0.375, got {channel}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_partial_edge_pixel_averages_only_the_quads_it_covers() {
+        // Three quads binned four at a time: the single output pixel must
+        // divide by three, not by four, or the frame's right edge darkens.
+        let mut data = vec![0_u16; 6 * 2];
+        for value in data.iter_mut() {
+            *value = 1000;
+        }
+        let corners: QuadCorners = [
+            (0, 0.0, 0.001),
+            (1, 0.0, 0.001),
+            (1, 0.0, 0.001),
+            (2, 0.0, 0.001),
+        ];
+        let plan = BinPlan {
+            roi: Rect::new(
+                rawler::imgop::Point::new(0, 0),
+                rawler::imgop::Dim2::new(6, 2),
+            ),
+            quads_wide: 3,
+            quads_high: 1,
+            factor: 4,
+            corners,
+            width: 1,
+            height: 1,
+        };
+        assert_eq!(bin_quads(&data, 6, &plan), vec![[1.0, 1.0, 1.0]]);
     }
 
     /// Times the noise reduction at export resolution, isolating it from decode

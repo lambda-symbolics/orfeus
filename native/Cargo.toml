@@ -22,8 +22,6 @@ rayon = "=1.12.0"
 sha2 = "=0.10.9"
 
 [build-dependencies]
-cc = "=1.4.0"
-pkg-config = "=0.3.33"
 
 [features]
 # Both measured on a 13700H at 20 MP, medians of three full exports: system

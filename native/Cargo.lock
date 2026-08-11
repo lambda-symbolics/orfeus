@@ -926,14 +926,12 @@ name = "orfeus-native"
 version = "0.1.0"
 dependencies = [
  "ash",
- "cc",
  "flate2",
  "image",
  "jpeg-encoder",
  "lensfun",
  "md-5",
  "mimalloc",
- "pkg-config",
  "rawler",
  "rayon",
  "rpmalloc",
