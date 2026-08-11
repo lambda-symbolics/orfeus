@@ -415,10 +415,47 @@ unsafe fn write_error(error: &str, buffer: *mut c_char, capacity: usize) {
     }
 }
 
+/// Keeps whole-image buffers on the heap instead of handing them back to the
+/// kernel between renders.
+///
+/// glibc's malloc mmaps anything past its dynamic threshold, which is capped at
+/// 32 MB, and unmaps it on free. A render allocates a handful of buffers a few
+/// tens of megabytes each and frees them a moment later, so above that cap
+/// every one of them was a fresh mapping faulted in a page at a time: a 2048 px
+/// preview drag measured 43 ms a tick against 14 ms with the threshold raised,
+/// while a 1600 px one — just under the cap — was already fast. The cost is
+/// resident memory the process holds rather than returns, which is the right
+/// trade for an editor that reuses the same few buffer sizes all session.
+#[cfg(target_env = "gnu")]
+fn tune_allocator() {
+    use std::ffi::c_int;
+    use std::sync::Once;
+    // glibc's mallopt parameter numbers; there is no crate binding here.
+    const M_TRIM_THRESHOLD: c_int = -1;
+    const M_MMAP_THRESHOLD: c_int = -3;
+    const LARGEST_POOLED_BUFFER: c_int = 512 * 1024 * 1024;
+    unsafe extern "C" {
+        fn mallopt(parameter: c_int, value: c_int) -> c_int;
+    }
+    static TUNED: Once = Once::new();
+    TUNED.call_once(|| {
+        // SAFETY: mallopt takes two plain integers and only adjusts allocator
+        // policy for this process.
+        unsafe {
+            mallopt(M_MMAP_THRESHOLD, LARGEST_POOLED_BUFFER);
+            mallopt(M_TRIM_THRESHOLD, LARGEST_POOLED_BUFFER);
+        }
+    });
+}
+
+#[cfg(not(target_env = "gnu"))]
+fn tune_allocator() {}
+
 unsafe fn ffi_result<F>(error_buffer: *mut c_char, error_capacity: usize, operation: F) -> i32
 where
     F: FnOnce() -> Result<(), Error>,
 {
+    tune_allocator();
     match catch_unwind(AssertUnwindSafe(operation)) {
         Ok(Ok(())) => {
             // SAFETY: Forwarding the caller-provided optional error buffer.

@@ -22,7 +22,6 @@ use sha2::{Digest, Sha256};
 
 use super::Error;
 use super::color::intermediate_to_linear_srgb;
-use super::tone::apply_default_display_tone;
 
 pub const SETTINGS_VERSION: u32 = 3;
 pub const OUTPUT_JPEG: u32 = 1;
@@ -411,10 +410,11 @@ pub(crate) fn apply_exposure(image: &mut RgbImage, ev: f32) {
         return;
     }
     let multiplier = 2.0_f32.powf(ev);
-    image
-        .data
-        .par_iter_mut()
-        .for_each(|value| *value *= multiplier);
+    image.data.par_chunks_mut(1 << 14).for_each(|chunk| {
+        for value in chunk {
+            *value *= multiplier;
+        }
+    });
 }
 
 fn kelvin_xy(kelvin: f32) -> (f32, f32) {
@@ -499,8 +499,10 @@ pub(crate) fn apply_white_adaptation(image: &mut RgbImage, kelvin: f32, tint: f3
         xyz_to_rgb,
         mat_mul(inverse, mat_mul(scale, mat_mul(bradford, rgb_to_xyz))),
     );
-    image.data.par_chunks_exact_mut(3).for_each(|pixel| {
-        pixel.copy_from_slice(&mat_vec(adaptation, [pixel[0], pixel[1], pixel[2]]))
+    image.data.par_chunks_mut(3 * 8192).for_each(|chunk| {
+        for pixel in chunk.as_chunks_mut::<3>().0 {
+            *pixel = mat_vec(adaptation, *pixel);
+        }
     });
 }
 
@@ -519,12 +521,14 @@ pub(crate) fn apply_tonal_equalizer(image: &mut RgbImage, adjustments: [f32; 7])
     if adjustments.iter().all(|adjustment| *adjustment == 0.0) {
         return;
     }
-    image.data.par_chunks_exact_mut(3).for_each(|pixel| {
-        let luminance = 0.212_672_9 * pixel[0] + 0.715_152_2 * pixel[1] + 0.072_175 * pixel[2];
-        let gain = tone_adjustment_ev(luminance, &adjustments).exp2();
-        pixel[0] *= gain;
-        pixel[1] *= gain;
-        pixel[2] *= gain;
+    image.data.par_chunks_mut(3 * 8192).for_each(|chunk| {
+        for pixel in chunk.as_chunks_mut::<3>().0 {
+            let luminance = 0.212_672_9 * pixel[0] + 0.715_152_2 * pixel[1] + 0.072_175 * pixel[2];
+            let gain = tone_adjustment_ev(luminance, &adjustments).exp2();
+            for value in pixel.iter_mut() {
+                *value *= gain;
+            }
+        }
     });
 }
 
@@ -856,9 +860,13 @@ fn median_filter_3x3_into(source: &[f32], width: usize, height: usize, output: &
 
 fn blend_toward(source: &mut [f32], filtered: &[f32], amount: f32) {
     source
-        .par_iter_mut()
-        .zip(filtered.par_iter())
-        .for_each(|(value, filtered)| *value += (*filtered - *value) * amount);
+        .par_chunks_mut(1 << 14)
+        .zip(filtered.par_chunks(1 << 14))
+        .for_each(|(values, filtered)| {
+            for (value, filtered) in values.iter_mut().zip(filtered) {
+                *value += (*filtered - *value) * amount;
+            }
+        });
 }
 
 fn soft_threshold(value: f32, threshold: f32) -> f32 {
@@ -953,14 +961,21 @@ pub(crate) fn cpu_noise_reduction(image: &mut RgbImage, luma: f32, chroma: f32) 
     let mut yy = vec![0.0_f32; pixel_count];
     let mut cb = vec![0.0_f32; pixel_count];
     let mut cr = vec![0.0_f32; pixel_count];
-    yy.par_iter_mut()
-        .zip(cb.par_iter_mut())
-        .zip(cr.par_iter_mut())
-        .zip(image.data.par_chunks_exact(3))
-        .for_each(|(((yy, cb), cr), pixel)| {
-            *yy = 0.2126 * pixel[0] + 0.7152 * pixel[1] + 0.0722 * pixel[2];
-            *cb = pixel[2] - *yy;
-            *cr = pixel[0] - *yy;
+    yy.par_chunks_mut(8192)
+        .zip(cb.par_chunks_mut(8192))
+        .zip(cr.par_chunks_mut(8192))
+        .zip(image.data.par_chunks(3 * 8192))
+        .for_each(|(((yy, cb), cr), pixels)| {
+            for (((yy, cb), cr), pixel) in yy
+                .iter_mut()
+                .zip(cb.iter_mut())
+                .zip(cr.iter_mut())
+                .zip(pixels.as_chunks::<3>().0)
+            {
+                *yy = 0.2126 * pixel[0] + 0.7152 * pixel[1] + 0.0722 * pixel[2];
+                *cb = pixel[2] - *yy;
+                *cr = pixel[0] - *yy;
+            }
         });
 
     let mut scratch = Vec::new();
@@ -986,14 +1001,18 @@ pub(crate) fn cpu_noise_reduction(image: &mut RgbImage, luma: f32, chroma: f32) 
             &mut scratch,
             &mut filtered,
         );
-        yy.par_iter_mut()
-            .zip(scale_one.par_iter())
-            .zip(filtered.par_iter())
-            .for_each(|((value, scale_one), scale_two)| {
-                let threshold = luma_strength * (0.012 + 0.035 * value.max(0.0).sqrt());
-                let fine = soft_threshold(*value - *scale_one, threshold);
-                let coarse = soft_threshold(*scale_one - *scale_two, threshold * 0.45);
-                *value = *scale_two + coarse + fine;
+        yy.par_chunks_mut(8192)
+            .zip(scale_one.par_chunks(8192))
+            .zip(filtered.par_chunks(8192))
+            .for_each(|((values, scale_one), scale_two)| {
+                for ((value, scale_one), scale_two) in
+                    values.iter_mut().zip(scale_one).zip(scale_two)
+                {
+                    let threshold = luma_strength * (0.012 + 0.035 * value.max(0.0).sqrt());
+                    let fine = soft_threshold(*value - *scale_one, threshold);
+                    let coarse = soft_threshold(*scale_one - *scale_two, threshold * 0.45);
+                    *value = *scale_two + coarse + fine;
+                }
             });
     }
 
@@ -1025,14 +1044,23 @@ pub(crate) fn cpu_noise_reduction(image: &mut RgbImage, luma: f32, chroma: f32) 
 
     image
         .data
-        .par_chunks_exact_mut(3)
-        .zip(yy.par_iter())
-        .zip(cb.par_iter())
-        .zip(cr.par_iter())
-        .for_each(|(((pixel, yy), cb), cr)| {
-            pixel[0] = *yy + *cr;
-            pixel[2] = *yy + *cb;
-            pixel[1] = (*yy - 0.2126 * pixel[0] - 0.0722 * pixel[2]) / 0.7152;
+        .par_chunks_mut(3 * 8192)
+        .zip(yy.par_chunks(8192))
+        .zip(cb.par_chunks(8192))
+        .zip(cr.par_chunks(8192))
+        .for_each(|(((pixels, yy), cb), cr)| {
+            for (((pixel, yy), cb), cr) in pixels
+                .as_chunks_mut::<3>()
+                .0
+                .iter_mut()
+                .zip(yy)
+                .zip(cb)
+                .zip(cr)
+            {
+                pixel[0] = *yy + *cr;
+                pixel[2] = *yy + *cb;
+                pixel[1] = (*yy - 0.2126 * pixel[0] - 0.0722 * pixel[2]) / 0.7152;
+            }
         });
 }
 
@@ -1646,27 +1674,110 @@ pub(crate) fn apply_display_transform(image: &mut RgbImage, profiling: bool) {
         false
     };
     if !gpu_completed {
-        apply_default_display_tone(&mut image.data);
-        srgb_transfer(image);
+        display_tone_and_transfer(&mut image.data);
     }
 }
 
-pub(crate) fn srgb_transfer(image: &mut RgbImage) {
-    image.data.par_iter_mut().for_each(|value| {
-        *value = if *value <= 0.003_130_8 {
-            12.92 * *value
-        } else {
-            1.055 * value.max(0.0).powf(1.0 / 2.4) - 0.055
-        };
+/// Tone maps scene-linear sRGB and encodes it for display in one traversal.
+///
+/// Both halves are point operations, and at preview resolution each pass over
+/// the image costs more in memory traffic than in arithmetic, so running them
+/// separately doubled the bill for no benefit.
+pub(crate) fn display_tone_and_transfer(data: &mut [f32]) {
+    debug_assert_eq!(data.len() % 3, 0, "RGB data must contain triplets");
+    data.par_chunks_mut(3 * 8192).for_each(|chunk| {
+        for pixel in chunk.as_chunks_mut::<3>().0 {
+            super::tone::tone_pixel(pixel);
+            for value in pixel.iter_mut() {
+                *value = srgb_encode(*value);
+            }
+        }
     });
 }
 
+/// Writes a finished image into a caller's 8-bit RGB buffer, tone mapping and
+/// encoding it on the way when it is still scene-linear.
+///
+/// One traversal for what used to be three. A drag tick is bounded by memory
+/// traffic rather than arithmetic — eight threads already saturate this
+/// machine's bandwidth on a preview-sized image — so every pass that can be
+/// folded into another is worth about as much as deleting it.
+pub(crate) fn write_display_bytes(image: &RgbImage, bytes: &mut [u8], scene_linear: bool) {
+    debug_assert!(bytes.len() >= image.data.len());
+    bytes
+        .par_chunks_mut(3 * 8192)
+        .zip(image.data.par_chunks(3 * 8192))
+        .for_each(|(out, source)| {
+            for (out, pixel) in out.as_chunks_mut::<3>().0.iter_mut().zip(source.as_chunks::<3>().0)
+            {
+                let mut pixel = *pixel;
+                if scene_linear {
+                    super::tone::tone_pixel(&mut pixel);
+                    for value in pixel.iter_mut() {
+                        *value = srgb_encode(*value);
+                    }
+                }
+                for (byte, value) in out.iter_mut().zip(pixel) {
+                    *byte = (value.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+                }
+            }
+        });
+}
+
+/// Entries in the sRGB encoding table, sampled on the square root of the
+/// signal so the steep part near black is resolved as finely as the top.
+const SRGB_TABLE_LAST: usize = 4096;
+
+fn srgb_table() -> &'static [f32; SRGB_TABLE_LAST + 1] {
+    static TABLE: OnceLock<Box<[f32; SRGB_TABLE_LAST + 1]>> = OnceLock::new();
+    TABLE.get_or_init(|| {
+        let mut table = Box::new([0.0_f32; SRGB_TABLE_LAST + 1]);
+        for (index, entry) in table.iter_mut().enumerate() {
+            let position = index as f32 / SRGB_TABLE_LAST as f32;
+            *entry = exact_srgb_encode(position * position);
+        }
+        table
+    })
+}
+
+fn exact_srgb_encode(value: f32) -> f32 {
+    if value <= 0.003_130_8 {
+        12.92 * value
+    } else {
+        1.055 * value.max(0.0).powf(1.0 / 2.4) - 0.055
+    }
+}
+
+/// Encodes one linear-light sRGB value for display.
+///
+/// A `powf` per sample costs about sixty cycles, and a preview render encodes
+/// nearly six million of them on every interactive tick. Reading a table on the
+/// square root of the signal instead holds the error under a thousandth of an
+/// 8-bit step; only the highlights above 1.0, which no display shows anyway,
+/// still take the exact path.
+#[inline]
+pub(crate) fn srgb_encode(value: f32) -> f32 {
+    if !(value > 0.0) {
+        return 0.0;
+    }
+    if value >= 1.0 {
+        return exact_srgb_encode(value);
+    }
+    let table = srgb_table();
+    let position = value.sqrt() * SRGB_TABLE_LAST as f32;
+    let index = position as usize;
+    let fraction = position - index as f32;
+    let next = (index + 1).min(SRGB_TABLE_LAST);
+    table[index] + (table[next] - table[index]) * fraction
+}
+
 pub(crate) fn apply_lut(image: &mut RgbImage, lut: &CubeLut, strength: f32) {
-    image.data.par_chunks_exact_mut(3).for_each(|pixel| {
-        let transformed = lut.sample([pixel[0], pixel[1], pixel[2]]);
-        for channel in 0..3 {
-            pixel[channel] = (pixel[channel] + (transformed[channel] - pixel[channel]) * strength)
-                .clamp(0.0, 1.0);
+    image.data.par_chunks_mut(3 * 8192).for_each(|chunk| {
+        for pixel in chunk.as_chunks_mut::<3>().0 {
+            let transformed = lut.sample(*pixel);
+            for (value, target) in pixel.iter_mut().zip(transformed) {
+                *value = (*value + (target - *value) * strength).clamp(0.0, 1.0);
+            }
         }
     });
 }
@@ -2873,6 +2984,81 @@ mod tests {
             height: 1,
         };
         assert_eq!(bin_quads(&data, 6, &plan), vec![[1.0, 1.0, 1.0]]);
+    }
+
+    #[test]
+    fn the_srgb_encoding_table_tracks_the_exact_transfer_function() {
+        // The table stands in for `powf` on every displayed pixel, so its error
+        // has to stay far below the 8-bit step it is quantised into.
+        let mut worst: f32 = 0.0;
+        for index in 0..200_001 {
+            let value = index as f32 / 200_000.0 * 1.2;
+            let error = (srgb_encode(value) - exact_srgb_encode(value)).abs();
+            worst = worst.max(error);
+        }
+        assert!(
+            worst < 1.0 / 255.0 / 100.0,
+            "worst sRGB table error {worst} is too large"
+        );
+        // Anchors: black, the linear/power join, and white land exactly.
+        assert_eq!(srgb_encode(0.0), 0.0);
+        assert_eq!(srgb_encode(-1.0), 0.0);
+        assert!((srgb_encode(1.0) - 1.0).abs() < 1.0e-6);
+        // Above white the exact function still applies, unclamped.
+        assert!(srgb_encode(4.0) > 1.0);
+        assert_eq!(srgb_encode(4.0), exact_srgb_encode(4.0));
+    }
+
+    /// Times the display transform at preview resolution, the pass an
+    /// interactive drag runs on every tick.
+    #[test]
+    #[ignore = "prints machine-specific timings"]
+    fn benchmark_display_transform_at_preview_resolution() {
+        let (width, height) = (1600, 1200);
+        let source: Vec<f32> = (0..width * height * 3)
+            .map(|index| (index % 997) as f32 / 700.0)
+            .collect();
+        for (label, transform) in [
+            (
+                "fused, tabled",
+                (|image: &mut RgbImage| display_tone_and_transfer(&mut image.data))
+                    as fn(&mut RgbImage),
+            ),
+            ("separate passes, powf", |image: &mut RgbImage| {
+                super::super::tone::apply_default_display_tone(&mut image.data);
+                image.data.par_chunks_mut(1 << 14).for_each(|chunk| {
+                    for value in chunk {
+                        *value = exact_srgb_encode(*value);
+                    }
+                });
+            }),
+            ("one pass, nothing but a multiply", |image: &mut RgbImage| {
+                image.data.par_chunks_mut(1 << 14).for_each(|chunk| {
+                    for value in chunk {
+                        *value = 1.055 * *value - 0.055;
+                    }
+                });
+            }),
+        ] {
+            let mut times = Vec::new();
+            for _ in 0..5 {
+                let mut image = RgbImage {
+                    width,
+                    height,
+                    data: source.clone(),
+                };
+                let started = std::time::Instant::now();
+                transform(&mut image);
+                times.push(started.elapsed().as_secs_f64() * 1000.0);
+                assert!(image.data.iter().all(|value| value.is_finite()));
+            }
+            times.sort_by(f64::total_cmp);
+            eprintln!(
+                "display-transform-benchmark {label:22} threads={} median={:.3} ms {times:?}",
+                rayon::current_num_threads(),
+                times[2]
+            );
+        }
     }
 
     /// Times the noise reduction at export resolution, isolating it from decode

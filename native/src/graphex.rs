@@ -12,6 +12,7 @@
 use std::ffi::{CStr, c_char};
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
 
 use rayon::prelude::*;
 
@@ -536,9 +537,13 @@ fn blend_images(base: &RgbImage, layer: &RgbImage, opacity: f32) -> Result<RgbIm
     let mut output = base.clone();
     output
         .data
-        .par_iter_mut()
-        .zip(layer.data.par_iter())
-        .for_each(|(value, other)| *value += (*other - *value) * opacity);
+        .par_chunks_mut(1 << 14)
+        .zip(layer.data.par_chunks(1 << 14))
+        .for_each(|(values, others)| {
+            for (value, other) in values.iter_mut().zip(others) {
+                *value += (*other - *value) * opacity;
+            }
+        });
     Ok(output)
 }
 
@@ -841,11 +846,22 @@ pub(crate) fn execute_graph_cached(
     context: &GraphContext<'_>,
     cache_key: Option<PrefixKey>,
 ) -> Result<RgbImage, Error> {
+    let (width, height, image) = execute_graph_into(ops, source, context, cache_key, None)?;
+    let _ = (width, height);
+    Ok(image.expect("a graph run without a byte buffer returns its image"))
+}
+
+fn execute_graph_into(
+    ops: &[GraphOp],
+    source: Arc<RgbImage>,
+    context: &GraphContext<'_>,
+    cache_key: Option<PrefixKey>,
+    bytes: Option<&mut [u8]>,
+) -> Result<(usize, usize, Option<RgbImage>), Error> {
     let count = ops.len();
     if count == 0 {
-        let mut image = render::orient(render::own_source(source), context.orientation);
-        to_display(&mut image);
-        return Ok(image);
+        let image = render::orient(render::own_source(source), context.orientation);
+        return finish(image, Domain::Linear, bytes);
     }
     // Interactive resume: reuse the deepest checkpoint of the previous
     // program that still lies on this program's unchanged prefix.
@@ -900,7 +916,10 @@ pub(crate) fn execute_graph_cached(
         .as_ref()
         .map(|(point, _)| *point)
         .unwrap_or((0, STAGE_ENTRY));
-    capture_points.retain(|point| *point >= (boundary, entry_stage));
+    // Strictly after the resume point: the cache already holds the checkpoint
+    // this run entered on, and the merge below keeps it. Re-capturing it copied
+    // the whole image again on every tick of a drag that never moved off it.
+    capture_points.retain(|point| *point > (boundary, entry_stage));
     // Remaining reader counts cover only the ops actually executed, so
     // images still move instead of cloning on their last read. A stage 1
     // resume re-reads its own half-finished register instead of its input.
@@ -1108,9 +1127,11 @@ pub(crate) fn execute_graph_cached(
                 // Picked color minus pixel, per channel, deliberately
                 // unclamped: this is the scene-linear negative inversion.
                 let color = [op.params[0], op.params[1], op.params[2]];
-                image.data.par_chunks_exact_mut(3).for_each(|pixel| {
-                    for (value, base) in pixel.iter_mut().zip(color) {
-                        *value = base - *value;
+                image.data.par_chunks_mut(3 * 8192).for_each(|chunk| {
+                    for pixel in chunk.as_chunks_mut::<3>().0 {
+                        for (value, base) in pixel.iter_mut().zip(color) {
+                            *value = base - *value;
+                        }
                     }
                 });
             }
@@ -1125,9 +1146,11 @@ pub(crate) fn execute_graph_cached(
                     channel_lut(curve_channel_points(&op.params, 1), luma.as_deref()),
                     channel_lut(curve_channel_points(&op.params, 2), luma.as_deref()),
                 ];
-                image.data.par_chunks_exact_mut(3).for_each(|pixel| {
-                    for (value, lut) in pixel.iter_mut().zip(&luts) {
-                        *value = apply_curve_value(lut, *value);
+                image.data.par_chunks_mut(3 * 8192).for_each(|chunk| {
+                    for pixel in chunk.as_chunks_mut::<3>().0 {
+                        for (value, lut) in pixel.iter_mut().zip(&luts) {
+                            *value = apply_curve_value(lut, *value);
+                        }
                     }
                 });
             }
@@ -1201,9 +1224,7 @@ pub(crate) fn execute_graph_cached(
     if !oriented[count] {
         image = render::orient(image, context.orientation);
     }
-    if domains[count] == Domain::Linear {
-        to_display(&mut image);
-    }
+    let result = finish(image, domains[count], bytes)?;
     if let Some(started) = tail_started {
         eprintln!(
             "orfeus-profile graph-tail resumed-from={}.{} milliseconds={:.3}",
@@ -1212,7 +1233,33 @@ pub(crate) fn execute_graph_cached(
             started.elapsed().as_secs_f64() * 1000.0
         );
     }
-    Ok(image)
+    Ok(result)
+}
+
+/// Delivers a finished graph: display-space pixels either as an image or
+/// written straight into the caller's 8-bit buffer.
+fn finish(
+    mut image: RgbImage,
+    domain: Domain,
+    bytes: Option<&mut [u8]>,
+) -> Result<(usize, usize, Option<RgbImage>), Error> {
+    let (width, height) = (image.width, image.height);
+    match bytes {
+        None => {
+            if domain == Domain::Linear {
+                to_display(&mut image);
+            }
+            Ok((width, height, Some(image)))
+        }
+        Some(bytes) => {
+            let needed = width * height * 3;
+            if bytes.len() < needed {
+                return Err(Error::InvalidArgument("preview buffer is too small"));
+            }
+            render::write_display_bytes(&image, &mut bytes[..needed], domain == Domain::Linear);
+            Ok((width, height, None))
+        }
+    }
 }
 
 /// Clones every live register: one checkpoint's worth of resume state.
@@ -1284,20 +1331,17 @@ pub fn render_graph_rgb(
     buffer: &mut [u8],
     cache_mode: u32,
 ) -> Result<(usize, usize), Error> {
-    let image = render_graph_image(input, frame, graph_bytes, cache_mode)?;
-    let needed = image.width * image.height * 3;
-    if buffer.len() < needed {
-        return Err(Error::InvalidArgument("preview buffer is too small"));
+    let profiling = std::env::var_os("ORFEUS_PROFILE").is_some();
+    let started = Instant::now();
+    let (width, height, _) =
+        render_graph_frame(input, frame, graph_bytes, cache_mode, Some(buffer))?;
+    if profiling {
+        eprintln!(
+            "orfeus-profile frame milliseconds={:.3}",
+            started.elapsed().as_secs_f64() * 1000.0
+        );
     }
-    buffer[..needed]
-        .par_chunks_mut(1 << 16)
-        .zip(image.data.par_chunks(1 << 16))
-        .for_each(|(bytes, values)| {
-            for (byte, value) in bytes.iter_mut().zip(values) {
-                *byte = (value.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
-            }
-        });
-    Ok((image.width, image.height))
+    Ok((width, height))
 }
 
 /// Whether a render develops a draft: only when the caller asked for one, and
@@ -1317,12 +1361,37 @@ fn render_graph_image(
     graph_bytes: &[u8],
     cache_mode: u32,
 ) -> Result<RgbImage, Error> {
+    let (_, _, image) = render_graph_frame(input, frame, graph_bytes, cache_mode, None)?;
+    Ok(image.expect("a frame rendered without a byte buffer returns its image"))
+}
+
+fn render_graph_frame(
+    input: &Path,
+    frame: &RenderFrameV1,
+    graph_bytes: &[u8],
+    cache_mode: u32,
+    bytes: Option<&mut [u8]>,
+) -> Result<(usize, usize, Option<RgbImage>), Error> {
     frame.validate()?;
     let ops = parse_graph(graph_bytes)?;
     if !matches!(cache_mode, render::CACHE_NONE | render::CACHE_USE) {
         return Err(Error::InvalidArgument("unsupported decode cache mode"));
     }
     let profiling = std::env::var_os("ORFEUS_PROFILE").is_some();
+    let mut stage_started = Instant::now();
+    macro_rules! profile_stage {
+        ($name:literal) => {
+            if profiling {
+                let now = Instant::now();
+                eprintln!(
+                    "orfeus-profile stage={} milliseconds={:.3}",
+                    $name,
+                    now.duration_since(stage_started).as_secs_f64() * 1000.0
+                );
+                stage_started = now;
+            }
+        };
+    }
     let needs_neural = ops
         .iter()
         .any(|op| op.kind == NODE_NOISE_REDUCTION && op.params[1] > 0.0);
@@ -1340,6 +1409,7 @@ fn render_graph_image(
     let draft = develops_draft(frame.flags, frame.max_width, frame.max_height);
     let (decoded, source_identity): (Arc<DecodedRaw>, Option<render::DecodeCacheKey>) =
         render::decoded_for_render_with_identity(input, cache_mode, draft, profiling)?;
+    profile_stage!("decoded-source");
     let (native_max_width, native_max_height) =
         render::native_downscale_bounds(decoded.orientation, frame.max_width, frame.max_height);
     let source = render::scaled_source_for_render(
@@ -1349,6 +1419,7 @@ fn render_graph_image(
         native_max_height,
         cache_mode,
     );
+    profile_stage!("scaled-source");
     let explicit_profile = if frame.lens_profile_model.is_null() {
         None
     } else {
@@ -1384,7 +1455,9 @@ fn render_graph_image(
     } else {
         None
     };
-    execute_graph_cached(&ops, source, &context, prefix_key)
+    profile_stage!("prefix-key");
+    let _ = stage_started;
+    execute_graph_into(&ops, source, &context, prefix_key, bytes)
 }
 
 #[cfg(test)]

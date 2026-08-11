@@ -1,6 +1,6 @@
 /orfeus
 /native/target/
-/native/target-nix/
+/native/target-nix*/
 # A cargo invocation run from inside native/ resolves CARGO_TARGET_DIR one level
 # deeper; ignore that too rather than committing a build tree.
 /native/native/

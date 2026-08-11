@@ -1,5 +1,6 @@
 //! Default scene-linear to display-linear tone mapping.
 
+#[cfg(test)]
 use rayon::prelude::*;
 
 const CURVE_INPUT_GAIN: f32 = 1.6;
@@ -15,40 +16,55 @@ const SRGB_LUMINANCE: [f32; 3] = [0.212_672_9, 0.715_152_2, 0.072_175];
 /// while reducing saturation only as much as the output gamut requires. The
 /// scalar curve lifts deep shadows and midtones to a practical display baseline.
 /// Explicit user exposure compensation remains a separate earlier step.
+///
+/// Kept as the unfused reference the tone tests and the GPU parity check
+/// measure against; renders fuse `tone_pixel` into a pass of their own.
+#[cfg(test)]
 pub(crate) fn apply_default_display_tone(linear_rgb: &mut [f32]) {
     assert_eq!(linear_rgb.len() % 3, 0, "RGB data must contain triplets");
-    linear_rgb.par_chunks_exact_mut(3).for_each(|pixel| {
-        let luminance = pixel
-            .iter()
-            .zip(SRGB_LUMINANCE)
-            .map(|(channel, coefficient)| channel * coefficient)
-            .sum::<f32>();
-        if !luminance.is_finite() || luminance <= 0.0 {
-            pixel.copy_from_slice(&[0.0; 3]);
-            return;
-        }
-
-        let target = default_display_tone(luminance);
-        let luminance_gain = target / luminance;
-        let toned = [
-            pixel[0] * luminance_gain,
-            pixel[1] * luminance_gain,
-            pixel[2] * luminance_gain,
-        ];
-        let mut saturation = 1.0_f32;
-        for channel in toned {
-            let chroma = channel - target;
-            if chroma > 0.0 {
-                saturation = saturation.min((1.0 - target) / chroma);
-            } else if chroma < 0.0 {
-                saturation = saturation.min(target / -chroma);
-            }
-        }
-        saturation = saturation.clamp(0.0, 1.0);
-        for (channel, toned_channel) in pixel.iter_mut().zip(toned) {
-            *channel = target + saturation * (toned_channel - target);
+    // Chunked well above one pixel: at preview sizes the per-item cost of a
+    // three-float parallel iterator is the same order as the arithmetic.
+    linear_rgb.par_chunks_mut(3 * 8192).for_each(|chunk| {
+        for pixel in chunk.as_chunks_mut::<3>().0 {
+            tone_pixel(pixel);
         }
     });
+}
+
+/// One pixel of `apply_default_display_tone`, for callers that fuse it into a
+/// pass of their own rather than traversing the image again.
+#[inline]
+pub(crate) fn tone_pixel(pixel: &mut [f32; 3]) {
+    let luminance = pixel
+        .iter()
+        .zip(SRGB_LUMINANCE)
+        .map(|(channel, coefficient)| channel * coefficient)
+        .sum::<f32>();
+    if !luminance.is_finite() || luminance <= 0.0 {
+        *pixel = [0.0; 3];
+        return;
+    }
+
+    let target = default_display_tone(luminance);
+    let luminance_gain = target / luminance;
+    let toned = [
+        pixel[0] * luminance_gain,
+        pixel[1] * luminance_gain,
+        pixel[2] * luminance_gain,
+    ];
+    let mut saturation = 1.0_f32;
+    for channel in toned {
+        let chroma = channel - target;
+        if chroma > 0.0 {
+            saturation = saturation.min((1.0 - target) / chroma);
+        } else if chroma < 0.0 {
+            saturation = saturation.min(target / -chroma);
+        }
+    }
+    saturation = saturation.clamp(0.0, 1.0);
+    for (channel, toned_channel) in pixel.iter_mut().zip(toned) {
+        *channel = target + saturation * (toned_channel - target);
+    }
 }
 
 fn default_display_tone(value: f32) -> f32 {
