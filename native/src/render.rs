@@ -1064,6 +1064,41 @@ pub(crate) fn cpu_noise_reduction(image: &mut RgbImage, luma: f32, chroma: f32) 
         });
 }
 
+/// Whether a sample coordinate lies inside the image.
+#[inline]
+pub(crate) fn inside(image: &RgbImage, x: f32, y: f32) -> bool {
+    x >= 0.0 && y >= 0.0 && x <= (image.width - 1) as f32 && y <= (image.height - 1) as f32
+}
+
+/// Samples all three channels at one point.
+///
+/// The weights and the four addresses are computed once for the pixel instead
+/// of once per channel, and the three channels of a corner are adjacent in
+/// memory, so each corner is one cache line rather than three lookups.
+#[inline]
+pub(crate) fn bilinear_rgb(image: &RgbImage, x: f32, y: f32) -> [f32; 3] {
+    if !inside(image, x, y) {
+        return [0.0; 3];
+    }
+    let (x0, y0) = (x.floor() as usize, y.floor() as usize);
+    let (x1, y1) = (
+        (x0 + 1).min(image.width - 1),
+        (y0 + 1).min(image.height - 1),
+    );
+    let (fx, fy) = (x - x0 as f32, y - y0 as f32);
+    let corner = |xx: usize, yy: usize| -> &[f32] {
+        let start = (yy * image.width + xx) * 3;
+        &image.data[start..start + 3]
+    };
+    let (top_left, top_right) = (corner(x0, y0), corner(x1, y0));
+    let (bottom_left, bottom_right) = (corner(x0, y1), corner(x1, y1));
+    std::array::from_fn(|channel| {
+        let top = top_left[channel] * (1.0 - fx) + top_right[channel] * fx;
+        let bottom = bottom_left[channel] * (1.0 - fx) + bottom_right[channel] * fx;
+        top * (1.0 - fy) + bottom * fy
+    })
+}
+
 pub(crate) fn bilinear(image: &RgbImage, x: f32, y: f32, channel: usize) -> f32 {
     if x < 0.0 || y < 0.0 || x > (image.width - 1) as f32 || y > (image.height - 1) as f32 {
         return 0.0;
@@ -1234,23 +1269,21 @@ fn zoom_center(image: &mut RgbImage, scale: f32) {
     if scale <= 1.001 {
         return;
     }
-    let source = image.clone();
     let width = image.width;
     let center_x = (image.width.saturating_sub(1)) as f32 * 0.5;
     let center_y = (image.height.saturating_sub(1)) as f32 * 0.5;
-    image
-        .data
+    let mut output = vec![0.0_f32; image.data.len()];
+    output
         .par_chunks_mut(width * 3)
         .enumerate()
         .for_each(|(y, output_row)| {
             let source_y = center_y + (y as f32 - center_y) / scale;
             for (x, pixel) in output_row.as_chunks_mut::<3>().0.iter_mut().enumerate() {
                 let source_x = center_x + (x as f32 - center_x) / scale;
-                for (channel, value) in pixel.iter_mut().enumerate() {
-                    *value = bilinear(&source, source_x, source_y, channel);
-                }
+                *pixel = bilinear_rgb(image, source_x, source_y);
             }
         });
+    image.data = output;
 }
 
 pub(crate) struct LensCorrectionOptions<'a> {
@@ -1336,7 +1369,6 @@ pub(crate) fn apply_lens(
             "lensfun profile for {display_name} lacks requested calibration"
         )));
     }
-    let source = image.clone();
     let width = image.width;
     let height = image.height;
     let row_stride = width * 3;
@@ -1369,8 +1401,10 @@ pub(crate) fn apply_lens(
         }
     }
     let mut valid = vec![true; width * height];
-    image
-        .data
+    // Resampled into a fresh buffer rather than through a copy of the image:
+    // at 80 MP that copy was a gigabyte read and written for nothing.
+    let mut output = vec![0.0_f32; width * height * 3];
+    output
         .par_chunks_mut(row_stride)
         .zip(valid.par_chunks_mut(width))
         .enumerate()
@@ -1399,24 +1433,23 @@ pub(crate) fn apply_lens(
                 } else {
                     (x as f32, y as f32)
                 };
+                if !tca {
+                    // Without a chromatic correction all three channels read the
+                    // same point, so they share one set of weights and land on
+                    // three adjacent floats.
+                    valid_row[x] &= inside(image, gx, gy);
+                    output_row[x * 3..x * 3 + 3].copy_from_slice(&bilinear_rgb(image, gx, gy));
+                    continue;
+                }
                 for channel in 0..3 {
-                    let (sx, sy) = if tca {
-                        (
-                            lerp_rows(&subpixel_rows, 6, x * 6 + channel * 2) + gx - x as f32,
-                            lerp_rows(&subpixel_rows, 6, x * 6 + channel * 2 + 1) + gy - y as f32,
-                        )
-                    } else {
-                        (gx, gy)
-                    };
-                    let coordinate_valid = sx >= 0.0
-                        && sy >= 0.0
-                        && sx <= (width - 1) as f32
-                        && sy <= (height - 1) as f32;
-                    valid_row[x] &= coordinate_valid;
-                    output_row[x * 3 + channel] = bilinear(&source, sx, sy, channel);
+                    let sx = lerp_rows(&subpixel_rows, 6, x * 6 + channel * 2) + gx - x as f32;
+                    let sy = lerp_rows(&subpixel_rows, 6, x * 6 + channel * 2 + 1) + gy - y as f32;
+                    valid_row[x] &= inside(image, sx, sy);
+                    output_row[x * 3 + channel] = bilinear(image, sx, sy, channel);
                 }
             }
         });
+    image.data = output;
     zoom_center(
         image,
         lens_auto_crop_scale(&valid, image.width, image.height),
