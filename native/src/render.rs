@@ -2349,8 +2349,7 @@ fn develop_roi(width: usize, height: usize, active: Option<Rect>, crop: Option<R
 }
 
 /// What one sensor quad contributes: the channel each of its four corners
-/// feeds, the black level subtracted there, and the reciprocal of the span to
-/// the white level.
+/// feeds, the black level subtracted there, and the span from it to white.
 type QuadCorners = [(usize, f32, f32); 4];
 
 /// Everything `bin_quads` needs that does not vary across the frame.
@@ -2405,8 +2404,10 @@ fn bin_quads<T: Copy + Into<f32> + Sync>(
                             data[left + stride + 1],
                         ];
                         for (corner, value) in quad.iter().enumerate() {
-                            let (channel, black, scale) = corners[corner];
-                            let level = ((*value).into() - black).max(0.0) * scale;
+                            let (channel, black, span) = corners[corner];
+                            // Divided, not scaled by a reciprocal, so a draft
+                            // and a full develop agree to the last bit.
+                            let level = ((*value).into() - black).max(0.0) / span;
                             // The two greens of a quad average into one.
                             sum[channel] += if channel == 1 { level * 0.5 } else { level };
                         }
@@ -2460,7 +2461,7 @@ fn develop_binned(raw: &RawImage, factor: usize) -> Option<Intermediate> {
             corners[row * 2 + column] = (
                 cfa.color_at(row, column),
                 black[level],
-                if span > 0.0 { 1.0 / span } else { 0.0 },
+                if span > 0.0 { span } else { f32::INFINITY },
             );
         }
     }
@@ -2482,6 +2483,78 @@ fn develop_binned(raw: &RawImage, factor: usize) -> Option<Intermediate> {
         plan.width,
         plan.height,
     )))
+}
+
+/// Develops a Bayer frame at full resolution, cropped as the camera asks.
+///
+/// Rawler's own entry point develops the whole active area into a
+/// whole-image RGB buffer, sweeps it four times, and then copies out the
+/// default crop. `demosaic` runs the same algorithm over cache-sized tiles and
+/// emits only the crop, which at 80 MP is the difference between about seven
+/// gigabytes of memory traffic and about one.
+fn develop_full(raw: &RawImage) -> Option<Intermediate> {
+    let RawPhotometricInterpretation::Cfa(config) = &raw.photometric else {
+        return None;
+    };
+    if !config.cfa.is_rgb() || raw.cpp != 1 {
+        return None;
+    }
+    let full = Rect::new(
+        rawler::imgop::Point::new(0, 0),
+        rawler::imgop::Dim2::new(raw.width, raw.height),
+    );
+    // The whole active area may be read; only the default crop is emitted.
+    let area = raw.active_area.unwrap_or(full);
+    let crop = develop_roi(raw.width, raw.height, raw.active_area, raw.crop_area);
+    let cfa = config.cfa.shift(area.p.x, area.p.y);
+    let black = raw.blacklevel.as_bayer_array();
+    let white = raw.whitelevel.as_bayer_array();
+    let mut colors = [0_usize; 4];
+    let mut levels = [(0.0_f32, 1.0_f32); 4];
+    for row in 0..2 {
+        for column in 0..2 {
+            let corner = row * 2 + column;
+            let level = ((area.p.y + row) & 1) * 2 + ((area.p.x + column) & 1);
+            let span = white[level] - black[level];
+            colors[corner] = cfa.color_at(row, column);
+            levels[corner] = (black[level], if span > 0.0 { span } else { f32::INFINITY });
+        }
+    }
+    let window = super::demosaic::Window {
+        left: crop.p.x - area.p.x,
+        top: crop.p.y - area.p.y,
+        width: crop.d.w,
+        height: crop.d.h,
+    };
+    let developed = match &raw.data {
+        RawImageData::Integer(data) => super::demosaic::demosaic_ppg(
+            &super::demosaic::BayerFrame {
+                data,
+                stride: raw.width,
+                left: area.p.x,
+                top: area.p.y,
+                width: area.d.w,
+                height: area.d.h,
+                colors,
+                levels,
+            },
+            window,
+        ),
+        RawImageData::Float(data) => super::demosaic::demosaic_ppg(
+            &super::demosaic::BayerFrame {
+                data,
+                stride: raw.width,
+                left: area.p.x,
+                top: area.p.y,
+                width: area.d.w,
+                height: area.d.h,
+                colors,
+                levels,
+            },
+            window,
+        ),
+    };
+    Some(Intermediate::ThreeColor(developed))
 }
 
 fn decode_linear_srgb(input: &Path, draft: bool, profiling: bool) -> Result<DecodedRaw, Error> {
@@ -2533,14 +2606,27 @@ fn decode_linear_srgb(input: &Path, draft: bool, profiling: bool) -> Result<Deco
             }
             binned
         }
-        None => {
-            if profiling {
-                eprintln!("orfeus-profile develop-path=demosaic draft={draft}");
+        None => match develop_full(&raw).filter(|_| {
+            // Set ORFEUS_TILED_DEMOSAIC=0 to develop through rawler instead,
+            // which is how the two are compared on real photographs.
+            std::env::var_os("ORFEUS_TILED_DEMOSAIC").as_deref()
+                != Some(std::ffi::OsStr::new("0"))
+        }) {
+            Some(developed) => {
+                if profiling {
+                    eprintln!("orfeus-profile develop-path=tiled-ppg");
+                }
+                developed
             }
-            RawDevelop { steps }
-                .develop_intermediate(&raw)
-                .map_err(|e| Error::Render(format!("RAW development: {e}")))?
-        }
+            None => {
+                if profiling {
+                    eprintln!("orfeus-profile develop-path=rawler draft={draft}");
+                }
+                RawDevelop { steps }
+                    .develop_intermediate(&raw)
+                    .map_err(|e| Error::Render(format!("RAW development: {e}")))?
+            }
+        },
     };
     profile_stage!("develop");
     // Start from the camera's neutral rendering for both as-shot and custom
@@ -2960,10 +3046,10 @@ mod tests {
         ];
         // RGGB: red 100, greens 200 and 300, blue 400, black 0, white 1000.
         let corners: QuadCorners = [
-            (0, 0.0, 0.001),
-            (1, 0.0, 0.001),
-            (1, 0.0, 0.001),
-            (2, 0.0, 0.001),
+            (0, 0.0, 1000.0),
+            (1, 0.0, 1000.0),
+            (1, 0.0, 1000.0),
+            (2, 0.0, 1000.0),
         ];
         let plan = BinPlan {
             roi: Rect::new(
@@ -2994,10 +3080,10 @@ mod tests {
             }
         }
         let corners: QuadCorners = [
-            (0, 1000.0, 1.0 / 2000.0),
-            (1, 1000.0, 1.0 / 2000.0),
-            (1, 1000.0, 1.0 / 2000.0),
-            (2, 1000.0, 1.0 / 2000.0),
+            (0, 1000.0, 2000.0),
+            (1, 1000.0, 2000.0),
+            (1, 1000.0, 2000.0),
+            (2, 1000.0, 2000.0),
         ];
         let plan = BinPlan {
             roi: Rect::new(
@@ -3029,10 +3115,10 @@ mod tests {
             *value = 1000;
         }
         let corners: QuadCorners = [
-            (0, 0.0, 0.001),
-            (1, 0.0, 0.001),
-            (1, 0.0, 0.001),
-            (2, 0.0, 0.001),
+            (0, 0.0, 1000.0),
+            (1, 0.0, 1000.0),
+            (1, 0.0, 1000.0),
+            (2, 0.0, 1000.0),
         ];
         let plan = BinPlan {
             roi: Rect::new(

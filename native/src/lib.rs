@@ -30,6 +30,7 @@ use rayon::prelude::*;
 use md5::{Digest, Md5};
 
 mod analyze;
+mod demosaic;
 mod color;
 mod gpu;
 mod graphex;
