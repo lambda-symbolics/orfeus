@@ -2072,6 +2072,26 @@ pub(crate) fn own_source(source: Arc<RgbImage>) -> RgbImage {
     Arc::try_unwrap(source).unwrap_or_else(|shared| (*shared).clone())
 }
 
+/// Takes the decoded image as a buffer the caller may write into.
+///
+/// A full-resolution render is bounded by nothing, so it works on the decode
+/// itself; when the decode cache is not holding it, moving the pixels out saves
+/// copying nearly a gigabyte at 80 MP, which measured 927 ms of every export.
+pub(crate) fn own_decoded(decoded: Arc<DecodedRaw>) -> RgbImage {
+    match Arc::try_unwrap(decoded) {
+        Ok(owned) => RgbImage {
+            width: owned.width,
+            height: owned.height,
+            data: owned.data,
+        },
+        Err(shared) => RgbImage {
+            width: shared.width,
+            height: shared.height,
+            data: shared.data.clone(),
+        },
+    }
+}
+
 /// A file's identity as the filesystem reports it, cheap to obtain.
 pub(crate) type StatIdentity = (u64, u64, u64, i64, i64);
 
@@ -2684,15 +2704,25 @@ pub fn render(
     let orientation = decoded.orientation;
     let (native_max_width, native_max_height) =
         native_downscale_bounds(orientation, settings.max_width, settings.max_height);
+    let (make, model, lens_name, focal) = (
+        decoded.make.clone(),
+        decoded.model.clone(),
+        decoded.lens_name.clone(),
+        decoded.focal,
+    );
     // Downscaling first commutes with the linear white adaptation and exposure
     // gains; interactive re-renders reuse the cached bounded source.
-    let mut image = own_source(scaled_source_for_render(
-        &decoded,
-        input,
-        native_max_width,
-        native_max_height,
-        cache_mode,
-    ));
+    let mut image = if native_max_width > 0 || native_max_height > 0 {
+        own_source(scaled_source_for_render(
+            &decoded,
+            input,
+            native_max_width,
+            native_max_height,
+            cache_mode,
+        ))
+    } else {
+        own_decoded(decoded)
+    };
     profile_stage!("downscale");
     apply_white_adaptation(&mut image, settings.kelvin, settings.tint);
     apply_exposure(&mut image, settings.exposure_ev);
@@ -2709,10 +2739,10 @@ pub fn render(
     apply_lens(
         &mut image,
         &LensCorrectionOptions {
-            make: &decoded.make,
-            model: &decoded.model,
-            lens_name: &decoded.lens_name,
-            focal: decoded.focal,
+            make: &make,
+            model: &model,
+            lens_name: &lens_name,
+            focal,
             flags: settings.flags,
             strength: settings.lens_correction_strength,
             explicit_profile,

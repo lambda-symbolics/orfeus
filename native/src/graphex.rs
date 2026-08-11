@@ -1412,13 +1412,28 @@ fn render_graph_frame(
     profile_stage!("decoded-source");
     let (native_max_width, native_max_height) =
         render::native_downscale_bounds(decoded.orientation, frame.max_width, frame.max_height);
-    let source = render::scaled_source_for_render(
-        &decoded,
-        input,
-        native_max_width,
-        native_max_height,
-        cache_mode,
+    let bounded = native_max_width > 0 || native_max_height > 0;
+    let (make, model, lens_name, focal, orientation) = (
+        decoded.make.clone(),
+        decoded.model.clone(),
+        decoded.lens_name.clone(),
+        decoded.focal,
+        decoded.orientation,
     );
+    let (decoded_width, decoded_height) = (decoded.width, decoded.height);
+    // A full-resolution render works on the whole decode, so it takes the
+    // buffer rather than copying it — nearly a gigabyte at 80 MP.
+    let source = if bounded {
+        render::scaled_source_for_render(
+            &decoded,
+            input,
+            native_max_width,
+            native_max_height,
+            cache_mode,
+        )
+    } else {
+        Arc::new(render::own_decoded(decoded))
+    };
     profile_stage!("scaled-source");
     let explicit_profile = if frame.lens_profile_model.is_null() {
         None
@@ -1430,22 +1445,21 @@ fn render_graph_frame(
         )
     };
     let context = GraphContext {
-        make: &decoded.make,
-        model: &decoded.model,
-        lens_name: &decoded.lens_name,
-        focal: decoded.focal,
+        make: &make,
+        model: &model,
+        lens_name: &lens_name,
+        focal,
         explicit_profile,
         focal_reducer: frame.focal_reducer,
         crop_factor: frame.lens_crop_factor,
         grain_seed: frame.grain_seed,
-        orientation: decoded.orientation,
+        orientation,
     };
-    let bounded = native_max_width > 0 || native_max_height > 0;
     let prefix_key = if cache_mode == render::CACHE_USE && bounded {
         Some(PrefixKey {
             input_path: input.to_string_lossy().into_owned(),
-            decoded_width: decoded.width,
-            decoded_height: decoded.height,
+            decoded_width,
+            decoded_height,
             max_width: native_max_width,
             max_height: native_max_height,
             source_identity: source_identity
