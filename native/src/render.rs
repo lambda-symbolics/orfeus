@@ -714,12 +714,21 @@ fn bilateral_row_horizontal(
 /// resident in cache instead of round-tripping the whole plane through DRAM.
 const BILATERAL_BAND_ROWS: usize = 64;
 
+/// Blurs SOURCE along edges in GUIDE, mixing BLEND of the result back over the
+/// source as it writes.
+///
+/// The mix is folded in here rather than run as its own pass because the row
+/// has just been written and is still in cache; as a separate traversal it read
+/// two planes and wrote a third for every one of the eight mixes a chroma
+/// denoise performs.
+#[allow(clippy::too_many_arguments)]
 fn edge_guided_blur_into(
     source: &[f32],
     guide: &[f32],
     width: usize,
     height: usize,
     step: usize,
+    blend: f32,
     horizontal: &mut Vec<f32>,
     output: &mut Vec<f32>,
 ) {
@@ -764,6 +773,7 @@ fn edge_guided_blur_into(
                         as usize)
                         - halo_lo
                 });
+                let mut blurred = false;
                 #[cfg(target_arch = "x86_64")]
                 if use_avx && width >= 8 {
                     // SAFETY: Tap rows live inside the band buffer, each
@@ -777,23 +787,32 @@ fn edge_guided_blur_into(
                         });
                         bilateral_span_avx(row_output, guide.as_ptr().add(y * width), taps, guides);
                     }
-                    continue;
+                    blurred = true;
                 }
                 let _ = use_avx;
-                for (x, value) in row_output.iter_mut().enumerate() {
-                    let center = guide[y * width + x];
-                    let sigma = 0.012 + 0.055 * center.max(0.0).sqrt();
-                    let inverse = 1.0 / (sigma * sigma);
-                    let mut sum = 0.0;
-                    let mut weight_sum = 0.0;
-                    for (kernel_index, tap_row) in tap_rows.iter().enumerate() {
-                        let guide_index = (tap_row + halo_lo) * width + x;
-                        let distance = guide[guide_index] - center;
-                        let weight = kernel[kernel_index] / (1.0 + distance * distance * inverse);
-                        sum += band_buffer[tap_row * width + x] * weight;
-                        weight_sum += weight;
+                if !blurred {
+                    for (x, value) in row_output.iter_mut().enumerate() {
+                        let center = guide[y * width + x];
+                        let sigma = 0.012 + 0.055 * center.max(0.0).sqrt();
+                        let inverse = 1.0 / (sigma * sigma);
+                        let mut sum = 0.0;
+                        let mut weight_sum = 0.0;
+                        for (kernel_index, tap_row) in tap_rows.iter().enumerate() {
+                            let guide_index = (tap_row + halo_lo) * width + x;
+                            let distance = guide[guide_index] - center;
+                            let weight =
+                                kernel[kernel_index] / (1.0 + distance * distance * inverse);
+                            sum += band_buffer[tap_row * width + x] * weight;
+                            weight_sum += weight;
+                        }
+                        *value = sum / weight_sum;
                     }
-                    *value = sum / weight_sum;
+                }
+                if blend != 1.0 {
+                    let source_row = &source[y * width..(y + 1) * width];
+                    for (value, source) in row_output.iter_mut().zip(source_row) {
+                        *value = source + (*value - source) * blend;
+                    }
                 }
             }
         });
@@ -830,7 +849,13 @@ fn median_of_9(mut samples: [f32; 9]) -> f32 {
     samples[4]
 }
 
-fn median_filter_3x3_into(source: &[f32], width: usize, height: usize, output: &mut Vec<f32>) {
+fn median_filter_3x3_into(
+    source: &[f32],
+    width: usize,
+    height: usize,
+    blend: f32,
+    output: &mut Vec<f32>,
+) {
     // Written in full below, so no clear; see `edge_guided_blur_into`.
     output.resize(source.len(), 0.0);
     output
@@ -843,7 +868,7 @@ fn median_filter_3x3_into(source: &[f32], width: usize, height: usize, output: &
             for (x, value) in output_row.iter_mut().enumerate() {
                 let left = x.saturating_sub(1);
                 let right = (x + 1).min(width - 1);
-                *value = median_of_9([
+                let median = median_of_9([
                     above[left],
                     above[x],
                     above[right],
@@ -854,17 +879,7 @@ fn median_filter_3x3_into(source: &[f32], width: usize, height: usize, output: &
                     below[x],
                     below[right],
                 ]);
-            }
-        });
-}
-
-fn blend_toward(source: &mut [f32], filtered: &[f32], amount: f32) {
-    source
-        .par_chunks_mut(1 << 14)
-        .zip(filtered.par_chunks(1 << 14))
-        .for_each(|(values, filtered)| {
-            for (value, filtered) in values.iter_mut().zip(filtered) {
-                *value += (*filtered - *value) * amount;
+                *value = center[x] + (median - center[x]) * blend;
             }
         });
 }
@@ -989,6 +1004,7 @@ pub(crate) fn cpu_noise_reduction(image: &mut RgbImage, luma: f32, chroma: f32) 
             image.width,
             image.height,
             1,
+            1.0,
             &mut scratch,
             &mut scale_one,
         );
@@ -998,6 +1014,7 @@ pub(crate) fn cpu_noise_reduction(image: &mut RgbImage, luma: f32, chroma: f32) 
             image.width,
             image.height,
             2,
+            1.0,
             &mut scratch,
             &mut filtered,
         );
@@ -1019,8 +1036,16 @@ pub(crate) fn cpu_noise_reduction(image: &mut RgbImage, luma: f32, chroma: f32) 
     let chroma_strength = chroma.clamp(0.0, 1.0);
     if chroma_strength > 0.0 {
         for channel in [&mut cb, &mut cr] {
-            median_filter_3x3_into(channel, image.width, image.height, &mut filtered);
-            blend_toward(channel, &filtered, (chroma_strength * 1.5).min(1.0));
+            // Each stage writes the already-mixed result into `filtered` and
+            // then trades buffers with it, so nothing traverses the plane twice.
+            median_filter_3x3_into(
+                channel,
+                image.width,
+                image.height,
+                (chroma_strength * 1.5).min(1.0),
+                &mut filtered,
+            );
+            std::mem::swap(channel, &mut filtered);
             for (step, amount) in [
                 (1, (chroma_strength * 1.8).min(1.0)),
                 (2, (chroma_strength * 1.25).min(1.0)),
@@ -1033,10 +1058,11 @@ pub(crate) fn cpu_noise_reduction(image: &mut RgbImage, luma: f32, chroma: f32) 
                         image.width,
                         image.height,
                         step,
+                        amount,
                         &mut scratch,
                         &mut filtered,
                     );
-                    blend_toward(channel, &filtered, amount);
+                    std::mem::swap(channel, &mut filtered);
                 }
             }
         }
@@ -3223,25 +3249,31 @@ mod tests {
                 (0.3 + ripple + (index % 1409) as f32 / 4000.0).max(0.0)
             })
             .collect();
-        let mut times = Vec::new();
-        for _ in 0..5 {
-            let mut image = RgbImage {
-                width,
-                height,
-                data: source.clone(),
-            };
-            let started = std::time::Instant::now();
-            cpu_noise_reduction(&mut image, 0.35, 0.35);
-            times.push(started.elapsed().as_secs_f64() * 1000.0);
-            assert!(image.data.iter().all(|value| value.is_finite()));
+        for (label, luma, chroma) in [
+            ("both", 0.35, 0.35),
+            ("luma only", 0.35, 0.0),
+            ("chroma only", 0.0, 0.35),
+        ] {
+            let mut times = Vec::new();
+            for _ in 0..5 {
+                let mut image = RgbImage {
+                    width,
+                    height,
+                    data: source.clone(),
+                };
+                let started = std::time::Instant::now();
+                cpu_noise_reduction(&mut image, luma, chroma);
+                times.push(started.elapsed().as_secs_f64() * 1000.0);
+                assert!(image.data.iter().all(|value| value.is_finite()));
+            }
+            times.sort_by(f64::total_cmp);
+            eprintln!(
+                "noise-reduction-benchmark {label:12} pixels={} threads={} median={:.1} ms {times:?}",
+                width * height,
+                rayon::current_num_threads(),
+                times[2]
+            );
         }
-        times.sort_by(f64::total_cmp);
-        eprintln!(
-            "noise-reduction-benchmark pixels={} threads={} ms={times:?} median={:.1}",
-            width * height,
-            rayon::current_num_threads(),
-            times[2]
-        );
     }
 
     use super::*;

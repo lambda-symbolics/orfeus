@@ -186,18 +186,20 @@ fn transform_pixels<const N: usize>(
     use rayon::prelude::*;
     let mut output = vec![0.0_f32; pixels.len() * 3];
     output
-        .par_chunks_exact_mut(3)
-        .zip(pixels.par_iter())
-        .for_each(|(destination, pixel)| {
-            let mut balanced: [f32; N] =
-                std::array::from_fn(|channel| pixel[channel] * white_balance[channel]);
-            reconstruct_clipped(pixel, &mut balanced);
-            for (value, row) in destination.iter_mut().zip(matrix) {
-                *value = row
-                    .iter()
-                    .zip(&balanced)
-                    .map(|(coefficient, channel)| coefficient * channel)
-                    .sum();
+        .par_chunks_mut(3 * 8192)
+        .zip(pixels.par_chunks(8192))
+        .for_each(|(destination, source)| {
+            for (destination, pixel) in destination.as_chunks_mut::<3>().0.iter_mut().zip(source) {
+                let mut balanced: [f32; N] =
+                    std::array::from_fn(|channel| pixel[channel] * white_balance[channel]);
+                reconstruct_clipped(pixel, &mut balanced);
+                for (value, row) in destination.iter_mut().zip(matrix) {
+                    *value = row
+                        .iter()
+                        .zip(&balanced)
+                        .map(|(coefficient, channel)| coefficient * channel)
+                        .sum();
+                }
             }
         });
     output
