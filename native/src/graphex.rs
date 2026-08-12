@@ -53,6 +53,8 @@ pub struct RenderFrameV1 {
     /// See `FRAME_FLAG_DRAFT`. Appended, so `struct_size` keeps older callers
     /// working; anything that does not set it gets full-quality development.
     pub flags: u32,
+    /// The lens to correct for when the container names none of its own.
+    pub lens_name: *const c_char,
 }
 
 /// Develop at half resolution, binning each sensor quad instead of
@@ -1413,10 +1415,13 @@ fn render_graph_frame(
     let (native_max_width, native_max_height) =
         render::native_downscale_bounds(decoded.orientation, frame.max_width, frame.max_height);
     let bounded = native_max_width > 0 || native_max_height > 0;
+    // SAFETY: The caller promises a null or NUL-terminated lens name.
+    let named_lens =
+        unsafe { render::borrowed_c_string(frame.lens_name, "lens name is not UTF-8")? };
     let (make, model, lens_name, focal, orientation) = (
         decoded.make.clone(),
         decoded.model.clone(),
-        decoded.lens_name.clone(),
+        render::effective_lens_name(&decoded.lens_name, named_lens).to_string(),
         decoded.focal,
         decoded.orientation,
     );

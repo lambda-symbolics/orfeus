@@ -6002,7 +6002,6 @@ new cache entry is published."
           (when after-live-back (cffi:foreign-free after-live-back))
           (setf after-live-front nil after-live-back nil)
           (release-waveform)
-          (orfeus::clear-render-source-cache)
           (clear-preview-cache)
           (ignore-errors
             (uiop:delete-directory-tree preview-session-directory :validate t

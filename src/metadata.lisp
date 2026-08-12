@@ -16,29 +16,61 @@
                      (string-trim '(#\Space #\Tab #\Return) line))
                    (uiop:split-string output :separator '(#\Newline)))))
 
-(defvar *photo-lens-description-cache*
+(defparameter *photo-lens-tags*
+  '("-Lens" "-LensModel" "-LensType" "-LensID")
+  "ExifTool lens tags, most specific to the photographer's own naming first.
+
+The first three name the lens as the camera wrote it, which is what an adapted
+lens is recognized by. The last two are ExifTool's decoding of the maker note's
+lens identifier, which is the name a lens profile is looked up under.")
+
+(defvar *photo-lens-cache*
   (make-hash-table :test #'equal #+sbcl :synchronized #+sbcl t)
   "ExifTool lens lookups keyed by path and write date; a spawn per render is
 otherwise the slowest step of an interactive preview.")
 
-(defun read-photo-lens-description (pathname)
+(defun read-photo-lens-tags (pathname)
+  "Return (VALUES DESCRIPTION NAME) read from PATHNAME in one ExifTool run.
+
+DESCRIPTION is how the camera wrote the lens down, which adapted-lens mappings
+are keyed by. NAME is ExifTool's decoded lens name, which is the same string
+rawler reports for an ORF and the one a Lensfun profile is found under. Asked
+for with -f so an absent tag keeps its place in the output as a dash."
   (multiple-value-bind (output error-output status)
       (uiop:run-program
-       (list "exiftool" "-s3" "-Lens" "-LensModel" "-LensType"
-             (namestring (pathname pathname)))
+       (append (list "exiftool" "-f" "-s3") *photo-lens-tags*
+               (list (namestring (pathname pathname))))
        :output :string :error-output :string :ignore-error-status t)
     (declare (ignore error-output))
-    (and (zerop status) (preferred-lens-description output))))
+    (if (zerop status)
+        (let ((lines (mapcar (lambda (line)
+                               (string-trim '(#\Space #\Tab #\Return) line))
+                             (uiop:split-string output :separator '(#\Newline)))))
+          (values (find-if #'usable-lens-description-p (subseq lines 0 (min 3 (length lines))))
+                  (find-if #'usable-lens-description-p (nthcdr 2 lines))))
+        (values nil nil))))
+
+(defun photo-lens-tags (pathname)
+  (let* ((key (cons (namestring (pathname pathname))
+                    (ignore-errors (file-write-date pathname))))
+         (cached (gethash key *photo-lens-cache* :missing)))
+    (if (eq cached :missing)
+        (setf (gethash key *photo-lens-cache*)
+              (multiple-value-bind (description name)
+                  (read-photo-lens-tags pathname)
+                (cons description name)))
+        cached)))
 
 (defun photo-lens-description (pathname)
   "Return PATHNAME's best electronic lens description, or NIL if unavailable."
-  (let* ((key (cons (namestring (pathname pathname))
-                    (ignore-errors (file-write-date pathname))))
-         (cached (gethash key *photo-lens-description-cache* :missing)))
-    (if (eq cached :missing)
-        (setf (gethash key *photo-lens-description-cache*)
-              (read-photo-lens-description pathname))
-        cached)))
+  (first (photo-lens-tags pathname)))
+
+(defun photo-lens-name (pathname)
+  "Return the lens name PATHNAME's maker note decodes to, or NIL.
+
+Handed to the renderer for containers that carry no lens metadata it can read:
+rawler names the lens in an ORF but not in the DNG converted from it."
+  (rest (photo-lens-tags pathname)))
 
 (defvar *photo-capture-timestamp-cache*
   (make-hash-table :test #'equal #+sbcl :synchronized #+sbcl t)

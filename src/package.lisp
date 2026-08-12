@@ -61,6 +61,7 @@
    #:photo-capture-description
    #:photo-extract-embedded-preview
    #:photo-lens-description
+   #:photo-lens-name
    #:photo-job
    #:photo-job-input-path
    #:photo-job-output-path

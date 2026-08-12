@@ -41,6 +41,18 @@ session, and the next render died in a thread SBCL did not even know about."
   (error-buffer :pointer)
   (error-capacity :size))
 
+(defmacro with-optional-foreign-string ((pointer value) &body body)
+  "Bind POINTER to a foreign string holding VALUE, or a null pointer when VALUE
+is NIL. Render structs carry several optional strings, and nesting the CFFI
+form by hand for each of them buried the call it guards."
+  (let ((text (gensym "TEXT")))
+    `(let ((,text ,value))
+       (if ,text
+           (with-foreign-string (,pointer ,text :encoding :utf-8)
+             ,@body)
+           (let ((,pointer (null-pointer)))
+             ,@body)))))
+
 (defcstruct render-settings-v1
   (struct-size :uint32)
   (version :uint32)
@@ -70,7 +82,11 @@ session, and the next render died in a thread SBCL did not even know about."
   (lens-crop-factor :float)
   (lut-path :pointer)
   (lens-profile-model :pointer)
-  (neural-noise-reduction :float))
+  (neural-noise-reduction :float)
+  ;; The lens to correct for when the RAW container names none of its own,
+  ;; which is every DNG: the description lives in a maker note the decoder
+  ;; does not read, though ExifTool does.
+  (lens-name :pointer))
 
 (defcfun ("orfeus_raw_render_capabilities_v1"
           %raw-render-capabilities-v1) :uint32)
@@ -104,7 +120,9 @@ session, and the next render died in a thread SBCL did not even know about."
   ;; Bit 0 asks the bridge to develop a draft: half resolution, binning each
   ;; sensor quad rather than interpolating every photosite. Set for previews,
   ;; never for anything the user keeps.
-  (flags :uint32))
+  (flags :uint32)
+  ;; The lens to correct for when the RAW container names none of its own.
+  (lens-name :pointer))
 
 (defcfun ("orfeus_raw_render_v3" %raw-render-v3) :int32
   (input-path :string)
@@ -223,14 +241,15 @@ returns at once, so a caller can spend it during startup instead."
                             tone-light-mids tone-highlights tone-whites
                             lens-correction-p lens-correction-strength
                             chromatic-aberration-correction-p
-                            lens-profile-model focal-reducer lens-crop-factor
+                            lens-profile-model lens-name
+                            focal-reducer lens-crop-factor
                             lut-path lut-strength grain-amount grain-size
                             (grain-seed 0) (max-width 0) (max-height 0)
                             (jpeg-quality 92) output-format cache-p
                             neural-noise-reduction)
   (native-library-load)
   (native-render-require-compatible)
-  (labels ((invoke (lut-pointer lens-pointer)
+  (labels ((invoke (lut-pointer lens-pointer name-pointer)
              (with-foreign-object (settings '(:struct render-settings-v1))
                (flet ((setting (name value)
                         (setf (foreign-slot-value
@@ -277,7 +296,8 @@ returns at once, so a caller can spend it during startup instead."
                  (setting 'lens-crop-factor
                           (float (or lens-crop-factor 0.0) 0.0))
                  (setting 'lut-path lut-pointer)
-                 (setting 'lens-profile-model lens-pointer))
+                 (setting 'lens-profile-model lens-pointer)
+                 (setting 'lens-name name-pointer))
                (with-foreign-pointer (error-buffer *native-error-buffer-size*)
                  (let ((status
                          #+sbcl
@@ -302,16 +322,12 @@ returns at once, so a caller can spend it during startup instead."
                             :status status
                             :message (native-error-message error-buffer)))))))
            (call-with-lens-pointer (lut-pointer)
-             (if lens-profile-model
-                 (with-foreign-string (lens-pointer lens-profile-model
-                                                    :encoding :utf-8)
-                   (invoke lut-pointer lens-pointer))
-                 (invoke lut-pointer (null-pointer)))))
-    (if lut-path
-        (with-foreign-string (lut-pointer (namestring lut-path)
-                                          :encoding :utf-8)
-          (call-with-lens-pointer lut-pointer))
-        (call-with-lens-pointer (null-pointer))))
+             (with-optional-foreign-string (lens-pointer lens-profile-model)
+               (with-optional-foreign-string (name-pointer lens-name)
+                 (invoke lut-pointer lens-pointer name-pointer)))))
+    (with-optional-foreign-string (lut-pointer (and lut-path
+                                                    (namestring lut-path)))
+      (call-with-lens-pointer lut-pointer)))
   output-pathname)
 
 (defcfun ("orfeus_analyze_negative_frame_v1" %analyze-negative-frame-v1) :int32
@@ -527,7 +543,7 @@ length behind a header of four point counts; 4 added the rotate node.")
     (coerce bytes '(simple-array (unsigned-byte 8) (*)))))
 
 (defun native-raw-render-graph (input-pathname output-pathname graph
-                                &key lens-profile-model focal-reducer
+                                &key lens-profile-model lens-name focal-reducer
                                   lens-crop-factor (grain-seed 0)
                                   (max-width 0) (max-height 0)
                                   (jpeg-quality 92) output-format cache-p
@@ -541,7 +557,7 @@ DRAFT-P asks the bridge to develop at half resolution. Only a preview may."
     (error 'native-library-incompatible
            :message "bridge ABI does not provide raw render v3"))
   (let ((program (graph->program-bytes graph)))
-    (flet ((invoke (lens-pointer)
+    (flet ((invoke (lens-pointer name-pointer)
              (with-foreign-object (frame '(:struct render-frame-v1))
                (flet ((setting (name value)
                         (setf (foreign-slot-value
@@ -561,6 +577,7 @@ DRAFT-P asks the bridge to develop at half resolution. Only a preview may."
                  (setting 'lens-crop-factor
                           (float (or lens-crop-factor 0.0) 0.0))
                  (setting 'lens-profile-model lens-pointer)
+                 (setting 'lens-name name-pointer)
                  (setting 'flags (if draft-p +frame-flag-draft+ 0)))
                (with-foreign-pointer (buffer (length program))
                  (loop for octet across program
@@ -593,15 +610,14 @@ DRAFT-P asks the bridge to develop at half resolution. Only a preview may."
                               :status status
                               :message (native-error-message
                                         error-buffer)))))))))
-      (if lens-profile-model
-          (with-foreign-string (lens-pointer lens-profile-model
-                                             :encoding :utf-8)
-            (invoke lens-pointer))
-          (invoke (null-pointer)))))
+      (with-optional-foreign-string (lens-pointer lens-profile-model)
+        (with-optional-foreign-string (name-pointer lens-name)
+          (invoke lens-pointer name-pointer)))))
   output-pathname)
 
 (defun native-raw-render-graph-rgb (input-pathname graph rgb-buffer capacity
-                                    &key lens-profile-model focal-reducer
+                                    &key lens-profile-model lens-name
+                                      focal-reducer
                                       lens-crop-factor (grain-seed 0)
                                       (max-width 0) (max-height 0) cache-p
                                       draft-p)
@@ -615,7 +631,7 @@ image width and height as two values."
     (error 'native-library-incompatible
            :message "bridge ABI does not provide raw render v3"))
   (let ((program (graph->program-bytes graph)))
-    (flet ((invoke (lens-pointer)
+    (flet ((invoke (lens-pointer name-pointer)
              (with-foreign-object (frame '(:struct render-frame-v1))
                (flet ((setting (name value)
                         (setf (foreign-slot-value
@@ -633,6 +649,7 @@ image width and height as two values."
                  (setting 'lens-crop-factor
                           (float (or lens-crop-factor 0.0) 0.0))
                  (setting 'lens-profile-model lens-pointer)
+                 (setting 'lens-name name-pointer)
                  (setting 'flags (if draft-p +frame-flag-draft+ 0)))
                (with-foreign-pointer (program-buffer (length program))
                  (loop for octet across program
@@ -672,11 +689,9 @@ image width and height as two values."
                          (values
                           (cffi:mem-ref out-width :uint32)
                           (cffi:mem-ref out-height :uint32))))))))))
-      (if lens-profile-model
-          (with-foreign-string (lens-pointer lens-profile-model
-                                             :encoding :utf-8)
-            (invoke lens-pointer))
-          (invoke (null-pointer))))))
+      (with-optional-foreign-string (lens-pointer lens-profile-model)
+        (with-optional-foreign-string (name-pointer lens-name)
+          (invoke lens-pointer name-pointer))))))
 
 (defun dng-original-filename (pathname)
   "Return the embedded original filename recorded by DNG PATHNAME."

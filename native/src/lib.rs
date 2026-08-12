@@ -354,6 +354,14 @@ fn decode_slot_zero(container: &[u8]) -> Result<Vec<u8>, Error> {
     Ok(decoded)
 }
 
+/// The original RAW a DNG was converted from, verified against its digest.
+///
+/// Exposed to the renderer so a container rawler cannot decode can still be
+/// developed from the file it was made from, without a temporary file.
+pub(crate) fn embedded_original(file: &[u8]) -> Result<Vec<u8>, Error> {
+    decode_and_verify(file)
+}
+
 fn decode_and_verify(file: &[u8]) -> Result<Vec<u8>, Error> {
     let tags = parse_original_tags(file)?;
     let container = tags
@@ -837,6 +845,57 @@ mod tests {
             result.extend_from_slice(&block);
         }
         result
+    }
+
+    /// A container rawler cannot decode is developed from the original it was
+    /// made from, without anything being written to disk on the way.
+    #[test]
+    fn an_undecodable_container_falls_back_to_its_embedded_original() {
+        let original = b"an ORF rawler would understand, if this were one".repeat(40);
+        let file = synthetic_dng(&original, Md5::digest(embedded_container(&original)).into());
+        let path = std::env::temp_dir().join(format!(
+            "orfeus-fallback-{}.dng",
+            std::process::id()
+        ));
+        fs::write(&path, &file).unwrap();
+        // Neither half of this synthetic file is a real RAW, so the decode
+        // fails — but its message has to show the embedded original was tried,
+        // which is the only way to see the fallback happen without shipping a
+        // photograph as a fixture.
+        let message = crate::render::decode_linear_srgb(&path, false, false)
+            .err()
+            .expect("a synthetic container cannot decode")
+            .to_string();
+        assert!(
+            message.contains("embedded original"),
+            "the embedded original was not tried: {message}"
+        );
+        fs::remove_file(&path).ok();
+    }
+
+    /// An ordinary file that simply is not a RAW must say so, rather than
+    /// complaining that it has no embedded original — which is true of every
+    /// RAW file and explains nothing.
+    #[test]
+    fn a_file_that_is_not_raw_at_all_reports_the_decoder_failure() {
+        let path = std::env::temp_dir().join(format!(
+            "orfeus-not-raw-{}.dng",
+            std::process::id()
+        ));
+        fs::write(&path, b"this is not a photograph").unwrap();
+        let message = crate::render::decode_linear_srgb(&path, false, false)
+            .err()
+            .expect("an unreadable file must fail")
+            .to_string();
+        assert!(
+            message.contains("RAW decoder"),
+            "unhelpful message: {message}"
+        );
+        assert!(
+            !message.contains("embedded original"),
+            "an ordinary file has no original to blame: {message}"
+        );
+        fs::remove_file(&path).ok();
     }
 
     fn synthetic_dng(original: &[u8], digest: [u8; 16]) -> Vec<u8> {

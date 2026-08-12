@@ -79,6 +79,9 @@ pub struct RenderSettingsV1 {
     pub lut_path: *const c_char,
     pub lens_profile_model: *const c_char,
     pub neural_noise_reduction: f32,
+    /// The lens to correct for when the container names none of its own.
+    /// Appended, so a caller built against an earlier struct still works.
+    pub lens_name: *const c_char,
 }
 
 impl Default for RenderSettingsV1 {
@@ -113,7 +116,43 @@ impl Default for RenderSettingsV1 {
             lut_path: std::ptr::null(),
             lens_profile_model: std::ptr::null(),
             neural_noise_reduction: 0.0,
+            lens_name: std::ptr::null(),
         }
+    }
+}
+
+/// Reads an optional caller-provided string out of a render struct.
+///
+/// # Safety
+///
+/// The pointer must be null or a NUL-terminated string that outlives the call.
+pub(crate) unsafe fn borrowed_c_string<'a>(
+    pointer: *const c_char,
+    what: &'static str,
+) -> Result<Option<&'a str>, Error> {
+    if pointer.is_null() {
+        return Ok(None);
+    }
+    let text = unsafe { CStr::from_ptr(pointer) }
+        .to_str()
+        .map_err(|_| Error::InvalidArgument(what))?;
+    Ok((!text.is_empty()).then_some(text))
+}
+
+/// The lens to correct for: what the RAW container says, or the caller's answer
+/// when it says nothing.
+///
+/// Rawler names the lens for an ORF but not for the DNG made from that same
+/// ORF, where the description lives in a maker note it does not read. Orfeus
+/// already asks ExifTool for that description, and ExifTool's decoded name is
+/// the very string rawler produces from the ORF — verified on two lenses — so
+/// handing it down keeps lens correction working on either container. The
+/// container wins when it has an answer, so nothing about an ORF render moves.
+pub(crate) fn effective_lens_name<'a>(decoded: &'a str, from_caller: Option<&'a str>) -> &'a str {
+    if decoded.is_empty() {
+        from_caller.unwrap_or_default()
+    } else {
+        decoded
     }
 }
 
@@ -2583,7 +2622,52 @@ fn develop_full(raw: &RawImage) -> Option<Intermediate> {
     Some(Intermediate::ThreeColor(developed))
 }
 
-fn decode_linear_srgb(input: &Path, draft: bool, profiling: bool) -> Result<DecodedRaw, Error> {
+/// Decodes a RAW file, unwrapping a DNG's embedded original if the container
+/// itself cannot be decoded.
+///
+/// Orfeus used to unwrap every DNG before looking at it, which wrote a 131 MB
+/// temporary file and cost 489 ms on the first view of an 80 MP scan — and made
+/// a DNG without an embedded original impossible to open at all. Rawler reads
+/// these DNGs directly: the photosite values are identical to the original's at
+/// the same coordinates. What it does not read is the maker note the lens
+/// description lives in, so the caller supplies that instead.
+///
+/// The unwrapping stays as a fallback, in memory rather than through a file,
+/// and is only paid for by a file that needs it.
+pub(crate) fn decode_linear_srgb(
+    input: &Path,
+    draft: bool,
+    profiling: bool,
+) -> Result<DecodedRaw, Error> {
+    let source = RawSource::new(input)?;
+    let container_error = match decode_source(&source, draft, profiling) {
+        Ok(decoded) => return Ok(decoded),
+        Err(error) => error,
+    };
+    let Ok(original) = super::embedded_original(source.buf()) else {
+        return Err(container_error);
+    };
+    if profiling {
+        eprintln!(
+            "orfeus-profile source=embedded-original bytes={}",
+            original.len()
+        );
+    }
+    let source = RawSource::new_from_shared_vec(Arc::new(original)).with_path(input);
+    decode_source(&source, draft, profiling).map_err(|original_error| {
+        // Both failed, so say so: naming only one of them sends the reader to
+        // the wrong half of the file.
+        Error::Render(format!(
+            "{container_error}, and its embedded original: {original_error}"
+        ))
+    })
+}
+
+fn decode_source(
+    source: &RawSource,
+    draft: bool,
+    profiling: bool,
+) -> Result<DecodedRaw, Error> {
     let mut stage_started = Instant::now();
     macro_rules! profile_stage {
         ($name:literal) => {
@@ -2598,17 +2682,16 @@ fn decode_linear_srgb(input: &Path, draft: bool, profiling: bool) -> Result<Deco
             }
         };
     }
-    let source = RawSource::new(input)?;
     let loader = RawLoader::new();
     let decoder = loader
-        .get_decoder(&source)
+        .get_decoder(source)
         .map_err(|e| Error::Render(format!("RAW decoder: {e}")))?;
     let params = RawDecodeParams::default();
     let metadata = decoder
-        .raw_metadata(&source, &params)
+        .raw_metadata(source, &params)
         .map_err(|e| Error::Render(format!("RAW metadata: {e}")))?;
     let mut raw = decoder
-        .raw_image(&source, &params, false)
+        .raw_image(source, &params, false)
         .map_err(|e| Error::Render(format!("RAW decode: {e}")))?;
     profile_stage!("decode");
     correct_pixel_shift_cfa(&metadata.make, &metadata.model, &mut raw);
@@ -2849,10 +2932,12 @@ pub fn render(
     let orientation = decoded.orientation;
     let (native_max_width, native_max_height) =
         native_downscale_bounds(orientation, settings.max_width, settings.max_height);
+    // SAFETY: The caller promises a null or NUL-terminated lens name.
+    let named_lens = unsafe { borrowed_c_string(settings.lens_name, "lens name is not UTF-8")? };
     let (make, model, lens_name, focal) = (
         decoded.make.clone(),
         decoded.model.clone(),
-        decoded.lens_name.clone(),
+        effective_lens_name(&decoded.lens_name, named_lens).to_string(),
         decoded.focal,
     );
     // Downscaling first commutes with the linear white adaptation and exposure
