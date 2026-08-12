@@ -377,6 +377,27 @@ binning would drop detail the downscale would have kept."
                 :cache-p cache-p
                 :graph graph))
 
+(defmacro with-decoded-while ((input-pathname &rest decode-arguments) &body body)
+  "Run BODY while INPUT-PATHNAME decodes on another thread, and return its values.
+
+The first view of a photograph reads its lens description out of the file
+before it can render, which is half a second of ExifTool on a 116 MB DNG, and
+the decode that follows does not depend on the answer. Running them at once
+hides the shorter behind the longer. A decode that fails here is not reported:
+the render that follows will decode again and say so properly."
+  (let ((decoding (gensym "DECODING"))
+        (path (gensym "PATH")))
+    `(let* ((,path ,input-pathname)
+            (,decoding
+              (unless (photo-lens-tags-known-p ,path)
+                (sb-thread:make-thread
+                 (lambda ()
+                   (ignore-errors (native-raw-decode ,path ,@decode-arguments)))
+                 :name "Orfeus decode warm-up"))))
+       (unwind-protect (progn ,@body)
+         (when ,decoding
+           (ignore-errors (sb-thread:join-thread ,decoding :default nil)))))))
+
 (defun render-preview-rgb (input-pathname graph rgb-buffer capacity
                            &key (max-width 2048) (max-height 2048)
                              (grain-seed 0) (cache-p t))
@@ -386,7 +407,10 @@ The interactive hot path: no JPEG encode, no file, no metadata copy.
 Returns the oriented image width and height as two values."
   (check-type graph processing-graph)
   (multiple-value-bind (lens-profile focal-reducer lens-crop-factor)
-      (resolve-lens-profile-alias (photo-lens-description input-pathname))
+      (with-decoded-while
+          (input-pathname :max-width max-width :max-height max-height
+                          :draft-p t :cache-p cache-p)
+        (resolve-lens-profile-alias (photo-lens-description input-pathname)))
     (call-with-render-source
      input-pathname
      (lambda (render-input-pathname)

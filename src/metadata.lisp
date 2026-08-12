@@ -61,6 +61,16 @@ for with -f so an absent tag keeps its place in the output as a dash."
                 (cons description name)))
         cached)))
 
+(defun photo-lens-tags-known-p (pathname)
+  "Whether PATHNAME's lens tags have already been read.
+
+Callers that arrange to spend the ExifTool wait on other work need to know
+whether there is a wait at all: on a drag there is not, and the arranging would
+cost more than it saves."
+  (let ((key (cons (namestring (pathname pathname))
+                   (ignore-errors (file-write-date pathname)))))
+    (nth-value 1 (gethash key *photo-lens-cache*))))
+
 (defun photo-lens-description (pathname)
   "Return PATHNAME's best electronic lens description, or NIL if unavailable."
   (first (photo-lens-tags pathname)))

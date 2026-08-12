@@ -488,10 +488,46 @@ where
 ///
 /// Version 2 added `orfeus_raw_render_v2` with an opt-in decode cache.
 /// Version 3 adds `orfeus_raw_render_v3`, which executes a serialized
-/// processing node graph. Every earlier entry point is unchanged.
+/// processing node graph. Version 4 adds `orfeus_raw_decode_v1`, which fills
+/// the decode cache without rendering. Every earlier entry point is unchanged.
 #[unsafe(no_mangle)]
 pub extern "C" fn orfeus_bridge_abi_version() -> u32 {
-    3
+    4
+}
+
+/// Decode INPUT into the cache without rendering anything.
+///
+/// A render needs the lens description before it can start, and reading that
+/// out of the file costs half a second of ExifTool on a 116 MB DNG — while the
+/// decode it precedes does not depend on it at all. A caller can run this on
+/// another thread meanwhile and have the decode waiting when the description
+/// arrives. Only worth doing with the cache on; without it the work is thrown
+/// away and the render decodes again.
+///
+/// FLAGS, MAX_WIDTH and MAX_HEIGHT are the render frame's, so that a preview
+/// warms the same draft entry it will go on to ask for.
+///
+/// # Safety
+///
+/// `input_path` must be a readable NUL-terminated path, and the error buffer,
+/// when non-null, writable for its stated capacity.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn orfeus_raw_decode_v1(
+    input_path: *const c_char,
+    flags: u32,
+    max_width: u32,
+    max_height: u32,
+    cache_mode: u32,
+    error_buffer: *mut c_char,
+    error_capacity: usize,
+) -> i32 {
+    // SAFETY: Pointer validation and dereferences remain inside the boundary.
+    unsafe {
+        ffi_result(error_buffer, error_capacity, || {
+            let input = path_from_c(input_path)?;
+            graphex::prewarm_decode(input, flags, max_width, max_height, cache_mode)
+        })
+    }
 }
 
 /// Read `OriginalRawFileName` from a classic TIFF/DNG into a caller buffer.
@@ -939,7 +975,7 @@ mod tests {
 
     #[test]
     fn reports_current_abi_version() {
-        assert_eq!(orfeus_bridge_abi_version(), 3);
+        assert_eq!(orfeus_bridge_abi_version(), 4);
         assert_eq!(orfeus_raw_render_capabilities_v1(), 1 | 2 | 4 | 16);
     }
 

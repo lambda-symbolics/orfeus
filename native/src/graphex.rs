@@ -1357,6 +1357,23 @@ fn develops_draft(flags: u32, max_width: u32, max_height: u32) -> bool {
     flags & FRAME_FLAG_DRAFT != 0 && render::draft_requested(max_width, max_height)
 }
 
+/// Fills the decode cache for a frame that is about to be rendered.
+pub fn prewarm_decode(
+    input: &Path,
+    flags: u32,
+    max_width: u32,
+    max_height: u32,
+    cache_mode: u32,
+) -> Result<(), Error> {
+    if !matches!(cache_mode, render::CACHE_NONE | render::CACHE_USE) {
+        return Err(Error::InvalidArgument("unsupported decode cache mode"));
+    }
+    let profiling = std::env::var_os("ORFEUS_PROFILE").is_some();
+    let draft = develops_draft(flags, max_width, max_height);
+    render::decoded_for_render_with_identity(input, cache_mode, draft, profiling)?;
+    Ok(())
+}
+
 fn render_graph_image(
     input: &Path,
     frame: &RenderFrameV1,

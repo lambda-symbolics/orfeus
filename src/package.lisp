@@ -62,6 +62,7 @@
    #:photo-extract-embedded-preview
    #:photo-lens-description
    #:photo-lens-name
+   #:photo-lens-tags-known-p
    #:photo-job
    #:photo-job-input-path
    #:photo-job-output-path

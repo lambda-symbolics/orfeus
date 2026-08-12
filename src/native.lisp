@@ -693,6 +693,34 @@ image width and height as two values."
         (with-optional-foreign-string (name-pointer lens-name)
           (invoke lens-pointer name-pointer))))))
 
+(defcfun ("orfeus_raw_decode_v1" %raw-decode-v1) :int32
+  (input-path :string)
+  (flags :uint32)
+  (max-width :uint32)
+  (max-height :uint32)
+  (cache-mode :uint32)
+  (error-buffer :pointer)
+  (error-capacity :size))
+
+(defun native-raw-decode (input-pathname &key (max-width 0) (max-height 0)
+                                           draft-p (cache-p t))
+  "Decode INPUT-PATHNAME into the bridge's cache without rendering anything.
+
+Returns T when the decode succeeded. A caller runs this to spend a wait it
+would otherwise sit through — reading the lens description out of the file, in
+practice — on work the render is about to need anyway."
+  (native-library-load)
+  ;; Without the cache the decode has nowhere to land and the render would do
+  ;; it again, so there is nothing to gain and a whole image to waste.
+  (unless (and cache-p (>= (native-bridge-version) 4))
+    (return-from native-raw-decode nil))
+  (with-foreign-pointer (error-buffer *native-error-buffer-size*)
+    (zerop (with-native-float-traps
+             (%raw-decode-v1 (namestring input-pathname)
+                             (if draft-p +frame-flag-draft+ 0)
+                             max-width max-height (if cache-p 1 0)
+                             error-buffer *native-error-buffer-size*)))))
+
 (defun dng-original-filename (pathname)
   "Return the embedded original filename recorded by DNG PATHNAME."
   (native-library-load)
