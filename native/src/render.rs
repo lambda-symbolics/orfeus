@@ -888,6 +888,99 @@ fn median_of_9(mut samples: [f32; 9]) -> f32 {
     samples[4]
 }
 
+/// Paeth's network again, eight pixels at a time.
+///
+/// The exchanges become min/max pairs, which for finite samples is the same
+/// comparison the scalar network makes — a chroma plane holds differences of
+/// developed pixels, so it is finite wherever the decode was. Nineteen vector
+/// instructions replace nineteen scalar ones per pixel, and the median is the
+/// second largest step of a chroma denoise.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn median_of_9_avx(mut samples: [std::arch::x86_64::__m256; 9]) -> std::arch::x86_64::__m256 {
+    use std::arch::x86_64::{_mm256_max_ps, _mm256_min_ps};
+    macro_rules! exchange {
+        ($a:expr, $b:expr) => {{
+            let low = _mm256_min_ps(samples[$a], samples[$b]);
+            let high = _mm256_max_ps(samples[$a], samples[$b]);
+            samples[$a] = low;
+            samples[$b] = high;
+        }};
+    }
+    exchange!(1, 2);
+    exchange!(4, 5);
+    exchange!(7, 8);
+    exchange!(0, 1);
+    exchange!(3, 4);
+    exchange!(6, 7);
+    exchange!(1, 2);
+    exchange!(4, 5);
+    exchange!(7, 8);
+    exchange!(0, 3);
+    exchange!(5, 8);
+    exchange!(4, 7);
+    exchange!(3, 6);
+    exchange!(1, 4);
+    exchange!(2, 5);
+    exchange!(4, 7);
+    exchange!(2, 4);
+    exchange!(4, 6);
+    exchange!(2, 4);
+    samples[4]
+}
+
+/// One row's interior, eight pixels at a time. Columns whose neighbourhood
+/// would clamp against an edge are left to the scalar path.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn median_row_avx(
+    output_row: &mut [f32],
+    above: *const f32,
+    center: *const f32,
+    below: *const f32,
+    blend: f32,
+) -> usize {
+    use std::arch::x86_64::{
+        _mm256_add_ps, _mm256_loadu_ps, _mm256_mul_ps, _mm256_set1_ps, _mm256_storeu_ps,
+        _mm256_sub_ps,
+    };
+    let width = output_row.len();
+    if width < 10 {
+        return 1;
+    }
+    let mixture = _mm256_set1_ps(blend);
+    let mut x = 1;
+    // SAFETY: Each load reads eight lanes starting at x-1, and x + 8 stays
+    // below width - 1, so every tap is inside its own row.
+    unsafe {
+        while x + 8 < width {
+            let samples = [
+                _mm256_loadu_ps(above.add(x - 1)),
+                _mm256_loadu_ps(above.add(x)),
+                _mm256_loadu_ps(above.add(x + 1)),
+                _mm256_loadu_ps(center.add(x - 1)),
+                _mm256_loadu_ps(center.add(x)),
+                _mm256_loadu_ps(center.add(x + 1)),
+                _mm256_loadu_ps(below.add(x - 1)),
+                _mm256_loadu_ps(below.add(x)),
+                _mm256_loadu_ps(below.add(x + 1)),
+            ];
+            let own = samples[4];
+            let median = median_of_9_avx(samples);
+            // Multiply and add separately rather than fusing them: an FMA
+            // rounds once where the scalar path rounds twice, and the two
+            // paths have to agree to the bit.
+            let mixed = _mm256_add_ps(
+                own,
+                _mm256_mul_ps(_mm256_sub_ps(median, own), mixture),
+            );
+            _mm256_storeu_ps(output_row.as_mut_ptr().add(x), mixed);
+            x += 8;
+        }
+    }
+    x
+}
+
 fn median_filter_3x3_into(
     source: &[f32],
     width: usize,
@@ -897,6 +990,7 @@ fn median_filter_3x3_into(
 ) {
     // Written in full below, so no clear; see `edge_guided_blur_into`.
     output.resize(source.len(), 0.0);
+    let use_avx = super::nn::fma_available();
     output
         .par_chunks_mut(width)
         .enumerate()
@@ -904,7 +998,23 @@ fn median_filter_3x3_into(
             let above = &source[y.saturating_sub(1) * width..];
             let center = &source[y * width..];
             let below = &source[(y + 1).min(height - 1) * width..];
-            for (x, value) in output_row.iter_mut().enumerate() {
+            let mut vectorized = 1;
+            #[cfg(target_arch = "x86_64")]
+            if use_avx {
+                // SAFETY: AVX2 was detected, and each row slice is at least
+                // `width` long because `source` holds whole rows.
+                vectorized = unsafe {
+                    median_row_avx(
+                        output_row,
+                        above.as_ptr(),
+                        center.as_ptr(),
+                        below.as_ptr(),
+                        blend,
+                    )
+                };
+            }
+            let _ = use_avx;
+            let scalar = |x: usize, value: &mut f32| {
                 let left = x.saturating_sub(1);
                 let right = (x + 1).min(width - 1);
                 let median = median_of_9([
@@ -919,6 +1029,14 @@ fn median_filter_3x3_into(
                     below[right],
                 ]);
                 *value = center[x] + (median - center[x]) * blend;
+            };
+            // The first column, whatever the vector loop did not reach, and
+            // the last column.
+            scalar(0, &mut output_row[0]);
+            for x in vectorized..width {
+                let mut value = 0.0;
+                scalar(x, &mut value);
+                output_row[x] = value;
             }
         });
 }
@@ -1007,6 +1125,21 @@ pub(crate) fn cpu_noise_reduction(image: &mut RgbImage, luma: f32, chroma: f32) 
     if (luma == 0.0 && chroma == 0.0) || image.width < 3 || image.height < 3 {
         return;
     }
+    let profiling = std::env::var_os("ORFEUS_PROFILE").is_some();
+    let mut step_started = Instant::now();
+    macro_rules! profile_step {
+        ($name:expr) => {
+            if profiling {
+                let now = Instant::now();
+                eprintln!(
+                    "orfeus-profile noise-step={} milliseconds={:.3}",
+                    $name,
+                    now.duration_since(step_started).as_secs_f64() * 1000.0
+                );
+                step_started = now;
+            }
+        };
+    }
     let pixel_count = image.width * image.height;
     // Zero-filled and then overwritten, which wastes a 240 MB memset at export
     // resolution — but measurably less than the alternatives: collecting the
@@ -1032,6 +1165,7 @@ pub(crate) fn cpu_noise_reduction(image: &mut RgbImage, luma: f32, chroma: f32) 
             }
         });
 
+    profile_step!("split");
     let mut scratch = Vec::new();
     let mut filtered = Vec::new();
     let luma_strength = luma.clamp(0.0, 1.0);
@@ -1072,6 +1206,7 @@ pub(crate) fn cpu_noise_reduction(image: &mut RgbImage, luma: f32, chroma: f32) 
             });
     }
 
+    profile_step!("luma");
     let chroma_strength = chroma.clamp(0.0, 1.0);
     if chroma_strength > 0.0 {
         for channel in [&mut cb, &mut cr] {
@@ -1085,6 +1220,7 @@ pub(crate) fn cpu_noise_reduction(image: &mut RgbImage, luma: f32, chroma: f32) 
                 &mut filtered,
             );
             std::mem::swap(channel, &mut filtered);
+            profile_step!("chroma-median");
             for (step, amount) in [
                 (1, (chroma_strength * 1.8).min(1.0)),
                 (2, (chroma_strength * 1.25).min(1.0)),
@@ -1102,6 +1238,7 @@ pub(crate) fn cpu_noise_reduction(image: &mut RgbImage, luma: f32, chroma: f32) 
                         &mut filtered,
                     );
                     std::mem::swap(channel, &mut filtered);
+                    profile_step!(format!("chroma-blur-{step}"));
                 }
             }
         }
@@ -1127,6 +1264,8 @@ pub(crate) fn cpu_noise_reduction(image: &mut RgbImage, luma: f32, chroma: f32) 
                 pixel[1] = (*yy - 0.2126 * pixel[0] - 0.0722 * pixel[2]) / 0.7152;
             }
         });
+    profile_step!("merge");
+    let _ = step_started;
 }
 
 /// Whether a sample coordinate lies inside the image.
@@ -3876,6 +4015,56 @@ mod tests {
         assert_eq!(median_of_9(samples), sorted[4]);
         let ramp = [9.0_f32, 8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0];
         assert_eq!(median_of_9(ramp), 5.0);
+    }
+
+    #[test]
+    fn the_vectorized_median_filter_matches_the_scalar_one_exactly() {
+        // A median is exact, so the vector path may not differ by so much as a
+        // bit; a plane wide enough to have an interior, a vector remainder and
+        // both clamped edges catches a mistake in any of them.
+        for width in [11_usize, 19, 24, 33, 64, 97, 1024, 4099] {
+            let height = 7;
+            let source: Vec<f32> = (0..width * height)
+                .map(|index| {
+                    // Flat runs, duplicates and both signed zeros as well as a
+                    // ramp: a chroma plane is a difference, so exact zeros are
+                    // its most common value.
+                    match (index * 2_654_435_761_usize) % 13 {
+                        0 => 0.0,
+                        1 => -0.0,
+                        2 => 0.25,
+                        3 => -0.25,
+                        4 => 4.0,
+                        other => (other as f32) / 500.0 - 1.0,
+                    }
+                })
+                .collect();
+            let mut vectorized = Vec::new();
+            median_filter_3x3_into(&source, width, height, 0.75, &mut vectorized);
+            let mut scalar = vec![0.0_f32; source.len()];
+            for y in 0..height {
+                let above = &source[y.saturating_sub(1) * width..];
+                let center = &source[y * width..];
+                let below = &source[(y + 1).min(height - 1) * width..];
+                for x in 0..width {
+                    let left = x.saturating_sub(1);
+                    let right = (x + 1).min(width - 1);
+                    let median = median_of_9([
+                        above[left],
+                        above[x],
+                        above[right],
+                        center[left],
+                        center[x],
+                        center[right],
+                        below[left],
+                        below[x],
+                        below[right],
+                    ]);
+                    scalar[y * width + x] = center[x] + (median - center[x]) * 0.75;
+                }
+            }
+            assert_eq!(vectorized, scalar, "width {width}");
+        }
     }
 
     #[test]
