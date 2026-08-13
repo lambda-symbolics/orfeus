@@ -179,11 +179,31 @@ fn reconstruct_clipped<const N: usize>(camera: &[f32; N], balanced: &mut [f32; N
 /// on the same machine's RTX 2000 across PCIe. Only stages with real arithmetic
 /// per byte — the tone transfer's `pow`, for one — repay the round trip.
 fn transform_pixels<const N: usize>(
-    pixels: Vec<[f32; N]>,
+    mut pixels: Vec<[f32; N]>,
     white_balance: &[f32; N],
     matrix: &[[f32; N]; 3],
 ) -> Vec<f32> {
     use rayon::prelude::*;
+    if N == 3 {
+        // Three channels in, three out: transform where the pixels already are
+        // and hand back the same allocation. At 80 MP the alternative is a
+        // second gigabyte, held at the same time as the first.
+        pixels.par_chunks_mut(8192).for_each(|source| {
+            for pixel in source {
+                let mut balanced: [f32; N] =
+                    std::array::from_fn(|channel| pixel[channel] * white_balance[channel]);
+                reconstruct_clipped(pixel, &mut balanced);
+                for (value, row) in pixel.iter_mut().zip(matrix) {
+                    *value = row
+                        .iter()
+                        .zip(&balanced)
+                        .map(|(coefficient, channel)| coefficient * channel)
+                        .sum();
+                }
+            }
+        });
+        return flatten_triples(pixels);
+    }
     let mut output = vec![0.0_f32; pixels.len() * 3];
     output
         .par_chunks_mut(3 * 8192)
@@ -203,6 +223,21 @@ fn transform_pixels<const N: usize>(
             }
         });
     output
+}
+
+/// Reads a vector of RGB triples as the flat vector of samples it already is.
+///
+/// An array of three floats is three contiguous floats with a float's own
+/// alignment and no padding, so the buffer's bytes, size and alignment are the
+/// same either way; only the element type the allocator will be told about on
+/// free changes, and it changes to one of the same total layout.
+fn flatten_triples<const N: usize>(pixels: Vec<[f32; N]>) -> Vec<f32> {
+    assert_eq!(N, 3, "only RGB triples flatten to three samples each");
+    let mut pixels = std::mem::ManuallyDrop::new(pixels);
+    let (pointer, length, capacity) = (pixels.as_mut_ptr(), pixels.len(), pixels.capacity());
+    // SAFETY: `[f32; 3]` is three contiguous `f32` with the same alignment, so
+    // the same allocation describes three times as many samples exactly.
+    unsafe { Vec::from_raw_parts(pointer.cast::<f32>(), length * 3, capacity * 3) }
 }
 
 /// Converts demosaiced camera channels to white-balanced, unclipped linear sRGB.
