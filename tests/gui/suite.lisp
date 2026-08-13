@@ -761,8 +761,19 @@ against 45 milliseconds for a canvas-sized render."
            "Preview status did not use one literal percent sign")
     (check (null (search "100%%" text))
            "Preview status contains a C-style doubled percent sign")
-    (check (search "NR: 35%" text)
-           "Preview status does not report active noise reduction")))
+    (check (search "NR: edge-aware 35%" text)
+           "Preview status does not name the denoiser that ran")
+    ;; The two denoisers are exclusive, so the status names one of them.
+    (let* ((neural (orfeus:make-processing-settings
+                    :neural-noise-reduction 0.5))
+           (project (orfeus:make-project :output-directory #P"exports/"
+                                         :defaults neural))
+           (text (orfeus/gui::preview-status-text
+                  (orfeus/gui:make-gui-model :project project))))
+      (check (search "NR: neural 50%" text)
+             "Preview status does not report the neural denoiser")
+      (check (null (search "edge-aware" text))
+             "Preview status reports a denoiser that did not run"))))
 
 (defun test-preview-priority-order ()
   (check (equal '(0 1 2 3 4)

@@ -1063,6 +1063,63 @@ fn median_filter_3x3_into(
         });
 }
 
+/// Averages a plane down by two in each direction, an odd edge included.
+fn downsample_half(plane: &[f32], width: usize, height: usize) -> Vec<f32> {
+    let (half_width, half_height) = (width.div_ceil(2), height.div_ceil(2));
+    let mut output = vec![0.0_f32; half_width * half_height];
+    output
+        .par_chunks_mut(half_width)
+        .enumerate()
+        .for_each(|(y, row)| {
+            let top = y * 2;
+            let bottom = (top + 1).min(height - 1);
+            for (x, value) in row.iter_mut().enumerate() {
+                let left = x * 2;
+                let right = (left + 1).min(width - 1);
+                *value = 0.25
+                    * (plane[top * width + left]
+                        + plane[top * width + right]
+                        + plane[bottom * width + left]
+                        + plane[bottom * width + right]);
+            }
+        });
+    output
+}
+
+/// Writes a half-sized plane back at full size, interpolating between its
+/// samples so a denoised colour plane does not arrive in visible blocks.
+fn upsample_double_into(
+    plane: &[f32],
+    half_width: usize,
+    half_height: usize,
+    output: &mut [f32],
+    width: usize,
+) {
+    output
+        .par_chunks_mut(width)
+        .enumerate()
+        .for_each(|(y, row)| {
+            // Half-resolution sample centres sit at 0.25 and 0.75 of each pair,
+            // so a full-resolution pixel lies a quarter or three quarters of
+            // the way between two of them.
+            let source = (y as f32 - 0.5) * 0.5;
+            let top = source.floor().max(0.0) as usize;
+            let bottom = (top + 1).min(half_height - 1);
+            let vertical = (source - source.floor().max(0.0)).clamp(0.0, 1.0);
+            for (x, value) in row.iter_mut().enumerate() {
+                let source = (x as f32 - 0.5) * 0.5;
+                let left = source.floor().max(0.0) as usize;
+                let right = (left + 1).min(half_width - 1);
+                let horizontal = (source - source.floor().max(0.0)).clamp(0.0, 1.0);
+                let above = plane[top * half_width + left] * (1.0 - horizontal)
+                    + plane[top * half_width + right] * horizontal;
+                let below = plane[bottom * half_width + left] * (1.0 - horizontal)
+                    + plane[bottom * half_width + right] * horizontal;
+                *value = above * (1.0 - vertical) + below * vertical;
+            }
+        });
+}
+
 fn soft_threshold(value: f32, threshold: f32) -> f32 {
     value.signum() * (value.abs() - threshold).max(0.0)
 }
@@ -1231,17 +1288,25 @@ pub(crate) fn cpu_noise_reduction(image: &mut RgbImage, luma: f32, chroma: f32) 
     profile_step!("luma");
     let chroma_strength = chroma.clamp(0.0, 1.0);
     if chroma_strength > 0.0 {
+        // Colour noise is coarse and colour detail is not: a sensor's chroma
+        // is interpolated from a quarter of its photosites to begin with, and
+        // every codec ever shipped stores it at half resolution. Denoising it
+        // there costs a quarter of the work and reaches wider blotches for the
+        // same filter, which is the half of this stage that was slowest.
+        let (half_width, half_height) = (image.width.div_ceil(2), image.height.div_ceil(2));
+        let guide = downsample_half(&yy, image.width, image.height);
         for channel in [&mut cb, &mut cr] {
+            let mut small = downsample_half(channel, image.width, image.height);
             // Each stage writes the already-mixed result into `filtered` and
             // then trades buffers with it, so nothing traverses the plane twice.
             median_filter_3x3_into(
-                channel,
-                image.width,
-                image.height,
+                &small,
+                half_width,
+                half_height,
                 (chroma_strength * 1.5).min(1.0),
                 &mut filtered,
             );
-            std::mem::swap(channel, &mut filtered);
+            std::mem::swap(&mut small, &mut filtered);
             profile_step!("chroma-median");
             for (step, amount) in [
                 (1, (chroma_strength * 1.8).min(1.0)),
@@ -1250,19 +1315,21 @@ pub(crate) fn cpu_noise_reduction(image: &mut RgbImage, luma: f32, chroma: f32) 
             ] {
                 if amount > 0.0 {
                     edge_guided_blur_into(
-                        channel,
-                        &yy,
-                        image.width,
-                        image.height,
+                        &small,
+                        &guide,
+                        half_width,
+                        half_height,
                         step,
                         amount,
                         &mut scratch,
                         &mut filtered,
                     );
-                    std::mem::swap(channel, &mut filtered);
+                    std::mem::swap(&mut small, &mut filtered);
                     profile_step!(format!("chroma-blur-{step}"));
                 }
             }
+            upsample_double_into(&small, half_width, half_height, channel, image.width);
+            profile_step!("chroma-upsample");
         }
     }
 
@@ -3192,19 +3259,25 @@ pub fn render(
     profile_stage!("lens");
     image = orient(image, orientation);
     profile_stage!("orient");
-    apply_noise_reduction(
-        &mut image,
-        settings.luma_noise_reduction,
-        settings.chroma_noise_reduction,
-    );
+    // One denoiser or the other. The neural one is not a finishing pass over
+    // the edge-aware one's output: it was trained on sensor noise, and handing
+    // it something already smoothed asks it to model noise that is no longer
+    // there while the two together erase texture neither would alone.
+    if settings.neural_noise_reduction > 0.0 {
+        super::nn::apply_neural_noise_reduction(
+            &mut image.data,
+            image.width,
+            image.height,
+            settings.neural_noise_reduction,
+        )?;
+    } else {
+        apply_noise_reduction(
+            &mut image,
+            settings.luma_noise_reduction,
+            settings.chroma_noise_reduction,
+        );
+    }
     profile_stage!("noise-reduction");
-    super::nn::apply_neural_noise_reduction(
-        &mut image.data,
-        image.width,
-        image.height,
-        settings.neural_noise_reduction,
-    )?;
-    profile_stage!("neural-noise-reduction");
     apply_tonal_equalizer(
         &mut image,
         [
@@ -3526,6 +3599,159 @@ mod tests {
                 "display-transform-benchmark {label:22} threads={} median={:.3} ms {times:?}",
                 rayon::current_num_threads(),
                 times[2]
+            );
+        }
+    }
+
+    /// A scene with the features a denoiser has to tell apart: flat fields at
+    /// several brightnesses, hard edges, a fine texture, and a smooth ramp.
+    fn denoise_test_scene(width: usize, height: usize) -> Vec<f32> {
+        let mut data = vec![0.0_f32; width * height * 3];
+        for y in 0..height {
+            for x in 0..width {
+                let (u, v) = (x as f32 / width as f32, y as f32 / height as f32);
+                let band = (v * 4.0) as usize;
+                let base = match band {
+                    0 => 0.06,             // deep shadow, where noise shows most
+                    1 => 0.20 + u * 0.30,  // a smooth ramp for banding
+                    2 => {
+                        // Hard edges: a bar chart the denoiser must not soften.
+                        if ((x / 37) % 2) == 0 { 0.62 } else { 0.30 }
+                    }
+                    _ => {
+                        // Fine texture at the scale noise lives at.
+                        0.45 + 0.10 * (((x / 2 + y / 2) % 2) as f32 - 0.5)
+                    }
+                };
+                let tint = [1.0, 0.94, 0.88];
+                for channel in 0..3 {
+                    data[(y * width + x) * 3 + channel] = base * tint[channel];
+                }
+            }
+        }
+        data
+    }
+
+    /// Photon noise plus a read floor, deterministically. Variance rises with
+    /// the signal, which is what makes a fixed threshold the wrong tool.
+    fn add_sensor_noise(clean: &[f32], scale: f32) -> Vec<f32> {
+        let mut state = 0x2545_F491_4F6C_DD1D_u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 40) as f32 / 16_777_216.0 - 0.5
+        };
+        clean
+            .iter()
+            .map(|value| {
+                // Two draws for something closer to Gaussian than a single one.
+                let unit = next() + next();
+                let shot = scale * (value.max(0.0).sqrt() * 0.9 + 0.25);
+                value + unit * shot
+            })
+            .collect()
+    }
+
+    fn peak_signal_to_noise(clean: &[f32], other: &[f32]) -> f32 {
+        let error: f64 = clean
+            .iter()
+            .zip(other)
+            .map(|(clean, other)| {
+                let difference = (*clean - *other) as f64;
+                difference * difference
+            })
+            .sum::<f64>()
+            / clean.len() as f64;
+        if error <= 0.0 {
+            return f32::INFINITY;
+        }
+        (10.0 * (1.0_f64 / error).log10()) as f32
+    }
+
+    /// Noise left in a flat field, separately for brightness and for colour.
+    ///
+    /// Measured apart because the two halves of the denoiser are separate and
+    /// a reader of one number cannot tell which one moved: red carries both Y
+    /// and Cr, so chroma work flatters a luma measurement taken off it.
+    fn flat_field_noise(data: &[f32], width: usize, height: usize) -> (f32, f32) {
+        let mut luma = (0.0_f64, 0.0_f64);
+        let mut chroma = (0.0_f64, 0.0_f64);
+        let mut count = 0.0_f64;
+        for y in 8..height / 4 - 8 {
+            for x in 8..width - 8 {
+                let pixel = &data[(y * width + x) * 3..][..3];
+                let y_value =
+                    (0.2126 * pixel[0] + 0.7152 * pixel[1] + 0.0722 * pixel[2]) as f64;
+                let cr = pixel[0] as f64 - y_value;
+                luma = (luma.0 + y_value, luma.1 + y_value * y_value);
+                chroma = (chroma.0 + cr, chroma.1 + cr * cr);
+                count += 1.0;
+            }
+        }
+        let deviation = |(total, squares): (f64, f64)| {
+            let mean = total / count;
+            ((squares / count - mean * mean).max(0.0)).sqrt() as f32
+        };
+        (deviation(luma), deviation(chroma))
+    }
+
+    /// Mean height of the bar-chart steps, which the clean scene sets at 0.32.
+    /// A denoiser that smooths edges away loses this; one that sharpens
+    /// inflates it.
+    fn edge_height(data: &[f32], width: usize, height: usize) -> f32 {
+        let row = height * 5 / 8;
+        let mut total = 0.0_f32;
+        let mut count = 0.0_f32;
+        let mut boundary = 37;
+        while boundary + 4 < width {
+            let before = data[(row * width + boundary - 4) * 3];
+            let after = data[(row * width + boundary + 4) * 3];
+            total += (after - before).abs();
+            count += 1.0;
+            boundary += 37;
+        }
+        if count > 0.0 { total / count } else { 0.0 }
+    }
+
+    /// Measures what the noise reduction actually achieves, against a scene
+    /// whose clean version is known.
+    #[test]
+    #[ignore = "prints machine-specific timings"]
+    fn benchmark_noise_reduction_quality() {
+        let (width, height) = (1600, 1200);
+        let clean = denoise_test_scene(width, height);
+        let noisy = add_sensor_noise(&clean, 0.09);
+        for (label, data) in [("clean", &clean), ("noisy", &noisy)] {
+            let (luma, chroma) = flat_field_noise(data, width, height);
+            eprintln!(
+                "noise-quality {label:22} psnr={:.2} dB  luma sigma={luma:.4}  chroma sigma={chroma:.4}  edge={:.3}",
+                peak_signal_to_noise(&clean, data),
+                edge_height(data, width, height)
+            );
+        }
+        for (label, luma, chroma) in [
+            // What the slider used to mean: a fifth of it for brightness.
+            ("old mapping, slider 0.35", 0.2 * 0.35, 0.35),
+            ("old mapping, slider 1.00", 0.2, 1.0),
+            // What it means now.
+            ("slider 0.35", 0.35, 0.35),
+            ("slider 0.60", 0.60, 0.60),
+            ("slider 1.00", 1.0, 1.0),
+        ] {
+            let mut image = RgbImage {
+                width,
+                height,
+                data: noisy.clone(),
+            };
+            let started = std::time::Instant::now();
+            cpu_noise_reduction(&mut image, luma, chroma);
+            let milliseconds = started.elapsed().as_secs_f64() * 1000.0;
+            let (luma_sigma, chroma_sigma) = flat_field_noise(&image.data, width, height);
+            eprintln!(
+                "noise-quality {label:22} psnr={:.2} dB  luma sigma={luma_sigma:.4}  chroma sigma={chroma_sigma:.4}  edge={:.3}  {milliseconds:.0} ms",
+                peak_signal_to_noise(&clean, &image.data),
+                edge_height(&image.data, width, height)
             );
         }
     }

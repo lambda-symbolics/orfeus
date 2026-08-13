@@ -995,10 +995,16 @@ new cache entry is published."
               (neural (gui-model-setting model :neural-noise-reduction))
               (lut (gui-model-setting model :lut-path))
               (strength (gui-model-setting model :lut-strength)))
-          (format nil "RAW preview  |  WB: ~A  |  NR: ~D%~@[  |  Neural: ~D%~]  |  LUT: ~A"
+          ;; One denoiser runs, not both, so name the one that did rather
+          ;; than listing a strength that was never applied.
+          (format nil "RAW preview  |  WB: ~A  |  NR: ~A  |  LUT: ~A"
                   (if temperature "Custom" "As shot")
-                  (round (* 100 noise-reduction))
-                  (when (plusp neural) (round (* 100 neural)))
+                  (cond ((plusp neural)
+                         (format nil "neural ~D%" (round (* 100 neural))))
+                        ((plusp noise-reduction)
+                         (format nil "edge-aware ~D%"
+                                 (round (* 100 noise-reduction))))
+                        (t "off"))
                   (if (and lut (plusp strength))
                       (format nil "~A (~D%)" (file-namestring lut)
                               (round (* 100 strength)))

@@ -1040,14 +1040,23 @@ fn execute_graph_into(
                 render::apply_exposure(&mut image, op.params[0]);
             }
             NODE_NOISE_REDUCTION => {
+                // One denoiser or the other, and the edge-aware one asks the
+                // same of brightness as of colour. It used to get a fifth of
+                // the slider for brightness, which is the noise that shows:
+                // at the default setting that left grain untouched — a
+                // measured drop of a tenth against a half for colour.
                 let edge = op.params[0];
-                render::apply_noise_reduction(&mut image, 0.2 * edge, edge);
-                super::nn::apply_neural_noise_reduction(
-                    &mut image.data,
-                    image.width,
-                    image.height,
-                    op.params[1],
-                )?;
+                let neural = op.params[1];
+                if neural > 0.0 {
+                    super::nn::apply_neural_noise_reduction(
+                        &mut image.data,
+                        image.width,
+                        image.height,
+                        neural,
+                    )?;
+                } else {
+                    render::apply_noise_reduction(&mut image, edge, edge);
+                }
             }
             NODE_TONE => {
                 let adjustments: [f32; 7] = op.params[..7]
