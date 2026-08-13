@@ -34,34 +34,42 @@ preview files needs."
         (buffer (make-array (* 8 +digest-chunk-words+)
                             :element-type '(unsigned-byte 8)))
         (total 0))
+    ;; A byte count is a fixnum for any file that can be read at all, and
+    ;; saying so keeps the mixing in machine words: declared merely as an
+    ;; UNSIGNED-BYTE it could be a bignum, so both the running total and the
+    ;; final fold compiled to generic arithmetic.
     (declare (type (unsigned-byte 64) low high)
              (type (simple-array (unsigned-byte 8) (*)) buffer)
-             (type unsigned-byte total)
-             (optimize (speed 3)))
+             (type fixnum total))
     (with-open-file (stream pathname :element-type '(unsigned-byte 8))
       (loop
         (let ((count (read-sequence buffer stream)))
           (declare (type fixnum count))
           (when (zerop count) (return))
           (incf total count)
-          (let ((words (ash count -3)))
-            (declare (type fixnum words))
-            (sb-sys:with-pinned-objects (buffer)
-              (let ((sap (sb-sys:vector-sap buffer)))
-                (loop for index of-type fixnum below words
-                      do (let ((word (sb-sys:sap-ref-64 sap (ash index 3))))
-                           (declare (type (unsigned-byte 64) word))
-                           (setf low (ldb (byte 64 0)
-                                          (* (logxor low word) +fnv-prime+))
-                                 high (ldb (byte 64 0)
-                                           (* (logxor high (logxor word index))
-                                              +fnv-prime+)))))))
-            ;; Bytes past the last whole word exist only at end of file, so the
-            ;; tail is folded here in the same order a separate pass would.
-            (loop for offset of-type fixnum from (ash words 3) below count
-                  do (setf low (ldb (byte 64 0)
-                                    (* (logxor low (aref buffer offset))
-                                       +fnv-prime+)))))
+          ;; Speed is asked for here, over the words, and not of the once-per
+          ;; file work outside: hex formatting has to box these words whatever
+          ;; the policy, and being told so on every build says nothing.
+          (locally (declare (optimize (speed 3)))
+            (let ((words (ash count -3)))
+              (declare (type fixnum words))
+              (sb-sys:with-pinned-objects (buffer)
+                (let ((sap (sb-sys:vector-sap buffer)))
+                  (loop for index of-type fixnum below words
+                        do (let ((word (sb-sys:sap-ref-64 sap (ash index 3))))
+                             (declare (type (unsigned-byte 64) word))
+                             (setf low (ldb (byte 64 0)
+                                            (* (logxor low word) +fnv-prime+))
+                                   high (ldb (byte 64 0)
+                                             (* (logxor high (logxor word index))
+                                                +fnv-prime+)))))))
+              ;; Bytes past the last whole word exist only at end of file, so
+              ;; the tail is folded here in the same order a separate pass
+              ;; would.
+              (loop for offset of-type fixnum from (ash words 3) below count
+                    do (setf low (ldb (byte 64 0)
+                                      (* (logxor low (aref buffer offset))
+                                         +fnv-prime+))))))
           ;; A short read means end of file, and only whole chunks may mix
           ;; indices 0..CHUNK-1, so stopping here keeps the key stable.
           (when (< count (length buffer)) (return)))))

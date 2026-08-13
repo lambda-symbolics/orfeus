@@ -1419,51 +1419,53 @@ new cache entry is published."
                    (when (and frame-width (plusp frame-width)
                               (plusp frame-height))
                      (values frame-width frame-height))))))
-           (active-crop-ratio ()
+           (crop-frame-and-ratio ()
+             ;; The frame and the proportions locked against it. Both callers
+             ;; need the frame as well as the ratio — a ratio is meaningless
+             ;; without the frame it is a ratio of — so this returns the three
+             ;; together rather than each fetching the frame again.
              (multiple-value-bind (frame-width frame-height) (crop-frame-size)
-               (and frame-width
-                    (crop-aspect-ratio crop-aspect frame-width frame-height))))
+               (values frame-width frame-height
+                       (and frame-width
+                            (crop-aspect-ratio crop-aspect frame-width
+                                               frame-height)))))
            (reshape-crop-to-aspect (node)
              ;; Shrink the current rectangle to the locked proportions about its
              ;; own centre. Shrinking rather than growing, so choosing a ratio
              ;; never pulls back in a part of the frame that had been cropped
              ;; away — the crop only ever tightens until the user widens it.
-             (multiple-value-bind (frame-width frame-height) (crop-frame-size)
-               (let ((ratio (and frame-width
-                                 (crop-aspect-ratio crop-aspect frame-width
-                                                    frame-height))))
-                 (when ratio
-                   (multiple-value-bind (left top width height)
-                       (crop-node-rect node)
-                     (multiple-value-call #'apply-crop-rect node
-                       (crop-rect-for-ratio left top width height
-                                            frame-width frame-height
-                                            ratio)))))))
+             (multiple-value-bind (frame-width frame-height ratio)
+                 (crop-frame-and-ratio)
+               (when ratio
+                 (multiple-value-bind (left top width height)
+                     (crop-node-rect node)
+                   (multiple-value-call #'apply-crop-rect node
+                     (crop-rect-for-ratio left top width height
+                                          frame-width frame-height
+                                          ratio))))))
            (set-crop-size-fraction (node axis fraction)
              ;; Size one axis as a share of the frame, keeping the centre. Under
              ;; a locked ratio the other axis follows, so the two fields stay
              ;; consistent with the lock instead of fighting it.
-             (multiple-value-bind (frame-width frame-height) (crop-frame-size)
-               (let ((ratio (and frame-width
-                                 (crop-aspect-ratio crop-aspect frame-width
-                                                    frame-height))))
-                 (multiple-value-bind (left top width height)
-                     (crop-node-rect node)
-                   (let* ((fraction (min 1.0d0 (max 0.05d0 fraction)))
-                          (new-width (if (eq axis :width) fraction width))
-                          (new-height (if (eq axis :height) fraction height)))
-                     (when ratio
-                       (if (eq axis :width)
-                           (setf new-height (/ (* new-width frame-width)
-                                               ratio frame-height))
-                           (setf new-width (/ (* new-height frame-height ratio)
-                                              frame-width))))
-                     (let ((center-u (+ left (/ width 2)))
-                           (center-v (+ top (/ height 2))))
-                       (apply-crop-rect node
-                                        (- center-u (/ new-width 2))
-                                        (- center-v (/ new-height 2))
-                                        new-width new-height))))))) 
+             (multiple-value-bind (frame-width frame-height ratio)
+                 (crop-frame-and-ratio)
+               (multiple-value-bind (left top width height)
+                   (crop-node-rect node)
+                 (let* ((fraction (min 1.0d0 (max 0.05d0 fraction)))
+                        (new-width (if (eq axis :width) fraction width))
+                        (new-height (if (eq axis :height) fraction height)))
+                   (when ratio
+                     (if (eq axis :width)
+                         (setf new-height (/ (* new-width frame-width)
+                                             ratio frame-height))
+                         (setf new-width (/ (* new-height frame-height ratio)
+                                            frame-width))))
+                   (let ((center-u (+ left (/ width 2)))
+                         (center-v (+ top (/ height 2))))
+                     (apply-crop-rect node
+                                      (- center-u (/ new-width 2))
+                                      (- center-v (/ new-height 2))
+                                      new-width new-height))))))
            (set-crop-node-angle (node angle)
              ;; The crop stage is bypassed while its node is selected, so
              ;; an angle change only moves the overlay; no re-render.
