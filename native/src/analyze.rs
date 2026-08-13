@@ -374,6 +374,7 @@ mod tests {
             model: String::new(),
             lens_name: String::new(),
             focal: 0.0,
+            as_shot_kelvin: None,
         }
     }
 
@@ -460,6 +461,7 @@ mod tests {
             model: String::new(),
             lens_name: String::new(),
             focal: 0.0,
+            as_shot_kelvin: None,
         }
     }
 

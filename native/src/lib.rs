@@ -492,7 +492,38 @@ where
 /// the decode cache without rendering. Every earlier entry point is unchanged.
 #[unsafe(no_mangle)]
 pub extern "C" fn orfeus_bridge_abi_version() -> u32 {
-    4
+    5
+}
+
+/// Report the colour temperature INPUT's camera balanced for, in kelvin.
+///
+/// Writes zero when the file's metadata does not identify one. A temperature
+/// control reads this to start where the photograph actually is, and the
+/// renderer treats the same value as the one that changes nothing.
+///
+/// # Safety
+///
+/// `input_path` must be a readable NUL-terminated path, `kelvin` writable, and
+/// the error buffer, when non-null, writable for its stated capacity.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn orfeus_raw_as_shot_kelvin_v1(
+    input_path: *const c_char,
+    _unused_cache_mode: u32,
+    kelvin: *mut f32,
+    error_buffer: *mut c_char,
+    error_capacity: usize,
+) -> i32 {
+    // SAFETY: Pointer validation and dereferences remain inside the boundary.
+    unsafe {
+        ffi_result(error_buffer, error_capacity, || {
+            if kelvin.is_null() {
+                return Err(Error::InvalidArgument("kelvin pointer is null"));
+            }
+            let input = path_from_c(input_path)?;
+            *kelvin = render::as_shot_kelvin(input)?.unwrap_or(0.0);
+            Ok(())
+        })
+    }
 }
 
 /// Decode INPUT into the cache without rendering anything.
@@ -975,7 +1006,7 @@ mod tests {
 
     #[test]
     fn reports_current_abi_version() {
-        assert_eq!(orfeus_bridge_abi_version(), 4);
+        assert_eq!(orfeus_bridge_abi_version(), 5);
         assert_eq!(orfeus_raw_render_capabilities_v1(), 1 | 2 | 4 | 16);
     }
 

@@ -141,6 +141,55 @@ fn usable_white_balance<const N: usize>(white_balance: &[f32; 4]) -> Result<[f32
     Ok(std::array::from_fn(|index| white_balance[index]))
 }
 
+/// The colour temperature the camera itself balanced for, in kelvin.
+///
+/// A camera's white balance coefficients are the gains that make its estimate
+/// of the scene's neutral come out equal in all three channels, so the
+/// reciprocals are that neutral in camera space. The camera matrix carries it
+/// back to XYZ and McCamy's cubic reads a correlated colour temperature off
+/// the chromaticity.
+///
+/// The matrix used here is the file's own XYZ-to-camera, not the
+/// camera-to-sRGB the renderer applies: that one is row-normalized so a
+/// balanced neutral lands on white by construction, which would report the
+/// same temperature for every photograph ever taken.
+///
+/// The number is what a temperature control should read when it is not
+/// changing anything: "as shot" and "shot at 4600 K" have to be the same
+/// rendering, or the control's own value lies about the picture.
+pub(crate) fn as_shot_kelvin(
+    matrices: &HashMap<Illuminant, FlatColorMatrix>,
+    white_balance: [f32; 4],
+) -> Option<f32> {
+    let (_, flat) = preferred_matrix(matrices).ok()?;
+    let xyz_to_camera = transform_1d::<3, 3>(flat)?;
+    let camera_to_xyz = pseudo_inverse(xyz_to_camera);
+    let balance = usable_white_balance::<3>(&white_balance).ok()?;
+    if balance.iter().any(|gain| !(*gain > 0.0)) {
+        return None;
+    }
+    let neutral: [f32; 3] = std::array::from_fn(|channel| 1.0 / balance[channel]);
+    let xyz: [f32; 3] = std::array::from_fn(|row| {
+        (0..3)
+            .map(|column| camera_to_xyz[row][column] * neutral[column])
+            .sum()
+    });
+    let total = xyz[0] + xyz[1] + xyz[2];
+    if !(total > 0.0) {
+        return None;
+    }
+    let (x, y) = (xyz[0] / total, xyz[1] / total);
+    // McCamy's approximation, good to a few kelvin over the range a camera
+    // balances for and undefined at its pole.
+    let denominator = 0.1858 - y;
+    if denominator.abs() < 1.0e-6 {
+        return None;
+    }
+    let n = (x - 0.3320) / denominator;
+    let kelvin = 449.0 * n * n * n + 3525.0 * n * n + 6823.3 * n + 5520.33;
+    (kelvin.is_finite() && (1500.0..=25_000.0).contains(&kelvin)).then_some(kelvin)
+}
+
 /// Camera level at which a photosite counts as saturated. Rawler's rescale maps
 /// every channel's white level to 1.0, so a clipped channel arrives at unity.
 pub(crate) const CLIP_ONSET: f32 = 0.97;

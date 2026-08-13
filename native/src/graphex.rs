@@ -561,6 +561,7 @@ fn to_display(image: &mut RgbImage) {
 }
 
 pub(crate) struct GraphContext<'a> {
+    pub(crate) as_shot_kelvin: Option<f32>,
     pub(crate) make: &'a str,
     pub(crate) model: &'a str,
     pub(crate) lens_name: &'a str,
@@ -1028,7 +1029,12 @@ fn execute_graph_into(
         }
         match op.kind {
             NODE_WHITE_BALANCE => {
-                render::apply_white_adaptation(&mut image, op.params[0], op.params[1]);
+                render::apply_white_adaptation(
+                    &mut image,
+                    op.params[0],
+                    op.params[1],
+                    context.as_shot_kelvin,
+                );
             }
             NODE_EXPOSURE => {
                 render::apply_exposure(&mut image, op.params[0]);
@@ -1442,6 +1448,7 @@ fn render_graph_frame(
         decoded.focal,
         decoded.orientation,
     );
+    let as_shot_kelvin = decoded.as_shot_kelvin;
     let (decoded_width, decoded_height) = (decoded.width, decoded.height);
     // A full-resolution render works on the whole decode, so it takes the
     // buffer rather than copying it — nearly a gigabyte at 80 MP.
@@ -1467,6 +1474,7 @@ fn render_graph_frame(
         )
     };
     let context = GraphContext {
+        as_shot_kelvin,
         make: &make,
         model: &model,
         lens_name: &lens_name,
@@ -1582,6 +1590,7 @@ mod tests {
             crop_factor: 0.0,
             grain_seed: seed,
             orientation: 1,
+            as_shot_kelvin: None,
         }
     }
 
@@ -1609,6 +1618,7 @@ mod tests {
             crop_factor: 2.0,
             grain_seed: 7,
             orientation: 6,
+            as_shot_kelvin: None,
         };
         let key = prefix_context_key(&[], &base).unwrap();
         assert_eq!(key.make, "Olympus");
@@ -1697,7 +1707,7 @@ mod tests {
         let via_graph = execute_graph(&ops, gradient_image(), &context(7)).unwrap();
 
         let mut reference = gradient_image();
-        render::apply_white_adaptation(&mut reference, 6500.0, 3.0);
+        render::apply_white_adaptation(&mut reference, 6500.0, 3.0, None);
         render::apply_exposure(&mut reference, 0.5);
         render::apply_tonal_equalizer(&mut reference, [0.3, 0.0, 0.0, -0.2, 0.0, 0.0, 0.1]);
         to_display(&mut reference);
@@ -1727,7 +1737,7 @@ mod tests {
         let via_graph = execute_graph(&ops, gradient_image(), &graph_context).unwrap();
 
         let mut reference = gradient_image();
-        render::apply_white_adaptation(&mut reference, 6500.0, 3.0);
+        render::apply_white_adaptation(&mut reference, 6500.0, 3.0, None);
         render::apply_exposure(&mut reference, 0.5);
         reference = render::orient(reference, 6);
         render::apply_noise_reduction(&mut reference, 0.0, 0.0);

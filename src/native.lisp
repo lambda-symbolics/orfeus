@@ -721,6 +721,32 @@ practice — on work the render is about to need anyway."
                              max-width max-height (if cache-p 1 0)
                              error-buffer *native-error-buffer-size*)))))
 
+(defcfun ("orfeus_raw_as_shot_kelvin_v1" %raw-as-shot-kelvin-v1) :int32
+  (input-path :string)
+  (cache-mode :uint32)
+  (kelvin :pointer)
+  (error-buffer :pointer)
+  (error-capacity :size))
+
+(defun native-as-shot-kelvin (input-pathname &key (cache-p t))
+  "Return the colour temperature INPUT-PATHNAME's camera balanced for, or NIL.
+
+NIL when the file's metadata does not identify one, which is also what a bridge
+too old to answer reports."
+  (native-library-load)
+  (when (< (native-bridge-version) 5)
+    (return-from native-as-shot-kelvin nil))
+  (with-foreign-object (kelvin :float)
+    (with-foreign-pointer (error-buffer *native-error-buffer-size*)
+      (let ((status (with-native-float-traps
+                      (%raw-as-shot-kelvin-v1 (namestring input-pathname)
+                                              (if cache-p 1 0) kelvin
+                                              error-buffer
+                                              *native-error-buffer-size*))))
+        (when (zerop status)
+          (let ((value (cffi:mem-ref kelvin :float)))
+            (when (plusp value) value)))))))
+
 (defun dng-original-filename (pathname)
   "Return the embedded original filename recorded by DNG PATHNAME."
   (native-library-load)

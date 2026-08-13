@@ -7,6 +7,7 @@
                 #:export-settings-timestamp-filenames-p
                 #:make-photo-job #:make-processing-preset
                 #:make-processing-settings #:make-project
+                #:photo-as-shot-kelvin
                 #:photo-capture-description #:photo-extract-embedded-preview
                 #:photo-lens-description
                 #:photo-job-disabled-stages #:photo-job-graph

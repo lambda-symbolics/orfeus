@@ -1148,6 +1148,14 @@ new cache entry is published."
                                       (photo-job-input-path job)))
                                    "Lens not identified"))))
                    "No photograph selected")))
+           (selected-as-shot-kelvin ()
+             ;; The temperature the camera balanced for. The renderer treats
+             ;; this value as the one that changes nothing, so a control that
+             ;; starts here starts where the photograph already is.
+             (let ((job (selected-job)))
+               (when job
+                 (ignore-errors
+                   (photo-as-shot-kelvin (photo-job-input-path job))))))
            (selected-capture-description ()
              (let ((job (selected-job)))
                (when job
@@ -3741,13 +3749,14 @@ new cache entry is published."
                                (max 0 (+ gallery-scroll (* dy 32)))))
                     (lightfast:redraw gallery-canvas))))))
            (sync-preset-action-label ()
-             (let ((count (selected-photo-count)))
+             (let ((count (selected-photo-count))
+                   (open (length (project-photos (gui-model-project model)))))
                (when preset-apply-button
                  (setf (lightfast:label preset-apply-button)
                        (format nil "Apply to ~D photo~:P" count)))
                (when photo-selection-label
                  (setf (lightfast:label photo-selection-label)
-                       (format nil "Photos · ~D selected · boxes toggle" count)))))
+                       (format nil "Photos · ~D open · ~D selected" open count)))))
            (save-current-preset ()
              (handler-case
                  (let ((preset (gui-model-save-preset
@@ -3786,6 +3795,14 @@ new cache entry is published."
                        (case key
                          ((:lens-correction-p :chromatic-aberration-correction-p)
                           (if (gui-model-setting model key) "1" "0"))
+                         ;; An untouched temperature shows the one the camera
+                         ;; balanced for rather than an empty box: it is the
+                         ;; value this photograph is already being rendered
+                         ;; at, and typing over it starts from the truth.
+                         (:white-balance-temperature
+                          (display-number
+                           (or (gui-model-setting model key)
+                               (selected-as-shot-kelvin))))
                          (otherwise (display-number (gui-model-setting model key)))))))
              (setf (lightfast:value wb-choice)
                    (if (gui-model-setting model :white-balance-temperature)
@@ -4220,8 +4237,9 @@ new cache entry is published."
                    (when (and (eq key :white-balance-tint)
                               (null (gui-model-setting
                                      model :white-balance-temperature)))
-                     (gui-model-set-setting model
-                                            :white-balance-temperature 5500.0))
+                     (gui-model-set-setting
+                      model :white-balance-temperature
+                      (or (selected-as-shot-kelvin) 5500.0)))
                    (gui-model-set-setting model key new-value)
                    (sync-controls)
                    (when (member key '(:white-balance-temperature
@@ -4515,8 +4533,13 @@ new cache entry is published."
                  (progn
                    (gui-model-set-setting model :white-balance-temperature nil)
                    (gui-model-set-setting model :white-balance-tint 0.0))
+                 ;; Custom starts at the frame's own temperature, which
+                 ;; renders exactly what "as shot" rendered — so switching
+                 ;; modes shows the number without moving the picture.
                  (unless (gui-model-setting model :white-balance-temperature)
-                   (gui-model-set-setting model :white-balance-temperature 5500.0)))
+                   (gui-model-set-setting
+                    model :white-balance-temperature
+                    (or (selected-as-shot-kelvin) 5500.0))))
              (sync-controls)
              (schedule-edited-preview))
            (toggle-comparison ()
@@ -5155,7 +5178,7 @@ new cache entry is published."
         (setf photo-selection-label
               (lightfast:make-label
                :parent filmstrip-pane :x 8 :y 2 :width 224 :height 24
-               :label "Photos · 1 selected · boxes toggle"))
+               :label "Photos · 0 open · 0 selected"))
         (lightfast:set-label-font photo-selection-label lightfast:+font-helvetica-bold+)
         (setf thumbnail-canvas
               (lightfast:make-canvas

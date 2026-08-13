@@ -383,20 +383,19 @@ binning would drop detail the downscale would have kept."
 The first view of a photograph reads its lens description out of the file
 before it can render, which is half a second of ExifTool on a 116 MB DNG, and
 the decode that follows does not depend on the answer. Running them at once
-hides the shorter behind the longer. A decode that fails here is not reported:
-the render that follows will decode again and say so properly."
-  (let ((decoding (gensym "DECODING"))
-        (path (gensym "PATH")))
-    `(let* ((,path ,input-pathname)
-            (,decoding
-              (unless (photo-lens-tags-known-p ,path)
-                (sb-thread:make-thread
-                 (lambda ()
-                   (ignore-errors (native-raw-decode ,path ,@decode-arguments)))
-                 :name "Orfeus decode warm-up"))))
-       (unwind-protect (progn ,@body)
-         (when ,decoding
-           (ignore-errors (sb-thread:join-thread ,decoding :default nil)))))))
+hides the shorter behind the longer.
+
+Nothing waits for the thread. The render decodes for itself if it gets there
+first — concurrent misses share one loader — and a failure here is not
+reported, because that render will fail again and say so properly."
+  (let ((path (gensym "PATH")))
+    `(let ((,path ,input-pathname))
+       (unless (photo-lens-tags-known-p ,path)
+         (sb-thread:make-thread
+          (lambda ()
+            (ignore-errors (native-raw-decode ,path ,@decode-arguments)))
+          :name "Orfeus decode warm-up"))
+       ,@body)))
 
 (defun render-preview-rgb (input-pathname graph rgb-buffer capacity
                            &key (max-width 2048) (max-height 2048)

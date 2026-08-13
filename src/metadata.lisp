@@ -82,6 +82,23 @@ Handed to the renderer for containers that carry no lens metadata it can read:
 rawler names the lens in an ORF but not in the DNG converted from it."
   (rest (photo-lens-tags pathname)))
 
+(defvar *photo-as-shot-kelvin-cache*
+  (make-hash-table :test #'equal #+sbcl :synchronized #+sbcl t)
+  "As-shot colour temperatures keyed by path and write date.")
+
+(defun photo-as-shot-kelvin (pathname)
+  "Return the colour temperature PATHNAME was balanced for, or NIL.
+
+Read from the camera's own white balance through the bridge, and memoized: a
+temperature control asks for it whenever the selection changes."
+  (let* ((key (cons (namestring (pathname pathname))
+                    (ignore-errors (file-write-date pathname))))
+         (cached (gethash key *photo-as-shot-kelvin-cache* :missing)))
+    (if (eq cached :missing)
+        (setf (gethash key *photo-as-shot-kelvin-cache*)
+              (ignore-errors (native-as-shot-kelvin pathname)))
+        cached)))
+
 (defvar *photo-capture-timestamp-cache*
   (make-hash-table :test #'equal #+sbcl :synchronized #+sbcl t)
   "Capture timestamps keyed by path and write date.")

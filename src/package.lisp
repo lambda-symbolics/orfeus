@@ -63,6 +63,7 @@
    #:photo-lens-description
    #:photo-lens-name
    #:photo-lens-tags-known-p
+   #:photo-as-shot-kelvin
    #:photo-job
    #:photo-job-input-path
    #:photo-job-output-path

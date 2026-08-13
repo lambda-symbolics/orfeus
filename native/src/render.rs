@@ -491,7 +491,21 @@ fn mat_mul(left: [[f32; 3]; 3], right: [[f32; 3]; 3]) -> [[f32; 3]; 3] {
 /// Camera WB remains rawler's camera-aware default when Kelvin is zero; tint is
 /// then a small working-space green/magenta adaptation around D65. A nonzero
 /// Kelvin deliberately disables camera WB and adapts the camera-matrix result.
-pub(crate) fn apply_white_adaptation(image: &mut RgbImage, kelvin: f32, tint: f32) {
+/// Adapts the image as if its neutral had been lit at KELVIN rather than at the
+/// temperature the camera balanced for.
+///
+/// AS_SHOT names that temperature, and the whole point of it is that passing it
+/// as KELVIN changes nothing: a control reading "5200 K" on a frame shot at
+/// 5200 K has to render exactly what "as shot" renders, or its number is a
+/// decoration. Adapting to D65 instead — which is what this did — meant every
+/// temperature except 6504 K shifted the picture the moment the control was
+/// touched, from a value that had nothing to do with the photograph.
+pub(crate) fn apply_white_adaptation(
+    image: &mut RgbImage,
+    kelvin: f32,
+    tint: f32,
+    as_shot: Option<f32>,
+) {
     if kelvin == 0.0 && tint == 0.0 {
         return;
     }
@@ -502,7 +516,15 @@ pub(crate) fn apply_white_adaptation(image: &mut RgbImage, kelvin: f32, tint: f3
     };
     y = (y * 2.0_f32.powf(tint * 0.025)).clamp(0.05, 0.9);
     let source_xyz = [x / y, 1.0, (1.0 - x - y) / y];
-    let d65_xyz = [0.95047, 1.0, 1.08883];
+    // The frame's own neutral when it is known, and D65 when it is not, which
+    // is the behaviour a file without usable balance metadata had all along.
+    let d65_xyz = match as_shot {
+        Some(as_shot) => {
+            let (x, y) = kelvin_xy(as_shot);
+            [x / y, 1.0, (1.0 - x - y) / y]
+        }
+        None => [0.95047, 1.0, 1.08883],
+    };
     let bradford = [
         [0.8951, 0.2664, -0.1614],
         [-0.7502, 1.7135, 0.0367],
@@ -2199,6 +2221,8 @@ pub(crate) struct DecodedRaw {
     pub(crate) model: String,
     pub(crate) lens_name: String,
     pub(crate) focal: f32,
+    /// The colour temperature the camera balanced for, when it can be read.
+    pub(crate) as_shot_kelvin: Option<f32>,
 }
 
 pub(crate) type DecodeCacheKey = [u8; 32];
@@ -2802,6 +2826,49 @@ pub(crate) fn decode_linear_srgb(
     })
 }
 
+/// The colour temperature of an already-decoded frame, if one is in the cache.
+///
+/// The decode works this out anyway, so a photograph on screen has already
+/// answered the question and the interface can have it for a hash lookup.
+fn cached_as_shot_kelvin(input: &Path) -> Option<f32> {
+    let key = decode_cache_key(input).ok()?;
+    let (cache_lock, _) = decode_cache();
+    let cache = cache_lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // A preview decodes a draft and an export decodes the frame itself; either
+    // knows the temperature, so take whichever is present.
+    [draft_identity(key), key].iter().find_map(|wanted| {
+        cache
+            .entries
+            .iter()
+            .find(|(held, _)| held == wanted)
+            .and_then(|(_, decoded)| decoded.as_shot_kelvin)
+    })
+}
+
+/// The colour temperature INPUT's camera balanced for, without developing it.
+///
+/// Asked for on the interface thread whenever the selection changes, so it
+/// decodes nothing: rawler fills in the white balance and the camera matrix
+/// from the file's metadata, and a dummy image decode skips the photosites
+/// entirely. Going through the ordinary decode instead would have cost two
+/// seconds of full-resolution development on an 80 MP frame.
+pub(crate) fn as_shot_kelvin(input: &Path) -> Result<Option<f32>, Error> {
+    if let Some(kelvin) = cached_as_shot_kelvin(input) {
+        return Ok(Some(kelvin));
+    }
+    let source = RawSource::new(input)?;
+    let loader = RawLoader::new();
+    let decoder = loader
+        .get_decoder(&source)
+        .map_err(|e| Error::Render(format!("RAW decoder: {e}")))?;
+    let raw = decoder
+        .raw_image(&source, &RawDecodeParams::default(), true)
+        .map_err(|e| Error::Render(format!("RAW metadata: {e}")))?;
+    Ok(super::color::as_shot_kelvin(&raw.color_matrix, raw.wb_coeffs))
+}
+
 fn decode_source(
     source: &RawSource,
     draft: bool,
@@ -2881,6 +2948,7 @@ fn decode_source(
     // temperature. Custom Kelvin is a relative chromatic adaptation around D65;
     // dropping the sensor WB coefficients leaves Bayer green dominant.
     let white_balance = raw.wb_coeffs;
+    let as_shot_kelvin = super::color::as_shot_kelvin(&raw.color_matrix, white_balance);
     let linear_srgb = intermediate_to_linear_srgb(developed, &raw.color_matrix, white_balance)
         .map_err(Error::Color)?;
     profile_stage!("camera-to-srgb");
@@ -2901,6 +2969,7 @@ fn decode_source(
             .focal_length
             .as_ref()
             .map_or(0.0, |value| value.as_f32()),
+        as_shot_kelvin,
     })
 }
 
@@ -3073,6 +3142,7 @@ pub fn render(
         native_downscale_bounds(orientation, settings.max_width, settings.max_height);
     // SAFETY: The caller promises a null or NUL-terminated lens name.
     let named_lens = unsafe { borrowed_c_string(settings.lens_name, "lens name is not UTF-8")? };
+    let as_shot_kelvin = decoded.as_shot_kelvin;
     let (make, model, lens_name, focal) = (
         decoded.make.clone(),
         decoded.model.clone(),
@@ -3093,7 +3163,7 @@ pub fn render(
         own_decoded(decoded)
     };
     profile_stage!("downscale");
-    apply_white_adaptation(&mut image, settings.kelvin, settings.tint);
+    apply_white_adaptation(&mut image, settings.kelvin, settings.tint, as_shot_kelvin);
     apply_exposure(&mut image, settings.exposure_ev);
     profile_stage!("color");
     let explicit_profile = if settings.lens_profile_model.is_null() {
@@ -3553,6 +3623,7 @@ mod tests {
             model: String::new(),
             lens_name: String::new(),
             focal: 0.0,
+            as_shot_kelvin: None,
         }
     }
 
@@ -3689,7 +3760,7 @@ mod tests {
             height: 1,
             data: vec![0.5, 0.5, 0.5],
         };
-        apply_white_adaptation(&mut image, 15_000.0, 0.0);
+        apply_white_adaptation(&mut image, 15_000.0, 0.0, None);
         assert!(image.data[0] > image.data[1]);
         assert!(image.data[1] > image.data[2]);
     }
@@ -3702,8 +3773,8 @@ mod tests {
             data: vec![0.5, 0.5, 0.5],
         };
         let mut green = magenta.clone();
-        apply_white_adaptation(&mut magenta, 0.0, 20.0);
-        apply_white_adaptation(&mut green, 0.0, -20.0);
+        apply_white_adaptation(&mut magenta, 0.0, 20.0, None);
+        apply_white_adaptation(&mut green, 0.0, -20.0, None);
         assert!(magenta.data[0] + magenta.data[2] > magenta.data[1] * 2.0);
         assert!(green.data[1] * 2.0 > green.data[0] + green.data[2]);
         assert!((magenta.data[1] - green.data[1]).abs() > 0.1);
@@ -4005,6 +4076,52 @@ mod tests {
         assert!((result.data[(2 * 4 - 1) * 3] - 0.0).abs() < 1.0e-6);
         let middle = result.data[3];
         assert!((middle - 1.0).abs() < 1.0e-6, "left half must stay white");
+    }
+
+    #[test]
+    fn the_shot_temperature_is_the_temperature_that_changes_nothing() {
+        // This is the whole contract of the control: asking for the
+        // temperature a frame was shot at must render what "as shot" renders.
+        // Anything else and the number on the control is decoration.
+        let pixels: Vec<f32> = (0..300).map(|index| (index % 97) as f32 / 96.0).collect();
+        let mut as_shot = RgbImage {
+            width: 10,
+            height: 10,
+            data: pixels.clone(),
+        };
+        let mut asked_for_its_own = RgbImage {
+            width: 10,
+            height: 10,
+            data: pixels,
+        };
+        apply_white_adaptation(&mut as_shot, 0.0, 0.0, Some(5200.0));
+        apply_white_adaptation(&mut asked_for_its_own, 5200.0, 0.0, Some(5200.0));
+        for (untouched, asked) in as_shot.data.iter().zip(&asked_for_its_own.data) {
+            assert!(
+                (untouched - asked).abs() < 1.0e-5,
+                "{untouched} against {asked}"
+            );
+        }
+        // And it still moves in the photographic direction: asking for a
+        // warmer illuminant than the frame was shot under warms the picture.
+        let mut warmer = RgbImage {
+            width: 10,
+            height: 10,
+            data: as_shot.data.clone(),
+        };
+        apply_white_adaptation(&mut warmer, 8000.0, 0.0, Some(5200.0));
+        let redness = |image: &RgbImage| -> f32 {
+            let (mut red, mut blue) = (0.0, 0.0);
+            for pixel in image.data.as_chunks::<3>().0 {
+                red += pixel[0];
+                blue += pixel[2];
+            }
+            red / blue.max(1.0e-6)
+        };
+        assert!(
+            redness(&warmer) > redness(&as_shot),
+            "a warmer illuminant did not warm the picture"
+        );
     }
 
     #[test]
