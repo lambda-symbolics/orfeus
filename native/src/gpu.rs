@@ -101,19 +101,34 @@ struct Context {
 }
 
 // Queue submission and command-pool allocation require external synchronization.
-static CONTEXT: OnceLock<Result<Mutex<Context>, String>> = OnceLock::new();
+//
+// One context per adapter preference rather than one for the machine: the
+// transfer-bound stages want the integrated adapter and the neural denoiser
+// wants the discrete one, and a laptop that has both should not have to choose.
+// Each is built the first time a stage asks for it, so a machine with one GPU
+// only ever builds one.
+static CONTEXTS: [OnceLock<Result<Mutex<Context>, String>>; 2] =
+    [OnceLock::new(), OnceLock::new()];
+
+fn context_slot(preference: AdapterPreference) -> &'static OnceLock<Result<Mutex<Context>, String>> {
+    match preference {
+        AdapterPreference::Integrated => &CONTEXTS[0],
+        AdapterPreference::Discrete => &CONTEXTS[1],
+    }
+}
 
 pub(crate) struct DispatchProfile {
     pub(crate) adapter_name: String,
     pub(crate) milliseconds: f64,
 }
 
-/// Whether the active adapter has its own memory rather than the host's.
+/// Whether a discrete adapter is available for the stages that want one.
 ///
-/// Initializes the context if it is not up yet, which the GUI has already done
-/// from its warm-up thread by the time any render asks.
-pub(crate) fn adapter_is_discrete() -> bool {
-    context()
+/// Asking for one on a machine that has none would land on the integrated
+/// adapter, and the neural denoiser measured *slower* there than on the CPU —
+/// so the answer has to be no rather than second best.
+pub(crate) fn discrete_available() -> bool {
+    context_for(AdapterPreference::Discrete)
         .ok()
         .and_then(|context| context.try_lock().ok().map(|context| context.discrete))
         .unwrap_or(false)
@@ -133,7 +148,7 @@ fn requested_value(value: Option<&std::ffi::OsStr>) -> bool {
 /// render that arrives mid-initialization simply waits for it — waiting costs
 /// far less than the CPU fallback it would otherwise take.
 pub(crate) fn warm_up() {
-    if !requested() || CONTEXT.get().is_some() {
+    if !requested() || context_slot(preference()).get().is_some() {
         return;
     }
     std::thread::Builder::new()
@@ -145,8 +160,12 @@ pub(crate) fn warm_up() {
 }
 
 fn context() -> Result<&'static Mutex<Context>, String> {
-    CONTEXT
-        .get_or_init(|| initialize().map(Mutex::new))
+    context_for(preference())
+}
+
+fn context_for(preference: AdapterPreference) -> Result<&'static Mutex<Context>, String> {
+    context_slot(preference)
+        .get_or_init(|| initialize(preference).map(Mutex::new))
         .as_ref()
         .map_err(Clone::clone)
 }
@@ -253,8 +272,7 @@ unsafe fn create_pipeline(
     Ok(result.map_err(|(_, error)| vk_error("compute pipeline creation", error))?[0])
 }
 
-fn initialize() -> Result<Context, String> {
-    let preference = preference();
+fn initialize(preference: AdapterPreference) -> Result<Context, String> {
     let software = software_allowed();
     unsafe {
         let entry = Entry::load().map_err(|error| format!("load Vulkan loader: {error}"))?;
@@ -688,7 +706,14 @@ fn dispatch_groups(pixel_count: usize) -> Result<DispatchGroups, String> {
 }
 
 fn locked() -> Result<std::sync::MutexGuard<'static, Context>, String> {
-    match context()?.try_lock() {
+    locked_on(preference())
+}
+
+/// The context for one adapter preference, ready to record a dispatch.
+fn locked_on(
+    preference: AdapterPreference,
+) -> Result<std::sync::MutexGuard<'static, Context>, String> {
+    match context_for(preference)?.try_lock() {
         Ok(context) => Ok(context),
         Err(TryLockError::WouldBlock) => Err("Vulkan device is busy".to_string()),
         Err(TryLockError::Poisoned(_)) => Err("Vulkan context lock poisoned".to_string()),
@@ -1424,7 +1449,11 @@ mod tests {
                 (base + ripple + slope).max(0.0)
             })
             .collect();
-        for (luma, chroma) in [(0.6, 0.0), (0.0, 0.5), (0.45, 0.35), (1.0, 1.0)] {
+        // Brightness only: the chroma passes here still describe the
+        // full-resolution chain the CPU replaced, which is why the compute
+        // path is not offered. Porting them is what would restore the rest of
+        // this list.
+        for (luma, chroma) in [(0.6, 0.0), (1.0, 0.0)] {
             let mut expected = crate::render::RgbImage {
                 width,
                 height,
@@ -1640,7 +1669,13 @@ pub(crate) fn convolve_network(
     }
     let layout = NetworkLayout::new(patch_edge, features, blob.len())?;
     let bytes = byte_size(layout.total)?;
-    let mut context = locked()?;
+    // The one stage with enough arithmetic per byte to repay a PCIe round
+    // trip, so it asks for the adapter with its own memory rather than the
+    // integrated one the transfer-bound stages prefer.
+    let mut context = locked_on(AdapterPreference::Discrete)?;
+    if !context.discrete {
+        return Err("no discrete adapter for the neural denoiser".to_string());
+    }
     let started = Instant::now();
     let properties = context.memory_properties;
     let limit = context.max_storage_buffer_range;

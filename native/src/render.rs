@@ -1139,8 +1139,18 @@ fn gpu_noise_reduction(image: &mut RgbImage, luma: f32, chroma: f32) -> bool {
     }
 }
 
+/// The compute path is not offered at present, whatever `ORFEUS_GPU_NOISE`
+/// says.
+///
+/// Its chroma passes implement the full-resolution chain the CPU replaced with
+/// a half-resolution one, so switching it on would put a visibly different
+/// picture on screen depending on an environment variable. It was never faster
+/// than the CPU on the machines it was measured on, and the CPU has since
+/// halved, so there is nothing to weigh against the divergence until the
+/// shaders are ported. The luma half is unchanged and still checked against
+/// the shaders by `actual_gpu_noise_reduction_matches_cpu_when_requested_for_testing`.
 fn gpu_noise_reduction_requested() -> bool {
-    std::env::var_os("ORFEUS_GPU_NOISE").as_deref() == Some(std::ffi::OsStr::new("1"))
+    false
 }
 
 pub(crate) fn cpu_noise_reduction(image: &mut RgbImage, luma: f32, chroma: f32) {
@@ -1250,7 +1260,8 @@ pub(crate) fn cpu_noise_reduction(image: &mut RgbImage, luma: f32, chroma: f32) 
 
     profile_step!("luma");
     let chroma_strength = chroma.clamp(0.0, 1.0);
-    if chroma_strength > 0.0 {
+    let filtering_chroma = chroma_strength > 0.0;
+    if filtering_chroma {
         // Guided by the luma this stage has already cleaned, not the raw
         // plane: a noisy guide reads its own noise as edges and keeps the
         // colour filter from crossing them.
@@ -1311,6 +1322,28 @@ pub(crate) fn cpu_noise_reduction(image: &mut RgbImage, luma: f32, chroma: f32) 
         }
     }
 
+    if !filtering_chroma {
+        // Colour was never touched, so it must arrive untouched: adding the
+        // brightness the filter changed keeps each pixel's own Cb and Cr
+        // exactly, where rebuilding from the halved planes would put the
+        // colour through a resampling it never asked for.
+        image
+            .data
+            .par_chunks_mut(3 * width)
+            .zip(yy.par_chunks(width))
+            .for_each(|(pixels, yy)| {
+                for (pixel, luma) in pixels.as_chunks_mut::<3>().0.iter_mut().zip(yy) {
+                    let before = 0.2126 * pixel[0] + 0.7152 * pixel[1] + 0.0722 * pixel[2];
+                    let delta = *luma - before;
+                    pixel[0] += delta;
+                    pixel[2] += delta;
+                    pixel[1] = (*luma - 0.2126 * pixel[0] - 0.0722 * pixel[2]) / 0.7152;
+                }
+            });
+        profile_step!("merge");
+        let _ = step_started;
+        return;
+    }
     image
         .data
         .par_chunks_mut(3 * width)

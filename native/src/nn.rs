@@ -534,10 +534,15 @@ fn report_gpu_neural_fallback(error: &str) {
 ///
 /// `ORFEUS_GPU_NEURAL=1` forces it on regardless, which is how the software
 /// rasterizer runs it under test.
+///
+/// It no longer waits to be asked for with `ORFEUS_GPU=discrete`: this stage
+/// takes its own context on the discrete adapter, so it can have one while
+/// every other stage keeps the integrated adapter they are faster on. A
+/// machine without a discrete adapter answers no and stays on the CPU.
 fn gpu_requested() -> bool {
     super::gpu::requested()
         && (std::env::var_os("ORFEUS_GPU_NEURAL").is_some()
-            || super::gpu::adapter_is_discrete())
+            || super::gpu::discrete_available())
 }
 
 /// Bytes of ping-pong scratch one worker needs for a tile of TILE_SIZE.
