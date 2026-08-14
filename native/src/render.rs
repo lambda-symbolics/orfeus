@@ -1348,7 +1348,12 @@ pub(crate) fn cpu_noise_reduction(image: &mut RgbImage, luma: f32, chroma: f32) 
 /// Whether a sample coordinate lies inside the image.
 #[inline]
 pub(crate) fn inside(image: &RgbImage, x: f32, y: f32) -> bool {
-    x >= 0.0 && y >= 0.0 && x <= (image.width - 1) as f32 && y <= (image.height - 1) as f32
+    inside_frame(x, y, image.width, image.height)
+}
+
+#[inline]
+fn inside_frame(x: f32, y: f32, width: usize, height: usize) -> bool {
+    x >= 0.0 && y >= 0.0 && x <= (width - 1) as f32 && y <= (height - 1) as f32
 }
 
 /// Samples all three channels at one point.
@@ -1518,53 +1523,50 @@ fn blend_lens_coordinate(identity: f32, corrected: f32, strength: f32) -> f32 {
     identity + (corrected - identity) * strength
 }
 
-fn lens_auto_crop_scale(valid: &[bool], width: usize, height: usize) -> f32 {
+/// How far a correction must zoom in before the border it could not fill
+/// leaves the frame.
+///
+/// VALID_AT is asked about every STEPth sample in each direction. The invalid
+/// region is a smooth band around the edge, so a coarse sweep finds the same
+/// nearest corner as an exhaustive one to well within the half percent of
+/// margin below — and a sweep is cheap only if it does not have to touch every
+/// pixel, since the point of it is to run *before* the resampling pass rather
+/// than force a second one.
+fn auto_crop_scale<F>(width: usize, height: usize, step: usize, valid_at: F) -> f32
+where
+    F: Fn(usize, usize) -> bool + Sync,
+{
     let center_x = (width.saturating_sub(1)) as f32 * 0.5;
     let center_y = (height.saturating_sub(1)) as f32 * 0.5;
-    let mut nearest_invalid_radius = 1.0_f32;
-    for y in 0..height {
-        for x in 0..width {
-            if !valid[y * width + x] {
-                let normalized_x = if center_x > 0.0 {
+    let nearest_invalid = (0..height.div_ceil(step))
+        .into_par_iter()
+        .map(|sample_row| {
+            let y = sample_row * step;
+            let mut nearest = 1.0_f32;
+            for x in (0..width).step_by(step) {
+                if valid_at(x, y) {
+                    continue;
+                }
+                let horizontal = if center_x > 0.0 {
                     (x as f32 - center_x).abs() / center_x
                 } else {
                     0.0
                 };
-                let normalized_y = if center_y > 0.0 {
+                let vertical = if center_y > 0.0 {
                     (y as f32 - center_y).abs() / center_y
                 } else {
                     0.0
                 };
-                nearest_invalid_radius = nearest_invalid_radius.min(normalized_x.max(normalized_y));
+                nearest = nearest.min(horizontal.max(vertical));
             }
-        }
-    }
-    if nearest_invalid_radius < 1.0 {
-        1.005 / nearest_invalid_radius.max(0.5)
+            nearest
+        })
+        .reduce(|| 1.0_f32, f32::min);
+    if nearest_invalid < 1.0 {
+        1.005 / nearest_invalid.max(0.5)
     } else {
         1.0
     }
-}
-
-fn zoom_center(image: &mut RgbImage, scale: f32) {
-    if scale <= 1.001 {
-        return;
-    }
-    let width = image.width;
-    let center_x = (image.width.saturating_sub(1)) as f32 * 0.5;
-    let center_y = (image.height.saturating_sub(1)) as f32 * 0.5;
-    let mut output = vec![0.0_f32; image.data.len()];
-    output
-        .par_chunks_mut(width * 3)
-        .enumerate()
-        .for_each(|(y, output_row)| {
-            let source_y = center_y + (y as f32 - center_y) / scale;
-            for (x, pixel) in output_row.as_chunks_mut::<3>().0.iter_mut().enumerate() {
-                let source_x = center_x + (x as f32 - center_x) / scale;
-                *pixel = bilinear_rgb(image, source_x, source_y);
-            }
-        });
-    image.data = output;
 }
 
 pub(crate) struct LensCorrectionOptions<'a> {
@@ -1600,6 +1602,8 @@ pub(crate) fn apply_lens(
             "RAW metadata does not identify a usable lens/focal length".into(),
         ));
     }
+    let profiling = std::env::var_os("ORFEUS_PROFILE").is_some();
+    let started = Instant::now();
     let db = lens_database()?;
     let profile_focal = focal / focal_reducer;
     let camera = find_camera_profile(db, make, model);
@@ -1681,60 +1685,128 @@ pub(crate) fn apply_lens(
             );
         }
     }
-    let mut valid = vec![true; width * height];
+    if profiling {
+        eprintln!("orfeus-profile lens-step=maps milliseconds={:.3}", started.elapsed().as_secs_f64() * 1000.0);
+    }
+    let remap_started = Instant::now();
+
+    // Where the maps put a pixel, at any position rather than only on the
+    // integer grid they were evaluated for. Distortion varies smoothly, so
+    // reading between two columns and two grid rows is as accurate as the grid
+    // itself; it is what lets the auto-crop zoom be folded into this pass.
+    let map_at = |rows: &[f32],
+                  stride: usize,
+                  component: usize,
+                  u: f32,
+                  grid_row: usize,
+                  fraction: f32| {
+        let column = (u.max(0.0) as usize).min(width - 1);
+        let next = (column + 1).min(width - 1);
+        let across = u - column as f32;
+        let at = |row: usize, column: usize| {
+            rows[row * width * stride + column * stride + component]
+        };
+        let top = at(grid_row, column) * (1.0 - across) + at(grid_row, next) * across;
+        let bottom = at(grid_row + 1, column) * (1.0 - across) + at(grid_row + 1, next) * across;
+        top * (1.0 - fraction) + bottom * fraction
+    };
+    let grid_at = |v: f32| {
+        let position = v.max(0.0) / LENS_MAP_ROW_STEP as f32;
+        let grid_row = (position as usize).min(grid_rows - 2);
+        (grid_row, position - grid_row as f32)
+    };
+
+    const VALIDITY_STEP: usize = 4;
+    let (center_x, center_y) = (
+        (width.saturating_sub(1)) as f32 * 0.5,
+        (height.saturating_sub(1)) as f32 * 0.5,
+    );
+    let scale = auto_crop_scale(width, height, VALIDITY_STEP, |x, y| {
+        let (grid_row, fraction) = grid_at(y as f32);
+        let (gx, gy) = if distortion {
+            (
+                blend_lens_coordinate(
+                    x as f32,
+                    map_at(&geometry_rows, 2, 0, x as f32, grid_row, fraction),
+                    correction_strength,
+                ),
+                blend_lens_coordinate(
+                    y as f32,
+                    map_at(&geometry_rows, 2, 1, x as f32, grid_row, fraction),
+                    correction_strength,
+                ),
+            )
+        } else {
+            (x as f32, y as f32)
+        };
+        if !inside_frame(gx, gy, width, height) {
+            return false;
+        }
+        if !tca {
+            return true;
+        }
+        (0..3).all(|channel| {
+            let sx = map_at(&subpixel_rows, 6, channel * 2, x as f32, grid_row, fraction) + gx
+                - x as f32;
+            let sy = map_at(&subpixel_rows, 6, channel * 2 + 1, x as f32, grid_row, fraction) + gy
+                - y as f32;
+            inside_frame(sx, sy, width, height)
+        })
+    });
+    let inverse_scale = 1.0 / scale;
+
     // Resampled into a fresh buffer rather than through a copy of the image:
-    // at 80 MP that copy was a gigabyte read and written for nothing.
+    // at 80 MP that copy was a gigabyte read and written for nothing. The
+    // auto-crop zoom rides along in the same gather: as its own pass it
+    // resampled the whole frame a second time — 319 ms at 80 MP to crop away
+    // one percent — and resampling twice softens what one pass keeps.
     let mut output = vec![0.0_f32; width * height * 3];
     output
         .par_chunks_mut(row_stride)
-        .zip(valid.par_chunks_mut(width))
         .enumerate()
-        .for_each(|(y, (output_row, valid_row))| {
-            let grid_row = y / LENS_MAP_ROW_STEP;
-            let fraction = (y - grid_row * LENS_MAP_ROW_STEP) as f32 / LENS_MAP_ROW_STEP as f32;
-            let lerp_rows = |rows: &[f32], stride: usize, index: usize| -> f32 {
-                let low = rows[grid_row * width * stride + index];
-                let high = rows[(grid_row + 1) * width * stride + index];
-                low + (high - low) * fraction
-            };
+        .for_each(|(y, output_row)| {
+            let v = center_y + (y as f32 - center_y) * inverse_scale;
+            let (grid_row, fraction) = grid_at(v);
             for x in 0..width {
+                let u = center_x + (x as f32 - center_x) * inverse_scale;
                 let (gx, gy) = if distortion {
                     (
                         blend_lens_coordinate(
-                            x as f32,
-                            lerp_rows(&geometry_rows, 2, x * 2),
+                            u,
+                            map_at(&geometry_rows, 2, 0, u, grid_row, fraction),
                             correction_strength,
                         ),
                         blend_lens_coordinate(
-                            y as f32,
-                            lerp_rows(&geometry_rows, 2, x * 2 + 1),
+                            v,
+                            map_at(&geometry_rows, 2, 1, u, grid_row, fraction),
                             correction_strength,
                         ),
                     )
                 } else {
-                    (x as f32, y as f32)
+                    (u, v)
                 };
                 if !tca {
                     // Without a chromatic correction all three channels read the
                     // same point, so they share one set of weights and land on
                     // three adjacent floats.
-                    valid_row[x] &= inside(image, gx, gy);
                     output_row[x * 3..x * 3 + 3].copy_from_slice(&bilinear_rgb(image, gx, gy));
                     continue;
                 }
                 for channel in 0..3 {
-                    let sx = lerp_rows(&subpixel_rows, 6, x * 6 + channel * 2) + gx - x as f32;
-                    let sy = lerp_rows(&subpixel_rows, 6, x * 6 + channel * 2 + 1) + gy - y as f32;
-                    valid_row[x] &= inside(image, sx, sy);
+                    let sx = map_at(&subpixel_rows, 6, channel * 2, u, grid_row, fraction) + gx - u;
+                    let sy =
+                        map_at(&subpixel_rows, 6, channel * 2 + 1, u, grid_row, fraction) + gy - v;
                     output_row[x * 3 + channel] = bilinear(image, sx, sy, channel);
                 }
             }
         });
     image.data = output;
-    zoom_center(
-        image,
-        lens_auto_crop_scale(&valid, image.width, image.height),
-    );
+    if profiling {
+        eprintln!(
+            "orfeus-profile lens-step=remap scale={scale:.4} milliseconds={:.3}",
+            remap_started.elapsed().as_secs_f64() * 1000.0
+        );
+    }
     Ok(())
 }
 
@@ -4181,9 +4253,20 @@ mod tests {
                 }
             }
         }
-        let scale = lens_auto_crop_scale(&valid, 100, 80);
-        assert!(scale > 1.09 && scale < 1.2, "unexpected crop scale {scale}");
-        assert_eq!(1.0, lens_auto_crop_scale(&vec![true; 100 * 80], 100, 80));
+        let exact = auto_crop_scale(100, 80, 1, |x, y| valid[y * 100 + x]);
+        assert!(exact > 1.09 && exact < 1.2, "unexpected crop scale {exact}");
+        assert_eq!(1.0, auto_crop_scale(100, 80, 1, |_, _| true));
+
+        // The production sweep looks at every fourth sample. On a border band
+        // like this one — which is what a lens correction leaves — that has to
+        // agree with looking at all of them, or the crop lets the border back
+        // in.
+        let coarse = auto_crop_scale(100, 80, 4, |x, y| valid[y * 100 + x]);
+        assert!(
+            (coarse - exact).abs() < 0.02,
+            "coarse sweep {coarse} disagrees with {exact}"
+        );
+        assert!(coarse >= exact - 0.005, "coarse sweep cropped too little");
     }
 
     #[test]
