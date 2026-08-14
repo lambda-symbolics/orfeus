@@ -1063,63 +1063,6 @@ fn median_filter_3x3_into(
         });
 }
 
-/// Averages a plane down by two in each direction, an odd edge included.
-fn downsample_half(plane: &[f32], width: usize, height: usize) -> Vec<f32> {
-    let (half_width, half_height) = (width.div_ceil(2), height.div_ceil(2));
-    let mut output = vec![0.0_f32; half_width * half_height];
-    output
-        .par_chunks_mut(half_width)
-        .enumerate()
-        .for_each(|(y, row)| {
-            let top = y * 2;
-            let bottom = (top + 1).min(height - 1);
-            for (x, value) in row.iter_mut().enumerate() {
-                let left = x * 2;
-                let right = (left + 1).min(width - 1);
-                *value = 0.25
-                    * (plane[top * width + left]
-                        + plane[top * width + right]
-                        + plane[bottom * width + left]
-                        + plane[bottom * width + right]);
-            }
-        });
-    output
-}
-
-/// Writes a half-sized plane back at full size, interpolating between its
-/// samples so a denoised colour plane does not arrive in visible blocks.
-fn upsample_double_into(
-    plane: &[f32],
-    half_width: usize,
-    half_height: usize,
-    output: &mut [f32],
-    width: usize,
-) {
-    output
-        .par_chunks_mut(width)
-        .enumerate()
-        .for_each(|(y, row)| {
-            // Half-resolution sample centres sit at 0.25 and 0.75 of each pair,
-            // so a full-resolution pixel lies a quarter or three quarters of
-            // the way between two of them.
-            let source = (y as f32 - 0.5) * 0.5;
-            let top = source.floor().max(0.0) as usize;
-            let bottom = (top + 1).min(half_height - 1);
-            let vertical = (source - source.floor().max(0.0)).clamp(0.0, 1.0);
-            for (x, value) in row.iter_mut().enumerate() {
-                let source = (x as f32 - 0.5) * 0.5;
-                let left = source.floor().max(0.0) as usize;
-                let right = (left + 1).min(half_width - 1);
-                let horizontal = (source - source.floor().max(0.0)).clamp(0.0, 1.0);
-                let above = plane[top * half_width + left] * (1.0 - horizontal)
-                    + plane[top * half_width + right] * horizontal;
-                let below = plane[bottom * half_width + left] * (1.0 - horizontal)
-                    + plane[bottom * half_width + right] * horizontal;
-                *value = above * (1.0 - vertical) + below * vertical;
-            }
-        });
-}
-
 fn soft_threshold(value: f32, threshold: f32) -> f32 {
     value.signum() * (value.abs() - threshold).max(0.0)
 }
@@ -1224,23 +1167,43 @@ pub(crate) fn cpu_noise_reduction(image: &mut RgbImage, luma: f32, chroma: f32) 
     // resolution — but measurably less than the alternatives: collecting the
     // three planes through rayon's `unzip` cost 687 ms against 652 ms for this,
     // its collection machinery outweighing the memset it avoids.
+    // Colour comes out of the split already halved, along with the luma that
+    // guides its filtering. Building those planes at full size only to average
+    // them down was two thirds of a gigabyte at 80 MP and two passes over it.
+    let (width, height) = (image.width, image.height);
+    let (half_width, half_height) = (width.div_ceil(2), height.div_ceil(2));
     let mut yy = vec![0.0_f32; pixel_count];
-    let mut cb = vec![0.0_f32; pixel_count];
-    let mut cr = vec![0.0_f32; pixel_count];
-    yy.par_chunks_mut(8192)
-        .zip(cb.par_chunks_mut(8192))
-        .zip(cr.par_chunks_mut(8192))
-        .zip(image.data.par_chunks(3 * 8192))
-        .for_each(|(((yy, cb), cr), pixels)| {
-            for (((yy, cb), cr), pixel) in yy
-                .iter_mut()
-                .zip(cb.iter_mut())
-                .zip(cr.iter_mut())
-                .zip(pixels.as_chunks::<3>().0)
-            {
-                *yy = 0.2126 * pixel[0] + 0.7152 * pixel[1] + 0.0722 * pixel[2];
-                *cb = pixel[2] - *yy;
-                *cr = pixel[0] - *yy;
+    let mut cb = vec![0.0_f32; half_width * half_height];
+    let mut cr = vec![0.0_f32; half_width * half_height];
+    yy.par_chunks_mut(width * 2)
+        .zip(cb.par_chunks_mut(half_width))
+        .zip(cr.par_chunks_mut(half_width))
+        .zip(image.data.par_chunks(3 * width * 2))
+        .enumerate()
+        .for_each(|(band, (((yy, cb), cr), pixels))| {
+            let rows = yy.len() / width;
+            let pixels = pixels.as_chunks::<3>().0;
+            for (x, pixel) in pixels.iter().enumerate() {
+                yy[x] = 0.2126 * pixel[0] + 0.7152 * pixel[1] + 0.0722 * pixel[2];
+            }
+            let _ = band;
+            for (x, (cb, cr)) in cb.iter_mut().zip(cr.iter_mut()).enumerate() {
+                // The 2x2 block, with an odd edge repeating its last sample so
+                // the average stays an average.
+                let left = x * 2;
+                let right = (left + 1).min(width - 1);
+                let (mut blue, mut red) = (0.0, 0.0);
+                for row in 0..2 {
+                    let row = row.min(rows - 1);
+                    for column in [left, right] {
+                        let pixel = pixels[row * width + column];
+                        let luma = yy[row * width + column];
+                        blue += pixel[2] - luma;
+                        red += pixel[0] - luma;
+                    }
+                }
+                *cb = 0.25 * blue;
+                *cr = 0.25 * red;
             }
         });
 
@@ -1288,25 +1251,42 @@ pub(crate) fn cpu_noise_reduction(image: &mut RgbImage, luma: f32, chroma: f32) 
     profile_step!("luma");
     let chroma_strength = chroma.clamp(0.0, 1.0);
     if chroma_strength > 0.0 {
+        // Guided by the luma this stage has already cleaned, not the raw
+        // plane: a noisy guide reads its own noise as edges and keeps the
+        // colour filter from crossing them.
+        let mut guide = vec![0.0_f32; half_width * half_height];
+        guide
+            .par_chunks_mut(half_width)
+            .enumerate()
+            .for_each(|(y, row)| {
+                let top = y * 2;
+                let bottom = (top + 1).min(height - 1);
+                for (x, value) in row.iter_mut().enumerate() {
+                    let left = x * 2;
+                    let right = (left + 1).min(width - 1);
+                    *value = 0.25
+                        * (yy[top * width + left]
+                            + yy[top * width + right]
+                            + yy[bottom * width + left]
+                            + yy[bottom * width + right]);
+                }
+            });
         // Colour noise is coarse and colour detail is not: a sensor's chroma
         // is interpolated from a quarter of its photosites to begin with, and
         // every codec ever shipped stores it at half resolution. Denoising it
         // there costs a quarter of the work and reaches wider blotches for the
         // same filter, which is the half of this stage that was slowest.
-        let (half_width, half_height) = (image.width.div_ceil(2), image.height.div_ceil(2));
-        let guide = downsample_half(&yy, image.width, image.height);
-        for channel in [&mut cb, &mut cr] {
-            let mut small = downsample_half(channel, image.width, image.height);
+        for small in [&mut cb, &mut cr] {
             // Each stage writes the already-mixed result into `filtered` and
             // then trades buffers with it, so nothing traverses the plane twice.
             median_filter_3x3_into(
-                &small,
+                small,
                 half_width,
                 half_height,
                 (chroma_strength * 1.5).min(1.0),
                 &mut filtered,
             );
-            std::mem::swap(&mut small, &mut filtered);
+            std::mem::swap(small, &mut filtered);
             profile_step!("chroma-median");
             for (step, amount) in [
                 (1, (chroma_strength * 1.8).min(1.0)),
@@ -1315,7 +1295,7 @@ pub(crate) fn cpu_noise_reduction(image: &mut RgbImage, luma: f32, chroma: f32) 
             ] {
                 if amount > 0.0 {
                     edge_guided_blur_into(
-                        &small,
+                        small,
                         &guide,
                         half_width,
                         half_height,
@@ -1324,32 +1304,40 @@ pub(crate) fn cpu_noise_reduction(image: &mut RgbImage, luma: f32, chroma: f32) 
                         &mut scratch,
                         &mut filtered,
                     );
-                    std::mem::swap(&mut small, &mut filtered);
+                    std::mem::swap(small, &mut filtered);
                     profile_step!(format!("chroma-blur-{step}"));
                 }
             }
-            upsample_double_into(&small, half_width, half_height, channel, image.width);
-            profile_step!("chroma-upsample");
         }
     }
 
     image
         .data
-        .par_chunks_mut(3 * 8192)
-        .zip(yy.par_chunks(8192))
-        .zip(cb.par_chunks(8192))
-        .zip(cr.par_chunks(8192))
-        .for_each(|(((pixels, yy), cb), cr)| {
-            for (((pixel, yy), cb), cr) in pixels
-                .as_chunks_mut::<3>()
-                .0
-                .iter_mut()
-                .zip(yy)
-                .zip(cb)
-                .zip(cr)
-            {
-                pixel[0] = *yy + *cr;
-                pixel[2] = *yy + *cb;
+        .par_chunks_mut(3 * width)
+        .zip(yy.par_chunks(width))
+        .enumerate()
+        .for_each(|(y, (pixels, yy))| {
+            // Half-resolution samples sit at the centre of each 2x2 block, so
+            // a full-resolution pixel lies a quarter or three quarters of the
+            // way between two of them.
+            let source = (y as f32 - 0.5) * 0.5;
+            let top = source.floor().max(0.0) as usize;
+            let bottom = (top + 1).min(half_height - 1);
+            let vertical = (source - source.floor().max(0.0)).clamp(0.0, 1.0);
+            for (x, (pixel, yy)) in pixels.as_chunks_mut::<3>().0.iter_mut().zip(yy).enumerate() {
+                let source = (x as f32 - 0.5) * 0.5;
+                let left = source.floor().max(0.0) as usize;
+                let right = (left + 1).min(half_width - 1);
+                let horizontal = (source - source.floor().max(0.0)).clamp(0.0, 1.0);
+                let sample = |plane: &[f32]| {
+                    let above = plane[top * half_width + left] * (1.0 - horizontal)
+                        + plane[top * half_width + right] * horizontal;
+                    let below = plane[bottom * half_width + left] * (1.0 - horizontal)
+                        + plane[bottom * half_width + right] * horizontal;
+                    above * (1.0 - vertical) + below * vertical
+                };
+                pixel[0] = *yy + sample(&cr);
+                pixel[2] = *yy + sample(&cb);
                 pixel[1] = (*yy - 0.2126 * pixel[0] - 0.0722 * pixel[2]) / 0.7152;
             }
         });
