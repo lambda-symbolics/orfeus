@@ -492,7 +492,77 @@ where
 /// the decode cache without rendering. Every earlier entry point is unchanged.
 #[unsafe(no_mangle)]
 pub extern "C" fn orfeus_bridge_abi_version() -> u32 {
-    5
+    6
+}
+
+/// Write a 64-bit perceptual signature of the image at PATH.
+///
+/// A difference hash: the picture is reduced to a nine by eight grid of
+/// brightness and each bit records whether one cell is brighter than the cell
+/// to its right. Two frames of the same burst differ in a handful of bits;
+/// two different subjects differ in dozens. Comparing brightness *gradients*
+/// rather than brightness itself is what makes it survive the exposure and
+/// white balance drift within a burst.
+///
+/// Any image the renderer can read will do, and the caller is expected to hand
+/// over a thumbnail it already had rather than a photograph: the point of this
+/// is to cost nothing.
+///
+/// # Safety
+///
+/// `path` must be a readable NUL-terminated path, `signature` writable, and the
+/// error buffer, when non-null, writable for its stated capacity.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn orfeus_image_signature_v1(
+    path: *const c_char,
+    signature: *mut u64,
+    error_buffer: *mut c_char,
+    error_capacity: usize,
+) -> i32 {
+    // SAFETY: Pointer validation and dereferences remain inside the boundary.
+    unsafe {
+        ffi_result(error_buffer, error_capacity, || {
+            if signature.is_null() {
+                return Err(Error::InvalidArgument("signature pointer is null"));
+            }
+            let path = path_from_c(path)?;
+            *signature = image_signature(path)?;
+            Ok(())
+        })
+    }
+}
+
+/// Columns and rows the signature grid is reduced to. Nine columns give the
+/// eight horizontal comparisons that fill one row of the hash.
+const SIGNATURE_COLUMNS: u32 = 9;
+const SIGNATURE_ROWS: u32 = 8;
+
+fn image_signature(path: &Path) -> Result<u64, Error> {
+    let image = image::ImageReader::open(path)
+        .map_err(Error::Io)?
+        .with_guessed_format()
+        .map_err(Error::Io)?
+        .decode()
+        .map_err(|error| Error::Render(format!("signature decode: {error}")))?
+        .resize_exact(
+            SIGNATURE_COLUMNS,
+            SIGNATURE_ROWS,
+            image::imageops::FilterType::Triangle,
+        )
+        .into_luma8();
+    let mut signature = 0_u64;
+    let mut bit = 0;
+    for row in 0..SIGNATURE_ROWS {
+        for column in 0..SIGNATURE_COLUMNS - 1 {
+            let left = image.get_pixel(column, row).0[0];
+            let right = image.get_pixel(column + 1, row).0[0];
+            if left > right {
+                signature |= 1 << bit;
+            }
+            bit += 1;
+        }
+    }
+    Ok(signature)
 }
 
 /// Report the colour temperature INPUT's camera balanced for, in kelvin.
@@ -1006,7 +1076,7 @@ mod tests {
 
     #[test]
     fn reports_current_abi_version() {
-        assert_eq!(orfeus_bridge_abi_version(), 5);
+        assert_eq!(orfeus_bridge_abi_version(), 6);
         assert_eq!(orfeus_raw_render_capabilities_v1(), 1 | 2 | 4 | 16);
     }
 

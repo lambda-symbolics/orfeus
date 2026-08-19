@@ -1558,6 +1558,73 @@ and then quietly relocated them would be lying about where a click puts things."
               while (plusp count)
               do (write-sequence buffer target :end count))))))
 
+(defun burst-grouping-p ()
+  "Frames close in time and alike belong together; the rest do not."
+  (let ((base 3989487541))
+    (flet ((group (entries &rest arguments)
+             (apply #'orfeus:group-captures entries arguments)))
+      (and
+       ;; A burst: one second apart, near-identical signatures.
+       (equal '(("a" "b" "c"))
+              (group (list (list "a" base 0)
+                           (list "b" (+ base 1) 1)
+                           (list "c" (+ base 2) 3))))
+       ;; The same frames with a long pause in the middle are two moments.
+       (equal '(("a" "b") ("c"))
+              (group (list (list "a" base 0)
+                           (list "b" (+ base 1) 1)
+                           (list "c" (+ base 60) 3))))
+       ;; Taken a second apart but of different things: a photographer turning
+       ;; around is not shooting a burst.
+       (equal '(("a") ("b"))
+              (group (list (list "a" base 0)
+                           (list "b" (+ base 1) #xFFFFFFFF))))
+       ;; A burst that pans stays one group: each frame is judged against the
+       ;; one before it, not against where the sequence started.
+       (equal '(("a" "b" "c"))
+              (group (list (list "a" base #b0000)
+                           (list "b" (+ base 1) #b0111)
+                           (list "c" (+ base 2) #b1111))
+                     :distance 3))
+       ;; A frame whose capture time could not be read cannot be shown to
+       ;; belong with anything, and must not drag its neighbours together.
+       (equal '(("a") ("b") ("c"))
+              (group (list (list "a" base 0)
+                           (list "b" nil 0)
+                           (list "c" (+ base 1) 0))))
+       ;; An unsigned frame is grouped on the clock alone rather than being
+       ;; treated as maximally different.
+       (equal '(("a" "b"))
+              (group (list (list "a" base 0) (list "b" (+ base 1) nil))))
+       ;; And the index reports each frame's place in its burst.
+       (let ((index (orfeus:group-index-of
+                     (group (list (list "a" base 0)
+                                  (list "b" (+ base 1) 1)
+                                  (list "c" (+ base 600) 1))))))
+         (and (equal '(0 0 2) (gethash "a" index))
+              (equal '(0 1 2) (gethash "b" index))
+              (equal '(1 0 1) (gethash "c" index))))))))
+
+(defun star-rating-reading-p ()
+  "A camera's zero means unrated, and nothing outside one to five is a rating."
+  (and (null (orfeus::parsed-rating "0"))
+       (null (orfeus::parsed-rating "-"))
+       (null (orfeus::parsed-rating nil))
+       (null (orfeus::parsed-rating "6"))
+       (eql 3 (orfeus::parsed-rating "3"))
+       (eql 5 (orfeus::parsed-rating "5"))
+       ;; ExifTool prints the percentage form with a suffix on some files.
+       (eql 4 (orfeus::parsed-rating "4 stars"))))
+
+(defun capture-time-parsing-p ()
+  (let ((seconds (orfeus::capture-universal-time "2026:08:02 18:35:12")))
+    (and seconds
+         (multiple-value-bind (second minute hour day month year)
+             (decode-universal-time seconds)
+           (and (= second 12) (= minute 35) (= hour 18)
+                (= day 2) (= month 8) (= year 2026)))
+         (null (orfeus::capture-universal-time "not a date")))))
+
 (defun bundled-film-luts-match-pinned-digests-p ()
   (let* ((directory (asdf:system-relative-pathname "orfeus" #P"data/luts/"))
          (expected
@@ -1676,6 +1743,9 @@ and then quietly relocated them would be lying about where a click puts things."
              (graph-edit-rollback-and-copy-p))
       (check "blends require compatible crop geometry on both branches"
              (graph-crop-branch-compatibility-p))
+      (check "bursts group by clock and likeness together" (burst-grouping-p))
+      (check "an unrated frame reads as unrated" (star-rating-reading-p))
+      (check "capture times parse to a comparable instant" (capture-time-parsing-p))
       (check "content digests are pinned and cover every byte"
              (content-digest-is-stable-and-complete-p))
       (check "curves nodes validate, serialize, and round trip"

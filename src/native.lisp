@@ -745,6 +745,26 @@ too old to answer reports."
           (let ((value (cffi:mem-ref kelvin :float)))
             (when (plusp value) value)))))))
 
+(defcfun ("orfeus_image_signature_v1" %image-signature-v1) :int32
+  (path :string)
+  (signature :pointer)
+  (error-buffer :pointer)
+  (error-capacity :size))
+
+(defun native-image-signature (pathname)
+  "Return a 64-bit perceptual signature of the image at PATHNAME, or NIL."
+  (native-library-load)
+  (when (< (native-bridge-version) 6)
+    (return-from native-image-signature nil))
+  (with-foreign-object (signature :uint64)
+    (with-foreign-pointer (error-buffer *native-error-buffer-size*)
+      (let ((status (with-native-float-traps
+                      (%image-signature-v1 (namestring pathname) signature
+                                           error-buffer
+                                           *native-error-buffer-size*))))
+        (when (zerop status)
+          (cffi:mem-ref signature :uint64))))))
+
 (defun dng-original-filename (pathname)
   "Return the embedded original filename recorded by DNG PATHNAME."
   (native-library-load)

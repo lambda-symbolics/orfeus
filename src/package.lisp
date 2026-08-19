@@ -62,8 +62,16 @@
    #:photo-extract-embedded-preview
    #:photo-lens-description
    #:photo-lens-name
-   #:photo-lens-tags-known-p
+   #:photo-metadata-known-p
    #:photo-as-shot-kelvin
+   #:photo-rating
+   #:photo-capture-seconds
+   #:photo-signature
+   #:group-captures
+   #:group-index-of
+   #:signature-distance
+   #:*group-within-seconds*
+   #:*group-signature-distance*
    #:photo-job
    #:photo-job-input-path
    #:photo-job-output-path

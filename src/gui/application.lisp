@@ -570,6 +570,32 @@ from the anchor, and control-shift adds that range to the selection."
   "Preserve SELECTED when ROW is already selected, otherwise select only ROW."
   (if (member row selected) selected (list row)))
 
+(defun draw-star (x y filled)
+  "Draw one five-pointed star at X, Y, solid when FILLED."
+  (let ((points '((8 . 1) (10 . 6) (15 . 6) (11 . 9) (13 . 14)
+                  (8 . 11) (3 . 14) (5 . 9) (1 . 6) (6 . 6))))
+    (if filled
+        (lightfast:draw-color-rgb :red 240 :green 200 :blue 90)
+        (lightfast:draw-color-rgb :red 96 :green 98 :blue 102))
+    ;; Drawn as its outline: the toolkit has no polygon fill, and at this size
+    ;; an outline in the same colour reads as a solid star anyway.
+    (loop for (from . rest) on points
+          for to = (or (first rest) (first points))
+          do (lightfast:draw-line (+ x (car from)) (+ y (cdr from))
+                                  (+ x (car to)) (+ y (cdr to))))
+    (when filled
+      (lightfast:draw-line (+ x 5) (+ y 8) (+ x 11) (+ y 8))
+      (lightfast:draw-line (+ x 6) (+ y 10) (+ x 10) (+ y 10)))))
+
+(defun draw-star-rating (rating x y)
+  "Draw RATING out of five stars, or nothing at all when unrated.
+
+An unrated frame shows no stars rather than five empty ones: a filmstrip of
+hollow stars beside every photograph says nothing and reads as clutter."
+  (when rating
+    (dotimes (index 5)
+      (draw-star (+ x (* index 15)) y (< index rating)))))
+
 (defun draw-interned-badge (x y)
   "Draw the mark that says a photograph no longer needs its card.
 
@@ -1058,6 +1084,10 @@ new cache entry is published."
            (lens-cache (make-hash-table :test #'eq))
            (capture-cache (make-hash-table :test #'eq))
            (thumbnail-files (make-hash-table :test #'eq))
+           ;; Photograph -> (burst number, place in it, how many): filled in
+           ;; from a background pass, because reading capture times is a
+           ;; subprocess per photograph and the filmstrip has to keep drawing.
+           (photo-groups (make-hash-table :test #'eq))
            (lut-paths (make-hash-table :test #'equal))
            window menu toolbar toolbar-bottom-rule main-tile root-layout left-column
            filmstrip-pane gallery-pane center-pane
@@ -2163,6 +2193,34 @@ new cache entry is published."
                  (orfeus:forget-content-key path))
                (photo-content-key path)))
            (thumbnail-row-height () 104)
+           (photo-group-of (job) (gethash job photo-groups))
+           (draw-photo-rating (job x y)
+             (draw-star-rating
+              (ignore-errors (orfeus:photo-rating (photo-job-input-path job)))
+              x y))
+           (draw-burst-bar (job x row-y row-height)
+             ;; A bar down the left edge of every frame of a burst, closed at
+             ;; the ends, so a run of them reads as one block rather than as
+             ;; unrelated rows that happen to look alike.
+             (let* ((place (photo-group-of job))
+                    (position (second place))
+                    (size (third place)))
+               (when (and size (> size 1))
+                 (lightfast:draw-color-rgb :red 120 :green 170 :blue 230)
+                 (lightfast:draw-filled-rect
+                  (+ x 1) (if (zerop position) (+ row-y 6) row-y)
+                  3
+                  (- row-height (if (zerop position) 6 0)
+                     (if (= position (1- size)) 6 0))))))
+           (draw-burst-position (job x y)
+             (let* ((place (photo-group-of job))
+                    (position (second place))
+                    (size (third place)))
+               (when (and size (> size 1))
+                 (lightfast:draw-color-rgb :red 150 :green 190 :blue 240)
+                 (lightfast:draw-text (format nil "burst ~D of ~D"
+                                              (1+ position) size)
+                                      x y))))
            (thumbnail-scroll-limit ()
              (if thumbnail-canvas
                  (max 0 (- (* (length (project-photos project))
@@ -3828,6 +3886,35 @@ new cache entry is published."
                          (format nil "Lens: ~A" (selected-lens-description)))))
              (sync-export-controls)
              (sync-preset-action-label))
+           (refresh-photo-groups ()
+             ;; Reading a capture time spawns ExifTool the first time, and a
+             ;; card's worth of photographs is a card's worth of spawns, so the
+             ;; whole pass runs on the background queue and posts its answer.
+             (let ((jobs (copy-list (project-photos project)))
+                   (thumbs (let ((copy (make-hash-table :test #'eq)))
+                             (maphash (lambda (job path)
+                                        (setf (gethash job copy) path))
+                                      thumbnail-files)
+                             copy)))
+               (enqueue-gui-task
+                background-queue :groups
+                (lambda ()
+                  (let ((entries
+                          (mapcar
+                           (lambda (job)
+                             (let ((input (photo-job-input-path job))
+                                   (thumb (gethash job thumbs)))
+                               (list job
+                                     (ignore-errors
+                                       (orfeus:photo-capture-seconds input))
+                                     (and thumb
+                                          (ignore-errors
+                                            (orfeus:photo-signature thumb))))))
+                           jobs)))
+                    (queue-event queue
+                                 (list :photo-groups
+                                       (orfeus:group-index-of
+                                        (orfeus:group-captures entries)))))))))
            (replace-project (new-project &optional path)
              (incf preview-generation)
              (clear-previews)
@@ -4935,7 +5022,14 @@ new cache entry is published."
                   (when (and (member (third event) (project-photos project) :test #'eq)
                              (null (gethash (third event) thumbnail-files)))
                     (setf (gethash (third event) thumbnail-files) (fourth event))
+                    ;; A thumbnail is also the first time this photograph can be
+                    ;; compared with its neighbours, so the bursts are worth
+                    ;; asking about again.
+                    (refresh-photo-groups)
                     (redraw-thumbnails)))
+                 (:photo-groups
+                  (setf photo-groups (second event))
+                  (redraw-thumbnails))
                  (:still-error
                   (when (gallery-generation-event-current-p event
                                                             gallery-generation)
@@ -5218,10 +5312,17 @@ new cache entry is published."
                                        (+ x 6) (+ row-y 6) 88 (- row-height 12)))))
                               (when (photo-interned-cached-p job)
                                 (draw-interned-badge (+ x 76) (+ row-y 8)))
+                              (draw-burst-bar job x row-y row-height)
                               (lightfast:draw-color-rgb :red 235 :green 235 :blue 235)
                               (lightfast:draw-text
                                (file-namestring (photo-job-input-path job))
                                (+ x 102) (+ row-y 30))
+                              ;; Filename, then the stars beneath it, then the
+                              ;; burst line: a star is drawn downwards from its
+                              ;; corner and text upwards from its baseline, so
+                              ;; the two need clear air between them.
+                              (draw-photo-rating job (+ x 102) (+ row-y 42))
+                              (draw-burst-position job (+ x 102) (+ row-y 78))
                               (let ((check-x (thumbnail-checkbox-x x width))
                                     (check-y (+ row-y 10)))
                                 (lightfast:draw-color-rgb :red 225 :green 225 :blue 225)

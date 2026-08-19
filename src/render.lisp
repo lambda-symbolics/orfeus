@@ -390,7 +390,7 @@ first — concurrent misses share one loader — and a failure here is not
 reported, because that render will fail again and say so properly."
   (let ((path (gensym "PATH")))
     `(let ((,path ,input-pathname))
-       (unless (photo-lens-tags-known-p ,path)
+       (unless (photo-metadata-known-p ,path)
          (sb-thread:make-thread
           (lambda ()
             (ignore-errors (native-raw-decode ,path ,@decode-arguments)))
