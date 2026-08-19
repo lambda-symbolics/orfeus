@@ -562,6 +562,9 @@ fn to_display(image: &mut RgbImage) {
 
 pub(crate) struct GraphContext<'a> {
     pub(crate) as_shot_kelvin: Option<f32>,
+    /// Pixels the photograph has at full resolution, so stages measured in
+    /// pixels can tell how far from it this render is.
+    pub(crate) full_pixels: usize,
     pub(crate) make: &'a str,
     pub(crate) model: &'a str,
     pub(crate) lens_name: &'a str,
@@ -1045,7 +1048,11 @@ fn execute_graph_into(
                 // the slider for brightness, which is the noise that shows:
                 // at the default setting that left grain untouched — a
                 // measured drop of a tenth against a half for colour.
-                let edge = op.params[0];
+                let edge = render::strength_for_scale(
+                    op.params[0],
+                    image.width * image.height,
+                    context.full_pixels,
+                );
                 let neural = op.params[1];
                 if neural > 0.0 {
                     super::nn::apply_neural_noise_reduction(
@@ -1459,6 +1466,7 @@ fn render_graph_frame(
     );
     let as_shot_kelvin = decoded.as_shot_kelvin;
     let (decoded_width, decoded_height) = (decoded.width, decoded.height);
+    let full_pixels = decoded.full_pixels;
     // A full-resolution render works on the whole decode, so it takes the
     // buffer rather than copying it — nearly a gigabyte at 80 MP.
     let source = if bounded {
@@ -1484,6 +1492,7 @@ fn render_graph_frame(
     };
     let context = GraphContext {
         as_shot_kelvin,
+        full_pixels,
         make: &make,
         model: &model,
         lens_name: &lens_name,
@@ -1600,6 +1609,7 @@ mod tests {
             grain_seed: seed,
             orientation: 1,
             as_shot_kelvin: None,
+            full_pixels: 0,
         }
     }
 
@@ -1628,6 +1638,7 @@ mod tests {
             grain_seed: 7,
             orientation: 6,
             as_shot_kelvin: None,
+            full_pixels: 0,
         };
         let key = prefix_context_key(&[], &base).unwrap();
         assert_eq!(key.make, "Olympus");

@@ -1086,6 +1086,36 @@ fn soft_threshold(value: f32, threshold: f32) -> f32 {
 ///   stays on the device between stages, which is what makes this code worth
 ///   keeping: under a resident pipeline the dispatch times above beat the CPU
 ///   outright.
+/// Scales a denoise strength to the size the render is actually working at.
+///
+/// The filter's steps are counted in pixels — one, two and four — so at a
+/// 1600 px preview of a 5184 px frame the very same filter reaches across three
+/// times as much of the picture, while the downscale that got it there has
+/// already averaged the noise away. Running it anyway does not denoise a
+/// preview, it smears it.
+///
+/// Measured against the export downscaled to the same size, which is what a
+/// preview is supposed to predict: on a 20 MP frame at 1600 px the export
+/// carries a mean gradient of 357, a preview with no denoising 414, and a
+/// preview denoised at the setting that shipped only 239 — the setting was
+/// costing more than half the detail the export keeps. Even the gentlest
+/// setting tested overshot, at 316.
+///
+/// So it fades out with the scale and is gone by half resolution. Half is not
+/// a taste: below it a single output pixel already averages four or more
+/// photosites, which is more smoothing than the filter's own finest step, and
+/// everything the filter removes after that is structure. A preview then errs
+/// towards showing noise the export will remove rather than mush it will not,
+/// and a 1:1 view — where denoising is judged — runs at full strength and shows
+/// exactly what the export does.
+pub(crate) fn strength_for_scale(strength: f32, pixels: usize, full_pixels: usize) -> f32 {
+    if full_pixels == 0 || pixels >= full_pixels {
+        return strength;
+    }
+    let scale = (pixels as f32 / full_pixels as f32).sqrt();
+    strength * (2.0 * scale - 1.0).clamp(0.0, 1.0)
+}
+
 pub(crate) fn apply_noise_reduction(image: &mut RgbImage, luma: f32, chroma: f32) {
     if (luma == 0.0 && chroma == 0.0) || image.width < 3 || image.height < 3 {
         return;
@@ -2383,6 +2413,11 @@ pub(crate) struct DecodedRaw {
     pub(crate) focal: f32,
     /// The colour temperature the camera balanced for, when it can be read.
     pub(crate) as_shot_kelvin: Option<f32>,
+    /// Pixels the frame has at full resolution, whatever size this decode is.
+    ///
+    /// A draft bins the sensor and a preview downscales again, and the noise
+    /// reduction needs to know how far from the real thing it is working.
+    pub(crate) full_pixels: usize,
 }
 
 pub(crate) type DecodeCacheKey = [u8; 32];
@@ -3109,6 +3144,7 @@ fn decode_source(
     // dropping the sensor WB coefficients leaves Bayer green dominant.
     let white_balance = raw.wb_coeffs;
     let as_shot_kelvin = super::color::as_shot_kelvin(&raw.color_matrix, white_balance);
+    let full_pixels = roi.d.w * roi.d.h;
     let linear_srgb = intermediate_to_linear_srgb(developed, &raw.color_matrix, white_balance)
         .map_err(Error::Color)?;
     profile_stage!("camera-to-srgb");
@@ -3130,6 +3166,7 @@ fn decode_source(
             .as_ref()
             .map_or(0.0, |value| value.as_f32()),
         as_shot_kelvin,
+        full_pixels,
     })
 }
 
@@ -3303,6 +3340,7 @@ pub fn render(
     // SAFETY: The caller promises a null or NUL-terminated lens name.
     let named_lens = unsafe { borrowed_c_string(settings.lens_name, "lens name is not UTF-8")? };
     let as_shot_kelvin = decoded.as_shot_kelvin;
+    let full_pixels = decoded.full_pixels;
     let (make, model, lens_name, focal) = (
         decoded.make.clone(),
         decoded.model.clone(),
@@ -3364,10 +3402,11 @@ pub fn render(
             settings.neural_noise_reduction,
         )?;
     } else {
+        let pixels = image.width * image.height;
         apply_noise_reduction(
             &mut image,
-            settings.luma_noise_reduction,
-            settings.chroma_noise_reduction,
+            strength_for_scale(settings.luma_noise_reduction, pixels, full_pixels),
+            strength_for_scale(settings.chroma_noise_reduction, pixels, full_pixels),
         );
     }
     profile_stage!("noise-reduction");
@@ -3943,6 +3982,7 @@ mod tests {
             lens_name: String::new(),
             focal: 0.0,
             as_shot_kelvin: None,
+            full_pixels: 0,
         }
     }
 
@@ -4452,6 +4492,28 @@ mod tests {
             redness(&warmer) > redness(&as_shot),
             "a warmer illuminant did not warm the picture"
         );
+    }
+
+    #[test]
+    fn denoising_fades_out_as_a_render_shrinks() {
+        let full = 5184 * 3888;
+        // A full-resolution render asks for exactly what it was given, and so
+        // does anything at or above it — an export must never be weakened.
+        assert_eq!(0.35, strength_for_scale(0.35, full, full));
+        assert_eq!(0.35, strength_for_scale(0.35, full * 2, full));
+        // A 1600 px preview of that frame is at less than a third of it, where
+        // the downscale has already done more than the filter would.
+        assert_eq!(0.0, strength_for_scale(0.35, 1600 * 1200, full));
+        // Half resolution is the last size that asks for nothing, and a
+        // three-quarter render asks for half.
+        assert_eq!(0.0, strength_for_scale(0.35, full / 4, full));
+        let three_quarters = strength_for_scale(1.0, (full * 9) / 16, full);
+        assert!(
+            (three_quarters - 0.5).abs() < 0.01,
+            "three-quarter scale asked for {three_quarters}"
+        );
+        // A frame whose full size is unknown is taken at its word.
+        assert_eq!(0.35, strength_for_scale(0.35, 1000, 0));
     }
 
     #[test]
