@@ -757,6 +757,24 @@ best effort housekeeping."
                   t)
             (decf total (third entry))))))))
 
+(defun discard-cached-previews (directory)
+  "Delete every cached preview in DIRECTORY and return how many went.
+
+A file another render is holding is left alone, the same way eviction leaves
+one: that render is about to publish it, and taking it out from under the
+publish is how half a preview ends up on screen. Anything skipped is simply
+rendered again on demand, so the cache still ends up rebuilt."
+  (let ((removed 0))
+    (dolist (file (ignore-errors (uiop:directory-files directory)) removed)
+      (unless (preview-cache-file-active-p file)
+        (ignore-errors
+          (call-with-preview-key-lock
+           file
+           (lambda () (when (probe-file file) (delete-file file)))
+           :timeout 0.0d0))
+        (unless (probe-file file)
+          (incf removed))))))
+
 (defun preview-recipe-snapshot (recipe)
   "Return an immutable deep copy of a settings or graph render RECIPE."
   (etypecase recipe
@@ -2432,6 +2450,23 @@ new cache entry is published."
                    (#.lightfast:+event-wheel+
                     (incf thumbnail-scroll (* dy 36))
                     (redraw-thumbnails))))))
+           (discard-previews ()
+             ;; Everything earlier renders left on disk, then everything held
+             ;; in memory, then a fresh render of what is on screen. Wanted
+             ;; whenever a render changes without the settings changing — a new
+             ;; build of Orfeus, most often — because a cached preview is keyed
+             ;; by the photograph and the grade, neither of which moved.
+             (let ((removed (discard-cached-previews preview-directory)))
+               (clear-previews)
+               (clear-preview-cache)
+               (clrhash thumbnail-files)
+               (clrhash gallery-thumbs)
+               (clrhash photo-groups)
+               (refresh-gallery)
+               (schedule-initial-preview)
+               (redraw-thumbnails)
+               (set-status
+                (format nil "Discarded ~D cached preview~:P; rebuilding" removed))))
            (clear-previews ()
              (setf preview-zoom 1d0
                    preview-center-x .5d0
@@ -5192,6 +5227,11 @@ new cache entry is published."
                                  (declare (ignore ignored))
                                  (schedule-initial-preview))
                                :shortcut +key-f5+)
+        (lightfast:add-menu-item menu "View/Rebuild Previews"
+                               (lambda (&rest ignored)
+                                 (declare (ignore ignored))
+                                 (discard-previews))
+                               :shortcut (logior +menu-shift+ +key-f5+))
         (lightfast:add-menu-item menu "Process/Grab Still"
                                (lambda (&rest ignored)
                                  (declare (ignore ignored))
