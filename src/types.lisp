@@ -92,7 +92,7 @@ them as a copyable node chain.")
   "Rotation amounts a rotate node offers, as quarter turns clockwise.")
 
 (defparameter *graph-only-node-kinds*
-  '(:blend :color-subtract :crop :rotate :curves)
+  '(:blend :color-subtract :contrast :sharpen :crop :rotate :curves)
   "Node kinds that exist only in graphs, beyond the flat pipeline stages.
 
 :COLOR-SUBTRACT computes picked-color minus pixel per channel in scene-linear
@@ -101,7 +101,17 @@ rectangle given in display (oriented) coordinates, so one graph fits both
 previews and full-resolution exports. :ROTATE turns the frame by whole quarter
 turns, which is the part of orientation a crop's -45..45 degree angle cannot
 reach. :CURVES applies a monotone spline per channel on the encoded signal, the
-per-stock decompression for inverted negatives.")
+per-stock decompression for inverted negatives. :CONTRAST is a straight slope in
+the logarithm of the signal about a fixed tone, which is the operator DaVinci's
+contrast control applies. :SHARPEN is an unsharp mask on brightness alone, with
+the frame's own noise floor kept out of what it amplifies.")
+
+(defparameter *contrast-keys* '(:contrast :pivot)
+  "Parameters of a contrast node: the slope, and the tone it turns about.")
+
+(defparameter *sharpen-keys* '(:amount :radius :threshold)
+  "Parameters of a sharpen node: how much detail to add back, over what radius,
+and how many deviations of the frame's own noise to leave behind.")
 
 (defparameter *color-subtract-keys* '(:red :green :blue))
 

@@ -1381,9 +1381,9 @@ and then quietly relocated them would be lying about where a click puts things."
                  :output 1))
          (bytes (orfeus::graph->program-bytes graph)))
     (equalp bytes
-            ;; magic "ORFG", version 4, one node: exposure(2), input 0,
+            ;; magic "ORFG", version 5, one node: exposure(2), input 0,
             ;; no second input, one parameter 0.5f0, no string.
-            (coerce #(#x4F #x52 #x46 #x47  4 0 0 0  1 0 0 0
+            (coerce #(#x4F #x52 #x46 #x47  5 0 0 0  1 0 0 0
                       2 0 0 0  0 0 0 0  #xFF #xFF #xFF #xFF
                       1 0 0 0  0 0 0 #x3F  0 0 0 0)
                     '(simple-array (unsigned-byte 8) (*))))))

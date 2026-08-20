@@ -218,6 +218,8 @@ the same reason.")
     (:film . "Film")
     (:blend . "Blend")
     (:color-subtract . "Subtr")
+    (:contrast . "Contr")
+    (:sharpen . "Sharp")
     (:crop . "Crop")
     (:rotate . "Rotate")
     (:curves . "Curves")
@@ -234,6 +236,8 @@ the same reason.")
     ("Film" . :film)
     ("Blend" . :blend)
     ("Color Subtract" . :color-subtract)
+    ("Contrast" . :contrast)
+    ("Sharpen" . :sharpen)
     ("Crop" . :crop)
     ("Rotate" . :rotate)
     ("Curves" . :curves))
@@ -454,6 +458,8 @@ channel carries anywhere from its two endpoints to a full film-stock shape."
   (case (orfeus:graph-node-kind node)
     (:blend t)
     (:color-subtract t)
+    (:contrast (/= 1.0 (getf (orfeus:graph-node-params node) :contrast 1.0)))
+    (:sharpen (plusp (getf (orfeus:graph-node-params node) :amount 0.0)))
     (:crop (let ((params (orfeus:graph-node-params node)))
              (or (plusp (getf params :left 0.0))
                  (plusp (getf params :top 0.0))
@@ -1163,6 +1169,9 @@ new cache entry is published."
            ;; preview develops only what is on screen, so the file on disk is a
            ;; window and the drawing has to know which one.
            before-preview-region after-preview-region requested-viewport-region
+           ;; (KEY WIDGET DEFAULT) for controls that edit a node's own
+           ;; parameters rather than a pipeline setting.
+           (node-param-controls '())
            (photo-groups (make-hash-table :test #'eq))
            ;; Which bursts the photographer has opened. Stored the way round
            ;; that makes closed the default without a pass to close them:
@@ -2982,6 +2991,12 @@ new cache entry is published."
                  (when crop-aspect-input
                    (setf (lightfast:value crop-aspect-input)
                          (or (crop-aspect-label crop-aspect) "Free"))))
+               (when (and node (member kind '(:contrast :sharpen)))
+                 (let ((params (orfeus:graph-node-params node)))
+                   (dolist (entry node-param-controls)
+                     (destructuring-bind (key widget default) entry
+                       (setf (lightfast:value widget)
+                             (format nil "~,3F" (getf params key default)))))))
                (when (and node (eq kind :rotate) rotate-turn-input)
                  (setf (lightfast:value rotate-turn-input)
                        (quarter-turn-label
@@ -5211,6 +5226,48 @@ new cache entry is published."
                 (list label-widget slider spinner)
                 parent 12 y 26 :page)
                spinner))
+           (make-node-number-field (key label minimum maximum step default y
+                                    parent)
+             ;; Like MAKE-NUMBER-FIELD, but for a node kind that carries its own
+             ;; parameters rather than one of the flat pipeline's settings: the
+             ;; value belongs to this node, so it is written straight to it.
+             (let* ((label-widget
+                      (lightfast:make-label :parent parent :x 12 :y y
+                                            :width 88 :height 26 :label label))
+                    (callback
+                      (lambda (widget event value)
+                        (declare (ignore event value))
+                        (handler-case
+                            (let ((node (gui-model-selected-graph-node model))
+                                  (number (parse-number
+                                           (lightfast:value widget))))
+                              (when node
+                                (gui-model-set-node-params
+                                 model node
+                                 (list key (float (max minimum
+                                                       (min maximum number))
+                                                  1.0)))
+                                (sync-node-tools)
+                                (when graph-canvas
+                                  (lightfast:redraw graph-canvas))
+                                (schedule-edited-preview)))
+                          (error (condition)
+                            (set-status (princ-to-string condition))))))
+                    (spinner (lightfast:make-spinner
+                              :parent parent :x 202 :y y
+                              :width 78 :height 26 :callback callback))
+                    (slider (lightfast:make-slider
+                             :parent parent :x 110 :y y
+                             :width 84 :height 26 :callback callback)))
+               (dolist (widget (list slider spinner))
+                 (lightfast:set-range widget minimum maximum)
+                 (lightfast:set-step widget step)
+                 (push (list key widget default) node-param-controls))
+               (register-inspector-row
+                (number-field-layout label-widget slider spinner)
+                (list label-widget slider spinner)
+                parent 12 y 26 :page)
+               spinner))
            (make-tone-band (key short-label full-label)
              (let* ((callback (lambda (widget event value)
                                 (declare (ignore event value))
@@ -6321,6 +6378,32 @@ new cache entry is published."
                   110 44 84 26 :page))
            (lightfast:set-range blend-opacity-input 0 1)
            (lightfast:set-step blend-opacity-input 0.05)))
+        (build-group
+         :contrast
+         (lambda ()
+           (register-inspector
+            (lightfast:make-label :parent node-page :x 12 :y 44
+                                  :width 292 :height 26
+                                  :label "Slope about a fixed tone")
+            12 44 :fill 26 :page)
+           (make-node-number-field :contrast "Contrast" 0.2 4.0 0.05 1.0 76
+                                   node-page)
+           (make-node-number-field :pivot "Pivot" 0.05 0.95 0.005 0.435 108
+                                   node-page)))
+        (build-group
+         :sharpen
+         (lambda ()
+           (register-inspector
+            (lightfast:make-label :parent node-page :x 12 :y 44
+                                  :width 292 :height 26
+                                  :label "Unsharp mask on brightness")
+            12 44 :fill 26 :page)
+           (make-node-number-field :amount "Amount" 0.0 3.0 0.05 0.0 76
+                                   node-page)
+           (make-node-number-field :radius "Radius (px)" 0.3 5.0 0.1 1.0 108
+                                   node-page)
+           (make-node-number-field :threshold "Noise floor" 0.0 8.0 0.25 2.0 140
+                                   node-page)))
         (build-group
          :color-subtract
          (lambda ()

@@ -2426,6 +2426,193 @@ fn srgb_table() -> &'static [f32; SRGB_TABLE_LAST + 1] {
     })
 }
 
+/// Turns a display-encoded value back into linear light.
+///
+/// The inverse of `exact_srgb_encode`, and used only where a control reads in
+/// display terms but the pixels are scene-linear — a contrast pivot, for one.
+pub(crate) fn srgb_decode(value: f32) -> f32 {
+    if value <= 0.040_45 {
+        value / 12.92
+    } else {
+        ((value + 0.055) / 1.055).max(0.0).powf(2.4)
+    }
+}
+
+/// Steepens or flattens the image about a fixed tone, leaving that tone put.
+///
+/// A straight slope in the logarithm of the signal: `out = p * (in / p) ^ c`.
+/// Written that way it is the same operator DaVinci's contrast control applies
+/// in its log working space, and it has the properties a contrast control
+/// wants and a subtract-multiply-add in linear light does not — it cannot drive
+/// a value negative, it cannot clip a highlight, it leaves the pivot exactly
+/// where it was, and doubling it twice is the same as quadrupling it once.
+///
+/// The pivot is stated in display terms, where a photographer can recognise it:
+/// DaVinci's default of 0.435 is a little under middle grey, which is 0.46.
+/// Applied per channel rather than to luminance alone, which is what makes
+/// contrast also add a little saturation — again as DaVinci's does.
+pub(crate) fn apply_contrast(image: &mut RgbImage, contrast: f32, pivot: f32) {
+    if contrast == 1.0 {
+        return;
+    }
+    let pivot = srgb_decode(pivot.clamp(0.01, 0.99)).max(1.0e-4);
+    let inverse = 1.0 / pivot;
+    image.data.par_chunks_mut(3 * 8192).for_each(|chunk| {
+        for value in chunk.iter_mut() {
+            if *value > 0.0 {
+                *value = pivot * (*value * inverse).powf(contrast);
+            }
+        }
+    });
+}
+
+/// The linear ratio between the size a render works at and the whole frame's.
+///
+/// One for an export. Anything that is measured in pixels — a blur radius, a
+/// sharpening radius — has to be scaled by this or it means something different
+/// in a preview than it does in the file that gets delivered.
+pub(crate) fn scale_ratio(pixels: usize, full_pixels: usize) -> f32 {
+    if full_pixels == 0 || pixels >= full_pixels {
+        return 1.0;
+    }
+    (pixels as f32 / full_pixels as f32).sqrt()
+}
+
+/// Smallest sharpening radius worth running, in pixels.
+///
+/// A fitted preview is a third of the size it will be exported at, so a radius
+/// scaled down with it lands under a pixel and the sharpening disappears —
+/// which is honest, since downsampling destroys it anyway, but leaves the
+/// control looking broken. Flooring the radius here shows a hint of the effect
+/// at fit while the zoomed view, where sharpening is actually judged, shows
+/// what the export will hold.
+const MIN_SHARPEN_RADIUS: f32 = 0.6;
+
+/// How far the sharpening reads around each pixel it writes.
+pub(crate) const SHARPEN_MAX_REACH: usize = 16;
+
+/// One separable Gaussian pass along the rows of a plane.
+fn blur_rows(source: &[f32], output: &mut [f32], width: usize, height: usize, kernel: &[f32]) {
+    let radius = (kernel.len() / 2) as isize;
+    output
+        .par_chunks_mut(width)
+        .enumerate()
+        .for_each(|(row, out)| {
+            let base = row * width;
+            for (column, value) in out.iter_mut().enumerate() {
+                let mut sum = 0.0;
+                for (index, weight) in kernel.iter().enumerate() {
+                    let at = (column as isize + index as isize - radius)
+                        .clamp(0, width as isize - 1) as usize;
+                    sum += weight * source[base + at];
+                }
+                *value = sum;
+            }
+        });
+    let _ = height;
+}
+
+/// Transposes a plane, so one row kernel serves both axes.
+fn transpose_plane(source: &[f32], output: &mut [f32], width: usize, height: usize) {
+    output
+        .par_chunks_mut(height)
+        .enumerate()
+        .for_each(|(column, out)| {
+            for (row, value) in out.iter_mut().enumerate() {
+                *value = source[row * width + column];
+            }
+        });
+}
+
+fn gaussian_kernel(radius: f32) -> Vec<f32> {
+    let extent = ((3.0 * radius).ceil() as usize).clamp(1, SHARPEN_MAX_REACH);
+    let weights: Vec<f32> = (0..=2 * extent)
+        .map(|index| {
+            let offset = index as f32 - extent as f32;
+            (-(offset * offset) / (2.0 * radius * radius)).exp()
+        })
+        .collect();
+    let total: f32 = weights.iter().sum();
+    weights.into_iter().map(|weight| weight / total).collect()
+}
+
+/// Unsharp masking on brightness alone, with the noise floor kept out of it.
+///
+/// Three things make this a photographic sharpener rather than a filter that
+/// happens to raise contrast at edges.
+///
+/// It works on **brightness only**, and puts the result back as a gain on the
+/// three channels, so hue and saturation come out untouched. Sharpening the
+/// channels separately is what produces coloured fringes on every edge.
+///
+/// It works on the **square root of the signal**, not on linear light. A linear
+/// unsharp mask spends most of its correction on the brightest pixels, which is
+/// where a halo is most visible and least wanted.
+///
+/// And the detail it adds back is **shrunk against the frame's own noise**
+/// before it is amplified, by the same garrote the denoiser uses. Sharpening
+/// without that is a grain amplifier: the finest scale of a photograph is where
+/// its noise lives, and THRESHOLD says how many deviations of it to leave
+/// behind.
+pub(crate) fn apply_sharpen(
+    image: &mut RgbImage,
+    amount: f32,
+    radius: f32,
+    threshold: f32,
+    profile: &NoiseProfile,
+) {
+    let (width, height) = (image.width, image.height);
+    if amount <= 0.0 || width < 3 || height < 3 {
+        return;
+    }
+    let radius = radius.max(MIN_SHARPEN_RADIUS);
+    let luma: Vec<f32> = image
+        .data
+        .as_chunks::<3>()
+        .0
+        .par_iter()
+        .map(|pixel| 0.2126 * pixel[0] + 0.7152 * pixel[1] + 0.0722 * pixel[2])
+        .collect();
+    let encoded: Vec<f32> = luma.par_iter().map(|value| value.max(0.0).sqrt()).collect();
+    let kernel = gaussian_kernel(radius);
+    let mut blurred = vec![0.0_f32; width * height];
+    let mut turned = vec![0.0_f32; width * height];
+    let mut turned_blur = vec![0.0_f32; width * height];
+    blur_rows(&encoded, &mut blurred, width, height, &kernel);
+    transpose_plane(&blurred, &mut turned, width, height);
+    blur_rows(&turned, &mut turned_blur, height, width, &kernel);
+    transpose_plane(&turned_blur, &mut blurred, height, width);
+    image
+        .data
+        .par_chunks_mut(3 * 8192)
+        .zip(luma.par_chunks(8192))
+        .zip(encoded.par_chunks(8192))
+        .zip(blurred.par_chunks(8192))
+        .for_each(|(((pixels, luma), encoded), blurred)| {
+            for (pixel, ((luma, encoded), blurred)) in pixels
+                .as_chunks_mut::<3>()
+                .0
+                .iter_mut()
+                .zip(luma.iter().zip(encoded).zip(blurred))
+            {
+                if *luma <= 1.0e-5 {
+                    continue;
+                }
+                // The noise profile measures linear light; the square root
+                // halves its slope, so the same noise is this much of a
+                // deviation here.
+                let floor = threshold * profile.deviation[noise_bin(*luma)]
+                    / (2.0 * encoded.max(1.0e-3));
+                let detail = shrink_detail(*encoded - *blurred, floor);
+                let sharpened = (*encoded + amount * detail).max(0.0);
+                let gain = (sharpened * sharpened) / *luma;
+                for channel in pixel.iter_mut() {
+                    *channel *= gain;
+                }
+            }
+        });
+}
+
 fn exact_srgb_encode(value: f32) -> f32 {
     if value <= 0.003_130_8 {
         12.92 * value
@@ -4429,6 +4616,164 @@ mod tests {
             })
             .sum::<f32>();
         (squared_error / (image.width * image.height) as f32).sqrt()
+    }
+
+    fn flat_image(width: usize, height: usize, pixel: [f32; 3]) -> RgbImage {
+        RgbImage {
+            width,
+            height,
+            data: pixel.repeat(width * height),
+        }
+    }
+
+    #[test]
+    fn contrast_pivots_without_clipping_and_composes() {
+        let pivot = 0.435_f32;
+        let linear_pivot = srgb_decode(pivot);
+        // The pivot is the fixed point, which is the whole promise of the
+        // control: raising contrast must not shift the exposure.
+        let mut image = flat_image(8, 8, [linear_pivot; 3]);
+        apply_contrast(&mut image, 2.0, pivot);
+        for value in &image.data {
+            assert!(
+                (*value - linear_pivot).abs() < 1.0e-5,
+                "the pivot moved to {value}"
+            );
+        }
+        // Identity, and no clipping either side of it.
+        let ramp: Vec<f32> = (0..64).map(|index| index as f32 / 16.0).collect();
+        for slope in [0.5_f32, 1.0, 2.0, 4.0] {
+            let mut image = RgbImage {
+                width: ramp.len(),
+                height: 1,
+                data: ramp.iter().flat_map(|value| [*value; 3]).collect(),
+            };
+            apply_contrast(&mut image, slope, pivot);
+            for (before, after) in ramp.iter().zip(image.data.as_chunks::<3>().0) {
+                assert!(after[0].is_finite() && after[0] >= 0.0, "{slope} produced {after:?}");
+                if slope == 1.0 {
+                    assert!((after[0] - before).abs() < 1.0e-6, "unity changed a value");
+                } else if *before > linear_pivot {
+                    assert_eq!(
+                        after[0] > *before,
+                        slope > 1.0,
+                        "highlights moved the wrong way at slope {slope}"
+                    );
+                }
+            }
+        }
+        // A slope in a logarithm composes by multiplication, which is what
+        // makes two nudges of the slider behave like one bigger nudge.
+        let start = flat_image(4, 4, [0.6, 0.3, 0.1]);
+        let mut twice = start.clone();
+        apply_contrast(&mut twice, 1.5, pivot);
+        apply_contrast(&mut twice, 1.5, pivot);
+        let mut once = start;
+        apply_contrast(&mut once, 2.25, pivot);
+        for (a, b) in twice.data.iter().zip(&once.data) {
+            assert!((a - b).abs() < 1.0e-5, "{a} is not {b}");
+        }
+    }
+
+    #[test]
+    fn sharpening_steepens_an_edge_and_keeps_colour() {
+        let (width, height) = (64, 32);
+        let mut data = Vec::with_capacity(width * height * 3);
+        for _ in 0..height {
+            for x in 0..width {
+                // A step with a soft transition, tinted so the hue can be
+                // checked, at a level where the encoding has some slope.
+                let level = if x < width / 2 { 0.18 } else { 0.42 };
+                data.extend_from_slice(&[level, level * 0.8, level * 0.55]);
+            }
+        }
+        let original = RgbImage {
+            width,
+            height,
+            data,
+        };
+        let profile = measure_noise_profile(&original);
+        let mut image = original.clone();
+        apply_sharpen(&mut image, 0.0, 1.0, 0.0, &profile);
+        assert_eq!(image.data, original.data, "no amount still changed the image");
+        let mut image = original.clone();
+        apply_sharpen(&mut image, 1.5, 1.2, 0.0, &profile);
+        let at = |image: &RgbImage, x: usize| {
+            let index = ((height / 2) * width + x) * 3;
+            [image.data[index], image.data[index + 1], image.data[index + 2]]
+        };
+        // The dark side of the edge goes darker and the light side lighter:
+        // an overshoot, which is what sharpening is.
+        let middle = width / 2;
+        assert!(
+            at(&image, middle - 1)[0] < at(&original, middle - 1)[0],
+            "the dark side of the edge did not darken"
+        );
+        assert!(
+            at(&image, middle)[0] > at(&original, middle)[0],
+            "the light side of the edge did not lighten"
+        );
+        // Far from the edge nothing happens, and everywhere the hue is intact.
+        for x in [2_usize, width - 3] {
+            let before = at(&original, x);
+            let after = at(&image, x);
+            assert!(
+                (after[0] - before[0]).abs() < 1.0e-4,
+                "a flat area moved at column {x}"
+            );
+        }
+        for x in 0..width {
+            let before = at(&original, x);
+            let after = at(&image, x);
+            let before_ratio = before[1] / before[0];
+            let after_ratio = after[1] / after[0];
+            assert!(
+                (before_ratio - after_ratio).abs() < 1.0e-4,
+                "column {x} changed hue: {before:?} became {after:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sharpening_leaves_the_noise_floor_where_it_is() {
+        let (width, height) = (96, 64);
+        let mut data = Vec::with_capacity(width * height * 3);
+        for y in 0..height {
+            for x in 0..width {
+                let bits = splitmix64((y as u64) << 32 | x as u64);
+                let value = 0.3 + ((bits >> 40) as f32 / 16_777_215.0 - 0.5) * 0.03;
+                data.extend_from_slice(&[value, value, value]);
+            }
+        }
+        let noisy = RgbImage {
+            width,
+            height,
+            data,
+        };
+        let profile = measure_noise_profile(&noisy);
+        let deviation = |image: &RgbImage| {
+            let mean: f32 = image.data.iter().sum::<f32>() / image.data.len() as f32;
+            (image.data.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>()
+                / image.data.len() as f32)
+                .sqrt()
+        };
+        let before = deviation(&noisy);
+        let mut uncored = noisy.clone();
+        apply_sharpen(&mut uncored, 1.5, 1.0, 0.0, &profile);
+        let mut cored = noisy;
+        apply_sharpen(&mut cored, 1.5, 1.0, 3.0, &profile);
+        let uncored = deviation(&uncored);
+        let cored = deviation(&cored);
+        assert!(
+            uncored > before * 1.2,
+            "with no floor, sharpening should have amplified the grain: \
+             {before} became {uncored}"
+        );
+        assert!(
+            cored < before * 1.05,
+            "with a floor, the grain should have been left alone: \
+             {before} became {cored}"
+        );
     }
 
     #[test]

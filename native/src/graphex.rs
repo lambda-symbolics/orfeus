@@ -22,7 +22,7 @@ use super::render::{self, DecodedRaw, LensCorrectionOptions, RgbImage};
 const GRAPH_MAGIC: u32 = 0x4746_524F; // "ORFG" little-endian
 // 3 made each curves channel variable length behind a count header;
 // 4 added the rotate node.
-const GRAPH_VERSION: u32 = 4;
+const GRAPH_VERSION: u32 = 5;
 const MAX_GRAPH_NODES: usize = 64;
 
 pub const NODE_WHITE_BALANCE: u32 = 1;
@@ -36,6 +36,8 @@ pub const NODE_COLOR_SUBTRACT: u32 = 8;
 pub const NODE_CROP: u32 = 9;
 pub const NODE_CURVES: u32 = 10;
 pub const NODE_ROTATE: u32 = 11;
+pub const NODE_CONTRAST: u32 = 12;
+pub const NODE_SHARPEN: u32 = 13;
 
 /// Frame-level settings shared by every node of one graph render.
 #[repr(C)]
@@ -188,6 +190,8 @@ fn param_arity(kind: u32) -> Result<ParamArity, Error> {
         NODE_CROP => ParamArity::Exact(5),          // left, top, width, height, angle
         NODE_CURVES => ParamArity::Curves,          // four counts, then their points
         NODE_ROTATE => ParamArity::Exact(1),        // quarter turns clockwise
+        NODE_CONTRAST => ParamArity::Exact(2),      // slope, pivot in display terms
+        NODE_SHARPEN => ParamArity::Exact(3),       // amount, radius, noise floor
         _ => return Err(Error::InvalidArgument("unknown graph node kind")),
     })
 }
@@ -402,6 +406,11 @@ fn validate_param(kind: u32, index: usize, value: f32) -> Result<(), Error> {
         (NODE_CROP, 2) | (NODE_CROP, 3) => (0.05..=1.0).contains(&value),
         (NODE_CROP, 4) => (-45.0..=45.0).contains(&value),
         (NODE_ROTATE, 0) => value == 0.0 || value == 1.0 || value == 2.0 || value == 3.0,
+        (NODE_CONTRAST, 0) => (0.2..=4.0).contains(&value),
+        (NODE_CONTRAST, 1) => (0.05..=0.95).contains(&value),
+        (NODE_SHARPEN, 0) => (0.0..=3.0).contains(&value),
+        (NODE_SHARPEN, 1) => (0.3..=5.0).contains(&value),
+        (NODE_SHARPEN, 2) => (0.0..=8.0).contains(&value),
         // The four leading parameters are point counts, not signal levels.
         (NODE_CURVES, index) if index < CURVE_CHANNELS => {
             (MIN_CURVE_POINTS as f32..=MAX_CURVE_POINTS as f32).contains(&value)
@@ -935,6 +944,7 @@ pub(crate) fn plan_viewport(ops: &[GraphOp]) -> Option<ViewportPlan> {
             NODE_NOISE_REDUCTION => {
                 render::NOISE_REDUCTION_REACH.max(super::nn::NETWORK_REACH)
             }
+            NODE_SHARPEN => render::SHARPEN_MAX_REACH,
             _ => 0,
         };
     }
@@ -1246,6 +1256,8 @@ fn execute_graph_into(
             && matches!(
                 op.kind,
                 NODE_NOISE_REDUCTION
+                    | NODE_CONTRAST
+                    | NODE_SHARPEN
                     | NODE_TONE
                     | NODE_FILM
                     | NODE_COLOR_SUBTRACT
@@ -1293,6 +1305,22 @@ fn execute_graph_into(
                 } else {
                     render::apply_noise_reduction(&mut image, edge, edge);
                 }
+            }
+            NODE_CONTRAST => {
+                render::apply_contrast(&mut image, op.params[0], op.params[1]);
+            }
+            NODE_SHARPEN => {
+                // The radius is stated for the photograph, not for whichever
+                // reduction of it is on screen, so it shrinks with the render.
+                let ratio = render::scale_ratio(context.scaled_pixels, context.full_pixels);
+                let profile = render::measure_noise_profile(&image);
+                render::apply_sharpen(
+                    &mut image,
+                    op.params[0],
+                    op.params[1] * ratio,
+                    op.params[2],
+                    &profile,
+                );
             }
             NODE_TONE => {
                 let adjustments: [f32; 7] = op.params[..7]
