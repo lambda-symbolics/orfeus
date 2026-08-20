@@ -4844,6 +4844,10 @@ new cache entry is published."
              (when debounce-id
                (ignore-errors (lightfast:remove-timeout debounce-id))
                (setf debounce-id nil))
+             ;; The render about to be abandoned will not report again, so its
+             ;; last stage must not be left narrating a wait that is over.
+             (setf render-stage nil
+                   render-stage-fraction 0.0)
              (incf preview-generation)
              (setf progress-total 0
                    progress-generation preview-generation)
