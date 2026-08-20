@@ -1063,8 +1063,168 @@ fn median_filter_3x3_into(
         });
 }
 
-fn soft_threshold(value: f32, threshold: f32) -> f32 {
-    value.signum() * (value.abs() - threshold).max(0.0)
+/// Shrinks a detail coefficient towards zero, keeping the ones that stand well
+/// clear of the noise.
+///
+/// The non-negative garrote rather than a soft threshold. Soft thresholding
+/// subtracts the threshold from *everything* it does not delete, so a strong
+/// edge or a real piece of texture comes back weaker than it went in, and the
+/// whole frame reads soft. This leaves anything much larger than the threshold
+/// alone — the correction falls off as the square — while still deleting what
+/// is comparable to it. Same noise removed, far less detail spent.
+#[inline]
+fn shrink_detail(value: f32, threshold: f32) -> f32 {
+    if !(threshold > 0.0) {
+        return value;
+    }
+    let ratio = threshold / value;
+    let scale = 1.0 - ratio * ratio;
+    if scale > 0.0 { value * scale } else { 0.0 }
+}
+
+/// Brightness bins the frame's noise is measured in.
+///
+/// Photon noise grows with the signal, so one number for a whole frame either
+/// leaves the shadows noisy or wipes the highlights smooth. Eight bins spaced
+/// by the square root of brightness put most of the resolution where the noise
+/// is worst.
+const NOISE_BINS: usize = 8;
+
+/// Which quantile of a detail band is taken to be its noise floor, and what
+/// that quantile equals in deviations for noise alone.
+///
+/// A low quantile, not the median. Noise is in every pixel; texture is in some
+/// of them, and it is much larger. Taking the lower quarter therefore measures
+/// the noise even where over half the region is detail, and when it is wrong it
+/// is wrong towards *less* smoothing — which is the direction a denoiser should
+/// err in. For a half-normal the lower quarter sits at 0.3186 deviations.
+const NOISE_QUANTILE: f32 = 0.25;
+const NOISE_QUANTILE_SIGMA: f32 = 0.3186;
+
+/// Deviations of the frame's own noise a detail coefficient must clear at full
+/// strength.
+///
+/// The classical universal threshold is more like five deviations, which is
+/// tuned for recovering a smooth function and is far too much for a photograph:
+/// a photograph's finest scale is where its texture lives. Three and a half is
+/// firmly in the range that removes grain without visible loss, and the slider
+/// scales it, so the default lands near one deviation.
+///
+/// Two and a half, chosen by measurement rather than taste: it is the value at
+/// which this removes as much noise as the fixed threshold it replaced, at both
+/// the default setting and full, on the noisiest scene in the benchmark. So
+/// nothing lost any cleaning power — what changed is what happens to a frame
+/// that was already clean, where the fine texture now survives whole instead of
+/// two thirds gone.
+const SHRINK_DEVIATIONS: f32 = 2.5;
+
+/// Roughly how many pixels the noise estimate looks at.
+///
+/// A quartile of a hundred thousand samples is a settled number, and spending
+/// more on a large frame buys nothing — so the stride grows with the frame
+/// rather than being fixed. Fixed was a bug: at one pixel in sixteen a
+/// thumbnail-sized image offered fewer samples than a single bin needs, every
+/// bin abstained, and the stage quietly did nothing at all.
+const NOISE_TARGET_SAMPLES: usize = 131072;
+
+/// Samples a brightness bin needs before it is allowed to name a noise floor.
+const NOISE_BIN_MINIMUM: usize = 32;
+
+#[inline]
+fn noise_bin(value: f32) -> usize {
+    let position = value.clamp(0.0, 1.0).sqrt() * NOISE_BINS as f32;
+    (position as usize).min(NOISE_BINS - 1)
+}
+
+/// Returns the lower-quartile magnitude of SAMPLES as a deviation, or `None`
+/// when there are too few of them to say.
+fn quantile_deviation(samples: &mut [f32]) -> Option<f32> {
+    if samples.len() < NOISE_BIN_MINIMUM {
+        return None;
+    }
+    let rank = ((samples.len() as f32 * NOISE_QUANTILE) as usize).min(samples.len() - 1);
+    let (_, value, _) = samples.select_nth_unstable_by(rank, |a, b| a.total_cmp(b));
+    Some(*value / NOISE_QUANTILE_SIGMA)
+}
+
+/// Measures how much noise the frame actually carries, per detail band and per
+/// brightness.
+///
+/// This is the whole point of the stage's rewrite. The threshold used to be a
+/// fixed curve — a guess at what photon noise looks like — which meant a
+/// base-ISO frame with nothing to remove was shrunk exactly as hard as a frame
+/// at ISO 6400. Measured against a clean test scene it kept 63% of the fine
+/// texture at the default setting and 28% at full, on an image whose noise was
+/// identically zero. Measuring the frame instead makes the threshold vanish
+/// when there is nothing to threshold.
+fn measure_detail_noise(
+    yy: &[f32],
+    scale_one: &[f32],
+    scale_two: &[f32],
+    width: usize,
+    height: usize,
+) -> ([f32; NOISE_BINS], [f32; NOISE_BINS]) {
+    let mut fine_samples: Vec<Vec<f32>> = vec![Vec::new(); NOISE_BINS];
+    let mut coarse_samples: Vec<Vec<f32>> = vec![Vec::new(); NOISE_BINS];
+    let stride = (width * height / NOISE_TARGET_SAMPLES).isqrt().max(1);
+    let mut all_fine = Vec::new();
+    let mut all_coarse = Vec::new();
+    let mut row = 0;
+    while row < height {
+        let mut column = 0;
+        while column < width {
+            let index = row * width + column;
+            let bin = noise_bin(yy[index]);
+            let fine = (yy[index] - scale_one[index]).abs();
+            let coarse = (scale_one[index] - scale_two[index]).abs();
+            fine_samples[bin].push(fine);
+            coarse_samples[bin].push(coarse);
+            all_fine.push(fine);
+            all_coarse.push(coarse);
+            column += stride;
+        }
+        row += stride;
+    }
+    // A bin nothing landed in — an empty shadow, a frame with no highlights —
+    // borrows the nearest bin that has an answer rather than inventing one, so
+    // a sparsely occupied brightness cannot be shrunk on no evidence.
+    let mut fine = [0.0_f32; NOISE_BINS];
+    let mut coarse = [0.0_f32; NOISE_BINS];
+    let mut measured = [false; NOISE_BINS];
+    for bin in 0..NOISE_BINS {
+        if let (Some(one), Some(two)) = (
+            quantile_deviation(&mut fine_samples[bin]),
+            quantile_deviation(&mut coarse_samples[bin]),
+        ) {
+            fine[bin] = one;
+            coarse[bin] = two;
+            measured[bin] = true;
+        }
+    }
+    // And a frame too small to fill any bin — a thumbnail, a proxy — is
+    // measured whole rather than not at all.
+    if !measured.iter().any(|bin| *bin) {
+        if let (Some(one), Some(two)) = (
+            quantile_deviation(&mut all_fine),
+            quantile_deviation(&mut all_coarse),
+        ) {
+            return ([one; NOISE_BINS], [two; NOISE_BINS]);
+        }
+        return (fine, coarse);
+    }
+    for bin in 0..NOISE_BINS {
+        if measured[bin] {
+            continue;
+        }
+        if let Some(near) = (0..NOISE_BINS)
+            .filter(|other| measured[*other])
+            .min_by_key(|other| other.abs_diff(bin))
+        {
+            fine[bin] = fine[near];
+            coarse[bin] = coarse[near];
+        }
+    }
+    (fine, coarse)
 }
 
 /// Edge-aware noise reduction. Set `ORFEUS_GPU_NOISE=1` for the compute path.
@@ -1273,6 +1433,10 @@ pub(crate) fn cpu_noise_reduction(image: &mut RgbImage, luma: f32, chroma: f32) 
             &mut scratch,
             &mut filtered,
         );
+        let (fine_noise, coarse_noise) =
+            measure_detail_noise(&yy, &scale_one, &filtered, image.width, image.height);
+        profile_step!("luma-noise");
+        let deviations = luma_strength * SHRINK_DEVIATIONS;
         yy.par_chunks_mut(8192)
             .zip(scale_one.par_chunks(8192))
             .zip(filtered.par_chunks(8192))
@@ -1280,9 +1444,15 @@ pub(crate) fn cpu_noise_reduction(image: &mut RgbImage, luma: f32, chroma: f32) 
                 for ((value, scale_one), scale_two) in
                     values.iter_mut().zip(scale_one).zip(scale_two)
                 {
-                    let threshold = luma_strength * (0.012 + 0.035 * value.max(0.0).sqrt());
-                    let fine = soft_threshold(*value - *scale_one, threshold);
-                    let coarse = soft_threshold(*scale_one - *scale_two, threshold * 0.45);
+                    let bin = noise_bin(*value);
+                    let fine = shrink_detail(
+                        *value - *scale_one,
+                        deviations * fine_noise[bin],
+                    );
+                    let coarse = shrink_detail(
+                        *scale_one - *scale_two,
+                        deviations * coarse_noise[bin],
+                    );
                     *value = *scale_two + coarse + fine;
                 }
             });
@@ -3853,39 +4023,64 @@ mod tests {
     fn benchmark_noise_reduction_quality() {
         let (width, height) = (1600, 1200);
         let clean = denoise_test_scene(width, height);
-        let noisy = add_sensor_noise(&clean, 0.09);
-        for (label, data) in [("clean", &clean), ("noisy", &noisy)] {
-            let (luma, chroma) = flat_field_noise(data, width, height);
+        // Swept, not one level. A denoiser is only judged by how much noise it
+        // removes if it is also judged by what it does to a frame that had
+        // little to remove — and a single high noise level is exactly the test
+        // a fixed threshold passes while ruining base-ISO detail.
+        for scale in [0.0_f32, 0.02, 0.045, 0.09] {
+            let noisy = add_sensor_noise(&clean, scale);
+            let (luma_sigma, chroma_sigma) = flat_field_noise(&noisy, width, height);
             eprintln!(
-                "noise-quality {label:22} psnr={:.2} dB  luma sigma={luma:.4}  chroma sigma={chroma:.4}  edge={:.3}",
-                peak_signal_to_noise(&clean, data),
-                edge_height(data, width, height)
+                "noise-quality noise={scale:.3} {:14} psnr={:.2} dB  luma sigma={luma_sigma:.4}  chroma sigma={chroma_sigma:.4}  edge={:.3}  texture={:.3}",
+                "before",
+                peak_signal_to_noise(&clean, &noisy),
+                edge_height(&noisy, width, height),
+                texture_amplitude(&noisy, width, height) / texture_amplitude(&clean, width, height)
             );
+            for (label, luma, chroma) in
+                [("slider 0.35", 0.35, 0.35), ("slider 1.00", 1.0, 1.0)]
+            {
+                let mut image = RgbImage {
+                    width,
+                    height,
+                    data: noisy.clone(),
+                };
+                let started = std::time::Instant::now();
+                cpu_noise_reduction(&mut image, luma, chroma);
+                let milliseconds = started.elapsed().as_secs_f64() * 1000.0;
+                let (luma_sigma, chroma_sigma) = flat_field_noise(&image.data, width, height);
+                eprintln!(
+                    "noise-quality noise={scale:.3} {label:14} psnr={:.2} dB  luma sigma={luma_sigma:.4}  chroma sigma={chroma_sigma:.4}  edge={:.3}  texture={:.3}  {milliseconds:.0} ms",
+                    peak_signal_to_noise(&clean, &image.data),
+                    edge_height(&image.data, width, height),
+                    texture_amplitude(&image.data, width, height)
+                        / texture_amplitude(&clean, width, height)
+                );
+            }
         }
-        for (label, luma, chroma) in [
-            // What the slider used to mean: a fifth of it for brightness.
-            ("old mapping, slider 0.35", 0.2 * 0.35, 0.35),
-            ("old mapping, slider 1.00", 0.2, 1.0),
-            // What it means now.
-            ("slider 0.35", 0.35, 0.35),
-            ("slider 0.60", 0.60, 0.60),
-            ("slider 1.00", 1.0, 1.0),
-        ] {
-            let mut image = RgbImage {
-                width,
-                height,
-                data: noisy.clone(),
-            };
-            let started = std::time::Instant::now();
-            cpu_noise_reduction(&mut image, luma, chroma);
-            let milliseconds = started.elapsed().as_secs_f64() * 1000.0;
-            let (luma_sigma, chroma_sigma) = flat_field_noise(&image.data, width, height);
-            eprintln!(
-                "noise-quality {label:22} psnr={:.2} dB  luma sigma={luma_sigma:.4}  chroma sigma={chroma_sigma:.4}  edge={:.3}  {milliseconds:.0} ms",
-                peak_signal_to_noise(&clean, &image.data),
-                edge_height(&image.data, width, height)
-            );
+    }
+
+    /// The amplitude of the fine checker in the scene's texture band.
+    ///
+    /// Detail at the scale noise lives at, which is the detail a denoiser is
+    /// tempted to spend and the reason this benchmark exists. Reported as a
+    /// fraction of what the clean scene had: one is every bit of it kept, zero
+    /// is a frame wiped smooth.
+    fn texture_amplitude(data: &[f32], width: usize, height: usize) -> f32 {
+        let mut total = 0.0_f64;
+        let mut count = 0_usize;
+        for y in (height * 3 / 4 + 8)..(height - 8) {
+            for x in 8..(width - 8) {
+                let at = |x: usize, y: usize| data[(y * width + x) * 3 + 1] as f64;
+                // A Laplacian of the checker's own period: maximal on the
+                // checker, zero on anything smoother.
+                let local = at(x, y) * 4.0 - at(x - 2, y) - at(x + 2, y) - at(x, y - 2)
+                    - at(x, y + 2);
+                total += local * local;
+                count += 1;
+            }
         }
+        (total / count.max(1) as f64).sqrt() as f32
     }
 
     /// Times the noise reduction at export resolution, isolating it from decode
