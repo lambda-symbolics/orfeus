@@ -1090,33 +1090,32 @@ fn shrink_detail(value: f32, threshold: f32) -> f32 {
 /// is worst.
 const NOISE_BINS: usize = 8;
 
-/// Which quantile of a detail band is taken to be its noise floor, and what
-/// that quantile equals in deviations for noise alone.
+/// Which quantile is taken to be the noise floor, and what that quantile
+/// equals in deviations for noise alone.
 ///
 /// A low quantile, not the median. Noise is in every pixel; texture is in some
 /// of them, and it is much larger. Taking the lower quarter therefore measures
-/// the noise even where over half the region is detail, and when it is wrong it
+/// the noise even where over half a region is detail, and when it is wrong it
 /// is wrong towards *less* smoothing — which is the direction a denoiser should
 /// err in. For a half-normal the lower quarter sits at 0.3186 deviations.
 const NOISE_QUANTILE: f32 = 0.25;
 const NOISE_QUANTILE_SIGMA: f32 = 0.3186;
 
-/// Deviations of the frame's own noise a detail coefficient must clear at full
-/// strength.
+/// What the five-tap Laplacian below does to white noise: it sums one centre
+/// and four quarter-weighted neighbours, so its variance is `1 + 4/16` times
+/// the pixel's.
+const LAPLACIAN_NOISE_GAIN: f32 = 1.118_034;
+
+/// Deviations of the frame's own pixel noise each detail band must clear at
+/// full strength.
 ///
-/// The classical universal threshold is more like five deviations, which is
-/// tuned for recovering a smooth function and is far too much for a photograph:
-/// a photograph's finest scale is where its texture lives. Three and a half is
-/// firmly in the range that removes grain without visible loss, and the slider
-/// scales it, so the default lands near one deviation.
-///
-/// Two and a half, chosen by measurement rather than taste: it is the value at
-/// which this removes as much noise as the fixed threshold it replaced, at both
-/// the default setting and full, on the noisiest scene in the benchmark. So
-/// nothing lost any cleaning power — what changed is what happens to a frame
-/// that was already clean, where the fine texture now survives whole instead of
-/// two thirds gone.
-const SHRINK_DEVIATIONS: f32 = 2.5;
+/// Two numbers rather than one because the two bands answer to noise
+/// differently: passing white noise through the fine band keeps 0.89 of its
+/// deviation and through the coarse band only 0.20, so a single multiplier
+/// would shrink one of them far too hard. Both were then confirmed against the
+/// quality benchmark, which is what they are really set by.
+const FINE_DEVIATIONS: f32 = 2.25;
+const COARSE_DEVIATIONS: f32 = 0.5;
 
 /// Roughly how many pixels the noise estimate looks at.
 ///
@@ -1130,10 +1129,37 @@ const NOISE_TARGET_SAMPLES: usize = 131072;
 /// Samples a brightness bin needs before it is allowed to name a noise floor.
 const NOISE_BIN_MINIMUM: usize = 32;
 
+/// How far the noise reduction reads around each pixel it writes.
+///
+/// The brightness chain blurs at step one and then at step two, each reaching
+/// twice its step, and colour is filtered at half resolution through a median
+/// and blurs at steps one, two and four — fifteen half-resolution pixels, so
+/// thirty of these. Rounded up with room to spare, because this is what a
+/// viewport render has to overlap its neighbours by for its interior to come
+/// out identical to a whole-frame render, and being generous costs a border.
+pub(crate) const NOISE_REDUCTION_REACH: usize = 48;
+
 #[inline]
 fn noise_bin(value: f32) -> usize {
     let position = value.clamp(0.0, 1.0).sqrt() * NOISE_BINS as f32;
     (position as usize).min(NOISE_BINS - 1)
+}
+
+/// The pixel noise a frame carries, per brightness.
+///
+/// Measured from the image the stage is about to filter, so the threshold is
+/// always in the units of the pixels it thresholds. That matters more than it
+/// sounds: an exposure node before this one scales signal and noise together,
+/// and a threshold measured anywhere else would be wrong by the gain.
+///
+/// The cost is that a render of part of a frame measures part of a frame, so
+/// panning a zoomed preview re-measures. It is a per-brightness lower quartile
+/// over some hundred thousand samples, so what moves is a few percent of a
+/// threshold — `A_WINDOWED_RENDER_MATCHES_THE_WHOLE_ONE` in `graphex` measures
+/// exactly how much, and it is far below anything visible.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct NoiseProfile {
+    deviation: [f32; NOISE_BINS],
 }
 
 /// Returns the lower-quartile magnitude of SAMPLES as a deviation, or `None`
@@ -1147,8 +1173,7 @@ fn quantile_deviation(samples: &mut [f32]) -> Option<f32> {
     Some(*value / NOISE_QUANTILE_SIGMA)
 }
 
-/// Measures how much noise the frame actually carries, per detail band and per
-/// brightness.
+/// Measures how much noise IMAGE actually carries, per brightness.
 ///
 /// This is the whole point of the stage's rewrite. The threshold used to be a
 /// fixed curve — a guess at what photon noise looks like — which meant a
@@ -1157,61 +1182,63 @@ fn quantile_deviation(samples: &mut [f32]) -> Option<f32> {
 /// texture at the default setting and 28% at full, on an image whose noise was
 /// identically zero. Measuring the frame instead makes the threshold vanish
 /// when there is nothing to threshold.
-fn measure_detail_noise(
-    yy: &[f32],
-    scale_one: &[f32],
-    scale_two: &[f32],
-    width: usize,
-    height: usize,
-) -> ([f32; NOISE_BINS], [f32; NOISE_BINS]) {
-    let mut fine_samples: Vec<Vec<f32>> = vec![Vec::new(); NOISE_BINS];
-    let mut coarse_samples: Vec<Vec<f32>> = vec![Vec::new(); NOISE_BINS];
+///
+/// Read through a five-tap Laplacian at sampled points rather than from the
+/// filter's own detail bands. Cheaper, by the square of the stride — but the
+/// reason is that it is a property of the pixels and not of the filter, so the
+/// same number is available before the filter runs and can be measured on a
+/// whole frame for the benefit of a render of part of one.
+pub(crate) fn measure_noise_profile(image: &RgbImage) -> NoiseProfile {
+    let (width, height) = (image.width, image.height);
+    let mut samples: Vec<Vec<f32>> = vec![Vec::new(); NOISE_BINS];
+    let mut all = Vec::new();
+    let mut deviation = [0.0_f32; NOISE_BINS];
+    if width < 3 || height < 3 {
+        return NoiseProfile { deviation };
+    }
+    let luma = |row: usize, column: usize| {
+        let pixel = &image.data[(row * width + column) * 3..];
+        0.2126 * pixel[0] + 0.7152 * pixel[1] + 0.0722 * pixel[2]
+    };
     let stride = (width * height / NOISE_TARGET_SAMPLES).isqrt().max(1);
-    let mut all_fine = Vec::new();
-    let mut all_coarse = Vec::new();
-    let mut row = 0;
-    while row < height {
-        let mut column = 0;
-        while column < width {
-            let index = row * width + column;
-            let bin = noise_bin(yy[index]);
-            let fine = (yy[index] - scale_one[index]).abs();
-            let coarse = (scale_one[index] - scale_two[index]).abs();
-            fine_samples[bin].push(fine);
-            coarse_samples[bin].push(coarse);
-            all_fine.push(fine);
-            all_coarse.push(coarse);
+    let mut row = 1;
+    while row + 1 < height {
+        let mut column = 1;
+        while column + 1 < width {
+            let centre = luma(row, column);
+            let laplacian = centre
+                - 0.25
+                    * (luma(row, column - 1)
+                        + luma(row, column + 1)
+                        + luma(row - 1, column)
+                        + luma(row + 1, column));
+            let magnitude = laplacian.abs();
+            samples[noise_bin(centre)].push(magnitude);
+            all.push(magnitude);
             column += stride;
         }
         row += stride;
     }
-    // A bin nothing landed in — an empty shadow, a frame with no highlights —
-    // borrows the nearest bin that has an answer rather than inventing one, so
-    // a sparsely occupied brightness cannot be shrunk on no evidence.
-    let mut fine = [0.0_f32; NOISE_BINS];
-    let mut coarse = [0.0_f32; NOISE_BINS];
     let mut measured = [false; NOISE_BINS];
     for bin in 0..NOISE_BINS {
-        if let (Some(one), Some(two)) = (
-            quantile_deviation(&mut fine_samples[bin]),
-            quantile_deviation(&mut coarse_samples[bin]),
-        ) {
-            fine[bin] = one;
-            coarse[bin] = two;
+        if let Some(value) = quantile_deviation(&mut samples[bin]) {
+            deviation[bin] = value / LAPLACIAN_NOISE_GAIN;
             measured[bin] = true;
         }
     }
-    // And a frame too small to fill any bin — a thumbnail, a proxy — is
-    // measured whole rather than not at all.
+    // A frame too small to fill any bin — a thumbnail, a proxy — is measured
+    // whole rather than not at all.
     if !measured.iter().any(|bin| *bin) {
-        if let (Some(one), Some(two)) = (
-            quantile_deviation(&mut all_fine),
-            quantile_deviation(&mut all_coarse),
-        ) {
-            return ([one; NOISE_BINS], [two; NOISE_BINS]);
+        if let Some(value) = quantile_deviation(&mut all) {
+            return NoiseProfile {
+                deviation: [value / LAPLACIAN_NOISE_GAIN; NOISE_BINS],
+            };
         }
-        return (fine, coarse);
+        return NoiseProfile { deviation };
     }
+    // A bin nothing landed in — an empty shadow, a frame with no highlights —
+    // borrows the nearest bin that has an answer rather than inventing one, so
+    // a sparsely occupied brightness cannot be shrunk on no evidence.
     for bin in 0..NOISE_BINS {
         if measured[bin] {
             continue;
@@ -1220,11 +1247,10 @@ fn measure_detail_noise(
             .filter(|other| measured[*other])
             .min_by_key(|other| other.abs_diff(bin))
         {
-            fine[bin] = fine[near];
-            coarse[bin] = coarse[near];
+            deviation[bin] = deviation[near];
         }
     }
-    (fine, coarse)
+    NoiseProfile { deviation }
 }
 
 /// Edge-aware noise reduction. Set `ORFEUS_GPU_NOISE=1` for the compute path.
@@ -1347,6 +1373,7 @@ pub(crate) fn cpu_noise_reduction(image: &mut RgbImage, luma: f32, chroma: f32) 
     if (luma == 0.0 && chroma == 0.0) || image.width < 3 || image.height < 3 {
         return;
     }
+    let profile = measure_noise_profile(image);
     let profiling = std::env::var_os("ORFEUS_PROFILE").is_some();
     let mut step_started = Instant::now();
     macro_rules! profile_step {
@@ -1433,10 +1460,8 @@ pub(crate) fn cpu_noise_reduction(image: &mut RgbImage, luma: f32, chroma: f32) 
             &mut scratch,
             &mut filtered,
         );
-        let (fine_noise, coarse_noise) =
-            measure_detail_noise(&yy, &scale_one, &filtered, image.width, image.height);
-        profile_step!("luma-noise");
-        let deviations = luma_strength * SHRINK_DEVIATIONS;
+        let fine_scale = luma_strength * FINE_DEVIATIONS;
+        let coarse_scale = luma_strength * COARSE_DEVIATIONS;
         yy.par_chunks_mut(8192)
             .zip(scale_one.par_chunks(8192))
             .zip(filtered.par_chunks(8192))
@@ -1444,15 +1469,9 @@ pub(crate) fn cpu_noise_reduction(image: &mut RgbImage, luma: f32, chroma: f32) 
                 for ((value, scale_one), scale_two) in
                     values.iter_mut().zip(scale_one).zip(scale_two)
                 {
-                    let bin = noise_bin(*value);
-                    let fine = shrink_detail(
-                        *value - *scale_one,
-                        deviations * fine_noise[bin],
-                    );
-                    let coarse = shrink_detail(
-                        *scale_one - *scale_two,
-                        deviations * coarse_noise[bin],
-                    );
+                    let noise = profile.deviation[noise_bin(*value)];
+                    let fine = shrink_detail(*value - *scale_one, fine_scale * noise);
+                    let coarse = shrink_detail(*scale_one - *scale_two, coarse_scale * noise);
                     *value = *scale_two + coarse + fine;
                 }
             });
@@ -2081,6 +2100,54 @@ pub(crate) fn orient(image: RgbImage, orientation: u16) -> RgbImage {
     output
 }
 
+/// Where a rectangle of the unoriented frame lands once the frame is oriented.
+///
+/// The forward of what `map_oriented_rect` undoes, in whole pixels rather than
+/// fractions, because a window render needs to know exactly — to the pixel —
+/// where the part it developed belongs. SOURCE is the unoriented frame's size
+/// and RECT is (left, top, width, height) within it.
+pub(crate) fn orient_rect(
+    orientation: u16,
+    source: (usize, usize),
+    rect: (usize, usize, usize, usize),
+) -> (usize, usize, usize, usize) {
+    let (width, height) = source;
+    let (left, top, rect_width, rect_height) = rect;
+    let (right, bottom) = (left + rect_width, top + rect_height);
+    match orientation {
+        2 => (width - right, top, rect_width, rect_height),
+        3 => (width - right, height - bottom, rect_width, rect_height),
+        4 => (left, height - bottom, rect_width, rect_height),
+        5 => (top, left, rect_height, rect_width),
+        6 => (height - bottom, left, rect_height, rect_width),
+        7 => (height - bottom, width - right, rect_height, rect_width),
+        8 => (top, width - right, rect_height, rect_width),
+        _ => (left, top, rect_width, rect_height),
+    }
+}
+
+/// Copies out one rectangle of IMAGE.
+pub(crate) fn crop_rect(
+    image: &RgbImage,
+    left: usize,
+    top: usize,
+    width: usize,
+    height: usize,
+) -> RgbImage {
+    let mut data = vec![0.0_f32; width * height * 3];
+    data.par_chunks_mut(width * 3)
+        .enumerate()
+        .for_each(|(row, out)| {
+            let start = ((top + row) * image.width + left) * 3;
+            out.copy_from_slice(&image.data[start..start + width * 3]);
+        });
+    RgbImage {
+        width,
+        height,
+        data,
+    }
+}
+
 pub(crate) fn native_downscale_bounds(
     orientation: u16,
     max_width: u32,
@@ -2401,14 +2468,28 @@ pub(crate) fn apply_lut(image: &mut RgbImage, lut: &CubeLut, strength: f32) {
     });
 }
 
-fn splitmix64(mut value: u64) -> u64 {
+pub(crate) fn splitmix64(mut value: u64) -> u64 {
     value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
     value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
     value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
     value ^ (value >> 31)
 }
 
-pub(crate) fn apply_grain(image: &mut RgbImage, amount: f32, size: f32, seed: u64) {
+/// Lays film grain down, seeded from where each pixel sits in the whole frame.
+///
+/// ORIGIN is the image's top-left corner within the frame it is part of, which
+/// is zero for a whole-frame render and the window's corner for a render of
+/// part of one. It has to be threaded through rather than assumed: the grain is
+/// seeded from its coordinates, so a window that counted from its own corner
+/// would get a different pattern from the frame it belongs to — the grain would
+/// crawl as the view was panned, and a preview would not match its export.
+pub(crate) fn apply_grain(
+    image: &mut RgbImage,
+    amount: f32,
+    size: f32,
+    seed: u64,
+    origin: (usize, usize),
+) {
     if amount == 0.0 {
         return;
     }
@@ -2418,10 +2499,11 @@ pub(crate) fn apply_grain(image: &mut RgbImage, amount: f32, size: f32, seed: u6
         .par_chunks_mut(width * 3)
         .enumerate()
         .for_each(|(y, row)| {
+            let y = y + origin.1;
             let gy = (y as f32 / size).floor() as u64;
             let row_seed = seed ^ gy.wrapping_mul(0x6eed_0e9d_a4d9_4a4f);
             for (x, pixel) in row.as_chunks_mut::<3>().0.iter_mut().enumerate() {
-                let gx = (x as f32 / size).floor() as u64;
+                let gx = ((x + origin.0) as f32 / size).floor() as u64;
                 let bits = splitmix64(row_seed ^ gx.wrapping_mul(0x517c_c1b7_2722_0a95));
                 let noise = ((bits >> 40) as f32 / 16_777_215.0 - 0.5) * amount * 0.16;
                 let luminance = 0.2126 * pixel[0] + 0.7152 * pixel[1] + 0.0722 * pixel[2];
@@ -3607,6 +3689,7 @@ pub fn render(
         settings.grain_amount,
         settings.grain_size,
         settings.grain_seed,
+        (0, 0),
     );
     profile_stage!("lut-grain");
     atomic_encode(
@@ -4355,9 +4438,16 @@ mod tests {
             height: 24,
             data: Vec::new(),
         };
+        // Real noise, from a hash that mixes. The first version of this walked
+        // `(x * 73 + y * 151 + x * y * 19) % 101`, which steps by a constant
+        // along each row and so is locally a straight ramp — affine, with a
+        // Laplacian of exactly zero. It looked like noise and was not, and a
+        // denoiser that measures the frame it is given correctly declined to
+        // touch it.
         for y in 0..original.height {
             for x in 0..original.width {
-                let hash = ((x * 73 + y * 151 + x * y * 19) % 101) as f32 / 100.0;
+                let bits = splitmix64((y as u64) << 32 | x as u64);
+                let hash = (bits >> 40) as f32 / 16_777_215.0;
                 let value = 0.5 + (hash - 0.5) * 0.16;
                 original.data.extend_from_slice(&[value, value, value]);
             }

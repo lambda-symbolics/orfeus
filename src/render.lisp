@@ -251,7 +251,7 @@ The output is published atomically and INPUT-PATHNAME is never modified."
 
 (defun render-native-photo-graph (input-pathname output-pathname graph
                                   &key max-width max-height jpeg-quality
-                                    grain-seed cache-p draft-p
+                                    grain-seed cache-p draft-p viewport
                                     (report-input-pathname input-pathname))
   (multiple-value-bind (lens-profile focal-reducer lens-crop-factor)
       (resolve-lens-profile-alias
@@ -262,6 +262,7 @@ The output is published atomically and INPUT-PATHNAME is never modified."
               :lens-name (photo-lens-name report-input-pathname)
               :cache-p cache-p
               :draft-p draft-p
+              :viewport viewport
               :output-format (render-output-format output-pathname)
               :lens-profile-model lens-profile
               :focal-reducer focal-reducer
@@ -286,7 +287,7 @@ The output is published atomically and INPUT-PATHNAME is never modified."
                      &key (if-exists :error)
                        (max-width 0) (max-height 0)
                        (jpeg-quality 92) (grain-seed 0)
-                       (preserve-metadata-p t) cache-p graph draft-p)
+                       (preserve-metadata-p t) cache-p graph draft-p viewport)
   "Render INPUT-PATHNAME to JPEG or TIFF using PROCESSING-SETTINGS.
 
 This frontend-independent operation is shared by the CLI and GUI. It renders
@@ -296,8 +297,23 @@ output dimensions; zero leaves a dimension unconstrained. CACHE-P asks the
 bridge to reuse decoded scene data across renders of the same unchanged input;
 interactive frontends enable it for the photograph under adjustment. GRAPH,
 when supplied, renders through the processing node graph instead of SETTINGS,
-which may then be NIL."
+which may then be NIL.
+
+VIEWPORT, when given, names the part of the frame to develop as four fractions
+of the oriented frame: left, top, width, height. Only an interactive preview
+gives one, and only when it is zoomed in far enough that most of the frame is
+off screen; an export is the whole photograph by definition."
   (check-type settings (or null processing-settings))
+  ;; A viewport is only implemented on the graph path, and the graph path
+  ;; renders the same picture — the interface already develops every project
+  ;; photograph through it. Converting here rather than at the call site keeps
+  ;; the rule where the reason for it is, and keeps a caller from asking for a
+  ;; window and silently getting a whole frame back: that mismatch is worse
+  ;; than either answer, because the caller then draws a frame as though it were
+  ;; the part of one it asked for.
+  (when (and viewport (null graph) settings)
+    (setf graph (settings->graph settings)
+          settings nil))
   (check-type graph (or null processing-graph))
   (unless (or settings graph)
     (error 'raw-render-error
@@ -340,7 +356,8 @@ which may then be NIL."
                      ;; Only the graph path can draft; a photograph still on
                      ;; flat settings goes through the older settings struct,
                      ;; which has no room to ask.
-                     :draft-p draft-p)
+                     :draft-p draft-p
+                     :viewport viewport)
                     (render-native-photo
                      render-input-pathname temporary settings
                      :report-input-pathname input-pathname
@@ -360,7 +377,7 @@ which may then be NIL."
                        &key (if-exists :error)
                          (max-width 1600) (max-height 1200)
                          (jpeg-quality 88) (grain-seed 0) cache-p graph
-                         (draft-p t))
+                         (draft-p t) viewport)
   "Render a bounded JPEG preview without metadata-copy overhead.
 
 Develops a draft by default: this is what the editor looks at, not what it
@@ -375,6 +392,7 @@ binning would drop detail the downscale would have kept."
                 :preserve-metadata-p nil
                 :if-exists if-exists
                 :cache-p cache-p
+                :viewport viewport
                 :graph graph))
 
 (defmacro with-decoded-while ((input-pathname &rest decode-arguments) &body body)

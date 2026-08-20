@@ -122,7 +122,10 @@ form by hand for each of them buried the call it guards."
   ;; never for anything the user keeps.
   (flags :uint32)
   ;; The lens to correct for when the RAW container names none of its own.
-  (lens-name :pointer))
+  (lens-name :pointer)
+  ;; The part of the frame to develop, as left, top, width and height in
+  ;; fractions of the oriented frame. All zeros means the whole of it.
+  (viewport :float :count 4))
 
 (defcfun ("orfeus_raw_render_v3" %raw-render-v3) :int32
   (input-path :string)
@@ -545,10 +548,16 @@ length behind a header of four point counts; 4 added the rotate node.")
                                   lens-crop-factor (grain-seed 0)
                                   (max-width 0) (max-height 0)
                                   (jpeg-quality 92) output-format cache-p
-                                  draft-p)
+                                  draft-p viewport)
   "Render INPUT-PATHNAME through the node GRAPH via the version 3 bridge.
 
-DRAFT-P asks the bridge to develop at half resolution. Only a preview may."
+DRAFT-P asks the bridge to develop at half resolution. Only a preview may.
+
+VIEWPORT, when given, is a list of four fractions of the oriented frame — left,
+top, width, height — and asks for only that part of it. A zoomed preview shows a
+fraction of the frame, and developing the rest is the largest waste left in the
+interactive path. Never given for an export: an export is the whole photograph
+by definition."
   (native-library-load)
   (native-render-require-compatible)
   (unless (>= (native-bridge-version) 3)
@@ -576,7 +585,14 @@ DRAFT-P asks the bridge to develop at half resolution. Only a preview may."
                           (float (or lens-crop-factor 0.0) 0.0))
                  (setting 'lens-profile-model lens-pointer)
                  (setting 'lens-name name-pointer)
-                 (setting 'flags (if draft-p +frame-flag-draft+ 0)))
+                 (setting 'flags (if draft-p +frame-flag-draft+ 0))
+                 (let ((slot (cffi:foreign-slot-pointer
+                              frame '(:struct render-frame-v1) 'viewport))
+                       (values (or viewport '(0.0 0.0 0.0 0.0))))
+                   (loop for index below 4
+                         for value in values
+                         do (setf (mem-aref slot :float index)
+                                  (float value 0.0)))))
                (with-foreign-pointer (buffer (length program))
                  (loop for octet across program
                        for index from 0
@@ -618,7 +634,7 @@ DRAFT-P asks the bridge to develop at half resolution. Only a preview may."
                                       focal-reducer
                                       lens-crop-factor (grain-seed 0)
                                       (max-width 0) (max-height 0) cache-p
-                                      draft-p)
+                                      draft-p viewport)
   "Render INPUT-PATHNAME through GRAPH into the foreign RGB-BUFFER.
 
 The live-preview hot path: no JPEG encode and no file. Returns the oriented
@@ -648,7 +664,14 @@ image width and height as two values."
                           (float (or lens-crop-factor 0.0) 0.0))
                  (setting 'lens-profile-model lens-pointer)
                  (setting 'lens-name name-pointer)
-                 (setting 'flags (if draft-p +frame-flag-draft+ 0)))
+                 (setting 'flags (if draft-p +frame-flag-draft+ 0))
+                 (let ((slot (cffi:foreign-slot-pointer
+                              frame '(:struct render-frame-v1) 'viewport))
+                       (values (or viewport '(0.0 0.0 0.0 0.0))))
+                   (loop for index below 4
+                         for value in values
+                         do (setf (mem-aref slot :float index)
+                                  (float value 0.0)))))
                (with-foreign-pointer (program-buffer (length program))
                  (loop for octet across program
                        for index from 0

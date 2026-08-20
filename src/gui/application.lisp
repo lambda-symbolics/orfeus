@@ -37,6 +37,35 @@ which is where it always was."
                  then (* 2 bound)
                when (>= bound needed) return bound))))
 
+(defparameter *viewport-margin* 0.3d0
+  "How far past the visible rectangle a windowed render develops, per side.
+
+As a fraction of the visible extent. This is what makes panning nearly free: a
+drag inside the margin moves the view across pixels that are already developed,
+and only a drag approaching its edge asks for more.
+
+The number is a straight trade and there is no setting that wins both ways. The
+margin costs render time by area — at three tenths, two and a half times the
+visible rectangle — and buys pan travel by length. Three tenths was chosen for
+the denoiser people actually use: with the edge-aware one a windowed re-render
+measures 320 milliseconds and a pan 190, so being a little eager to re-render
+costs nothing noticeable. The neural denoiser is slow at any window size (six
+seconds against twenty-two for the whole frame), and no margin makes that
+interactive.")
+
+(defparameter *viewport-margin-spent* 0.25d0
+  "How much of the margin may be left before more frame is asked for.
+
+Asking while a quarter of the margin is still ahead of the view means the answer
+usually arrives before the view reaches the edge of what is developed, so a pan
+slides rather than stalling against it.")
+
+(defparameter *viewport-whole-frame-fraction* 0.45d0
+  "How much of the frame may be on screen before a window stops being worth it.
+
+Past this the window plus its margin is most of the frame anyway, and asking for
+part of it would only cost a cache entry that the fitted view cannot share.")
+
 (defparameter *gui-draft-preview-size* 2048
   "Bounding size of the fast draft preview rendered before the full one.
 
@@ -1129,6 +1158,11 @@ new cache entry is published."
            ;; Photograph -> (burst number, place in it, how many): filled in
            ;; from a background pass, because reading capture times is a
            ;; subprocess per photograph and the filmstrip has to keep drawing.
+           ;; Which part of the frame each drawn preview covers, as four
+           ;; fractions of the oriented frame, or NIL for all of it. A zoomed
+           ;; preview develops only what is on screen, so the file on disk is a
+           ;; window and the drawing has to know which one.
+           before-preview-region after-preview-region requested-viewport-region
            (photo-groups (make-hash-table :test #'eq))
            ;; Which bursts the photographer has opened. Stored the way round
            ;; that makes closed the default without a pass to close them:
@@ -1309,11 +1343,69 @@ new cache entry is published."
              (and after-live-p after-live-front (plusp after-live-width)
                   (<= preview-zoom 1.0001d0)
                   (or (null canvas) (eq canvas after-canvas))))
+           (draw-current-preview (widget path)
+             ;; The adapter fits, zooms and pans a file about its own centre, so
+             ;; a file that is only part of the frame is drawn by restating the
+             ;; frame's placement in the file's own terms: the same screen
+             ;; pixels per render pixel, and the frame point that belongs at the
+             ;; canvas centre expressed as a fraction of the window instead of
+             ;; of the frame.
+             (let ((region (preview-region-for widget)))
+               (multiple-value-bind (frame-width frame-height)
+                   (preview-frame-size widget path)
+                 (multiple-value-bind (file-width file-height)
+                     (preview-file-size path)
+                   (if (and region frame-width file-width
+                            (plusp file-width) (plusp file-height))
+                       (destructuring-bind (left top width height) region
+                         (let* ((canvas-width (lightfast:widget-width widget))
+                                (canvas-height (lightfast:widget-height widget))
+                                (frame-fit
+                                  (min (/ canvas-width (float frame-width 1d0))
+                                       (/ canvas-height (float frame-height 1d0))))
+                                (scale (min (max frame-fit 2d0)
+                                            (* frame-fit preview-zoom)))
+                                (file-fit
+                                  (min (/ canvas-width (float file-width 1d0))
+                                       (/ canvas-height (float file-height 1d0)))))
+                           (draw-preview-file
+                            widget path
+                            :zoom (max 1d0 (/ scale file-fit))
+                            :center-x (/ (- preview-center-x left)
+                                         (max 1d-6 width))
+                            :center-y (/ (- preview-center-y top)
+                                         (max 1d-6 height)))))
+                       (draw-preview-file widget path
+                                          :zoom preview-zoom
+                                          :center-x preview-center-x
+                                          :center-y preview-center-y))))))
+           (preview-region-for (canvas)
+             (if (eq canvas before-canvas)
+                 before-preview-region
+                 after-preview-region))
+           (preview-frame-size (canvas path)
+             ;; The whole frame's size in render pixels, which is the file's own
+             ;; size only when the file is the whole frame. A windowed preview
+             ;; covers a fraction of it, and dividing the file's size by that
+             ;; fraction recovers what the frame would have measured — which is
+             ;; what every fit, zoom limit and overlay is stated against.
+             (multiple-value-bind (source-width source-height)
+                 (cond ((live-view-p canvas)
+                        (values after-live-width after-live-height))
+                       ;; Asked before anything has been developed, which is
+                       ;; where the viewport machinery first looks: no file, no
+                       ;; frame, and no window to ask for.
+                       ((null path) (values nil nil))
+                       (t (preview-file-size path)))
+               (let ((region (and (not (live-view-p canvas))
+                                  (preview-region-for canvas))))
+                 (if (and source-width region)
+                     (values (/ source-width (max 1d-6 (third region)))
+                             (/ source-height (max 1d-6 (fourth region))))
+                     (values source-width source-height)))))
            (preview-scaled-size (canvas path zoom)
              (multiple-value-bind (source-width source-height)
-                 (if (live-view-p canvas)
-                     (values after-live-width after-live-height)
-                     (preview-file-size path))
+                 (preview-frame-size canvas path)
                (when source-width
                  (let ((fit (min (/ (lightfast:widget-width canvas)
                                     (float source-width 1d0))
@@ -1323,6 +1415,88 @@ new cache entry is published."
                      (values (* source-width scale)
                              (* source-height scale)
                              fit))))))
+           (maybe-refresh-viewport ()
+             ;; Called after the view moves. A windowed preview covers the
+             ;; visible rectangle and a margin around it, so most movement is
+             ;; free; this is what asks for more once the margin is nearly
+             ;; spent, while the developed window is still on screen to look at.
+             (let ((job (selected-job)))
+               (when (and job (not (live-view-p)))
+                 (let ((needed (viewport-request))
+                       (current (or requested-viewport-region after-preview-region)))
+                   (when (and needed current (not (region-covers-view-p current)))
+                     (setf requested-viewport-region needed)
+                     (discard-gui-tasks queue :after)
+                     (enqueue-render queue :after job
+                                     (gui-model-selected-index model)
+                                     (current-settings) preview-generation t
+                                     :front-p t :cache-p t :viewport needed))))))
+           (visible-frame-rect (canvas)
+             ;; The part of the frame on screen, as fractions of it. Clamped the
+             ;; same way the drawing clamps its pan, so the answer describes
+             ;; what is actually visible rather than what was asked for.
+             (let ((canvas (or canvas after-canvas before-canvas)))
+               (when canvas
+                 (multiple-value-bind (scaled-width scaled-height)
+                     (preview-scaled-size canvas
+                                          (preview-path-for-canvas canvas)
+                                          preview-zoom)
+                   (when (and scaled-width (plusp scaled-width))
+                     (let* ((width (min 1d0 (/ (lightfast:widget-width canvas)
+                                               scaled-width)))
+                            (height (min 1d0 (/ (lightfast:widget-height canvas)
+                                                scaled-height)))
+                            (center-x (min (- 1d0 (/ width 2))
+                                           (max (/ width 2) preview-center-x)))
+                            (center-y (min (- 1d0 (/ height 2))
+                                           (max (/ height 2) preview-center-y))))
+                       (list (- center-x (/ width 2)) (- center-y (/ height 2))
+                             width height)))))))
+           (viewport-request ()
+             ;; What to ask the renderer to develop: the visible rectangle grown
+             ;; by a margin, or NIL for the whole frame when most of the frame is
+             ;; on screen anyway.
+             ;;
+             ;; The margin is what makes panning free. Without it every drag
+             ;; would leave the developed region immediately and the photograph
+             ;; would have to be re-developed to move it a pixel; with it the
+             ;; view slides inside what is already there, and a new render is
+             ;; only wanted when it approaches the edge.
+             (let ((visible (visible-frame-rect nil)))
+               (when visible
+                 (destructuring-bind (left top width height) visible
+                   (when (< (* width height) *viewport-whole-frame-fraction*)
+                     (let ((grow-x (* width *viewport-margin*))
+                           (grow-y (* height *viewport-margin*)))
+                       (let ((new-left (max 0d0 (- left grow-x)))
+                             (new-top (max 0d0 (- top grow-y)))
+                             (new-right (min 1d0 (+ left width grow-x)))
+                             (new-bottom (min 1d0 (+ top height grow-y))))
+                         (list new-left new-top
+                               (- new-right new-left)
+                               (- new-bottom new-top)))))))))
+           (region-covers-view-p (region)
+             ;; Whether what is developed still comfortably covers what is on
+             ;; screen. Comfortably: a new render is asked for while the view is
+             ;; still inside the developed region, so the answer usually lands
+             ;; before the edge is reached and the pan never stalls.
+             (let ((visible (visible-frame-rect nil)))
+               (cond ((null visible) t)
+                     ((null region) t)
+                     (t (destructuring-bind (left top width height) visible
+                          (destructuring-bind (rl rt rw rh) region
+                            (let ((slack-x (* width *viewport-margin*
+                                              *viewport-margin-spent*))
+                                  (slack-y (* height *viewport-margin*
+                                              *viewport-margin-spent*)))
+                              (and (or (<= rl 0d0)
+                                       (>= (- left slack-x) rl))
+                                   (or (<= rt 0d0)
+                                       (>= (- top slack-y) rt))
+                                   (or (>= (+ rl rw) 1d0)
+                                       (<= (+ left width slack-x) (+ rl rw)))
+                                   (or (>= (+ rt rh) 1d0)
+                                       (<= (+ top height slack-y) (+ rt rh)))))))))))
            (preview-zoom-limit (canvas path)
              (multiple-value-bind (scaled-width scaled-height fit)
                  (preview-scaled-size canvas path 1d0)
@@ -1366,7 +1540,11 @@ new cache entry is published."
                      (ignore-errors (lightfast:remove-timeout live-settle-id))
                      (setf live-settle-id nil))
                    (discard-gui-tasks queue :after)
-                   (enqueue-preview nil)))
+                   (enqueue-preview nil))
+                 ;; Zooming out inside one rung asks for no new render, but it
+                 ;; does widen what is on screen — possibly past the window that
+                 ;; was developed for the tighter view.
+                 (maybe-refresh-viewport))
                (redraw-previews)
                ;; ~,0F leaves the decimal point behind: "125.%".
                (set-status (format nil "Preview zoom: ~D%"
@@ -2219,6 +2397,7 @@ new cache entry is published."
                                      preview-center-y
                                      (- preview-drag-center-y
                                         (/ (- y preview-drag-y) height)))
+                               (maybe-refresh-viewport)
                                (redraw-previews))))))))
                    (#.lightfast:+event-release+
                     (setf crop-drag nil
@@ -2643,10 +2822,29 @@ new cache entry is published."
              (dolist (path (list before-preview-file after-preview-file))
                (when path (forget-preview-file path)))
              (setf before-preview-file nil
-                   after-preview-file nil)
+                   after-preview-file nil
+                   before-preview-region nil
+                   after-preview-region nil
+                   requested-viewport-region nil)
              (when before-canvas (lightfast:redraw before-canvas))
              (when after-canvas (lightfast:redraw after-canvas)))
-           (publish-preview (role path generation)
+           (published-region (path region bound)
+             ;; Trust the file over the request. A renderer that quietly ignored
+             ;; the viewport would hand back a whole frame while the interface
+             ;; believed it held a window, and the frame would then be drawn at
+             ;; the scale the window would have needed — which is how a zoomed
+             ;; view was seen shrinking by two and a half times. A file as wide
+             ;; as the whole bound is not a window, whatever was asked for.
+             (multiple-value-bind (file-width file-height) (preview-file-size path)
+               (cond ((null region) nil)
+                     ;; A render with no bound — the one-to-one view asks the
+                     ;; bridge for sensor resolution — leaves nothing to check
+                     ;; the file against.
+                     ((or (null bound) (zerop bound)) region)
+                     ((null file-width) nil)
+                     ((< (max file-width file-height) (* 0.98 bound)) region)
+                     (t nil))))
+           (publish-preview (role path generation region)
              (let ((old-path (ecase role
                                (:before before-preview-file)
                                (:after after-preview-file))))
@@ -2654,9 +2852,11 @@ new cache entry is published."
                  (forget-preview-file old-path))
                (forget-preview-file path)
                (ecase role
-                 (:before (setf before-preview-file path)
+                 (:before (setf before-preview-region region)
+                          (setf before-preview-file path)
                           (lightfast:redraw before-canvas))
-                 (:after (setf after-preview-file path
+                 (:after (setf after-preview-region region
+                               after-preview-file path
                                after-preview-generation generation
                                after-live-p nil
                                (gethash (selected-job) thumbnail-files) path)
@@ -4345,7 +4545,7 @@ new cache entry is published."
                      (setf (orfeus:graph-node-bypassed-p twin) t))))
                settings))
            (enqueue-render (target-queue role job index settings generation publish-p
-                            &key front-p draft-p cache-p)
+                            &key front-p draft-p cache-p viewport)
              ;; Scheduling is constant-time on the FLTK thread. Content hashing,
              ;; cache lookup, rendering, and hit materialization all run here.
              (let* ((settings (preview-recipe-snapshot settings))
@@ -4355,7 +4555,16 @@ new cache entry is published."
                                *gui-draft-preview-size*
                                (viewport-render-bound)))
                     (max-width bound)
-                    (max-height bound))
+                    (max-height bound)
+                    ;; Part of the cache name, not decoration: two renders of
+                    ;; the same photograph at the same settings and bound are
+                    ;; different pictures when they cover different parts of it.
+                    (region-token (if viewport
+                                      (format nil "-w~{~4,'0D~^~}"
+                                              (mapcar (lambda (value)
+                                                        (round (* 1000 value)))
+                                                      viewport))
+                                      "")))
                (enqueue-gui-task
                 target-queue role
                 (lambda ()
@@ -4364,10 +4573,13 @@ new cache entry is published."
                       (loop for attempt below 3
                           for digest = (photo-content-key-for job generation
                                                               (plusp attempt))
-                          for settings-key = (preview-settings-key
-                                              settings :max-width max-width
-                                              :max-height max-height
-                                              :jpeg-quality 88)
+                          for settings-key = (concatenate
+                                              'string
+                                              (preview-settings-key
+                                               settings :max-width max-width
+                                               :max-height max-height
+                                               :jpeg-quality 88)
+                                              region-token)
                           for output = (preview-pathname
                                         preview-directory digest file-role settings
                                         :max-width max-width :max-height max-height
@@ -4375,10 +4587,13 @@ new cache entry is published."
                           for dependencies-current-p =
                             (lambda ()
                               (string= settings-key
-                                       (preview-settings-key
-                                        settings :max-width max-width
-                                        :max-height max-height
-                                        :jpeg-quality 88)))
+                                       (concatenate
+                                        'string
+                                        (preview-settings-key
+                                         settings :max-width max-width
+                                         :max-height max-height
+                                         :jpeg-quality 88)
+                                        region-token)))
                           do (handler-case
                                  (progn
                                    (call-with-preview-cache-fill
@@ -4390,11 +4605,13 @@ new cache entry is published."
                                                           :max-width max-width
                                                           :max-height max-height
                                                           :cache-p cache-p
+                                                          :viewport viewport
                                                           :if-exists :supersede)
                                           (render-preview input temporary settings
                                                           :max-width max-width
                                                           :max-height max-height
                                                           :cache-p cache-p
+                                                          :viewport viewport
                                                           :if-exists :supersede))
                                       (unless (string= digest (photo-content-key input))
                                         (error "RAW source changed during preview render")))
@@ -4411,7 +4628,8 @@ new cache entry is published."
                                                 (= generation preview-generation))
                                        (queue-event queue
                                                     (list :preview generation index job
-                                                          role display))))
+                                                          role display viewport
+                                                          bound))))
                                    (return))
                                (error (condition)
                                  (when (= attempt 2) (error condition)))))
@@ -4501,14 +4719,17 @@ new cache entry is published."
                  ;; preview renders behind it; both reuse the decoded RAW.
                  ;; Once checkpointed re-renders come back fast enough, the
                  ;; draft layer only adds churn, so it is skipped.
-                 (let ((settings (current-settings)))
+                 (let ((settings (current-settings))
+                       (window (viewport-request)))
                    (when (and (>= last-render-ms 300) (not (live-view-p))
+                              (null window)
                               (draft-preview-fits-the-view-p))
                      (enqueue-render queue :after job index settings
                                      generation t
                                      :front-p t :draft-p t :cache-p t))
+                   (setf requested-viewport-region window)
                    (enqueue-render queue :after job index settings generation t
-                                   :cache-p t))
+                                   :cache-p t :viewport window))
                  (enqueue-background-previews initial-p generation))))
            (schedule-initial-preview ()
              (when debounce-id
@@ -5264,7 +5485,10 @@ new cache entry is published."
                     (set-status (third event))))
                  (:preview
                   (when (gui-preview-event-current-p model event preview-generation)
-                    (publish-preview (fifth event) (sixth event) (second event))
+                    (publish-preview (fifth event) (sixth event) (second event)
+                                     (published-region (sixth event)
+                                                       (seventh event)
+                                                       (eighth event)))
                     (set-status (preview-status-text model))))
                  (:live-preview
                   (when (and (= (second event) preview-generation)
@@ -5716,10 +5940,7 @@ new cache entry is published."
                                               :center-y preview-center-y)
                          (draw-crop-overlay widget))
                         (path
-                         (draw-preview-file widget path
-                                            :zoom preview-zoom
-                                            :center-x preview-center-x
-                                            :center-y preview-center-y)
+                         (draw-current-preview widget path)
                          (when (eq role :after)
                            (draw-crop-overlay widget)))
                         ;; Nothing developed yet. The sidebar has already

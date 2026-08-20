@@ -55,6 +55,15 @@ pub struct RenderFrameV1 {
     pub flags: u32,
     /// The lens to correct for when the container names none of its own.
     pub lens_name: *const c_char,
+    /// The part of the frame to develop, as (left, top, width, height) in
+    /// fractions of the oriented frame, or all zeros for the whole of it.
+    ///
+    /// A zoomed-in preview only shows a fraction of the frame, and developing
+    /// the rest of it is the largest waste left in the interactive path: at four
+    /// times fit, a 1400-pixel canvas was having 5600 pixels of frame denoised,
+    /// tone-mapped and encoded so that 1400 of them could be looked at. Naming
+    /// the region turns that back into the work it should have been.
+    pub viewport: [f32; 4],
 }
 
 /// Develop at half resolution, binning each sensor quad instead of
@@ -574,6 +583,16 @@ pub(crate) struct GraphContext<'a> {
     pub(crate) crop_factor: f32,
     pub(crate) grain_seed: u64,
     pub(crate) orientation: u16,
+    /// Pixels the whole frame has at the size this render works at.
+    ///
+    /// Not the pixel count of whatever image a stage happens to hold. The
+    /// denoiser fades out as a render shrinks, and the thing it should fade
+    /// with is how much the frame was reduced — not how much of it is being
+    /// looked at. Reading the image's own size made a zoomed viewport, which is
+    /// small but not reduced at all, come back barely denoised; it also
+    /// under-denoised any render with a crop node in it, which was a quieter
+    /// version of the same mistake.
+    pub(crate) scaled_pixels: usize,
 }
 
 /// Maps a crop rectangle from oriented display coordinates into the
@@ -837,6 +856,17 @@ fn film_grain_capture(ops: &[GraphOp]) -> Option<StagePoint> {
         .map(|index| (index, STAGE_FILM_GRAIN))
 }
 
+#[cfg(test)]
+pub(crate) fn execute_graph_windowed(
+    ops: &[GraphOp],
+    source: RgbImage,
+    context: &GraphContext<'_>,
+    viewport: [f32; 4],
+) -> Result<RgbImage, Error> {
+    execute_graph_into(ops, Arc::new(source), context, Some(viewport), None, None)
+        .map(|(_, _, image)| image.expect("no byte buffer was asked for"))
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn execute_graph(
     ops: &[GraphOp],
@@ -852,23 +882,183 @@ pub(crate) fn execute_graph_cached(
     context: &GraphContext<'_>,
     cache_key: Option<PrefixKey>,
 ) -> Result<RgbImage, Error> {
-    let (width, height, image) = execute_graph_into(ops, source, context, cache_key, None)?;
+    let (width, height, image) = execute_graph_into(ops, source, context, None, cache_key, None)?;
     let _ = (width, height);
     Ok(image.expect("a graph run without a byte buffer returns its image"))
+}
+
+/// Where a render of part of a frame may start working on just that part, and
+/// how much overlap it needs there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ViewportPlan {
+    /// Index of the first op that runs on the window.
+    pub(crate) barrier: usize,
+    /// Pixels of frame the window has to carry beyond its own edges for its
+    /// interior to come out identical to a whole-frame render.
+    pub(crate) halo: usize,
+}
+
+/// Decides whether and where a render bounded to a viewport can narrow.
+///
+/// Geometric nodes — lens correction, crop, rotate, and the blend that joins
+/// two branches of possibly different geometry — are written against whole
+/// frames: each reads a map defined in frame coordinates and would have to be
+/// told where a window sat before it could run on one. So the narrowing happens
+/// after the last of them and everything before it runs whole.
+///
+/// That is less of a compromise than it sounds. The geometric prefix is cheap
+/// beside the tail it feeds — a remap is one pass over memory, while the
+/// denoiser and the neural network are many — and the checkpoint cache keeps
+/// the prefix from being re-run at all when a downstream node changes or the
+/// view is merely panned. What is left to pay for is exactly the part the
+/// photographer is looking at.
+///
+/// Returns `None` when the tail is not a simple chain, because a register that
+/// bypassed the narrowing would then be read at the wrong size. Every graph the
+/// interface builds is a chain past its last geometric node, so this is a
+/// correctness guard rather than a path anyone travels.
+pub(crate) fn plan_viewport(ops: &[GraphOp]) -> Option<ViewportPlan> {
+    let barrier = ops
+        .iter()
+        .rposition(|op| matches!(op.kind, NODE_OPTICS | NODE_CROP | NODE_ROTATE | NODE_BLEND))
+        .map_or(0, |index| index + 1);
+    let mut halo = 0;
+    for (index, op) in ops.iter().enumerate().skip(barrier) {
+        if op.input_a != index {
+            return None;
+        }
+        // Every other node in the tail answers for one pixel at a time, so it
+        // needs no overlap at all. The two that read their neighbours are added
+        // rather than maxed: a window feeds the next stage what it has, so two
+        // filters in a row each want their own reach.
+        halo += match op.kind {
+            NODE_NOISE_REDUCTION => {
+                render::NOISE_REDUCTION_REACH.max(super::nn::NETWORK_REACH)
+            }
+            _ => 0,
+        };
+    }
+    Some(ViewportPlan { barrier, halo })
+}
+
+/// Narrows IMAGE to the part of the frame RECT names, in oriented fractions.
+///
+/// Returns the window, its origin in oriented pixels, and whether it came back
+/// oriented. The origin is what lets the one stage that cares where it is —
+/// film grain, which seeds from its coordinates — put the grain where the whole
+/// frame would have had it.
+///
+/// The narrowing happens in the frame's own unoriented coordinates when the
+/// image has not been turned yet, so that turning it is a permutation of the
+/// window rather than of the whole frame. Where the window then lands is worked
+/// out with `render::orient_rect` instead of by rounding the fraction twice,
+/// which keeps the answer exact to the pixel.
+fn crop_to_viewport(
+    image: RgbImage,
+    rect: [f32; 4],
+    halo: usize,
+    orientation: u16,
+    oriented: bool,
+) -> (RgbImage, (usize, usize), (usize, usize, usize, usize)) {
+    let (frame_width, frame_height) = if oriented || orientation < 5 {
+        (image.width, image.height)
+    } else {
+        (image.height, image.width)
+    };
+    // The window in oriented pixels, grown by the halo and clipped to the
+    // frame. Rounded outwards so the requested region is always covered.
+    let left = ((rect[0] * frame_width as f32).floor() as isize - halo as isize).max(0) as usize;
+    let top = ((rect[1] * frame_height as f32).floor() as isize - halo as isize).max(0) as usize;
+    let right = (((rect[0] + rect[2]) * frame_width as f32).ceil() as usize + halo)
+        .min(frame_width);
+    let bottom = (((rect[1] + rect[3]) * frame_height as f32).ceil() as usize + halo)
+        .min(frame_height);
+    let (width, height) = (right.saturating_sub(left), bottom.saturating_sub(top));
+    // The region actually asked for, which is the window less its halo. Kept
+    // separately so the halo can be trimmed off at the end: it exists to make
+    // the interior come out right, not to be delivered.
+    let asked = (
+        (rect[0] * frame_width as f32).floor().max(0.0) as usize,
+        (rect[1] * frame_height as f32).floor().max(0.0) as usize,
+        ((rect[2] * frame_width as f32).ceil() as usize).max(1),
+        ((rect[3] * frame_height as f32).ceil() as usize).max(1),
+    );
+    if width == 0 || height == 0 || (width >= frame_width && height >= frame_height) {
+        return (image, (0, 0), (0, 0, frame_width, frame_height));
+    }
+    let inside = |placed: (usize, usize, usize, usize)| {
+        let offset_x = asked.0.saturating_sub(placed.0);
+        let offset_y = asked.1.saturating_sub(placed.1);
+        (
+            offset_x,
+            offset_y,
+            asked.2.min(placed.2.saturating_sub(offset_x)).max(1),
+            asked.3.min(placed.3.saturating_sub(offset_y)).max(1),
+        )
+    };
+    if oriented {
+        let placed = (left, top, width, height);
+        return (
+            render::crop_rect(&image, left, top, width, height),
+            (left, top),
+            inside(placed),
+        );
+    }
+    // Unoriented: ask `map_oriented_rect` which part of the sensor frame this
+    // is, take it, then turn the window.
+    let mapped = map_oriented_rect(
+        orientation,
+        [
+            left as f32 / frame_width as f32,
+            top as f32 / frame_height as f32,
+            width as f32 / frame_width as f32,
+            height as f32 / frame_height as f32,
+        ],
+    );
+    let source_left = (mapped[0] * image.width as f32).round() as usize;
+    let source_top = (mapped[1] * image.height as f32).round() as usize;
+    let source_width = ((mapped[2] * image.width as f32).round() as usize)
+        .max(1)
+        .min(image.width - source_left.min(image.width - 1));
+    let source_height = ((mapped[3] * image.height as f32).round() as usize)
+        .max(1)
+        .min(image.height - source_top.min(image.height - 1));
+    let placed = render::orient_rect(
+        orientation,
+        (image.width, image.height),
+        (source_left, source_top, source_width, source_height),
+    );
+    let window = render::crop_rect(&image, source_left, source_top, source_width, source_height);
+    (
+        render::orient(window, orientation),
+        (placed.0, placed.1),
+        inside(placed),
+    )
 }
 
 fn execute_graph_into(
     ops: &[GraphOp],
     source: Arc<RgbImage>,
     context: &GraphContext<'_>,
+    viewport: Option<[f32; 4]>,
     cache_key: Option<PrefixKey>,
     bytes: Option<&mut [u8]>,
 ) -> Result<(usize, usize, Option<RgbImage>), Error> {
     let count = ops.len();
     if count == 0 {
         let image = render::orient(render::own_source(source), context.orientation);
+        let image = match viewport {
+            Some(rect) => crop_to_viewport(image, rect, 0, context.orientation, true).0,
+            None => image,
+        };
         return finish(image, Domain::Linear, bytes);
     }
+    // Where the window may narrow, if it may at all.
+    let plan = viewport.and_then(|rect| plan_viewport(ops).map(|plan| (rect, plan)));
+    let mut window_origin = (0_usize, 0_usize);
+    // The requested region inside the window that was developed, so the halo
+    // can come off before the result is handed back.
+    let mut window_inner: Option<(usize, usize, usize, usize)> = None;
     // Interactive resume: reuse the deepest checkpoint of the previous
     // program that still lies on this program's unchanged prefix.
     let mut resume: Option<(StagePoint, Vec<PrefixSnapshot>)> = None;
@@ -880,10 +1070,14 @@ fn execute_graph_into(
         let limit = if let Some(position) = cache.iter().position(|(held, _)| held == key) {
             let entry = &cache[position].1;
             let limit = resume_limit(&entry.ops, ops);
+            let deepest = match &plan {
+                Some((_, plan)) => limit.min((plan.barrier, STAGE_ENTRY)),
+                None => limit,
+            };
             if let Some((point, snapshots)) = entry
                 .checkpoints
                 .iter()
-                .filter(|(point, _)| *point > (0, STAGE_ENTRY) && *point <= limit)
+                .filter(|(point, _)| *point > (0, STAGE_ENTRY) && *point <= deepest)
                 .max_by_key(|(point, _)| *point)
             {
                 resume = Some((
@@ -915,6 +1109,20 @@ fn execute_graph_into(
         capture_points.push(default_snapshot_boundary(ops));
         capture_points.extend(film_grain_capture(ops));
         capture_points.retain(|point| *point > (0, STAGE_ENTRY));
+        // A checkpoint has to describe a whole frame. One taken past the point
+        // where the render narrows would hold a particular window, and would
+        // then be handed back for a different one the moment the view was
+        // panned — so the narrowing point is also the last place worth saving.
+        // Nothing is lost by it: everything past that point now costs what the
+        // viewport costs, which is the cheap part.
+        // ...and it is also the *best* place: everything before it is the
+        // geometry that does not change when the view moves, and everything
+        // after it now costs what the window costs. Saving exactly there is what
+        // makes a pan re-run the cheap part and nothing else.
+        if let Some((_, plan)) = &plan {
+            capture_points.retain(|point| *point < (plan.barrier, STAGE_ENTRY));
+            capture_points.push((plan.barrier, STAGE_ENTRY));
+        }
         capture_points.sort_unstable();
         capture_points.dedup();
     }
@@ -987,6 +1195,26 @@ fn execute_graph_into(
             captured.push(((index, STAGE_ENTRY), snapshots));
         }
         let slot = index + 1;
+        // The moment the render narrows. Everything from here on works on the
+        // part of the frame the viewport asked for, which is why the stages
+        // that read their neighbours had a halo added to it.
+        if let Some((rect, plan)) = &plan
+            && index == plan.barrier
+            && stage == STAGE_ENTRY
+            && let Some(whole) = registers[op.input_a].take()
+        {
+            let (window, origin, inner) = crop_to_viewport(
+                whole,
+                *rect,
+                plan.halo,
+                context.orientation,
+                oriented[op.input_a],
+            );
+            window_origin = origin;
+            window_inner = Some(inner);
+            oriented[op.input_a] = true;
+            registers[op.input_a] = Some(window);
+        }
         let take = |registers: &mut Vec<Option<RgbImage>>,
                     uses: &mut Vec<usize>,
                     from: usize|
@@ -1043,6 +1271,7 @@ fn execute_graph_into(
                 render::apply_exposure(&mut image, op.params[0]);
             }
             NODE_NOISE_REDUCTION => {
+
                 // One denoiser or the other, and the edge-aware one asks the
                 // same of brightness as of colour. It used to get a fifth of
                 // the slider for brightness, which is the noise that shows:
@@ -1050,7 +1279,7 @@ fn execute_graph_into(
                 // measured drop of a tenth against a half for colour.
                 let edge = render::strength_for_scale(
                     op.params[0],
-                    image.width * image.height,
+                    context.scaled_pixels,
                     context.full_pixels,
                 );
                 let neural = op.params[1];
@@ -1130,6 +1359,7 @@ fn execute_graph_into(
                         op.params[1],
                         op.params[2],
                         context.grain_seed ^ film_ordinal.wrapping_mul(0x9e37_79b9),
+                        window_origin,
                     );
                     film_ordinal += 1;
                 }
@@ -1247,6 +1477,21 @@ fn execute_graph_into(
         .ok_or(Error::Render("graph produced no output".into()))?;
     if !oriented[count] {
         image = render::orient(image, context.orientation);
+    }
+    // A graph whose every node is geometric narrows here instead, after all of
+    // them; there was no later op to do it before.
+    if let Some((rect, plan)) = &plan
+        && plan.barrier == count
+    {
+        let (window, _, inner) =
+            crop_to_viewport(image, *rect, plan.halo, context.orientation, true);
+        image = window;
+        window_inner = Some(inner);
+    }
+    if let Some((left, top, width, height)) = window_inner
+        && (width < image.width || height < image.height)
+    {
+        image = render::crop_rect(&image, left, top, width, height);
     }
     let result = finish(image, domains[count], bytes)?;
     if let Some(started) = tail_started {
@@ -1490,9 +1735,24 @@ fn render_graph_frame(
                 .map_err(|_| Error::InvalidArgument("lens profile model is not UTF-8"))?,
         )
     };
+    // Zeros, a degenerate rectangle, or one that already covers the frame all
+    // mean the whole frame: a caller that does not know about viewports leaves
+    // the field zeroed, and one that is fitted to the window asks for all of it.
+    let viewport = {
+        let [left, top, width, height] = frame.viewport;
+        let covers = left <= 0.0 && top <= 0.0 && width >= 1.0 && height >= 1.0;
+        (width > 0.0 && height > 0.0 && !covers).then_some([
+            left.clamp(0.0, 1.0),
+            top.clamp(0.0, 1.0),
+            width.clamp(0.0, 1.0),
+            height.clamp(0.0, 1.0),
+        ])
+    };
+    let scaled_pixels = source.width * source.height;
     let context = GraphContext {
         as_shot_kelvin,
         full_pixels,
+        scaled_pixels,
         make: &make,
         model: &model,
         lens_name: &lens_name,
@@ -1519,7 +1779,7 @@ fn render_graph_frame(
     };
     profile_stage!("prefix-key");
     let _ = stage_started;
-    execute_graph_into(&ops, source, &context, prefix_key, bytes)
+    execute_graph_into(&ops, source, &context, viewport, prefix_key, bytes)
 }
 
 #[cfg(test)]
@@ -1599,6 +1859,7 @@ mod tests {
 
     fn context(seed: u64) -> GraphContext<'static> {
         GraphContext {
+            scaled_pixels: 0,
             make: "",
             model: "",
             lens_name: "",
@@ -1628,6 +1889,7 @@ mod tests {
     #[test]
     fn prefix_context_key_tracks_context_and_lut_identity() {
         let base = GraphContext {
+            scaled_pixels: 0,
             make: "Olympus",
             model: "PEN-F",
             lens_name: "M.Zuiko",
@@ -1697,6 +1959,152 @@ mod tests {
             height,
             data,
         }
+    }
+
+    /// A frame with real noise in it, big enough that a window has an interior.
+    fn noisy_scene(width: usize, height: usize) -> RgbImage {
+        let mut data = Vec::with_capacity(width * height * 3);
+        for y in 0..height {
+            for x in 0..width {
+                // Structure at several scales, so the denoiser has both edges
+                // to keep and flat ground to clean.
+                let base = 0.18
+                    + 0.5 * (x as f32 / width as f32)
+                    + if (x / 23 + y / 19) % 2 == 0 { 0.12 } else { 0.0 };
+                let bits = render::splitmix64((y as u64) << 32 | x as u64);
+                let noise = ((bits >> 40) as f32 / 16_777_215.0 - 0.5) * 0.05;
+                let value = (base + noise).clamp(0.0, 1.0);
+                data.extend_from_slice(&[value, value * 0.93, value * 0.86]);
+            }
+        }
+        RgbImage {
+            width,
+            height,
+            data,
+        }
+    }
+
+    /// The whole point of rendering a viewport: it has to produce what the
+    /// whole-frame render would have produced there.
+    ///
+    /// Run twice over. Without the denoiser every stage is either pointwise or
+    /// the film grain, so the window has to agree to the last bit — that is
+    /// what pins the geometry, and in particular that the grain was taught
+    /// where the window sits instead of seeding from its own corner. With the
+    /// denoiser a small difference is expected and is not a bug: it measures
+    /// the noise of the image it is handed, so a window measures a window and
+    /// arrives at a slightly different threshold. Bounding that separately is
+    /// what keeps the first assertion able to be exact.
+    #[test]
+    fn a_windowed_render_matches_the_whole_one() {
+        let pointwise = parse_graph(
+            &GraphBuilder::new()
+                .node(NODE_EXPOSURE, 0, -1, &[0.4], None)
+                .node(NODE_TONE, 1, -1, &[0.2, 0.1, 0.0, -0.1, 0.0, 0.1, 0.0], None)
+                .node(NODE_FILM, 2, -1, &[0.0, 0.4, 2.0], None)
+                .build(),
+        )
+        .unwrap();
+        let denoised = parse_graph(
+            &GraphBuilder::new()
+                .node(NODE_EXPOSURE, 0, -1, &[0.4], None)
+                .node(NODE_NOISE_REDUCTION, 1, -1, &[0.6, 0.0], None)
+                .node(NODE_TONE, 2, -1, &[0.2, 0.1, 0.0, -0.1, 0.0, 0.1, 0.0], None)
+                .node(NODE_FILM, 3, -1, &[0.0, 0.4, 2.0], None)
+                .build(),
+        )
+        .unwrap();
+        // The plain case and two quarter turns, which is what an Olympus frame
+        // actually does and where a rectangle is easiest to map to the wrong
+        // corner.
+        for orientation in [1_u16, 6, 8] {
+            let mut graph_context = context(11);
+            graph_context.orientation = orientation;
+            for (label, ops, tolerance) in [
+                ("pointwise", &pointwise, 1.0e-6_f32),
+                // Measured: the worst pixel moves by 0.0019, which is half of
+                // one eight-bit level, and only where a corner window sees a
+                // narrower range of brightness than the frame does.
+                ("denoised", &denoised, 0.003),
+            ] {
+                let whole = execute_graph(ops, noisy_scene(320, 240), &graph_context).unwrap();
+                for rect in [
+                    [0.25_f32, 0.25, 0.5, 0.5],
+                    [0.0, 0.0, 0.4, 0.4],
+                    [0.55, 0.6, 0.45, 0.4],
+                ] {
+                    let window =
+                        execute_graph_windowed(ops, noisy_scene(320, 240), &graph_context, rect)
+                            .unwrap();
+                    let left = (rect[0] * whole.width as f32).floor() as usize;
+                    let top = (rect[1] * whole.height as f32).floor() as usize;
+                    let expected = render::crop_rect(
+                        &whole,
+                        left,
+                        top,
+                        window.width.min(whole.width - left),
+                        window.height.min(whole.height - top),
+                    );
+                    assert_eq!(
+                        (window.width, window.height),
+                        (expected.width, expected.height),
+                        "{label} at orientation {orientation} rect {rect:?} came back \
+                         the wrong size"
+                    );
+                    let difference = max_difference(&window, &expected);
+                    assert!(
+                        difference < tolerance,
+                        "{label} at orientation {orientation} rect {rect:?} differs \
+                         by {difference}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Where the narrowing may happen, and where it may not.
+    #[test]
+    fn a_viewport_narrows_after_the_last_geometric_node() {
+        let plan = |ops: &[u32]| {
+            let mut builder = GraphBuilder::new();
+            for (index, kind) in ops.iter().enumerate() {
+                let params: &[f32] = match *kind {
+                    NODE_TONE => &[0.0; 7],
+                    NODE_FILM => &[0.0, 0.0, 1.0],
+                    NODE_NOISE_REDUCTION => &[0.5, 0.0],
+                    NODE_CROP => &[0.1, 0.1, 0.8, 0.8, 0.0],
+                    NODE_OPTICS => &[1.0, 1.0, 0.0],
+                    _ => &[0.0],
+                };
+                builder = builder.node(*kind, index as i32, -1, params, None);
+            }
+            let bytes = builder.build();
+            plan_viewport(&parse_graph(&bytes).unwrap())
+        };
+        // Nothing geometric: the whole program runs on the window.
+        assert_eq!(
+            plan(&[NODE_EXPOSURE, NODE_TONE]).unwrap().barrier,
+            0,
+            "a program with no geometry still rendered the whole frame"
+        );
+        // Lens correction reads a map in frame coordinates, so it goes first
+        // and the narrowing follows it.
+        assert_eq!(plan(&[NODE_OPTICS, NODE_NOISE_REDUCTION]).unwrap().barrier, 1);
+        assert_eq!(
+            plan(&[NODE_EXPOSURE, NODE_CROP, NODE_TONE]).unwrap().barrier,
+            2
+        );
+        // A geometric node last leaves nothing to narrow before, which is
+        // handled after the loop rather than being refused.
+        let tail = plan(&[NODE_NOISE_REDUCTION, NODE_CROP]).unwrap();
+        assert_eq!(tail.barrier, 2);
+        assert_eq!(tail.halo, 0, "a halo was reserved for an empty tail");
+        // Only the stages that read their neighbours ask for overlap, and two
+        // of them ask twice.
+        assert_eq!(plan(&[NODE_EXPOSURE, NODE_TONE]).unwrap().halo, 0);
+        let one = plan(&[NODE_NOISE_REDUCTION]).unwrap().halo;
+        assert!(one >= render::NOISE_REDUCTION_REACH);
+        assert_eq!(plan(&[NODE_NOISE_REDUCTION, NODE_NOISE_REDUCTION]).unwrap().halo, 2 * one);
     }
 
     fn max_difference(first: &RgbImage, second: &RgbImage) -> f32 {
@@ -1770,7 +2178,7 @@ mod tests {
         .unwrap();
         render::apply_tonal_equalizer(&mut reference, [0.3, 0.0, 0.0, -0.2, 0.0, 0.0, 0.1]);
         to_display(&mut reference);
-        render::apply_grain(&mut reference, 0.25, 1.0, 17);
+        render::apply_grain(&mut reference, 0.25, 1.0, 17, (0, 0));
 
         assert_eq!(via_graph.width, reference.width);
         assert_eq!(via_graph.height, reference.height);
@@ -2531,8 +2939,8 @@ mod tests {
 
         let mut reference = gradient_image();
         to_display(&mut reference);
-        render::apply_grain(&mut reference, 0.5, 1.0, 11);
-        render::apply_grain(&mut reference, 0.25, 2.0, 11 ^ 0x9e37_79b9);
+        render::apply_grain(&mut reference, 0.5, 1.0, 11, (0, 0));
+        render::apply_grain(&mut reference, 0.25, 2.0, 11 ^ 0x9e37_79b9, (0, 0));
         assert_eq!(grained.data, reference.data);
 
         let repeat = execute_graph(&ops, gradient_image(), &context(11)).unwrap();

@@ -493,7 +493,7 @@ where
 /// the decode cache without rendering. Every earlier entry point is unchanged.
 #[unsafe(no_mangle)]
 pub extern "C" fn orfeus_bridge_abi_version() -> u32 {
-    7
+    8
 }
 
 /// Write a 64-bit perceptual signature of the image at PATH.
@@ -1124,7 +1124,7 @@ mod tests {
 
     #[test]
     fn reports_current_abi_version() {
-        assert_eq!(orfeus_bridge_abi_version(), 7);
+        assert_eq!(orfeus_bridge_abi_version(), 8);
         assert_eq!(orfeus_raw_render_capabilities_v1(), 1 | 2 | 4 | 16);
     }
 

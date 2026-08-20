@@ -31,6 +31,15 @@ const TILE: usize = 192;
 /// deliverable should not vary at all with where it was rendered.
 const MIN_TILES: usize = 16;
 const HALO: usize = LAYER_COUNT;
+
+/// How far the network reads around each pixel it writes, in image pixels.
+///
+/// Twelve three-by-three convolutions reach twelve pixels either side of the
+/// plane they run on, and that plane is a two-times pixel-unshuffle of the
+/// image, so each of its pixels is two of the image's. A render of part of a
+/// frame has to overlap its neighbours by this much for its interior to come
+/// out identical to a render of the whole.
+pub(crate) const NETWORK_REACH: usize = 2 * HALO;
 /// Scratch memory allowed for tiles in flight, across all worker threads.
 ///
 /// Tiles are the only parallelism in the network: `convolve_valid` is serial, so
