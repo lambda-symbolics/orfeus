@@ -9,7 +9,7 @@
 //! may consume the result. The final image is oriented and encoded exactly
 //! like the flat pipeline.
 
-use std::ffi::{CStr, c_char};
+use std::ffi::{CStr, c_char, c_void};
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
@@ -57,6 +57,15 @@ pub struct RenderFrameV1 {
     pub flags: u32,
     /// The lens to correct for when the container names none of its own.
     pub lens_name: *const c_char,
+    /// Called as the render passes each stage, or null for no reporting.
+    ///
+    /// Invoked on the thread that called in, never from a worker, so a caller
+    /// may do anything on it that it could do around the call itself. The name
+    /// is a static NUL-terminated string and is not to be freed; the fraction
+    /// runs from zero to one and is monotonic within one render.
+    pub progress: Option<unsafe extern "C" fn(*mut c_void, *const c_char, f32)>,
+    /// Handed back to `progress` unexamined.
+    pub progress_context: *mut c_void,
     /// The part of the frame to develop, as (left, top, width, height) in
     /// fractions of the oriented frame, or all zeros for the whole of it.
     ///
@@ -66,6 +75,46 @@ pub struct RenderFrameV1 {
     /// tone-mapped and encoded so that 1400 of them could be looked at. Naming
     /// the region turns that back into the work it should have been.
     pub viewport: [f32; 4],
+}
+
+/// What a render tells its caller as it goes.
+///
+/// A render used to be a black box that took between forty milliseconds and
+/// half a minute, and the interface could only say how many jobs were queued
+/// behind it — which says nothing at all about the one in front. Naming the
+/// stage costs a function call per stage.
+#[derive(Clone, Copy)]
+pub(crate) struct Reporter {
+    hook: Option<unsafe extern "C" fn(*mut c_void, *const c_char, f32)>,
+    context: *mut c_void,
+}
+
+impl Reporter {
+    pub(crate) fn none() -> Self {
+        Self {
+            hook: None,
+            context: std::ptr::null_mut(),
+        }
+    }
+
+    /// Reports a named stage and how far through the render it is.
+    ///
+    /// NAME must be NUL-terminated and outlive the call, which every caller
+    /// here satisfies with a literal.
+    pub(crate) fn report(&self, name: &'static str, fraction: f32) {
+        if let Some(hook) = self.hook {
+            debug_assert!(name.ends_with('\0'), "stage names are passed as C strings");
+            // SAFETY: The caller promised a function it is willing to have
+            // called on this thread, and the name is a NUL-terminated literal.
+            unsafe {
+                hook(
+                    self.context,
+                    name.as_ptr() as *const c_char,
+                    fraction.clamp(0.0, 1.0),
+                );
+            }
+        }
+    }
 }
 
 /// Develop at half resolution, binning each sensor quad instead of
@@ -872,8 +921,16 @@ pub(crate) fn execute_graph_windowed(
     context: &GraphContext<'_>,
     viewport: [f32; 4],
 ) -> Result<RgbImage, Error> {
-    execute_graph_into(ops, Arc::new(source), context, Some(viewport), None, None)
-        .map(|(_, _, image)| image.expect("no byte buffer was asked for"))
+    execute_graph_into(
+        ops,
+        Arc::new(source),
+        context,
+        Some(viewport),
+        Reporter::none(),
+        None,
+        None,
+    )
+    .map(|(_, _, image)| image.expect("no byte buffer was asked for"))
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -891,9 +948,34 @@ pub(crate) fn execute_graph_cached(
     context: &GraphContext<'_>,
     cache_key: Option<PrefixKey>,
 ) -> Result<RgbImage, Error> {
-    let (width, height, image) = execute_graph_into(ops, source, context, None, cache_key, None)?;
+    let (width, height, image) =
+        execute_graph_into(ops, source, context, None, Reporter::none(), cache_key, None)?;
     let _ = (width, height);
     Ok(image.expect("a graph run without a byte buffer returns its image"))
+}
+
+/// The name a caller is told while a node runs.
+///
+/// Static NUL-terminated literals so reporting allocates nothing. Worded as what
+/// the renderer is doing rather than as the node's own name: a status bar that
+/// says "optics" tells a photographer less than one that says "correcting lens".
+fn node_stage_name(kind: u32) -> &'static str {
+    match kind {
+        NODE_WHITE_BALANCE => "white balance\0",
+        NODE_EXPOSURE => "exposure\0",
+        NODE_NOISE_REDUCTION => "reducing noise\0",
+        NODE_TONE => "tone\0",
+        NODE_OPTICS => "correcting lens\0",
+        NODE_FILM => "film look\0",
+        NODE_BLEND => "blending\0",
+        NODE_COLOR_SUBTRACT => "inverting\0",
+        NODE_CROP => "cropping\0",
+        NODE_CURVES => "curves\0",
+        NODE_ROTATE => "turning\0",
+        NODE_CONTRAST => "contrast\0",
+        NODE_SHARPEN => "sharpening\0",
+        _ => "developing\0",
+    }
 }
 
 /// Where a render of part of a frame may start working on just that part, and
@@ -1046,11 +1128,13 @@ fn crop_to_viewport(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_graph_into(
     ops: &[GraphOp],
     source: Arc<RgbImage>,
     context: &GraphContext<'_>,
     viewport: Option<[f32; 4]>,
+    reporter: Reporter,
     cache_key: Option<PrefixKey>,
     bytes: Option<&mut [u8]>,
 ) -> Result<(usize, usize, Option<RgbImage>), Error> {
@@ -1191,8 +1275,16 @@ fn execute_graph_into(
     }
     let profiling = std::env::var_os("ORFEUS_PROFILE").is_some();
     let mut captured: Vec<(StagePoint, Vec<PrefixSnapshot>)> = Vec::new();
+    let executed = count.saturating_sub(boundary).max(1) as f32;
     for (index, op) in ops.iter().enumerate().skip(boundary) {
         let node_started = profiling.then(std::time::Instant::now);
+        // A quarter of the bar covers reading and scaling, and the nodes share
+        // the rest: a caller can say which correction is being applied, which
+        // is the part that actually takes the time.
+        reporter.report(
+            node_stage_name(op.kind),
+            0.25 + 0.7 * ((index - boundary) as f32 / executed),
+        );
         let stage = if index == boundary {
             entry_stage
         } else {
@@ -1521,7 +1613,9 @@ fn execute_graph_into(
     {
         image = render::crop_rect(&image, left, top, width, height);
     }
+    reporter.report("writing\0", 0.95);
     let result = finish(image, domains[count], bytes)?;
+    reporter.report("done\0", 1.0);
     if let Some(started) = tail_started {
         eprintln!(
             "orfeus-profile graph-tail resumed-from={}.{} milliseconds={:.3}",
@@ -1721,9 +1815,15 @@ fn render_graph_frame(
     // A live preview develops a draft: each sensor quad becomes one pixel
     // rather than interpolating a colour for every photosite.
     let draft = develops_draft(frame.flags, frame.max_width, frame.max_height);
+    let reporter = Reporter {
+        hook: frame.progress,
+        context: frame.progress_context,
+    };
+    reporter.report("reading\0", 0.0);
     let (decoded, source_identity): (Arc<DecodedRaw>, Option<render::DecodeCacheKey>) =
         render::decoded_for_render_with_identity(input, cache_mode, draft, profiling)?;
     profile_stage!("decoded-source");
+    reporter.report("scaling\0", 0.2);
     let (native_max_width, native_max_height) =
         render::native_downscale_bounds(decoded.orientation, frame.max_width, frame.max_height);
     let bounded = native_max_width > 0 || native_max_height > 0;
@@ -1807,7 +1907,7 @@ fn render_graph_frame(
     };
     profile_stage!("prefix-key");
     let _ = stage_started;
-    execute_graph_into(&ops, source, &context, viewport, prefix_key, bytes)
+    execute_graph_into(&ops, source, &context, viewport, reporter, prefix_key, bytes)
 }
 
 #[cfg(test)]

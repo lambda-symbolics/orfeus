@@ -123,6 +123,10 @@ form by hand for each of them buried the call it guards."
   (flags :uint32)
   ;; The lens to correct for when the RAW container names none of its own.
   (lens-name :pointer)
+  ;; Called as the render passes each stage, on the calling thread, with the
+  ;; context pointer, a stage name, and how far along it is.
+  (progress :pointer)
+  (progress-context :pointer)
   ;; The part of the frame to develop, as left, top, width and height in
   ;; fractions of the oriented frame. All zeros means the whole of it.
   (viewport :float :count 4))
@@ -432,6 +436,22 @@ the contrast and sharpen nodes.")
 (defun graph-boolean-parameter (value)
   (if value 1.0 0.0))
 
+(defvar *render-progress-hook* nil
+  "Called with a stage name and a fraction while a render runs, or NIL.
+
+Bound around the native call rather than passed as a context pointer: the
+bridge invokes the callback on the thread that called in, so a dynamic binding
+reaches it and there is nothing to keep alive across threads.")
+
+(cffi:defcallback render-progress-trampoline :void
+    ((context :pointer) (name :string) (fraction :float))
+  (declare (ignore context))
+  ;; Nothing may escape from here. An unwinding condition would tear through
+  ;; Rust's stack, and a status line is not worth that.
+  (ignore-errors
+    (when *render-progress-hook*
+      (funcall *render-progress-hook* name fraction))))
+
 (defun graph-node-program-parameters (node)
   "Return NODE's packed parameter list and its optional string payload."
   (flet ((parameter (key)
@@ -561,7 +581,7 @@ the contrast and sharpen nodes.")
                                   lens-crop-factor (grain-seed 0)
                                   (max-width 0) (max-height 0)
                                   (jpeg-quality 92) output-format cache-p
-                                  draft-p viewport)
+                                  draft-p viewport progress)
   "Render INPUT-PATHNAME through the node GRAPH via the version 3 bridge.
 
 DRAFT-P asks the bridge to develop at half resolution. Only a preview may.
@@ -599,6 +619,11 @@ by definition."
                  (setting 'lens-profile-model lens-pointer)
                  (setting 'lens-name name-pointer)
                  (setting 'flags (if draft-p +frame-flag-draft+ 0))
+                 (setting 'progress
+                          (if progress
+                              (cffi:callback render-progress-trampoline)
+                              (cffi:null-pointer)))
+                 (setting 'progress-context (cffi:null-pointer))
                  (let ((slot (cffi:foreign-slot-pointer
                               frame '(:struct render-frame-v1) 'viewport))
                        (values (or viewport '(0.0 0.0 0.0 0.0))))
@@ -637,9 +662,10 @@ by definition."
                               :status status
                               :message (native-error-message
                                         error-buffer)))))))))
-      (with-optional-foreign-string (lens-pointer lens-profile-model)
-        (with-optional-foreign-string (name-pointer lens-name)
-          (invoke lens-pointer name-pointer)))))
+      (let ((*render-progress-hook* progress))
+        (with-optional-foreign-string (lens-pointer lens-profile-model)
+          (with-optional-foreign-string (name-pointer lens-name)
+            (invoke lens-pointer name-pointer))))))
   output-pathname)
 
 (defun native-raw-render-graph-rgb (input-pathname graph rgb-buffer capacity
@@ -647,7 +673,7 @@ by definition."
                                       focal-reducer
                                       lens-crop-factor (grain-seed 0)
                                       (max-width 0) (max-height 0) cache-p
-                                      draft-p viewport)
+                                      draft-p viewport progress)
   "Render INPUT-PATHNAME through GRAPH into the foreign RGB-BUFFER.
 
 The live-preview hot path: no JPEG encode and no file. Returns the oriented
@@ -678,6 +704,11 @@ image width and height as two values."
                  (setting 'lens-profile-model lens-pointer)
                  (setting 'lens-name name-pointer)
                  (setting 'flags (if draft-p +frame-flag-draft+ 0))
+                 (setting 'progress
+                          (if progress
+                              (cffi:callback render-progress-trampoline)
+                              (cffi:null-pointer)))
+                 (setting 'progress-context (cffi:null-pointer))
                  (let ((slot (cffi:foreign-slot-pointer
                               frame '(:struct render-frame-v1) 'viewport))
                        (values (or viewport '(0.0 0.0 0.0 0.0))))

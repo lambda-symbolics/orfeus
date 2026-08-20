@@ -251,7 +251,7 @@ The output is published atomically and INPUT-PATHNAME is never modified."
 
 (defun render-native-photo-graph (input-pathname output-pathname graph
                                   &key max-width max-height jpeg-quality
-                                    grain-seed cache-p draft-p viewport
+                                    grain-seed cache-p draft-p viewport progress
                                     (report-input-pathname input-pathname))
   (multiple-value-bind (lens-profile focal-reducer lens-crop-factor)
       (resolve-lens-profile-alias
@@ -263,6 +263,7 @@ The output is published atomically and INPUT-PATHNAME is never modified."
               :cache-p cache-p
               :draft-p draft-p
               :viewport viewport
+              :progress progress
               :output-format (render-output-format output-pathname)
               :lens-profile-model lens-profile
               :focal-reducer focal-reducer
@@ -287,7 +288,8 @@ The output is published atomically and INPUT-PATHNAME is never modified."
                      &key (if-exists :error)
                        (max-width 0) (max-height 0)
                        (jpeg-quality 92) (grain-seed 0)
-                       (preserve-metadata-p t) cache-p graph draft-p viewport)
+                       (preserve-metadata-p t) cache-p graph draft-p viewport
+                       progress)
   "Render INPUT-PATHNAME to JPEG or TIFF using PROCESSING-SETTINGS.
 
 This frontend-independent operation is shared by the CLI and GUI. It renders
@@ -302,7 +304,12 @@ which may then be NIL.
 VIEWPORT, when given, names the part of the frame to develop as four fractions
 of the oriented frame: left, top, width, height. Only an interactive preview
 gives one, and only when it is zoomed in far enough that most of the frame is
-off screen; an export is the whole photograph by definition."
+off screen; an export is the whole photograph by definition.
+
+PROGRESS, when given, is called with a stage name and a fraction as the render
+passes each stage, on this thread. A render takes anywhere from forty
+milliseconds to half a minute depending on which nodes are in it, and this is
+what lets a frontend say which one it is waiting on."
   (check-type settings (or null processing-settings))
   ;; A viewport is only implemented on the graph path, and the graph path
   ;; renders the same picture — the interface already develops every project
@@ -357,7 +364,8 @@ off screen; an export is the whole photograph by definition."
                      ;; flat settings goes through the older settings struct,
                      ;; which has no room to ask.
                      :draft-p draft-p
-                     :viewport viewport)
+                     :viewport viewport
+                     :progress progress)
                     (render-native-photo
                      render-input-pathname temporary settings
                      :report-input-pathname input-pathname
@@ -377,7 +385,7 @@ off screen; an export is the whole photograph by definition."
                        &key (if-exists :error)
                          (max-width 1600) (max-height 1200)
                          (jpeg-quality 88) (grain-seed 0) cache-p graph
-                         (draft-p t) viewport)
+                         (draft-p t) viewport progress)
   "Render a bounded JPEG preview without metadata-copy overhead.
 
 Develops a draft by default: this is what the editor looks at, not what it
@@ -393,6 +401,7 @@ binning would drop detail the downscale would have kept."
                 :if-exists if-exists
                 :cache-p cache-p
                 :viewport viewport
+                :progress progress
                 :graph graph))
 
 (defmacro with-decoded-while ((input-pathname &rest decode-arguments) &body body)

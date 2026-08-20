@@ -381,6 +381,45 @@ sliders and nothing else has to be recomputed."
   "Return true when EVENT belongs to the current still-gallery GENERATION."
   (= (second event) generation))
 
+(defparameter *node-kind-glyphs*
+  ;; Twelve-by-twelve line drawings, one per node kind, as :LINE x1 y1 x2 y2 and
+  ;; :RECT x y width height in the glyph's own coordinates. A node graph read at
+  ;; a glance is read by shape long before the four-letter caption is spelled
+  ;; out, and a chain of eight boxes that differ only in their text is a chain
+  ;; nobody scans.
+  '((:white-balance (:rect 4 1 4 2) (:rect 4 9 4 2) (:rect 1 4 2 4)
+                    (:rect 9 4 2 4) (:rect 4 4 4 4))
+    (:exposure (:rect 4 4 4 4) (:line 6 0 6 2) (:line 6 10 6 12)
+               (:line 0 6 2 6) (:line 10 6 12 6)
+               (:line 1 1 3 3) (:line 9 9 11 11)
+               (:line 11 1 9 3) (:line 3 9 1 11))
+    (:noise-reduction (:rect 1 2 2 2) (:rect 6 1 2 2) (:rect 9 5 2 2)
+                      (:rect 3 6 2 2) (:rect 7 8 2 2) (:rect 1 9 2 2))
+    (:tone (:rect 1 8 2 4) (:rect 5 5 2 7) (:rect 9 2 2 10))
+    (:optics (:line 3 1 3 11) (:line 9 1 9 11) (:line 3 1 9 4)
+             (:line 3 11 9 8) (:line 6 5 6 7))
+    (:film (:rect 2 1 8 10) (:rect 0 2 2 2) (:rect 0 7 2 2)
+           (:rect 10 2 2 2) (:rect 10 7 2 2))
+    (:blend (:rect 1 1 7 7) (:rect 4 4 7 7))
+    (:color-subtract (:rect 1 1 10 10) (:rect 3 5 6 2))
+    (:contrast (:rect 1 1 10 10) (:rect 6 2 4 8))
+    (:sharpen (:line 6 0 1 11) (:line 6 0 11 11) (:line 1 11 11 11))
+    (:crop (:line 3 0 3 9) (:line 0 3 9 3) (:line 8 2 8 11) (:line 2 8 11 8))
+    (:rotate (:line 1 10 1 2) (:line 1 2 9 2) (:line 6 0 9 2) (:line 6 4 9 2))
+    (:curves (:line 0 11 4 8) (:line 4 8 7 4) (:line 7 4 11 1))
+    (:node (:rect 2 2 8 8)))
+  "Per-kind glyphs for the node graph, drawn beside each node's caption.")
+
+(defun draw-node-glyph (kind x y)
+  "Draw KIND's glyph with its top-left corner at X, Y."
+  (dolist (part (rest (assoc kind *node-kind-glyphs*)))
+    (ecase (first part)
+      (:line (destructuring-bind (x1 y1 x2 y2) (rest part)
+               (lightfast:draw-line (+ x x1) (+ y y1) (+ x x2) (+ y y2))))
+      (:rect (destructuring-bind (left top width height) (rest part)
+               (lightfast:draw-filled-rect (+ x left) (+ y top)
+                                           width height))))))
+
 (defun node-kind-label (kind)
   (or (rest (assoc kind *node-kind-labels*)) (string kind)))
 
@@ -1172,6 +1211,11 @@ new cache entry is published."
            ;; (KEY WIDGET DEFAULT) for controls that edit a node's own
            ;; parameters rather than a pipeline setting.
            (node-param-controls '())
+           ;; What the renderer last said it was doing, and how far along. Set
+           ;; from a background render thread through the queue, so the status
+           ;; line can name the stage rather than the queue depth.
+           render-stage
+           (render-stage-fraction 0.0)
            (photo-groups (make-hash-table :test #'eq))
            ;; Which bursts the photographer has opened. Stored the way round
            ;; that makes closed the default without a pass to close them:
@@ -2414,6 +2458,34 @@ new cache entry is published."
                    (#.lightfast:+event-wheel+
                     (zoom-preview (if (minusp dy) 1.25d0 .8d0)
                                   canvas x y))))))
+           (show-render-progress ()
+             (setf (lightfast:value progress)
+                   (format nil "~D"
+                           (max 2 (min 99 (round (* 100 render-stage-fraction)))))))
+           (render-summary-text ()
+             ;; After a render, what it cost and at what size — the two facts
+             ;; that explain the wait that just happened and predict the next.
+             (format nil "~A~@[  |  ~A~]" (preview-status-text model)
+                     (when (plusp last-render-ms)
+                       (let ((bound (viewport-render-bound)))
+                         (format nil "Last render: ~D ms at ~D px~:[~; (window)~]"
+                                 (round last-render-ms)
+                                 bound
+                                 (and after-preview-region t))))))
+           (render-activity-text ()
+             ;; What the renderer is doing, in its own words, with the size it
+             ;; is doing it at. The size matters: the same photograph takes a
+             ;; fifth as long developed for a window as for the whole frame, and
+             ;; a photographer wondering why one edit was instant and the next
+             ;; was not deserves to be told which happened.
+             (let ((bound (viewport-render-bound))
+                   (window (and after-preview-region t)))
+               (format nil "Developing~@[ ~A~]~@[ · ~A~]~@[ · ~D px~]~:[~; · window~]"
+                       (and render-stage (string-downcase render-stage))
+                       (let ((job (selected-job)))
+                         (and job (file-namestring (photo-job-input-path job))))
+                       (and (plusp bound) bound)
+                       window)))
            (set-status (text)
              (setf (lightfast:value status) text))
            (selected-job ()
@@ -3053,7 +3125,7 @@ new cache entry is published."
                  (when (and (<= x gx (+ x w)) (<= y gy (+ y h)))
                    (return-from graph-editor-hit (values :output nil))))
                (values nil nil)))
-           (draw-editor-box (x y w h label style selected)
+           (draw-editor-box (x y w h label style selected &optional (indent 0))
              ;; Body colour carries the pipeline order the graph enforces, in
              ;; three tiers: green optics, which must precede every crop; cool
              ;; scene-linear corrections; and warm display space, from the film
@@ -3091,7 +3163,7 @@ new cache entry is published."
                  (lightfast:draw-color-rgb :red 225 :green 225 :blue 230)
                  (lightfast:draw-color-rgb :red 10 :green 10 :blue 12))
              (lightfast:draw-font :size 12)
-             (lightfast:draw-text label (+ x 10) (+ y (floor h 2) 5))
+             (lightfast:draw-text label (+ x 10 indent) (+ y (floor h 2) 5))
              (lightfast:draw-font :size 12))
            (draw-graph-wire (fx fy tx ty red green blue)
              ;; Wires leave the bottom of a node and enter the top of the
@@ -3229,19 +3301,33 @@ new cache entry is published."
                      (let* ((bx (+ ox x)) (by (+ oy y))
                             (bypassed (orfeus:graph-node-bypassed-p node))
                             (blend-p (orfeus:graph-node-blend-p node)))
+                       ;; The caption steps aside for the glyph rather than
+                       ;; sharing its pixels with it.
                        (draw-editor-box bx by w h
                                         (node-kind-label
                                          (orfeus:graph-node-kind node))
                                         (graph-node-body-style
                                          node
                                          (node-in-display-domain-p node))
-                                        (eq node selected))
+                                        (eq node selected)
+                                        16)
                        (if (graph-node-active-p node)
                            (lightfast:draw-color-rgb :red 40 :green 150
                                                    :blue 40)
                            (lightfast:draw-color-rgb :red 150 :green 150
                                                    :blue 150))
                        (lightfast:draw-filled-rect (+ bx w -13) (+ by 5) 8 8)
+                       ;; The kind's own shape, in the corner opposite the
+                       ;; activity light. Dimmed when the node is bypassed,
+                       ;; because a bypassed node is still there and still
+                       ;; wants identifying.
+                       (if bypassed
+                           (lightfast:draw-color-rgb :red 128 :green 128
+                                                     :blue 132)
+                           (lightfast:draw-color-rgb :red 58 :green 74
+                                                     :blue 104))
+                       (draw-node-glyph (orfeus:graph-node-kind node)
+                                        (+ bx 7) (+ by (floor h 2) -6))
                        ;; The input and output port nubs.
                        (lightfast:draw-color-rgb :red 235 :green 235 :blue 240)
                        (lightfast:draw-filled-rect (+ bx (floor w 2) -4)
@@ -4584,7 +4670,13 @@ new cache entry is published."
                 target-queue role
                 (lambda ()
                   (when (or (not publish-p) (= generation preview-generation))
-                    (let ((render-started (get-internal-real-time)))
+                    (let ((render-started (get-internal-real-time))
+                          (reporter
+                            (and publish-p (eq role :after)
+                                 (lambda (stage fraction)
+                                   (queue-event queue
+                                                (list :render-stage generation
+                                                      stage fraction))))))
                       (loop for attempt below 3
                           for digest = (photo-content-key-for job generation
                                                               (plusp attempt))
@@ -4621,12 +4713,14 @@ new cache entry is published."
                                                           :max-height max-height
                                                           :cache-p cache-p
                                                           :viewport viewport
+                                                          :progress reporter
                                                           :if-exists :supersede)
                                           (render-preview input temporary settings
                                                           :max-width max-width
                                                           :max-height max-height
                                                           :cache-p cache-p
                                                           :viewport viewport
+                                                          :progress reporter
                                                           :if-exists :supersede))
                                       (unless (string= digest (photo-content-key input))
                                         (error "RAW source changed during preview render")))
@@ -5488,8 +5582,11 @@ new cache entry is published."
                  (lightfast:resize-widget toolbar-bottom-rule :x 0 :y 38
                                         :width width :height 2))
                (when lens-name
-                 (lightfast:resize-widget lens-name :x 342 :y 6
-                                        :width (max 120 (- width 352)) :height 28))
+                 ;; Kept in step with the toolbar's last button rather than
+                 ;; pinned: the resize runs on every window change and would
+                 ;; otherwise drag the label back over the zoom controls.
+                 (lightfast:resize-widget lens-name :x 402 :y 6
+                                        :width (max 120 (- width 412)) :height 28))
                (lightfast:resize-widget left-column :x 0 :y 0
                                       :width left :height main-height)
                (lightfast:resize-widget center-pane :x left :y 0
@@ -5546,7 +5643,9 @@ new cache entry is published."
                                      (published-region (sixth event)
                                                        (seventh event)
                                                        (eighth event)))
-                    (set-status (preview-status-text model))))
+                    (setf render-stage nil
+                          render-stage-fraction 0.0)
+                    (set-status (render-summary-text))))
                  (:live-preview
                   (when (and (= (second event) preview-generation)
                              (eq (third event) (selected-job)))
@@ -5580,6 +5679,14 @@ new cache entry is published."
                  (:photo-groups
                   (setf photo-groups (second event))
                   (redraw-thumbnails))
+                 (:render-stage
+                  ;; Only the render the interface is waiting for; a stale one
+                  ;; still finishing must not narrate over it.
+                  (when (= (second event) preview-generation)
+                    (setf render-stage (third event)
+                          render-stage-fraction (fourth event))
+                    (set-status (render-activity-text))
+                    (show-render-progress)))
                  (:photo-focus
                   (when (member (second event) (project-photos project) :test #'eq)
                     (setf (gethash (second event) photo-focus-reports)
@@ -5640,8 +5747,16 @@ new cache entry is published."
                    (preview-progress-state load progress-total preview-generation
                                            progress-generation)
                  (setf progress-total total
-                       progress-generation generation
-                       (lightfast:value progress) (format nil "~D" percent))))))
+                       progress-generation generation)
+                 ;; A render that is reporting its own stages knows better than
+                 ;; the queue does: the queue counts jobs, and one job is the
+                 ;; whole wait. Its own fraction wins for as long as it lasts,
+                 ;; and an export batch — many jobs, each short — keeps the
+                 ;; count.
+                 (if (and render-stage (zerop export-load))
+                     (show-render-progress)
+                     (setf (lightfast:value progress)
+                           (format nil "~D" percent)))))))
         (setf after-live-capacity
               (* *gui-live-preview-size* *gui-live-preview-size* 3)
               after-live-front (cffi:foreign-alloc
@@ -5825,21 +5940,31 @@ new cache entry is published."
                    button)))
           (rule 6 10 2 18 130 130 130)
           (rule 10 10 2 18 245 245 245)
-          (toolbar-button 18 :open "Add RAW photographs to project" #'add-photos)
+          ;; A photograph and a project are not the same thing and must not
+          ;; wear the same picture. They did, because the toolkit aliased
+          ;; folder-open to the icon it uses for open, so both buttons drew a
+          ;; folder with papers in it.
+          (toolbar-button 18 :photo "Add RAW photographs to project" #'add-photos)
           (toolbar-button 48 :folder-open "Open project" #'open-project)
-          (toolbar-button 78 :delete "Remove selected photographs" #'remove-selected-photo)
-          (rule 112 7 1 24 150 150 150)
-          (toolbar-button 120 :export "Export photographs..." #'open-export-dialog)
-          (toolbar-button 150 :pipeline "Show or hide Before and After" #'toggle-comparison)
-          (rule 184 7 1 24 150 150 150)
-          (toolbar-text-button 192 28 "−" "Zoom out" (lambda () (zoom-preview .8d0)))
-          (toolbar-text-button 222 38 "Fit" "Fit preview" #'reset-preview-view)
-          (toolbar-text-button 262 28 "+" "Zoom in" (lambda () (zoom-preview 1.25d0)))
-          (toolbar-text-button 292 38 "1:1" "Show image pixels at 1:1" #'preview-one-to-one)
-          (rule 334 7 1 24 150 150 150)
+          (toolbar-button 78 :save "Save project" #'save-project)
+          (toolbar-button 108 :delete "Remove selected photographs"
+                          #'remove-selected-photo)
+          (rule 142 7 1 24 150 150 150)
+          (toolbar-button 150 :export "Export photographs..." #'open-export-dialog)
+          (toolbar-button 180 :pipeline "Show or hide Before and After"
+                          #'toggle-comparison)
+          (toolbar-button 210 :focus "Select photographs that look out of focus"
+                          #'find-and-select-blurry-photos)
+          (rule 244 7 1 24 150 150 150)
+          (toolbar-button 252 :zoom-out "Zoom out" (lambda () (zoom-preview .8d0)))
+          (toolbar-text-button 282 38 "Fit" "Fit preview" #'reset-preview-view)
+          (toolbar-button 322 :zoom-in "Zoom in" (lambda () (zoom-preview 1.25d0)))
+          (toolbar-text-button 352 38 "1:1" "Show image pixels at 1:1"
+                               #'preview-one-to-one)
+          (rule 394 7 1 24 150 150 150)
           (setf toolbar-bottom-rule (rule 0 38 1280 2 145 145 145)))
-        (setf lens-name (lightfast:make-label :parent toolbar :x 342 :y 6
-                                            :width 912 :height 28
+        (setf lens-name (lightfast:make-label :parent toolbar :x 402 :y 6
+                                            :width 852 :height 28
                                             :label "Lens: No photograph selected"))
         (lightfast:set-label-font lens-name 1)
         (setf main-tile (lightfast:make-tile :parent window :x 0 :y 64
