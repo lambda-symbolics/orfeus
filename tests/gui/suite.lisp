@@ -511,6 +511,31 @@ against 45 milliseconds for a canvas-sized render."
              orfeus/gui::*gui-preview-maximum-bound*)
          "An extreme zoom escaped the ceiling"))
 
+(defun test-draft-preview-covers-the-view ()
+  "A draft stands in for the view only while it can fill it.
+
+The draft is bounded at the size below which the bridge bins sensor quads rather
+than interpolating them, and the adapter magnifies a preview at most twice — so
+past twice that bound the draft is drawn smaller than the render it replaces.
+Publishing it anyway made the photograph zoom out and back in whenever an
+expensive node was changed at a zoomed-in view."
+  (let ((bound orfeus/gui::*gui-draft-preview-size*))
+    (check (orfeus/gui::draft-preview-fits-viewport-p 1400 1d0 bound)
+           "A fitted view refused a draft it could have used")
+    (check (orfeus/gui::draft-preview-fits-viewport-p 1400 2d0 bound)
+           "A modest zoom refused a draft it could have used")
+    ;; 1400 by 2.9 is 4060, just inside twice the bound; by 3 it is 4200, just
+    ;; outside, and past that the picture would move.
+    (check (orfeus/gui::draft-preview-fits-viewport-p 1400 2.9d0 bound)
+           "A draft was refused while it still covered the view")
+    (check (not (orfeus/gui::draft-preview-fits-viewport-p 1400 3d0 bound))
+           "A draft too small for the view was still allowed")
+    (check (not (orfeus/gui::draft-preview-fits-viewport-p 1400 8d0 bound))
+           "A draft was allowed at a zoom it cannot cover")
+    ;; A wider canvas runs out of draft sooner, at the same zoom.
+    (check (not (orfeus/gui::draft-preview-fits-viewport-p 2600 2d0 bound))
+           "A wide canvas was allowed a draft that could not cover it")))
+
 (defun test-preset-bulk-application ()
   (let* ((jobs (loop for name in '("one" "two" "three")
                      collect (orfeus:make-photo-job
@@ -1533,6 +1558,7 @@ against 45 milliseconds for a canvas-sized render."
   (test-node-body-tiers)
   (test-crop-aspect-and-default)
   (test-viewport-render-bound)
+  (test-draft-preview-covers-the-view)
   (test-curve-spline-shapes)
   (test-preset-bulk-application)
   (test-grade-workflow)

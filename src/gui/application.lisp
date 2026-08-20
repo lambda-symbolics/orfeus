@@ -38,7 +38,22 @@ which is where it always was."
                when (>= bound needed) return bound))))
 
 (defparameter *gui-draft-preview-size* 2048
-  "Bounding size of the fast draft preview rendered before the full one.")
+  "Bounding size of the fast draft preview rendered before the full one.
+
+Not a free choice: it is the size below which the bridge develops by binning
+whole sensor quads instead of interpolating every photosite, which is the entire
+reason a draft is fast. Raising it past that would make the draft cost what the
+full render costs.")
+
+(defun draft-preview-fits-viewport-p (canvas-pixels zoom draft-bound)
+  "Whether a draft bounded at DRAFT-BOUND can stand in for the current view.
+
+The adapter magnifies a preview at most twice, so a draft covers a viewport up
+to twice its own bound and no further. Past that it is drawn *smaller* than the
+render it replaces, and changing an expensive node while zoomed in made the
+photograph visibly zoom out and then back in as the full render landed. The
+frame a photographer is looking at should not move because a node was retimed."
+  (<= (* canvas-pixels zoom) (* 2 draft-bound)))
 
 (defparameter *gui-live-preview-size* 1600
   "Bounding size of live drag previews rendered straight into the canvas
@@ -4469,6 +4484,14 @@ new cache entry is published."
                    (let ((job (nth index photos)))
                      (enqueue-render background-queue :after job index
                                      (settings-for-job job) nil nil))))))
+           (draft-preview-fits-the-view-p ()
+             (let* ((canvas (or after-canvas before-canvas))
+                    (pixels (if canvas
+                                (max (lightfast:widget-width canvas)
+                                     (lightfast:widget-height canvas))
+                                *gui-preview-minimum-bound*)))
+               (draft-preview-fits-viewport-p pixels preview-zoom
+                                              *gui-draft-preview-size*)))
            (enqueue-preview (initial-p)
              (let ((job (selected-job))
                    (index (gui-model-selected-index model))
@@ -4479,7 +4502,8 @@ new cache entry is published."
                  ;; Once checkpointed re-renders come back fast enough, the
                  ;; draft layer only adds churn, so it is skipped.
                  (let ((settings (current-settings)))
-                   (when (and (>= last-render-ms 300) (not (live-view-p)))
+                   (when (and (>= last-render-ms 300) (not (live-view-p))
+                              (draft-preview-fits-the-view-p))
                      (enqueue-render queue :after job index settings
                                      generation t
                                      :front-p t :draft-p t :cache-p t))
