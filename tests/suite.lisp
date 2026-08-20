@@ -1558,6 +1558,35 @@ and then quietly relocated them would be lying about where a click puts things."
               while (plusp count)
               do (write-sequence buffer target :end count))))))
 
+(defun focus-verdict-reading-p ()
+  "A blur radius past the threshold reads soft; a featureless frame reads
+neither way."
+  (flet ((report (blur typical judgeable)
+           (orfeus::%make-photo-focus-report :blur-radius blur
+                                             :typical-blur typical
+                                             :judgeable judgeable)))
+    (and
+     ;; Where the real photographs measured.
+     (eq :sharp (orfeus:focus-verdict (report 0.45 1.2 0.8)))
+     (eq :sharp (orfeus:focus-verdict (report 0.73 1.1 0.9)))
+     ;; A whole pixel of blur at viewing size, which reads about 1.1.
+     (eq :soft (orfeus:focus-verdict (report 1.15 2.0 0.8)))
+     (eq :soft (orfeus:focus-verdict (report 4.9 4.9 0.6)))
+     ;; A frame of sky has nothing in it to be sharp or soft, and saying
+     ;; `blurry' about one would be a guess dressed as a measurement.
+     (eq :unknown (orfeus:focus-verdict (report 8.0 8.0 0.0)))
+     (eq :unknown (orfeus:focus-verdict (report 4.0 4.0 0.01)))
+     (eq :unknown (orfeus:focus-verdict nil))
+     ;; The threshold is a parameter, and moving it moves the verdict.
+     (eq :sharp (orfeus:focus-verdict (report 1.15 2.0 0.8) :threshold 2.0))
+     (eq :soft (orfeus:focus-verdict (report 0.45 1.2 0.8) :threshold 0.2))
+     ;; Only a soft frame is worth a word in the filmstrip, and it names the
+     ;; number it was judged on.
+     (search "soft" (orfeus:focus-description (report 1.4 2.0 0.8)))
+     (search "1.4" (orfeus:focus-description (report 1.4 2.0 0.8)))
+     (search "sharp" (orfeus:focus-description (report 0.45 1.2 0.8)))
+     (null (orfeus:focus-description nil)))))
+
 (defun burst-grouping-p ()
   "Frames close in time and alike belong together; the rest do not."
   (let ((base 3989487541))
@@ -1744,6 +1773,8 @@ and then quietly relocated them would be lying about where a click puts things."
       (check "blends require compatible crop geometry on both branches"
              (graph-crop-branch-compatibility-p))
       (check "bursts group by clock and likeness together" (burst-grouping-p))
+      (check "a blur radius past the threshold reads soft"
+             (focus-verdict-reading-p))
       (check "an unrated frame reads as unrated" (star-rating-reading-p))
       (check "capture times parse to a comparable instant" (capture-time-parsing-p))
       (check "content digests are pinned and cover every byte"

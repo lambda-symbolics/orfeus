@@ -691,6 +691,15 @@ removed, or replaced photograph can never leave a stale graph on screen."
         (uiop:temporary-directory)))
       (error "Cannot create a secure preview cache directory.")))
 
+(defun gui-focus-cache-directory ()
+  "Return where focus measurements are kept between runs, or NIL.
+
+Beside the previews, and for the same reason: measuring focus means developing
+the frame, so a card's worth of photographs is minutes of work that must not be
+repeated on every launch. Keyed by content, so interning a RAW off a card keeps
+what was already measured for it."
+  (make-secure-preview-directory (uiop:xdg-cache-home "orfeus/focus/")))
+
 (defun photo-content-key (pathname)
   "Return the shared content key for PATHNAME. See ORFEUS:FILE-CONTENT-KEY."
   (orfeus:file-content-key pathname))
@@ -1106,6 +1115,16 @@ new cache entry is published."
            ;; from a background pass, because reading capture times is a
            ;; subprocess per photograph and the filmstrip has to keep drawing.
            (photo-groups (make-hash-table :test #'eq))
+           ;; Which bursts the photographer has opened. Stored the way round
+           ;; that makes closed the default without a pass to close them:
+           ;; absence is closed, so a burst that has only just been discovered
+           ;; is already folded when it first draws.
+           (expanded-bursts (make-hash-table :test #'eq))
+           ;; Photograph -> focus report, from a background pass of its own.
+           ;; Measuring means developing the frame, so this arrives slowly and
+           ;; the filmstrip draws whatever has arrived.
+           (photo-focus-reports (make-hash-table :test #'eq))
+           (focus-pass-running-p nil)
            (lut-paths (make-hash-table :test #'equal))
            window menu toolbar toolbar-bottom-rule main-tile root-layout left-column
            filmstrip-pane gallery-pane center-pane
@@ -2239,9 +2258,102 @@ new cache entry is published."
                  (lightfast:draw-text (format nil "burst ~D of ~D"
                                               (1+ position) size)
                                       x y))))
+           (burst-leader-p (job)
+             (let ((place (photo-group-of job)))
+               (and place (eql 0 (second place)) (> (third place) 1))))
+           (burst-collapsed-p (job)
+             (and (burst-leader-p job) (not (gethash job expanded-bursts))))
+           (thumbnail-display-rows ()
+             ;; What the filmstrip actually shows: one entry per drawn row,
+             ;; (INDICES . LEADER), where INDICES are places in the project and
+             ;; LEADER is the leading photograph when the row stands for a
+             ;; folded burst. A burst arrives as a run of consecutive
+             ;; photographs, which is what lets a folded one be one row without
+             ;; the project's own order being disturbed.
+             ;;
+             ;; Recomputed on every draw rather than kept and invalidated. A
+             ;; card's worth of photographs is a few hundred conses, which is
+             ;; nothing beside the drawing, and a cache here would have to be
+             ;; invalidated from every place that adds a photograph, removes
+             ;; one, regroups, or folds — four chances to show the wrong rows.
+             (let ((rows '())
+                   (photos (project-photos project))
+                   (skip 0))
+               (loop for job in photos
+                     for index from 0
+                     do (cond
+                          ((plusp skip) (decf skip))
+                          ((burst-collapsed-p job)
+                           (let* ((size (third (photo-group-of job)))
+                                  (end (min (+ index size) (length photos))))
+                             (setf skip (- end index 1))
+                             (push (cons (loop for place from index below end
+                                               collect place)
+                                         job)
+                                   rows)))
+                          (t (push (cons (list index) nil) rows))))
+               (nreverse rows)))
+           (toggle-burst (leader)
+             (if (gethash leader expanded-bursts)
+                 (remhash leader expanded-bursts)
+                 (setf (gethash leader expanded-bursts) t))
+             (redraw-thumbnails))
+           (set-bursts-expanded (expanded-p)
+             (clrhash expanded-bursts)
+             (when expanded-p
+               (dolist (job (project-photos project))
+                 (when (burst-leader-p job)
+                   (setf (gethash job expanded-bursts) t))))
+             (redraw-thumbnails)
+             (set-status (if expanded-p "Bursts expanded" "Bursts collapsed")))
+           (photo-focus-of (job) (gethash job photo-focus-reports))
+           (photo-focus-verdict (job)
+             ;; A frame that could not be measured at all is remembered as
+             ;; such, so the pass does not try it again every time it runs; it
+             ;; is not a report, and it is not evidence of anything either.
+             (let ((report (photo-focus-of job)))
+               (if (orfeus:photo-focus-report-p report)
+                   (orfeus:focus-verdict report)
+                   :unknown)))
+           (draw-burst-chevron (x row-y collapsed-p count)
+             ;; The one thing on a row that is not a selection: folding a burst
+             ;; open and shut. Drawn over the thumbnail's own corner on a dark
+             ;; square, because the row has no spare width and a control that
+             ;; sits on the picture is at least unambiguous about which picture
+             ;; it belongs to.
+             (lightfast:draw-color-rgb :red 26 :green 28 :blue 30)
+             (lightfast:draw-filled-rect (+ x 6) (+ row-y 6) 18 18)
+             (lightfast:draw-color-rgb :red 150 :green 190 :blue 240)
+             (if collapsed-p
+                 (loop for offset below 5
+                       do (lightfast:draw-line (+ x 12 offset) (+ row-y 10 offset)
+                                               (+ x 12 offset) (+ row-y 20 (- offset))))
+                 (loop for offset below 5
+                       do (lightfast:draw-line (+ x 10 offset) (+ row-y 12 offset)
+                                               (+ x 20 (- offset)) (+ row-y 12 offset))))
+             (when collapsed-p
+               (lightfast:draw-color-rgb :red 150 :green 190 :blue 240)
+               (lightfast:draw-text (format nil "~D frames" count)
+                                    (+ x 102) (+ row-y 78))))
+           (burst-chevron-hit-p (event-x event-y row-y)
+             (and event-x event-y
+                  (< event-x 26)
+                  (>= event-y (+ row-y 4))
+                  (< event-y (+ row-y 26))))
+           (draw-focus-mark (job x y)
+             ;; Only ever drawn for a frame that came back soft. A row saying
+             ;; `sharp' beside every photograph is a row of noise: the useful
+             ;; information is the exception.
+             (when (eq :soft (photo-focus-verdict job))
+               (lightfast:draw-color-rgb :red 240 :green 176 :blue 84)
+               (lightfast:draw-text
+                (or (and (orfeus:photo-focus-report-p (photo-focus-of job))
+                         (orfeus:focus-description (photo-focus-of job)))
+                    "soft")
+                x y)))
            (thumbnail-scroll-limit ()
              (if thumbnail-canvas
-                 (max 0 (- (* (length (project-photos project))
+                 (max 0 (- (* (length (thumbnail-display-rows))
                               (thumbnail-row-height))
                            (lightfast:widget-height thumbnail-canvas)))
                  0))
@@ -2258,37 +2370,58 @@ new cache entry is published."
                        (format nil "~D" thumbnail-scroll)))
                (lightfast:redraw thumbnail-canvas)))
            (select-thumbnail-row (row state)
-             (when (and (>= row 0) (< row (length (project-photos project))))
-               (multiple-value-bind (selection anchor)
-                   (thumbnail-selection-after-click
-                    (gui-model-selected-indices model) row thumbnail-anchor state)
-                 (setf thumbnail-anchor anchor)
-                 (gui-model-set-selected-indices model selection)
-                 (when (member row selection)
-                   (setf (gui-model-selected-index model) row))
-                 (setf (gui-model-selected-node model) nil
-                       pick-color-node nil)
-                 (set-preview-cursor :default)
-                 (clear-previews)
-                 (sync-controls)
-                 (sync-node-tools)
-                 (when graph-canvas (lightfast:redraw graph-canvas))
-                 (if selection
-                     (schedule-initial-preview)
-                     (progn
-                       (incf preview-generation)
-                       (when debounce-id
-                         (ignore-errors (lightfast:remove-timeout debounce-id))
-                         (setf debounce-id nil))
-                       (discard-gui-tasks queue :before)
-                       (discard-gui-tasks queue :after)
-                       (discard-gui-tasks background-queue :before)
-                       (discard-gui-tasks background-queue :after)
-                       (discard-gui-tasks histogram-queue :histogram)
-                       (release-waveform)
-                       (setf after-preview-generation nil
-                             curve-histogram nil)))
-                 (redraw-thumbnails))))
+             ;; ROW is a drawn row, which is not a photograph when a burst is
+             ;; folded: it stands for all of them. The click arithmetic — plain,
+             ;; control, shift — therefore happens in drawn rows, and only the
+             ;; answer is translated back into places in the project, which is
+             ;; the only space the rest of the interface knows about. Doing it
+             ;; the other way round would make shift-clicking across a folded
+             ;; burst select its first frame and nothing else.
+             (let* ((rows (thumbnail-display-rows))
+                    (entry (nth row rows)))
+               (when entry
+                 (let ((chosen (loop for (indices . nil) in rows
+                                     for place from 0
+                                     when (subsetp indices
+                                                   (gui-model-selected-indices model))
+                                       collect place)))
+                   (multiple-value-bind (drawn anchor)
+                       (thumbnail-selection-after-click
+                        chosen row thumbnail-anchor state)
+                     (apply-thumbnail-selection
+                      (sort (loop for place in drawn
+                                  append (copy-list (car (nth place rows))))
+                            #'<)
+                      (first (car entry))
+                      anchor))))))
+           (apply-thumbnail-selection (selection focus-index anchor)
+             (setf thumbnail-anchor anchor)
+             (gui-model-set-selected-indices model selection)
+             (when (member focus-index selection)
+               (setf (gui-model-selected-index model) focus-index))
+             (setf (gui-model-selected-node model) nil
+                   pick-color-node nil)
+             (set-preview-cursor :default)
+             (clear-previews)
+             (sync-controls)
+             (sync-node-tools)
+             (when graph-canvas (lightfast:redraw graph-canvas))
+             (if selection
+                 (schedule-initial-preview)
+                 (progn
+                   (incf preview-generation)
+                   (when debounce-id
+                     (ignore-errors (lightfast:remove-timeout debounce-id))
+                     (setf debounce-id nil))
+                   (discard-gui-tasks queue :before)
+                   (discard-gui-tasks queue :after)
+                   (discard-gui-tasks background-queue :before)
+                   (discard-gui-tasks background-queue :after)
+                   (discard-gui-tasks histogram-queue :histogram)
+                   (release-waveform)
+                   (setf after-preview-generation nil
+                         curve-histogram nil)))
+             (redraw-thumbnails))
            (select-all-thumbnails ()
              (let ((indices (loop for index below (length (project-photos project))
                                   collect index))
@@ -2404,12 +2537,17 @@ new cache entry is published."
                          (format nil "Interned ~D photograph~:P into ~A"
                                  interned
                                  (namestring (orfeus:interned-raw-directory))))))))))
-           (select-thumbnail-context-row (row)
+           (select-thumbnail-context-row (indices)
              ;; Right-clicking targets a photograph without opening it: the menu
              ;; acts on the row under the cursor while the preview keeps showing
              ;; whatever it already had. Opening one is a left-click.
-             (let ((selection (thumbnail-context-selection
-                               (gui-model-selected-indices model) row)))
+             ;;
+             ;; A folded burst is one row standing for several photographs, so
+             ;; the menu acts on all of them — which is the point of folding it.
+             (let ((selection
+                     (if (subsetp indices (gui-model-selected-indices model))
+                         (gui-model-selected-indices model)
+                         indices)))
                (unless (equal selection (gui-model-selected-indices model))
                  (let ((anchor (gui-model-selected-index model)))
                    (gui-model-set-selected-indices model selection)
@@ -2419,8 +2557,9 @@ new cache entry is published."
                  (sync-preset-action-label)
                  (redraw-thumbnails))))
            (show-thumbnail-context-menu (row)
-             (when (and (>= row 0) (< row (length (project-photos project))))
-               (select-thumbnail-context-row row)
+             (let ((entry (nth row (thumbnail-display-rows))))
+               (when entry
+                 (select-thumbnail-context-row (car entry))
                (case (thumbnail-context-action-at
                       (lightfast:popup-menu (thumbnail-context-menu-items)))
                  (:export (open-export-dialog "Selected photographs"))
@@ -2429,7 +2568,7 @@ new cache entry is published."
                  (:copy-paths (copy-selected-photo-paths))
                  (:select-all (select-all-thumbnails))
                  (:intern (intern-selected-photos))
-                 (:remove (remove-selected-photo-with-confirmation)))))
+                 (:remove (remove-selected-photo-with-confirmation))))))
            (handle-thumbnail-mouse (canvas event value)
              (multiple-value-bind (x y button dx dy state)
                  (parse-preview-event value)
@@ -2437,16 +2576,26 @@ new cache entry is published."
                (when y
                  (case event
                    (#.lightfast:+event-push+
-                    (let ((row (thumbnail-row-at y thumbnail-scroll
-                                                 (thumbnail-row-height))))
-                      (if (= button 3)
-                          (show-thumbnail-context-menu row)
-                          (select-thumbnail-row
-                           row
-                           (if (thumbnail-toggle-hit-p
-                                x (lightfast:widget-width canvas))
-                               (logior state +thumbnail-control-mask+)
-                               state)))))
+                    (let* ((row-height (thumbnail-row-height))
+                           (row (thumbnail-row-at y thumbnail-scroll row-height))
+                           (row-y (- (* row row-height) thumbnail-scroll))
+                           (entry (nth row (thumbnail-display-rows)))
+                           (photos (project-photos project))
+                           (job (and entry (nth (first (car entry)) photos)))
+                           (leader (and job
+                                        (or (cdr entry)
+                                            (and (burst-leader-p job) job)))))
+                      (cond
+                        ((= button 3) (show-thumbnail-context-menu row))
+                        ((and leader (burst-chevron-hit-p x y row-y))
+                         (toggle-burst leader))
+                        (t
+                         (select-thumbnail-row
+                          row
+                          (if (thumbnail-toggle-hit-p
+                               x (lightfast:widget-width canvas))
+                              (logior state +thumbnail-control-mask+)
+                              state))))))
                    (#.lightfast:+event-wheel+
                     (incf thumbnail-scroll (* dy 36))
                     (redraw-thumbnails))))))
@@ -3950,6 +4099,67 @@ new cache entry is published."
                                  (list :photo-groups
                                        (orfeus:group-index-of
                                         (orfeus:group-captures entries)))))))))
+           (refresh-photo-focus (&key then)
+             ;; Measuring focus develops the frame, which is half a second
+             ;; each, so this runs on a thread of its own rather than on the
+             ;; background queue: that queue renders previews with one worker,
+             ;; and a card's worth of measuring would hold every preview behind
+             ;; it for minutes. Answers arrive one at a time and the filmstrip
+             ;; draws whatever has come in.
+             (let ((jobs (remove-if (lambda (job) (gethash job photo-focus-reports))
+                                    (copy-list (project-photos project)))))
+               (cond
+                 (focus-pass-running-p
+                  (set-status "Still measuring focus"))
+                 ((null jobs) (when then (funcall then)))
+                 (t
+                  (setf focus-pass-running-p t)
+                  (set-status (format nil "Measuring focus of ~D photograph~:P"
+                                      (length jobs)))
+                  (let ((total (length jobs)))
+                    (sb-thread:make-thread
+                     (lambda ()
+                       (unwind-protect
+                            (loop for job in jobs
+                                  for done from 1
+                                  do (queue-event
+                                      queue
+                                      (list :photo-focus job
+                                            (ignore-errors
+                                              (orfeus:photo-focus
+                                               (photo-job-input-path job)))
+                                            done total)))
+                         (queue-event queue (list :photo-focus-done then))))
+                     :name "orfeus focus"))))))
+           (select-blurry-photos ()
+             (let* ((photos (project-photos project))
+                    (indices (loop for job in photos
+                                   for index from 0
+                                   when (eq :soft (photo-focus-verdict job))
+                                     collect index)))
+               (if (null indices)
+                   (set-status
+                    (format nil "Nothing looks out of focus in ~D photograph~:P"
+                            (count-if (lambda (job) (photo-focus-of job)) photos)))
+                   (progn
+                     ;; Open any burst holding one, or the selection would be a
+                     ;; half-filled box on a folded row and the photographer
+                     ;; could not see which frame was meant.
+                     (loop for job in photos
+                           for index from 0
+                           when (and (member index indices) (photo-group-of job))
+                             do (let ((place (photo-group-of job)))
+                                  (let ((leader (nth (- index (second place))
+                                                     photos)))
+                                    (when (and leader (burst-leader-p leader))
+                                      (setf (gethash leader expanded-bursts) t)))))
+                     (apply-thumbnail-selection indices (first indices)
+                                                (first indices))
+                     (set-status
+                      (format nil "Selected ~D of ~D photograph~:P that look soft"
+                              (length indices) (length photos)))))))
+           (find-and-select-blurry-photos ()
+             (refresh-photo-focus :then #'select-blurry-photos))
            (replace-project (new-project &optional path)
              (incf preview-generation)
              (clear-previews)
@@ -5065,6 +5275,17 @@ new cache entry is published."
                  (:photo-groups
                   (setf photo-groups (second event))
                   (redraw-thumbnails))
+                 (:photo-focus
+                  (when (member (second event) (project-photos project) :test #'eq)
+                    (setf (gethash (second event) photo-focus-reports)
+                          (or (third event) :unmeasurable))
+                    (when (zerop (mod (fourth event) 8))
+                      (set-status (format nil "Measuring focus ~D of ~D"
+                                          (fourth event) (fifth event))))
+                    (redraw-thumbnails)))
+                 (:photo-focus-done
+                  (setf focus-pass-running-p nil)
+                  (when (second event) (funcall (second event))))
                  (:still-error
                   (when (gallery-generation-event-current-p event
                                                             gallery-generation)
@@ -5126,6 +5347,10 @@ new cache entry is published."
                                           :label "Orfeus"
                                           :app-id "org.orfeus.Orfeus"))
         (lightfast:apply-classic-theme)
+        ;; The core keeps focus measurements wherever this points, and only a
+        ;; frontend knows where that should be.
+        (setf orfeus:*focus-cache-directory*
+              (ignore-errors (gui-focus-cache-directory)))
         (lightfast:set-size-range window :min-width 960 :min-height 700)
         (setf menu (lightfast:make-menu-bar :parent window :x 0 :y 0
                                           :width 1280 :height 24))
@@ -5204,6 +5429,10 @@ new cache entry is published."
                                (lambda (&rest ignored)
                                  (declare (ignore ignored))
                                  (remove-selected-photo)))
+        (lightfast:add-menu-item menu "Edit/Select Blurry Photos"
+                                 (lambda (&rest ignored)
+                                   (declare (ignore ignored))
+                                   (find-and-select-blurry-photos)))
         (lightfast:add-menu-item menu "Edit/Reset Selected Photos"
                                (lambda (&rest ignored)
                                  (declare (ignore ignored))
@@ -5232,6 +5461,14 @@ new cache entry is published."
                                  (declare (ignore ignored))
                                  (discard-previews))
                                :shortcut (logior +menu-shift+ +key-f5+))
+        (lightfast:add-menu-item menu "View/Expand All Bursts"
+                                 (lambda (&rest ignored)
+                                   (declare (ignore ignored))
+                                   (set-bursts-expanded t)))
+        (lightfast:add-menu-item menu "View/Collapse All Bursts"
+                                 (lambda (&rest ignored)
+                                   (declare (ignore ignored))
+                                   (set-bursts-expanded nil)))
         (lightfast:add-menu-item menu "Process/Grab Still"
                                (lambda (&rest ignored)
                                  (declare (ignore ignored))
@@ -5333,46 +5570,68 @@ new cache entry is published."
                        (row-height (thumbnail-row-height)))
                    (lightfast:draw-color-rgb :red 42 :green 44 :blue 46)
                    (lightfast:draw-filled-rect x y width height)
-                   (loop for job in (project-photos project)
+                   (loop with photos = (coerce (project-photos project) 'vector)
+                         with selected = (gui-model-selected-indices model)
+                         for (indices . leader) in (thumbnail-display-rows)
                          for row from 0
                          for row-y = (+ y (* row row-height) (- thumbnail-scroll))
                          when (and (< row-y (+ y height))
                                    (> (+ row-y row-height) y))
-                           do (when (member row (gui-model-selected-indices model))
-                                (lightfast:draw-color-rgb :red 0 :green 0 :blue 128)
-                                (lightfast:draw-filled-rect x row-y width row-height))
-                              (let ((path (gethash job thumbnail-files)))
-                                (if path
-                                    (draw-thumbnail-file widget path
-                                                         (+ x 6) (+ row-y 6)
-                                                         88 (- row-height 12))
+                           do (let* ((job (aref photos (first indices)))
+                                     (chosen (count-if (lambda (place)
+                                                         (member place selected))
+                                                       indices))
+                                     (all-chosen (= chosen (length indices))))
+                                (when (plusp chosen)
+                                  (lightfast:draw-color-rgb :red 0 :green 0
+                                                            :blue (if all-chosen 128 72))
+                                  (lightfast:draw-filled-rect x row-y width row-height))
+                                (let ((path (gethash job thumbnail-files)))
+                                  (if path
+                                      (draw-thumbnail-file widget path
+                                                           (+ x 6) (+ row-y 6)
+                                                           88 (- row-height 12))
+                                      (progn
+                                        (lightfast:draw-color-rgb :red 62 :green 64 :blue 66)
+                                        (lightfast:draw-filled-rect
+                                         (+ x 6) (+ row-y 6) 88 (- row-height 12)))))
+                                (when (photo-interned-cached-p job)
+                                  (draw-interned-badge (+ x 76) (+ row-y 8)))
+                                (draw-burst-bar job x row-y row-height)
+                                (lightfast:draw-color-rgb :red 235 :green 235 :blue 235)
+                                (lightfast:draw-text
+                                 (file-namestring (photo-job-input-path job))
+                                 (+ x 102) (+ row-y 30))
+                                ;; Filename, then the stars beneath it, then the
+                                ;; focus mark, then the burst line: a star is
+                                ;; drawn downwards from its corner and text
+                                ;; upwards from its baseline, so the two need
+                                ;; clear air between them.
+                                (draw-photo-rating job (+ x 102) (+ row-y 42))
+                                (draw-focus-mark job (+ x 102) (+ row-y 62))
+                                (if leader
+                                    (draw-burst-chevron x row-y t (length indices))
                                     (progn
-                                      (lightfast:draw-color-rgb :red 62 :green 64 :blue 66)
-                                      (lightfast:draw-filled-rect
-                                       (+ x 6) (+ row-y 6) 88 (- row-height 12)))))
-                              (when (photo-interned-cached-p job)
-                                (draw-interned-badge (+ x 76) (+ row-y 8)))
-                              (draw-burst-bar job x row-y row-height)
-                              (lightfast:draw-color-rgb :red 235 :green 235 :blue 235)
-                              (lightfast:draw-text
-                               (file-namestring (photo-job-input-path job))
-                               (+ x 102) (+ row-y 30))
-                              ;; Filename, then the stars beneath it, then the
-                              ;; burst line: a star is drawn downwards from its
-                              ;; corner and text upwards from its baseline, so
-                              ;; the two need clear air between them.
-                              (draw-photo-rating job (+ x 102) (+ row-y 42))
-                              (draw-burst-position job (+ x 102) (+ row-y 78))
-                              (let ((check-x (thumbnail-checkbox-x x width))
-                                    (check-y (+ row-y 10)))
-                                (lightfast:draw-color-rgb :red 225 :green 225 :blue 225)
-                                (lightfast:draw-filled-rect check-x check-y 14 14)
-                                (when (member row (gui-model-selected-indices model))
-                                  (lightfast:draw-color-rgb :red 0 :green 0 :blue 128)
-                                  (lightfast:draw-filled-rect (+ check-x 3) (+ check-y 3) 8 8)))
-                              (lightfast:draw-color-rgb :red 125 :green 127 :blue 129)
-                              (lightfast:draw-filled-rect x (+ row-y row-height -1)
-                                                       width 1))))))
+                                      (when (burst-leader-p job)
+                                        (draw-burst-chevron x row-y nil 0))
+                                      (draw-burst-position job (+ x 102) (+ row-y 78))))
+                                (let ((check-x (thumbnail-checkbox-x x width))
+                                      (check-y (+ row-y 10)))
+                                  (lightfast:draw-color-rgb :red 225 :green 225 :blue 225)
+                                  (lightfast:draw-filled-rect check-x check-y 14 14)
+                                  (when (plusp chosen)
+                                    (lightfast:draw-color-rgb :red 0 :green 0 :blue 128)
+                                    (if all-chosen
+                                        (lightfast:draw-filled-rect
+                                         (+ check-x 3) (+ check-y 3) 8 8)
+                                        ;; Part of a folded burst, not all of
+                                        ;; it: a bar rather than a box, so the
+                                        ;; row does not claim more than it has.
+                                        (lightfast:draw-filled-rect
+                                         (+ check-x 3) (+ check-y 6) 8 3))))
+                                (lightfast:draw-color-rgb :red 125 :green 127 :blue 129)
+                                (lightfast:draw-filled-rect x (+ row-y row-height -1)
+                                                            width 1)))))))
         (lightfast:set-tooltip
          thumbnail-canvas
          "Click boxes to toggle; Shift-click selects a range; right-click for actions")

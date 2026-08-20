@@ -765,6 +765,33 @@ too old to answer reports."
         (when (zerop status)
           (cffi:mem-ref signature :uint64))))))
 
+(defcfun ("orfeus_image_focus_v1" %image-focus-v1) :int32
+  (path :string)
+  (focus :pointer)
+  (error-buffer :pointer)
+  (error-capacity :size))
+
+(defun native-image-focus (pathname)
+  "Return how well PATHNAME is focused, as three values, or NIL.
+
+The values are the blur radius of the best-focused part of the frame in pixels
+at a 1600-pixel long edge, the same for the middling part, and how much of the
+frame carried enough edge structure to judge at all. Read the radius as unknown
+when that last one is near zero: a frame of sky says nothing about focus."
+  (native-library-load)
+  (when (< (native-bridge-version) 7)
+    (return-from native-image-focus nil))
+  (with-foreign-object (focus :float 3)
+    (with-foreign-pointer (error-buffer *native-error-buffer-size*)
+      (let ((status (with-native-float-traps
+                      (%image-focus-v1 (namestring pathname) focus
+                                       error-buffer
+                                       *native-error-buffer-size*))))
+        (when (zerop status)
+          (values (cffi:mem-aref focus :float 0)
+                  (cffi:mem-aref focus :float 1)
+                  (cffi:mem-aref focus :float 2)))))))
+
 (defun dng-original-filename (pathname)
   "Return the embedded original filename recorded by DNG PATHNAME."
   (native-library-load)

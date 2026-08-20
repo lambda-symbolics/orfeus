@@ -31,6 +31,7 @@ use md5::{Digest, Md5};
 
 mod analyze;
 mod demosaic;
+mod focus;
 mod color;
 mod gpu;
 mod graphex;
@@ -492,7 +493,7 @@ where
 /// the decode cache without rendering. Every earlier entry point is unchanged.
 #[unsafe(no_mangle)]
 pub extern "C" fn orfeus_bridge_abi_version() -> u32 {
-    6
+    7
 }
 
 /// Write a 64-bit perceptual signature of the image at PATH.
@@ -527,6 +528,53 @@ pub unsafe extern "C" fn orfeus_image_signature_v1(
             }
             let path = path_from_c(path)?;
             *signature = image_signature(path)?;
+            Ok(())
+        })
+    }
+}
+
+/// Write a focus measurement of the RAW at PATH: blur radius, coverage, and
+/// how much of the frame could be judged at all.
+///
+/// The three floats are, in order, the blur radius of the best-focused part of
+/// the frame in pixels at a 1600-pixel long edge; the same for the middling
+/// part of the frame, which separates a shallow plane of focus from a frame
+/// with nothing sharp in it; and the fraction of the frame that carried enough
+/// edge structure to judge. A radius near zero is as sharp as the sampling can
+/// express. A judgeable fraction near zero means the frame
+/// answered nothing — a sky, a wall, a lens cap — and the radius should be read
+/// as unknown rather than as bad.
+///
+/// Measured on a draft develop, which bins whole sensor quads: two to three
+/// thousand pixels on the long edge, which is the size a preview is looked at
+/// and therefore the size the question is worth asking at. The decode is
+/// deliberately not cached — a cull sweeps hundreds of frames and would evict
+/// the photograph the interface is showing.
+///
+/// # Safety
+///
+/// `path` must be a readable NUL-terminated path, `focus` writable for three
+/// floats, and the error buffer, when non-null, writable for its capacity.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn orfeus_image_focus_v1(
+    path: *const c_char,
+    focus: *mut f32,
+    error_buffer: *mut c_char,
+    error_capacity: usize,
+) -> i32 {
+    // SAFETY: Pointer validation and dereferences remain inside the boundary.
+    unsafe {
+        ffi_result(error_buffer, error_capacity, || {
+            if focus.is_null() {
+                return Err(Error::InvalidArgument("focus pointer is null"));
+            }
+            let path = path_from_c(path)?;
+            let decoded = render::decode_linear_srgb(path, true, false)?;
+            let report = focus::measure_frame(decoded.width, decoded.height, &decoded.data);
+            let out = std::slice::from_raw_parts_mut(focus, 3);
+            out[0] = report.blur_radius;
+            out[1] = report.typical_blur;
+            out[2] = report.judgeable;
             Ok(())
         })
     }
@@ -1076,7 +1124,7 @@ mod tests {
 
     #[test]
     fn reports_current_abi_version() {
-        assert_eq!(orfeus_bridge_abi_version(), 6);
+        assert_eq!(orfeus_bridge_abi_version(), 7);
         assert_eq!(orfeus_raw_render_capabilities_v1(), 1 | 2 | 4 | 16);
     }
 

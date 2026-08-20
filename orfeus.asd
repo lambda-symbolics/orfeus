@@ -24,6 +24,7 @@
                (:file "src/native")
                (:file "src/metadata")
                (:file "src/grouping")
+               (:file "src/focus")
                (:file "src/project")
                (:file "src/graph")
                (:file "src/lens-aliases")

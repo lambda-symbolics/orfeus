@@ -72,6 +72,18 @@
    #:signature-distance
    #:*group-within-seconds*
    #:*group-signature-distance*
+   #:photo-focus
+   #:photo-focus-report-p
+   #:photo-focus-known-p
+   #:photo-focus-report-blur-radius
+   #:photo-focus-report-typical-blur
+   #:photo-focus-report-judgeable
+   #:focus-verdict
+   #:focus-description
+   #:blurry-photo-p
+   #:*blur-radius-threshold*
+   #:*focus-minimum-judgeable*
+   #:*focus-cache-directory*
    #:photo-job
    #:photo-job-input-path
    #:photo-job-output-path
