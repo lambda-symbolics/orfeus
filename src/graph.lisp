@@ -288,20 +288,21 @@ while blends stay scene-linear."
            ;; A rotation is indifferent to which domain it turns, like a crop.
            (when (member (first inputs) display)
              (push id display)))
-          ((eq kind :curves)
+          ((member kind '(:curves :contrast :sharpen))
+           ;; Tone shaping carries its branch's domain rather than refusing it.
+           ;; Shaping tone after a look is the point of having a look: without
+           ;; this there was nowhere to lift a shadow a film LUT had buried,
+           ;; because everything a photographer could reach ran before the
+           ;; transform that then crushed it again. :TONE takes the same route
+           ;; through GRAPH-FILTER-KIND-P below.
            (unless (= 1 (length inputs))
              (graph-invalid node "filter node ~S needs exactly one input" id))
-           (curves-params-validate (graph-node-params node))
+           (ecase kind
+             (:curves (curves-params-validate (graph-node-params node)))
+             (:contrast (contrast-params-validate (graph-node-params node)))
+             (:sharpen (sharpen-params-validate (graph-node-params node))))
            (when (member (first inputs) display)
-             (graph-invalid node "node ~S cannot process film output" id)))
-          ((member kind '(:contrast :sharpen))
-           (unless (= 1 (length inputs))
-             (graph-invalid node "filter node ~S needs exactly one input" id))
-           (if (eq kind :contrast)
-               (contrast-params-validate (graph-node-params node))
-               (sharpen-params-validate (graph-node-params node)))
-           (when (member (first inputs) display)
-             (graph-invalid node "node ~S cannot process film output" id)))
+             (push id display)))
           ((eq kind :node)
            ;; An untyped container: passes its branch through unchanged,
            ;; in either domain, until a correction type is assigned.
@@ -321,11 +322,15 @@ while blends stay scene-linear."
                       (gethash (first inputs) geometry))
              (graph-invalid node
                             "optics node ~S cannot process cropped output" id))
-           (if (eq kind :film)
-               (pushnew id display)
-               (when (member (first inputs) display)
-                 (graph-invalid node
-                                "node ~S cannot process film output" id))))
+           (cond ((eq kind :film) (pushnew id display))
+                 ;; A tonal equalizer reads a brightness and rewrites it, which
+                 ;; is as meaningful on a graded image as on a scene-linear one.
+                 ((eq kind :tone)
+                  (when (member (first inputs) display)
+                    (push id display)))
+                 ((member (first inputs) display)
+                  (graph-invalid node
+                                 "node ~S cannot process film output" id))))
           (t (graph-invalid node "unknown node kind ~S" kind)))
         (setf (gethash id geometry)
               (cond

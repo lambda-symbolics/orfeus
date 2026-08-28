@@ -447,13 +447,16 @@ the failure list, and both ON-ERROR modes without needing real RAW files."
                                                 :params '(:tone-whites 1.0)
                                                 :inputs '(0)))
                   :output 1))
-     ;; Filter consuming film output.
+     ;; A scene-linear filter consuming film output. Tone shaping is allowed
+     ;; there now — see GRAPH-TONE-SHAPING-AFTER-FILM-P — but an exposure is
+     ;; still refused, because it means something only in linear light.
      (rejected-p (make-processing-graph
                   :nodes (list (make-graph-node :id 1 :kind :film
                                                 :params '(:grain-amount 0.5)
                                                 :inputs '(0))
-                               (make-graph-node :id 2 :kind :tone
-                                                :params '() :inputs '(1)))
+                               (make-graph-node :id 2 :kind :exposure
+                                                :params '(:exposure 0.5)
+                                                :inputs '(1)))
                   :output 2))
      ;; Blend consuming film output.
      (rejected-p (make-processing-graph
@@ -715,15 +718,15 @@ and then quietly relocated them would be lying about where a click puts things."
     (and
      ;; A scene-linear, uncropped position accepts everything.
      (null (set-difference all (graph-insertable-kinds graph linear)))
-     ;; Below the film transform only the display-space kinds remain: another
-     ;; film node, a crop, and a rotation, all of which are indifferent to which
-     ;; domain they reframe.
-     (null (set-difference (graph-insertable-kinds graph film)
-                           '(:film :crop :rotate)))
-     (null (set-difference '(:film :crop :rotate)
-                           (graph-insertable-kinds graph film)))
-     (null (set-difference (graph-insertable-kinds graph display-crop)
-                           '(:film :crop :rotate)))
+     ;; Below the film transform: another film node, a crop and a rotation,
+     ;; which are indifferent to which domain they reframe, plus the four that
+     ;; shape tone. Shaping tone after a look is the point of a look — without
+     ;; it there is nowhere to lift a shadow the look buried.
+     (let ((below '(:film :crop :rotate :tone :curves :contrast :sharpen)))
+       (and (null (set-difference (graph-insertable-kinds graph film) below))
+            (null (set-difference below (graph-insertable-kinds graph film)))
+            (null (set-difference (graph-insertable-kinds graph display-crop)
+                                  below))))
      ;; Every offered kind really does insert, and every withheld one really
      ;; does not: the menu and the validator must not disagree either way.
      (every (lambda (kind) (graph-can-insert-p graph film kind))

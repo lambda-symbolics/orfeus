@@ -575,6 +575,16 @@ pub(crate) fn parse_graph(bytes: &[u8]) -> Result<Vec<GraphOp>, Error> {
                 display[index] = display[input_a];
                 cropped[index] = true;
             }
+            // Shaping tone after a film look is the whole point of a look:
+            // a LUT is a starting position, not the last word on it. These four
+            // read a brightness and rewrite it, which is as meaningful on a
+            // graded image as on a scene-linear one — and without them there
+            // was nowhere at all to lift a shadow the LUT had buried, because
+            // everything a photographer could reach ran before the transform
+            // that then crushed it again.
+            NODE_TONE | NODE_CURVES | NODE_CONTRAST | NODE_SHARPEN => {
+                display[index] = display[input_a];
+            }
             _ => {
                 if display[input_a] {
                     return Err(Error::InvalidArgument(
@@ -1418,7 +1428,11 @@ fn execute_graph_into(
                 let adjustments: [f32; 7] = op.params[..7]
                     .try_into()
                     .expect("parameter count was validated");
-                render::apply_tonal_equalizer(&mut image, adjustments);
+                render::apply_tonal_equalizer(
+                    &mut image,
+                    adjustments,
+                    domains[slot] == Domain::Display,
+                );
             }
             NODE_OPTICS => {
                 let mut flags = 0;
@@ -2265,7 +2279,7 @@ mod tests {
         let mut reference = gradient_image();
         render::apply_white_adaptation(&mut reference, 6500.0, 3.0, None);
         render::apply_exposure(&mut reference, 0.5);
-        render::apply_tonal_equalizer(&mut reference, [0.3, 0.0, 0.0, -0.2, 0.0, 0.0, 0.1]);
+        render::apply_tonal_equalizer(&mut reference, [0.3, 0.0, 0.0, -0.2, 0.0, 0.0, 0.1], false);
         to_display(&mut reference);
         assert!(max_difference(&via_graph, &reference) < 1.0e-6);
     }
@@ -2304,7 +2318,7 @@ mod tests {
             0.0,
         )
         .unwrap();
-        render::apply_tonal_equalizer(&mut reference, [0.3, 0.0, 0.0, -0.2, 0.0, 0.0, 0.1]);
+        render::apply_tonal_equalizer(&mut reference, [0.3, 0.0, 0.0, -0.2, 0.0, 0.0, 0.1], false);
         to_display(&mut reference);
         render::apply_grain(&mut reference, 0.25, 1.0, 17, (0, 0));
 
@@ -2417,7 +2431,7 @@ mod tests {
     }
 
     #[test]
-    fn film_after_film_is_legal_but_tone_after_film_is_not() {
+    fn tone_shaping_may_follow_film_but_scene_linear_work_may_not() {
         assert!(
             parse_graph(
                 &GraphBuilder::new()
@@ -2427,15 +2441,58 @@ mod tests {
             )
             .is_ok()
         );
-        assert!(matches!(
-            parse_graph(
-                &GraphBuilder::new()
-                    .node(NODE_FILM, 0, -1, &[0.0, 0.3, 1.0], None)
-                    .node(NODE_TONE, 1, -1, &[0.0; 7], None)
-                    .build(),
-            ),
-            Err(Error::InvalidArgument(_))
-        ));
+        // Shaping tone after a look is the point of a look. Without this there
+        // was nowhere to lift a shadow a film LUT had buried, because every
+        // control a photographer could reach ran before the transform that then
+        // crushed it again.
+        for kind in [NODE_TONE, NODE_CURVES, NODE_CONTRAST, NODE_SHARPEN] {
+            let params: &[f32] = match kind {
+                NODE_TONE => &[0.0; 7],
+                NODE_CURVES => &[2.0, 2.0, 2.0, 2.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0,
+                                 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0],
+                NODE_CONTRAST => &[1.2, 0.435],
+                _ => &[0.5, 1.0, 2.0],
+            };
+            assert!(
+                parse_graph(
+                    &GraphBuilder::new()
+                        .node(NODE_FILM, 0, -1, &[0.0, 0.3, 1.0], None)
+                        .node(kind, 1, -1, params, None)
+                        .build(),
+                )
+                .is_ok(),
+                "kind {kind} was refused after a film node"
+            );
+        }
+        // What still may not: everything that means something only in scene
+        // linear light. A white balance or an exposure applied to a graded
+        // image is not the same operation under a different name, and a blend
+        // of a graded branch with a linear one is not a blend of anything.
+        for kind in [
+            NODE_WHITE_BALANCE,
+            NODE_EXPOSURE,
+            NODE_NOISE_REDUCTION,
+            NODE_COLOR_SUBTRACT,
+        ] {
+            let params: &[f32] = match kind {
+                NODE_WHITE_BALANCE => &[0.0, 0.0],
+                NODE_EXPOSURE => &[0.5],
+                NODE_NOISE_REDUCTION => &[0.5, 0.0],
+                _ => &[1.0, 1.0, 1.0],
+            };
+            assert!(
+                matches!(
+                    parse_graph(
+                        &GraphBuilder::new()
+                            .node(NODE_FILM, 0, -1, &[0.0, 0.3, 1.0], None)
+                            .node(kind, 1, -1, params, None)
+                            .build(),
+                    ),
+                    Err(Error::InvalidArgument(_))
+                ),
+                "kind {kind} was allowed to read film output"
+            );
+        }
         assert!(matches!(
             parse_graph(
                 &GraphBuilder::new()
@@ -3017,13 +3074,26 @@ mod tests {
             )
             .is_ok()
         );
-        // film -> crop -> tone must stay illegal.
+        // A crop carries the film domain along with it, and tone shaping is
+        // legal on the far side of both.
         assert!(
             parse_graph(
                 &GraphBuilder::new()
                     .node(NODE_FILM, 0, -1, &[0.0, 0.2, 1.0], None)
                     .node(NODE_CROP, 1, -1, &[0.0, 0.0, 0.5, 0.5, 0.0], None)
                     .node(NODE_TONE, 2, -1, &[0.0; 7], None)
+                    .build(),
+            )
+            .is_ok()
+        );
+        // An exposure there is still refused: the crop did not undo the film
+        // transform, it only reframed it.
+        assert!(
+            parse_graph(
+                &GraphBuilder::new()
+                    .node(NODE_FILM, 0, -1, &[0.0, 0.2, 1.0], None)
+                    .node(NODE_CROP, 1, -1, &[0.0, 0.0, 0.5, 0.5, 0.0], None)
+                    .node(NODE_EXPOSURE, 2, -1, &[0.5], None)
                     .build(),
             )
             .is_err()

@@ -67,7 +67,7 @@ pub(crate) fn tone_pixel(pixel: &mut [f32; 3]) {
     }
 }
 
-fn default_display_tone(value: f32) -> f32 {
+pub(crate) fn default_display_tone(value: f32) -> f32 {
     let value = value.max(0.0) * CURVE_INPUT_GAIN;
     let numerator = value * (1.0 + CURVE_NUMERATOR * value);
     let denominator = 1.0 + CURVE_DENOMINATOR * value + CURVE_NUMERATOR * value * value;

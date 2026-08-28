@@ -567,25 +567,63 @@ pub(crate) fn apply_white_adaptation(
     });
 }
 
-fn tone_adjustment_ev(luminance: f32, adjustments: &[f32; 7]) -> f32 {
+/// Where a luminance sits among the seven zones: 0 at black, 6 at white.
+///
+/// Anchored on what the pixel will *look* like rather than on how many stops it
+/// is from middle grey. The stops version put its anchors at -6, -4, -2, 0, +2,
+/// +4 and +6 EV, which sounds even and is not: run through the display tone
+/// curve those land at 6%, 15%, 35%, **72%**, 95%, 99.3% and 99.9%. Four of the
+/// seven sliders lived above 95% display, where they were indistinguishable
+/// from each other and reached almost no pixels, while the one labelled
+/// midtones sat at nearly three-quarters brightness. On a scanned negative it
+/// was worse still: the whole inverted range lands under one stop over middle
+/// grey, so only the bottom two zones could reach the picture at all and the
+/// control looked broken.
+///
+/// Spread evenly over displayed brightness instead, each slider owns a sixth of
+/// what the eye sees and the labels mean what they say.
+fn tone_zone_position(luminance: f32, display_referred: bool) -> f32 {
+    // Through the transfer as well as the tone curve. Display-linear is not
+    // what the eye reads and not what a histogram plots: half of display-linear
+    // is three-quarters of the way up the screen, so anchoring there would
+    // repeat, more quietly, the bunching this replaced.
+    let displayed = if display_referred {
+        luminance
+    } else {
+        srgb_encode(super::tone::default_display_tone(luminance))
+    };
+    displayed.clamp(0.0, 1.0) * 6.0
+}
+
+fn tone_adjustment_ev(luminance: f32, adjustments: &[f32; 7], display_referred: bool) -> f32 {
     if !luminance.is_finite() || luminance <= 0.0 {
         return 0.0;
     }
-    let position = (luminance / 0.18).log2().clamp(-6.0, 6.0);
-    let interval = ((position + 6.0) * 0.5).floor().clamp(0.0, 5.0) as usize;
-    let t = ((position - (-6.0 + interval as f32 * 2.0)) * 0.5).clamp(0.0, 1.0);
+    let position = tone_zone_position(luminance, display_referred);
+    let interval = position.floor().clamp(0.0, 5.0) as usize;
+    let t = (position - interval as f32).clamp(0.0, 1.0);
     let smooth = t * t * (3.0 - 2.0 * t);
     adjustments[interval] * (1.0 - smooth) + adjustments[interval + 1] * smooth
 }
 
-pub(crate) fn apply_tonal_equalizer(image: &mut RgbImage, adjustments: [f32; 7]) {
+/// Lifts or lowers seven bands of brightness independently.
+///
+/// DISPLAY_REFERRED says whether the pixels have already been through the
+/// display transform, which decides where the zones sit: a graded image after a
+/// film look is already the brightness it will be shown at, while a
+/// scene-linear one has to be asked what it will become.
+pub(crate) fn apply_tonal_equalizer(
+    image: &mut RgbImage,
+    adjustments: [f32; 7],
+    display_referred: bool,
+) {
     if adjustments.iter().all(|adjustment| *adjustment == 0.0) {
         return;
     }
     image.data.par_chunks_mut(3 * 8192).for_each(|chunk| {
         for pixel in chunk.as_chunks_mut::<3>().0 {
             let luminance = 0.212_672_9 * pixel[0] + 0.715_152_2 * pixel[1] + 0.072_175 * pixel[2];
-            let gain = tone_adjustment_ev(luminance, &adjustments).exp2();
+            let gain = tone_adjustment_ev(luminance, &adjustments, display_referred).exp2();
             for value in pixel.iter_mut() {
                 *value *= gain;
             }
@@ -3860,6 +3898,7 @@ pub fn render(
             settings.tone_highlights,
             settings.tone_whites,
         ],
+        false,
     );
     profile_stage!("tonal-equalizer");
     apply_display_transform(&mut image, profiling);
@@ -4894,14 +4933,49 @@ mod tests {
             data: vec![0.01, 0.02, 0.03, 0.2, 0.4, 0.8],
         };
         let before = image.data.clone();
-        apply_tonal_equalizer(&mut image, [0.0; 7]);
+        apply_tonal_equalizer(&mut image, [0.0; 7], false);
         assert_eq!(image.data, before);
     }
 
+    /// The scene-linear luminance that will be displayed at TARGET.
+    fn linear_for_display(target: f32) -> f32 {
+        let (mut low, mut high) = (0.0_f32, 64.0_f32);
+        for _ in 0..60 {
+            let middle = 0.5 * (low + high);
+            if srgb_encode(super::super::tone::default_display_tone(middle)) < target {
+                low = middle;
+            } else {
+                high = middle;
+            }
+        }
+        0.5 * (low + high)
+    }
+
+    /// Each slider owns a sixth of displayed brightness, and moving one by a
+    /// stop doubles exactly the tones it is named for.
+    ///
+    /// The anchors are derived from the tone curve rather than written down,
+    /// because that is the claim: the zones are wherever a sixth of what the
+    /// eye sees falls, not at fixed distances from middle grey.
     #[test]
     fn tonal_equalizer_applies_each_anchor_gain() {
-        let anchors = [0.002_812_5, 0.011_25, 0.045, 0.18, 0.72, 2.88, 11.52];
+        let anchors: Vec<f32> = (0..7)
+            .map(|index| linear_for_display(index as f32 / 6.0))
+            .collect();
+        // Spread across the displayed range rather than bunched at the top: the
+        // old anchors put four of the seven past 95% display.
+        // The middle slider must land on a tone that reads as middle: about
+        // half way up the screen, which is a long way under middle grey in
+        // scene-linear terms once the tone curve has lifted it.
+        assert!(
+            anchors[3] > 0.0 && anchors[3] < 0.18,
+            "the middle zone sits at {}, which is not a midtone",
+            anchors[3]
+        );
         for (index, luminance) in anchors.into_iter().enumerate() {
+            if luminance <= 0.0 {
+                continue;
+            }
             let mut adjustments = [0.0; 7];
             adjustments[index] = 1.0;
             let mut image = RgbImage {
@@ -4909,7 +4983,7 @@ mod tests {
                 height: 1,
                 data: vec![luminance; 3],
             };
-            apply_tonal_equalizer(&mut image, adjustments);
+            apply_tonal_equalizer(&mut image, adjustments, false);
             for value in image.data {
                 assert!((value - luminance * 2.0).abs() < luminance * 1.0e-5 + 1.0e-7);
             }
@@ -4919,10 +4993,23 @@ mod tests {
     #[test]
     fn tonal_equalizer_is_smooth_and_preserves_chromaticity() {
         let adjustments = [-1.0, -0.5, 0.0, 0.5, 1.0, 0.25, -0.25];
-        let boundary = 0.18;
-        let below = tone_adjustment_ev(boundary * 2.0_f32.powf(-0.001), &adjustments);
-        let above = tone_adjustment_ev(boundary * 2.0_f32.powf(0.001), &adjustments);
-        assert!((below - above).abs() < 0.001);
+        // Swept rather than sampled either side of one boundary. The zone
+        // position is read through the display transfer's lookup table, whose
+        // steps are the size of a two-point check's tolerance — so a sweep that
+        // bounds every step at once is both stricter about a real discontinuity
+        // and honest about the table.
+        let mut previous = tone_adjustment_ev(1.0e-4, &adjustments, false);
+        let mut largest = 0.0_f32;
+        for step in 1..4000 {
+            let luminance = 1.0e-4 * (12.0_f32).powf(step as f32 / 1000.0);
+            let value = tone_adjustment_ev(luminance, &adjustments, false);
+            largest = largest.max((value - previous).abs());
+            previous = value;
+        }
+        assert!(
+            largest < 0.02,
+            "the zone blend jumped by {largest} between neighbouring tones"
+        );
 
         let mut image = RgbImage {
             width: 1,
@@ -4930,7 +5017,7 @@ mod tests {
             data: vec![0.09, 0.18, 0.36],
         };
         let before = image.data.clone();
-        apply_tonal_equalizer(&mut image, adjustments);
+        apply_tonal_equalizer(&mut image, adjustments, false);
         let red_gain = image.data[0] / before[0];
         let green_gain = image.data[1] / before[1];
         let blue_gain = image.data[2] / before[2];

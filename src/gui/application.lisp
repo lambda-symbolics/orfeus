@@ -74,6 +74,38 @@ whole sensor quads instead of interpolating every photosite, which is the entire
 reason a draft is fast. Raising it past that would make the draft cost what the
 full render costs.")
 
+(defun recipe-geometry-key (recipe)
+  "What in RECIPE decides the *shape* of the developed frame.
+
+A viewport is a rectangle of one particular frame, so it means nothing once the
+frame changes shape — and several ordinary edits change it. Selecting a crop
+node bypasses that crop, which makes the frame bigger; changing the crop rect,
+turning the frame, or switching lens correction all do the same.
+
+A window computed against the old shape and applied to the new one develops an
+unrelated part of the photograph, and the interface then draws it believing it
+is the part it asked for. That is exactly what happened: zooming into a crop and
+then selecting the crop node to adjust it jumped the view somewhere else
+entirely and drew the crop handles across it."
+  (typecase recipe
+    (orfeus:processing-graph
+     (loop for node in (orfeus:processing-graph-nodes recipe)
+           for kind = (orfeus:graph-node-kind node)
+           when (member kind '(:crop :rotate :optics))
+             collect (list kind
+                           (and (orfeus:graph-node-bypassed-p node) t)
+                           (let ((params (orfeus:graph-node-params node)))
+                             (loop for key in '(:left :top :width :height :angle
+                                                :quarter-turns
+                                                :lens-correction-p
+                                                :lens-correction-strength)
+                                   collect (getf params key))))))
+    (orfeus:processing-settings
+     (list :lens (and (orfeus:processing-settings-lens-correction-p recipe) t)
+           :strength (orfeus:processing-settings-lens-correction-strength
+                      recipe)))
+    (t nil)))
+
 (defun draft-preview-fits-viewport-p (canvas-pixels zoom draft-bound)
   "Whether a draft bounded at DRAFT-BOUND can stand in for the current view.
 
@@ -1208,6 +1240,9 @@ new cache entry is published."
            ;; preview develops only what is on screen, so the file on disk is a
            ;; window and the drawing has to know which one.
            before-preview-region after-preview-region requested-viewport-region
+           ;; The frame shape the drawn preview was developed with. A viewport
+           ;; is only asked for while the recipe still has that shape.
+           after-preview-geometry
            ;; (KEY WIDGET DEFAULT) for controls that edit a node's own
            ;; parameters rather than a pipeline setting.
            (node-param-controls '())
@@ -1515,7 +1550,9 @@ new cache entry is published."
              ;; would have to be re-developed to move it a pixel; with it the
              ;; view slides inside what is already there, and a new render is
              ;; only wanted when it approaches the edge.
-             (let ((visible (visible-frame-rect nil)))
+             (let ((visible (and (equal (recipe-geometry-key (current-settings))
+                                        after-preview-geometry)
+                                 (visible-frame-rect nil))))
                (when visible
                  (destructuring-bind (left top width height) visible
                    (when (< (* width height) *viewport-whole-frame-fraction*)
@@ -2925,7 +2962,7 @@ new cache entry is published."
                      ((null file-width) nil)
                      ((< (max file-width file-height) (* 0.98 bound)) region)
                      (t nil))))
-           (publish-preview (role path generation region)
+           (publish-preview (role path generation region geometry)
              (let ((old-path (ecase role
                                (:before before-preview-file)
                                (:after after-preview-file))))
@@ -2937,6 +2974,7 @@ new cache entry is published."
                           (setf before-preview-file path)
                           (lightfast:redraw before-canvas))
                  (:after (setf after-preview-region region
+                               after-preview-geometry geometry
                                after-preview-file path
                                after-preview-generation generation
                                after-live-p nil
@@ -4660,6 +4698,7 @@ new cache entry is published."
                     ;; Part of the cache name, not decoration: two renders of
                     ;; the same photograph at the same settings and bound are
                     ;; different pictures when they cover different parts of it.
+                    (geometry (recipe-geometry-key settings))
                     (region-token (if viewport
                                       (format nil "-w~{~4,'0D~^~}"
                                               (mapcar (lambda (value)
@@ -4738,7 +4777,7 @@ new cache entry is published."
                                        (queue-event queue
                                                     (list :preview generation index job
                                                           role display viewport
-                                                          bound))))
+                                                          bound geometry))))
                                    (return))
                                (error (condition)
                                  (when (= attempt 2) (error condition)))))
@@ -5646,7 +5685,8 @@ new cache entry is published."
                     (publish-preview (fifth event) (sixth event) (second event)
                                      (published-region (sixth event)
                                                        (seventh event)
-                                                       (eighth event)))
+                                                       (eighth event))
+                                     (ninth event))
                     (setf render-stage nil
                           render-stage-fraction 0.0)
                     (set-status (render-summary-text))))
