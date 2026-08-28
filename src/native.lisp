@@ -420,18 +420,18 @@ the straightening angle in degrees for a crop node."
   '((:white-balance . 1) (:exposure . 2) (:noise-reduction . 3)
     (:tone . 4) (:optics . 5) (:film . 6) (:blend . 7)
     (:color-subtract . 8) (:crop . 9) (:curves . 10) (:rotate . 11)
-    (:contrast . 12) (:sharpen . 13))
+    (:contrast . 12) (:sharpen . 13) (:flip . 14))
   "Wire codes of graph node kinds in the native program format.")
 
 (defconstant +graph-program-magic+ #x4746524F
   "Little-endian magic of a serialized graph program, spelling ORFG.")
 
-(defconstant +graph-program-version+ 5
+(defconstant +graph-program-version+ 6
   "Serialized graph program version.
 
 2 added the curves node's luma channel; 3 made each curve channel variable
 length behind a header of four point counts; 4 added the rotate node; 5 added
-the contrast and sharpen nodes.")
+the contrast and sharpen nodes; 6 added the flip node.")
 
 (defun graph-boolean-parameter (value)
   (if value 1.0 0.0))
@@ -507,6 +507,11 @@ reaches it and there is nothing to keep alive across threads.")
        (values (list (float (getf (graph-node-params node) :quarter-turns 0)
                            1.0))
                nil))
+      (:flip
+       (let ((params (graph-node-params node)))
+         (values (list (graph-boolean-parameter (getf params :horizontal))
+                       (graph-boolean-parameter (getf params :vertical)))
+                 nil)))
       (:contrast
        (let ((params (graph-node-params node)))
          (values (list (float (getf params :contrast 1.0) 1.0)

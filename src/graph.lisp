@@ -27,6 +27,14 @@
                             key))
   params)
 
+(defun flip-params-validate (params)
+  (unless (and (listp params) (plist-known-keys-p params *flip-keys*))
+    (graph-invalid params "expected :horizontal and :vertical parameters"))
+  (loop for (key value) on params by #'cddr
+        unless (member value '(t nil))
+          do (graph-invalid params "flip axis ~S must be true or false" key))
+  params)
+
 (defun contrast-params-validate (params)
   (unless (and (listp params) (plist-known-keys-p params *contrast-keys*))
     (graph-invalid params "expected :contrast and :pivot parameters"))
@@ -194,6 +202,7 @@ whose frame has already moved, whichever of the two moved it."
     ((eq kind :color-subtract) (color-subtract-params-validate params))
     ((eq kind :crop) (crop-params-validate params))
     ((eq kind :rotate) (rotate-params-validate params))
+    ((eq kind :flip) (flip-params-validate params))
     ((eq kind :curves) (curves-params-validate params))
     ((eq kind :contrast) (contrast-params-validate params))
     ((eq kind :sharpen) (sharpen-params-validate params))
@@ -281,11 +290,14 @@ while blends stay scene-linear."
            ;; Crops keep their branch's domain.
            (when (member (first inputs) display)
              (push id display)))
-          ((eq kind :rotate)
+          ((member kind '(:rotate :flip))
            (unless (= 1 (length inputs))
              (graph-invalid node "filter node ~S needs exactly one input" id))
-           (rotate-params-validate (graph-node-params node))
-           ;; A rotation is indifferent to which domain it turns, like a crop.
+           (if (eq kind :rotate)
+               (rotate-params-validate (graph-node-params node))
+               (flip-params-validate (graph-node-params node)))
+           ;; Turning or mirroring is indifferent to which domain it reframes,
+           ;; like a crop.
            (when (member (first inputs) display)
              (push id display)))
           ((member kind '(:curves :contrast :sharpen))

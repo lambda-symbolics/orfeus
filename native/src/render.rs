@@ -2138,6 +2138,31 @@ pub(crate) fn orient(image: RgbImage, orientation: u16) -> RgbImage {
     output
 }
 
+/// Mirrors the image across either axis, or both.
+///
+/// A permutation of the pixels, done in place: nothing is resampled and nothing
+/// is lost, so flipping twice returns exactly what went in. Wanted more often
+/// than it sounds for film — a negative laid on the light table emulsion side up
+/// comes out mirrored, and no amount of rotating fixes a mirror.
+pub(crate) fn apply_flip(image: &mut RgbImage, horizontal: bool, vertical: bool) {
+    let (width, height) = (image.width, image.height);
+    if horizontal {
+        image.data.par_chunks_mut(width * 3).for_each(|row| {
+            let pixels = row.as_chunks_mut::<3>().0;
+            pixels.reverse();
+        });
+    }
+    if vertical {
+        // Split at the middle and walk the far half backwards, so each pair of
+        // rows is swapped exactly once. An odd height leaves its middle row
+        // unpaired, which `zip` drops on its own.
+        let (top, bottom) = image.data.split_at_mut(width * 3 * (height / 2));
+        top.par_chunks_mut(width * 3)
+            .zip(bottom.par_chunks_mut(width * 3).rev())
+            .for_each(|(row, mirrored)| row.swap_with_slice(mirrored));
+    }
+}
+
 /// Where a rectangle of the unoriented frame lands once the frame is oriented.
 ///
 /// The forward of what `map_oriented_rect` undoes, in whole pixels rather than
@@ -4662,6 +4687,51 @@ mod tests {
             width,
             height,
             data: pixel.repeat(width * height),
+        }
+    }
+
+    /// A mirror is a permutation: nothing resampled, nothing lost, and doing
+    /// it twice is doing nothing.
+    #[test]
+    fn flipping_mirrors_exactly_and_undoes_itself() {
+        for (width, height) in [(7_usize, 4_usize), (4, 7), (8, 8), (1, 5), (5, 1)] {
+            let original = RgbImage {
+                width,
+                height,
+                data: (0..width * height)
+                    .flat_map(|index| {
+                        let value = index as f32;
+                        [value, value + 0.5, value + 0.25]
+                    })
+                    .collect(),
+            };
+            let at = |image: &RgbImage, x: usize, y: usize| {
+                let start = (y * width + x) * 3;
+                [image.data[start], image.data[start + 1], image.data[start + 2]]
+            };
+            for (horizontal, vertical) in
+                [(true, false), (false, true), (true, true)]
+            {
+                let mut image = original.clone();
+                apply_flip(&mut image, horizontal, vertical);
+                assert_eq!((image.width, image.height), (width, height));
+                for y in 0..height {
+                    for x in 0..width {
+                        let source_x = if horizontal { width - 1 - x } else { x };
+                        let source_y = if vertical { height - 1 - y } else { y };
+                        assert_eq!(
+                            at(&image, x, y),
+                            at(&original, source_x, source_y),
+                            "{width}x{height} h={horizontal} v={vertical} at {x},{y}"
+                        );
+                    }
+                }
+                apply_flip(&mut image, horizontal, vertical);
+                assert_eq!(image.data, original.data, "flipping twice changed the image");
+            }
+            let mut untouched = original.clone();
+            apply_flip(&mut untouched, false, false);
+            assert_eq!(untouched.data, original.data);
         }
     }
 

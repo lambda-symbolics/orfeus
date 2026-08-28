@@ -722,7 +722,7 @@ and then quietly relocated them would be lying about where a click puts things."
      ;; which are indifferent to which domain they reframe, plus the four that
      ;; shape tone. Shaping tone after a look is the point of a look — without
      ;; it there is nowhere to lift a shadow the look buried.
-     (let ((below '(:film :crop :rotate :tone :curves :contrast :sharpen)))
+     (let ((below '(:film :crop :rotate :flip :tone :curves :contrast :sharpen)))
        (and (null (set-difference (graph-insertable-kinds graph film) below))
             (null (set-difference below (graph-insertable-kinds graph film)))
             (null (set-difference (graph-insertable-kinds graph display-crop)
@@ -1384,9 +1384,9 @@ and then quietly relocated them would be lying about where a click puts things."
                  :output 1))
          (bytes (orfeus::graph->program-bytes graph)))
     (equalp bytes
-            ;; magic "ORFG", version 5, one node: exposure(2), input 0,
+            ;; magic "ORFG", version 6, one node: exposure(2), input 0,
             ;; no second input, one parameter 0.5f0, no string.
-            (coerce #(#x4F #x52 #x46 #x47  5 0 0 0  1 0 0 0
+            (coerce #(#x4F #x52 #x46 #x47  6 0 0 0  1 0 0 0
                       2 0 0 0  0 0 0 0  #xFF #xFF #xFF #xFF
                       1 0 0 0  0 0 0 #x3F  0 0 0 0)
                     '(simple-array (unsigned-byte 8) (*))))))

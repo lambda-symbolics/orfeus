@@ -141,6 +141,21 @@ portrait crop of a landscape frame is a normal thing to want, and picking 2:3
 from a list says exactly what you get. :ORIGINAL follows the photograph's own
 proportions, whatever they are.")
 
+(defparameter *flip-choices*
+  '(("None" nil nil)
+    ("Left to right" t nil)
+    ("Top to bottom" nil t)
+    ("Both" t t))
+  "Mirror states offered by a flip node, as label then the two axes.")
+
+(defun flip-choice-label (horizontal vertical)
+  "Return the menu label for a mirror across HORIZONTAL and VERTICAL."
+  (or (first (find-if (lambda (entry)
+                        (and (eq (not (second entry)) (not horizontal))
+                             (eq (not (third entry)) (not vertical))))
+                      *flip-choices*))
+      "None"))
+
 (defun quarter-turn-label (turns)
   (or (rest (assoc turns orfeus:*quarter-turn-labels*)) "None"))
 
@@ -254,6 +269,7 @@ the same reason.")
     (:sharpen . "Sharp")
     (:crop . "Crop")
     (:rotate . "Rotate")
+    (:flip . "Flip")
     (:curves . "Curves")
     (:node . "Node"))
   "Short node captions for the graph panel, in menu order.")
@@ -272,6 +288,7 @@ the same reason.")
     ("Sharpen" . :sharpen)
     ("Crop" . :crop)
     ("Rotate" . :rotate)
+    ("Flip" . :flip)
     ("Curves" . :curves))
   "Correction picker entries for the Node panel, in menu order.")
 
@@ -438,6 +455,8 @@ sliders and nothing else has to be recomputed."
     (:sharpen (:line 6 0 1 11) (:line 6 0 11 11) (:line 1 11 11 11))
     (:crop (:line 3 0 3 9) (:line 0 3 9 3) (:line 8 2 8 11) (:line 2 8 11 8))
     (:rotate (:line 1 10 1 2) (:line 1 2 9 2) (:line 6 0 9 2) (:line 6 4 9 2))
+    (:flip (:line 6 0 6 12) (:line 0 3 4 3) (:line 0 9 4 9) (:line 0 3 0 9)
+           (:rect 8 3 4 7))
     (:curves (:line 0 11 4 8) (:line 4 8 7 4) (:line 7 4 11 1))
     (:node (:rect 2 2 8 8)))
   "Per-kind glyphs for the node graph, drawn beside each node's caption.")
@@ -530,6 +549,8 @@ channel carries anywhere from its two endpoints to a full film-stock shape."
     (:blend t)
     (:color-subtract t)
     (:contrast (/= 1.0 (getf (orfeus:graph-node-params node) :contrast 1.0)))
+    (:flip (let ((params (orfeus:graph-node-params node)))
+             (or (getf params :horizontal) (getf params :vertical))))
     (:sharpen (plusp (getf (orfeus:graph-node-params node) :amount 0.0)))
     (:crop (let ((params (orfeus:graph-node-params node)))
              (or (plusp (getf params :left 0.0))
@@ -1277,7 +1298,7 @@ new cache entry is published."
            inspector tabs node-page export-page
            kind-choice
            (node-panel-groups '())
-           blend-opacity-input crop-angle-input rotate-turn-input
+           blend-opacity-input crop-angle-input rotate-turn-input flip-axis-input
            base-red-input base-green-input base-blue-input base-swatch
            crop-aspect-input crop-width-input crop-height-input
            ;; NIL is a free crop; otherwise an entry from
@@ -3107,6 +3128,11 @@ new cache entry is published."
                      (destructuring-bind (key widget default) entry
                        (setf (lightfast:value widget)
                              (format nil "~,3F" (getf params key default)))))))
+               (when (and node (eq kind :flip) flip-axis-input)
+                 (let ((params (orfeus:graph-node-params node)))
+                   (setf (lightfast:value flip-axis-input)
+                         (flip-choice-label (getf params :horizontal)
+                                            (getf params :vertical)))))
                (when (and node (eq kind :rotate) rotate-turn-input)
                  (setf (lightfast:value rotate-turn-input)
                        (quarter-turn-label
@@ -6669,6 +6695,42 @@ new cache entry is published."
             (lightfast:make-label
              :parent node-page :x 12 :y 76 :width 292 :height 26
              :label "Whole turns keep every photosite")
+            12 76 :fill 26 :page)))
+        (build-group
+         :flip
+         (lambda ()
+           ;; One choice rather than two checkboxes: a mirror has four states
+           ;; and naming them reads better than two boxes whose combination the
+           ;; reader has to work out.
+           (let ((field
+                   (lightfast:make-labeled-choice
+                    :parent node-page :x 12 :y 44 :width 292 :height 26
+                    :label "Mirror" :label-width 88
+                    :items (mapcar #'first *flip-choices*)
+                    :callback
+                    (lambda (widget event value)
+                      (declare (ignore event value))
+                      (let ((node (gui-model-selected-graph-node model))
+                            (axes (rest (assoc (lightfast:value widget)
+                                               *flip-choices* :test #'string=))))
+                        (when node
+                          (handler-case
+                              (progn
+                                (gui-model-set-node-params
+                                 model node
+                                 (list :horizontal (first axes)
+                                       :vertical (second axes)))
+                                (after-graph-edit
+                                 (format nil "Mirror: ~A"
+                                         (lightfast:value widget))))
+                            (error (condition)
+                              (set-status (princ-to-string condition))))))))))
+             (setf flip-axis-input (lightfast:field-control field))
+             (register-field field 44 :page))
+           (register-inspector
+            (lightfast:make-label
+             :parent node-page :x 12 :y 76 :width 292 :height 26
+             :label "A mirror keeps every photosite")
             12 76 :fill 26 :page)))
         (build-group
          :crop

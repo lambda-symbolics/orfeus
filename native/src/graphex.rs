@@ -22,7 +22,7 @@ use super::render::{self, DecodedRaw, LensCorrectionOptions, RgbImage};
 const GRAPH_MAGIC: u32 = 0x4746_524F; // "ORFG" little-endian
 // 3 made each curves channel variable length behind a count header;
 // 4 added the rotate node.
-const GRAPH_VERSION: u32 = 5;
+const GRAPH_VERSION: u32 = 6;
 const MAX_GRAPH_NODES: usize = 64;
 
 pub const NODE_WHITE_BALANCE: u32 = 1;
@@ -38,6 +38,7 @@ pub const NODE_CURVES: u32 = 10;
 pub const NODE_ROTATE: u32 = 11;
 pub const NODE_CONTRAST: u32 = 12;
 pub const NODE_SHARPEN: u32 = 13;
+pub const NODE_FLIP: u32 = 14;
 
 /// Frame-level settings shared by every node of one graph render.
 #[repr(C)]
@@ -241,6 +242,7 @@ fn param_arity(kind: u32) -> Result<ParamArity, Error> {
         NODE_ROTATE => ParamArity::Exact(1),        // quarter turns clockwise
         NODE_CONTRAST => ParamArity::Exact(2),      // slope, pivot in display terms
         NODE_SHARPEN => ParamArity::Exact(3),       // amount, radius, noise floor
+        NODE_FLIP => ParamArity::Exact(2),          // mirror across x?, across y?
         _ => return Err(Error::InvalidArgument("unknown graph node kind")),
     })
 }
@@ -460,6 +462,7 @@ fn validate_param(kind: u32, index: usize, value: f32) -> Result<(), Error> {
         (NODE_SHARPEN, 0) => (0.0..=3.0).contains(&value),
         (NODE_SHARPEN, 1) => (0.3..=5.0).contains(&value),
         (NODE_SHARPEN, 2) => (0.0..=8.0).contains(&value),
+        (NODE_FLIP, _) => value == 0.0 || value == 1.0,
         // The four leading parameters are point counts, not signal levels.
         (NODE_CURVES, index) if index < CURVE_CHANNELS => {
             (MIN_CURVE_POINTS as f32..=MAX_CURVE_POINTS as f32).contains(&value)
@@ -568,10 +571,10 @@ pub(crate) fn parse_graph(bytes: &[u8]) -> Result<Vec<GraphOp>, Error> {
                     return Err(Error::InvalidArgument("crop rectangle leaves the frame"));
                 }
             }
-            NODE_ROTATE => {
-                // A rotation is indifferent to the domain it turns, and counts
-                // as reframing for the same reason a crop does: optics maps
-                // against the frame it was measured on.
+            NODE_ROTATE | NODE_FLIP => {
+                // A rotation or a mirror is indifferent to the domain it turns,
+                // and counts as reframing for the same reason a crop does:
+                // optics maps against the frame it was measured on.
                 display[index] = display[input_a];
                 cropped[index] = true;
             }
@@ -982,6 +985,7 @@ fn node_stage_name(kind: u32) -> &'static str {
         NODE_CROP => "cropping\0",
         NODE_CURVES => "curves\0",
         NODE_ROTATE => "turning\0",
+        NODE_FLIP => "mirroring\0",
         NODE_CONTRAST => "contrast\0",
         NODE_SHARPEN => "sharpening\0",
         _ => "developing\0",
@@ -1021,7 +1025,12 @@ pub(crate) struct ViewportPlan {
 pub(crate) fn plan_viewport(ops: &[GraphOp]) -> Option<ViewportPlan> {
     let barrier = ops
         .iter()
-        .rposition(|op| matches!(op.kind, NODE_OPTICS | NODE_CROP | NODE_ROTATE | NODE_BLEND))
+        .rposition(|op| {
+            matches!(
+                op.kind,
+                NODE_OPTICS | NODE_CROP | NODE_ROTATE | NODE_FLIP | NODE_BLEND
+            )
+        })
         .map_or(0, |index| index + 1);
     let mut halo = 0;
     for (index, op) in ops.iter().enumerate().skip(barrier) {
@@ -1365,6 +1374,7 @@ fn execute_graph_into(
                     | NODE_COLOR_SUBTRACT
                     | NODE_CROP
                     | NODE_ROTATE
+                    | NODE_FLIP
                     | NODE_CURVES
             )
             && !oriented[slot]
@@ -1410,6 +1420,9 @@ fn execute_graph_into(
             }
             NODE_CONTRAST => {
                 render::apply_contrast(&mut image, op.params[0], op.params[1]);
+            }
+            NODE_FLIP => {
+                render::apply_flip(&mut image, op.params[0] != 0.0, op.params[1] != 0.0);
             }
             NODE_SHARPEN => {
                 // The radius is stated for the photograph, not for whichever
