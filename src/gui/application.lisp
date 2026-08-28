@@ -141,6 +141,70 @@ portrait crop of a landscape frame is a normal thing to want, and picking 2:3
 from a list says exactly what you get. :ORIGINAL follows the photograph's own
 proportions, whatever they are.")
 
+(defun rect-turned-clockwise (rect)
+  "Return RECT as it lands after its frame turns one quarter clockwise."
+  (destructuring-bind (left top width height) rect
+    (list (- 1d0 (+ top height)) left height width)))
+
+(defun rect-mirrored (rect horizontal vertical)
+  "Return RECT as it lands after its frame is mirrored across either axis."
+  (destructuring-bind (left top width height) rect
+    (list (if horizontal (- 1d0 (+ left width)) left)
+          (if vertical (- 1d0 (+ top height)) top)
+          width height)))
+
+(defun graph-forward-chain (graph id)
+  "Return the nodes from ID's consumer down to the output, in order.
+
+NIL when the path is not a simple chain, which is the honest answer: a branch
+that rejoins through a blend has no single geometry to speak of."
+  (let ((nodes (orfeus:processing-graph-nodes graph))
+        (output (orfeus:processing-graph-output graph))
+        (chain '())
+        (current id))
+    (loop
+      (when (eql current output) (return (nreverse chain)))
+      (let ((consumers (remove-if-not
+                        (lambda (node)
+                          (member current (orfeus:graph-node-inputs node)))
+                        nodes)))
+        (unless (= 1 (length consumers)) (return nil))
+        (push (first consumers) chain)
+        (setf current (orfeus:graph-node-id (first consumers)))))))
+
+(defun downstream-geometry (graph node)
+  "Return the turns and mirrors applied to NODE's output before it is shown.
+
+A crop rectangle means what it means in the frame the crop node itself sees,
+which is not the frame on screen when anything downstream turns or mirrors it.
+Without this the overlay drew a rectangle in one place and the render took it
+from another — with a half turn below the crop, from the diagonally opposite
+corner, which is as wrong as it can get."
+  (loop for downstream in (graph-forward-chain
+                           graph (orfeus:graph-node-id node))
+        for params = (orfeus:graph-node-params downstream)
+        unless (orfeus:graph-node-bypassed-p downstream)
+          append (case (orfeus:graph-node-kind downstream)
+                   (:rotate (list (list :turn (getf params :quarter-turns 0))))
+                   (:flip (list (list :mirror (getf params :horizontal)
+                                      (getf params :vertical))))
+                   (t '()))))
+
+(defun rect-through-geometry (rect geometry &optional backwards)
+  "Carry RECT through GEOMETRY, or back against it when BACKWARDS."
+  (let ((steps (if backwards (reverse geometry) geometry)))
+    (dolist (step steps rect)
+      (setf rect
+            (ecase (first step)
+              (:turn
+               (let ((turns (mod (if backwards (- (second step)) (second step))
+                                 4)))
+                 (loop repeat turns
+                       do (setf rect (rect-turned-clockwise rect)))
+                 rect))
+              ;; A mirror undoes itself, so it needs no separate inverse.
+              (:mirror (rect-mirrored rect (second step) (third step))))))))
+
 (defparameter *flip-choices*
   '(("None" nil nil)
     ("Left to right" t nil)
@@ -1688,13 +1752,24 @@ new cache entry is published."
                     (discard-gui-tasks queue :after)
                     (enqueue-preview nil)
                     (set-status "Developing 1:1 preview"))))
+           (crop-node-geometry (node)
+             (let ((graph (gui-model-display-graph model)))
+               (and graph (downstream-geometry graph node))))
            (crop-node-rect (node)
+             ;; In the coordinates of the picture on screen, which is not where
+             ;; the rectangle is stored: it is stored in the frame the crop node
+             ;; itself sees, and anything below it that turns or mirrors the
+             ;; frame moves it out from under the overlay.
              (let ((params (orfeus:graph-node-params node)))
-               (values (float (getf params :left 0.0) 1d0)
-                       (float (getf params :top 0.0) 1d0)
-                       (float (getf params :width 1.0) 1d0)
-                       (float (getf params :height 1.0) 1d0)
-                       (float (getf params :angle 0.0) 1d0))))
+               (destructuring-bind (left top width height)
+                   (rect-through-geometry
+                    (list (float (getf params :left 0.0) 1d0)
+                          (float (getf params :top 0.0) 1d0)
+                          (float (getf params :width 1.0) 1d0)
+                          (float (getf params :height 1.0) 1d0))
+                    (crop-node-geometry node))
+                 (values left top width height
+                         (float (getf params :angle 0.0) 1d0)))))
            (preview-image-frame (canvas path)
              ;; Widget-relative placement of the drawn preview, mirroring
              ;; the native adapter's pan clamping so overlays land on the
@@ -1779,12 +1854,20 @@ new cache entry is published."
                     (left (min (- 1.0 width) (max 0.0 left)))
                     (top (min (- 1.0 height) (max 0.0 top))))
                (handler-case
-                   (progn
+                   (destructuring-bind (stored-left stored-top
+                                        stored-width stored-height)
+                       ;; Back out of display coordinates into the frame the
+                       ;; crop node reads, which is what CROP-NODE-RECT undoes.
+                       (rect-through-geometry
+                        (list (float left 1d0) (float top 1d0)
+                              (float width 1d0) (float height 1d0))
+                        (crop-node-geometry node) t)
                      (gui-model-set-node-params
                       model node
-                      (list :left (float left 1.0) :top (float top 1.0)
-                            :width (float width 1.0)
-                            :height (float height 1.0)))
+                      (list :left (float stored-left 1.0)
+                            :top (float stored-top 1.0)
+                            :width (float stored-width 1.0)
+                            :height (float stored-height 1.0)))
                      (when after-canvas (lightfast:redraw after-canvas))
                      (set-status
                       (format nil "Crop ~,2F ~,2F ~,2Fx~,2F"

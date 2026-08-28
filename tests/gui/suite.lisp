@@ -536,6 +536,48 @@ expensive node was changed at a zoomed-in view."
     (check (not (orfeus/gui::draft-preview-fits-viewport-p 2600 2d0 bound))
            "A wide canvas was allowed a draft that could not cover it")))
 
+(defun test-crop-rect-follows-downstream-geometry ()
+  "A crop rectangle is drawn where the render will take it from.
+
+The rectangle is stored in the frame the crop node itself sees. Anything below
+it that turns or mirrors the frame moves the picture out from under the overlay,
+so the editor carries the rectangle through that geometry to draw it and back
+again to store it. With a half turn below the crop it was taken from the
+diagonally opposite corner — as wrong as a crop can be."
+  (flet ((same (a b)
+           ;; A turn subtracts from one twice over, so the round trip lands
+           ;; within a rounding step rather than exactly on its start.
+           (every (lambda (x y) (< (abs (- x y)) 1d-9)) a b)))
+    ;; Off centre on both axes, so a mirror across either one has to move it.
+    (let ((rect '(0.20d0 0.10d0 0.50d0 0.40d0)))
+      ;; A half turn moves a rectangle to the opposite corner, same size.
+      (check (same (orfeus/gui::rect-through-geometry rect '((:turn 2)))
+                   '(0.30d0 0.5d0 0.50d0 0.40d0))
+             "A half turn did not move the rectangle to the opposite corner")
+      ;; A quarter turn swaps the axes.
+      (check (same (orfeus/gui::rect-through-geometry rect '((:turn 1)))
+                   '(0.5d0 0.20d0 0.40d0 0.50d0))
+             "A quarter turn did not swap the rectangle's axes")
+    ;; A mirror is its own inverse, and so is a half turn.
+    (dolist (geometry '(((:turn 2))
+                        ((:mirror t nil))
+                        ((:mirror nil t))
+                        ((:turn 1))
+                        ((:turn 3))
+                        ;; What a scanned negative actually needs: turned upside
+                        ;; down and then mirrored left to right.
+                        ((:turn 2) (:mirror t nil))
+                        ((:mirror t t) (:turn 1) (:mirror nil t))))
+      (let ((there (orfeus/gui::rect-through-geometry rect geometry)))
+        (check (same (orfeus/gui::rect-through-geometry there geometry t) rect)
+               (format nil "~S did not carry a rectangle back where it started"
+                       geometry))
+        (check (not (same there rect))
+               (format nil "~S moved nothing at all" geometry))))
+      ;; Nothing downstream means nothing to undo.
+      (check (same (orfeus/gui::rect-through-geometry rect '()) rect)
+             "An empty geometry moved the rectangle"))))
+
 (defun test-preset-bulk-application ()
   (let* ((jobs (loop for name in '("one" "two" "three")
                      collect (orfeus:make-photo-job
@@ -1559,6 +1601,7 @@ expensive node was changed at a zoomed-in view."
   (test-crop-aspect-and-default)
   (test-viewport-render-bound)
   (test-draft-preview-covers-the-view)
+  (test-crop-rect-follows-downstream-geometry)
   (test-curve-spline-shapes)
   (test-preset-bulk-application)
   (test-grade-workflow)
