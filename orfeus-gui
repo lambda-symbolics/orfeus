@@ -9,9 +9,20 @@ fi
 
 cargo build --release --manifest-path native/Cargo.toml
 
+# Ask make whether the toolkit needs rebuilding rather than guessing at it. Its
+# Makefile already names every source and every pixmap as a prerequisite, so
+# this costs nothing when the build is current and does the right thing when it
+# is not. Guessing was the bug: the old test rebuilt only when the library was
+# missing or unlinkable, so a `git pull` that brought new sources left the old
+# library in place and everything those sources added — new stock icons, in the
+# case that found this — was silently absent.
 lightfast_bridge="${ORFEUS_LIGHTFAST_SOURCE}/build/liblightfast.so"
-if [ ! -f "$lightfast_bridge" ] || ldd "$lightfast_bridge" 2>/dev/null | grep -q 'not found'; then
+if ldd "$lightfast_bridge" 2>/dev/null | grep -q 'not found'; then
+  # A library that no longer links has to be built from scratch: its own make
+  # thinks it is current, because what moved was underneath it.
   make -B -C "$ORFEUS_LIGHTFAST_SOURCE" native
+else
+  make -C "$ORFEUS_LIGHTFAST_SOURCE" native
 fi
 make gui-native
 

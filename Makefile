@@ -14,7 +14,11 @@ $(GUI_PREVIEW): $(GUI_PREVIEW_SRC) $(LIGHTFAST)/native/cl_fltk_bridge.hpp $(LIGH
 	mkdir -p native/build
 	$(CXX) $(GUI_CXXFLAGS) $< -o $@ $(GUI_LDFLAGS)
 
-$(LIGHTFAST)/build/liblightfast.so:
+# Named prerequisites, not just the file: a rule with none is considered current
+# the moment the file exists, however old it is against the sources beside it.
+LIGHTFAST_SOURCES := $(wildcard $(LIGHTFAST)/native/*)
+
+$(LIGHTFAST)/build/liblightfast.so: $(LIGHTFAST_SOURCES)
 	$(MAKE) -C $(LIGHTFAST) native
 
 clean-gui-native:
