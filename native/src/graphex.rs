@@ -759,8 +759,17 @@ fn rotate_crop_image(
         ((height * image.height as f32).round() as usize).clamp(1, image.height - y0);
     let x0 = x0 as f32;
     let y0 = y0 as f32;
-    let center_x = x0 + target_width as f32 * 0.5;
-    let center_y = y0 + target_height as f32 * 0.5;
+    // Turned about the middle of the frame, not the middle of the rectangle.
+    //
+    // That is what lets an editor show the straightening honestly: the whole
+    // frame turned by the same angle is the picture the crop is taken from, so
+    // an upright rectangle drawn on it selects exactly what the render will
+    // deliver. Turning about the rectangle's own centre instead made the two
+    // differ by a translation that grew as the rectangle moved off centre —
+    // and left the interface drawing a tilted rectangle over an upright photo,
+    // which is the opposite of what straightening looks like.
+    let center_x = image.width as f32 * 0.5;
+    let center_y = image.height as f32 * 0.5;
     let radians = sensor_angle.to_radians();
     let (sin, cos) = radians.sin_cos();
     let mut output = RgbImage {
@@ -2215,6 +2224,51 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Straightening is the same picture whether the frame is cut before or
+    /// after it is turned.
+    ///
+    /// This is what an editor needs to show the angle honestly. If the two
+    /// disagreed, the only truthful preview of a tilted crop would be a tilted
+    /// rectangle drawn over an upright photograph — which is not what
+    /// straightening looks like to anyone doing it.
+    #[test]
+    fn a_tilted_crop_is_a_crop_of_the_tilted_frame() {
+        let scene = noisy_scene(160, 120);
+        for angle in [3.0_f32, -7.5, 12.0] {
+            let whole = rotate_crop_image(&scene, [0.0, 0.0, 1.0, 1.0], angle).unwrap();
+            for rect in [
+                [0.25_f32, 0.25, 0.5, 0.5],
+                [0.1, 0.3, 0.4, 0.4],
+                [0.45, 0.05, 0.5, 0.6],
+            ] {
+                let direct = rotate_crop_image(&scene, rect, angle).unwrap();
+                let left = (rect[0] * whole.width as f32).round() as usize;
+                let top = (rect[1] * whole.height as f32).round() as usize;
+                let expected = render::crop_rect(
+                    &whole,
+                    left,
+                    top,
+                    direct.width.min(whole.width - left),
+                    direct.height.min(whole.height - top),
+                );
+                assert_eq!(
+                    (direct.width, direct.height),
+                    (expected.width, expected.height),
+                    "angle {angle} rect {rect:?} came back the wrong size"
+                );
+                let difference = max_difference(&direct, &expected);
+                assert!(
+                    difference < 1.0e-5,
+                    "angle {angle} rect {rect:?} differs by {difference}"
+                );
+            }
+        }
+        // And with no angle it is still a plain cut.
+        let plain = rotate_crop_image(&scene, [0.2, 0.2, 0.5, 0.5], 0.0).unwrap();
+        let cut = crop_image(&scene, [0.2, 0.2, 0.5, 0.5]).unwrap();
+        assert!(max_difference(&plain, &cut) < 1.0e-5);
     }
 
     /// Where the narrowing may happen, and where it may not.

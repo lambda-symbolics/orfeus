@@ -1363,6 +1363,7 @@ new cache entry is published."
            kind-choice
            (node-panel-groups '())
            blend-opacity-input crop-angle-input rotate-turn-input flip-axis-input
+           (crop-angle-controls '())
            base-red-input base-green-input base-blue-input base-swatch
            crop-aspect-input crop-width-input crop-height-input
            ;; NIL is a free crop; otherwise an entry from
@@ -1803,7 +1804,11 @@ new cache entry is published."
                    (when frame-x
                      (multiple-value-bind (left top width height angle)
                          (crop-node-rect node)
-                       (let ((radians (* angle (/ pi 180))))
+                       (declare (ignore angle))
+                       ;; Upright, always. The preview beneath it is already
+                       ;; straightened by the same angle, so a tilted rectangle
+                       ;; here would tilt the crop twice over.
+                       (let ((radians 0d0))
                          (values (+ frame-x (* (+ left (/ width 2))
                                                frame-width))
                                  (+ frame-y (* (+ top (/ height 2))
@@ -1935,12 +1940,13 @@ new cache entry is published."
                                       (- center-v (/ new-height 2))
                                       new-width new-height))))))
            (set-crop-node-angle (node angle)
-             ;; The crop stage is bypassed while its node is selected, so
-             ;; an angle change only moves the overlay; no re-render.
+             ;; The preview shows the straightening, so an angle change is a
+             ;; change to the picture and not merely to the overlay.
              (handler-case
                  (progn
                    (gui-model-set-node-params model node (list :angle angle))
                    (when after-canvas (lightfast:redraw after-canvas))
+                   (schedule-edited-preview)
                    (set-status (format nil "Crop angle ~,1F deg" angle)))
                (error (condition)
                  (set-status (princ-to-string condition)))))
@@ -3188,11 +3194,10 @@ new cache entry is published."
                        (format nil "~,2F"
                                (orfeus:graph-node-opacity node))))
                (when (and node (eq kind :crop))
-                 (when crop-angle-input
-                   (setf (lightfast:value crop-angle-input)
-                         (format nil "~,1F"
-                                 (getf (orfeus:graph-node-params node)
-                                       :angle 0.0))))
+                 (let ((angle (getf (orfeus:graph-node-params node) :angle 0.0)))
+                   (dolist (entry crop-angle-controls)
+                     (setf (lightfast:value (second entry))
+                           (format nil "~,1F" angle))))
                  (multiple-value-bind (left top width height)
                      (crop-node-rect node)
                    (declare (ignore left top))
@@ -4777,9 +4782,13 @@ new cache entry is published."
              (or (orfeus:photo-job-graph job)
                  (orfeus:photo-render-settings project job)))
            (current-settings ()
-             ;; While a crop node is selected its stage is bypassed in the
-             ;; preview: the full frame stays visible under the editing
-             ;; overlay, and rect changes cost a redraw, not a render.
+             ;; While a crop node is selected its rectangle is opened out to the
+             ;; whole frame, but its *angle* is kept. So the preview shows the
+             ;; photograph straightened exactly as the render will straighten
+             ;; it, with everything outside the rectangle still visible to crop
+             ;; from — and the rectangle itself can be drawn upright, which is
+             ;; what straightening looks like. Rect changes still cost only a
+             ;; redraw; only the angle asks for a render.
              (let ((settings (preview-recipe-snapshot
                               (settings-for-job (selected-job))))
                    (node (crop-editing-node)))
@@ -4790,7 +4799,13 @@ new cache entry is published."
                                    (orfeus:processing-graph-nodes settings)
                                    :key #'orfeus:graph-node-id)))
                    (when twin
-                     (setf (orfeus:graph-node-bypassed-p twin) t))))
+                     (let ((angle (getf (orfeus:graph-node-params twin)
+                                        :angle 0.0)))
+                       (if (zerop angle)
+                           (setf (orfeus:graph-node-bypassed-p twin) t)
+                           (setf (orfeus:graph-node-params twin)
+                                 (list :left 0.0 :top 0.0 :width 1.0
+                                       :height 1.0 :angle angle)))))))
                settings))
            (enqueue-render (target-queue role job index settings generation publish-p
                             &key front-p draft-p cache-p viewport)
@@ -6822,11 +6837,7 @@ new cache entry is published."
             (lightfast:make-label :parent node-page :x 12 :y 44
                                 :width 88 :height 26 :label "Angle")
             12 44 88 26 :page)
-           (setf crop-angle-input
-                 (register-inspector
-                  (lightfast:make-spinner
-                   :parent node-page :x 110 :y 44 :width 84 :height 26
-                   :callback
+           (let ((angle-callback
                    (lambda (widget event value)
                      (declare (ignore event value))
                      (let ((node (crop-editing-node)))
@@ -6839,10 +6850,27 @@ new cache entry is published."
                                 (float (max -45 (min 45 angle)) 1.0)))
                            (error (condition)
                              (set-status
-                              (princ-to-string condition))))))))
-                  110 44 84 26 :page))
-           (lightfast:set-range crop-angle-input -45 45)
-           (lightfast:set-step crop-angle-input 0.1)
+                              (princ-to-string condition)))))))))
+             ;; A slider as well as a number: levelling a horizon is a thing
+             ;; you nudge until it looks right, not a figure anybody knows in
+             ;; advance.
+             (let ((slider (register-inspector
+                            (lightfast:make-slider
+                             :parent node-page :x 110 :y 44
+                             :width 84 :height 26 :callback angle-callback)
+                            110 44 84 26 :page)))
+               (lightfast:set-range slider -45 45)
+               (lightfast:set-step slider 0.1)
+               (push (list :crop-angle slider) crop-angle-controls))
+             (setf crop-angle-input
+                   (register-inspector
+                    (lightfast:make-spinner
+                     :parent node-page :x 202 :y 44 :width 78 :height 26
+                     :callback angle-callback)
+                    202 44 78 26 :page))
+             (lightfast:set-range crop-angle-input -45 45)
+             (lightfast:set-step crop-angle-input 0.1)
+             (push (list :crop-angle crop-angle-input) crop-angle-controls))
            (let ((aspect-field
                    (lightfast:make-labeled-choice
                     :parent node-page :x 12 :y 76 :width 292 :height 26
