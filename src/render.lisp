@@ -243,12 +243,42 @@ The output is published atomically and INPUT-PATHNAME is never modified."
                        (or (getf params :lens-correction-p)
                            (getf params :chromatic-aberration-correction-p))))))
 
-(defun graph-without-optics (graph)
-  "Return a copy of GRAPH with every optics node bypassed."
+(defvar *lens-profile-warned*
+  (make-hash-table :test #'equal #+sbcl :synchronized #+sbcl t)
+  "Photographs already reported as having no lens profile.
+
+An interactive drag renders on every tick, and a lens the database does not
+know will not come to know itself between two of them. Saying so once per
+photograph is information; saying it forty times a second is noise.")
+
+(defun warn-lens-profile-once (input-pathname message)
+  "Report a missing lens profile for INPUT-PATHNAME, at most once."
+  (let ((key (cons (namestring (pathname input-pathname)) message)))
+    (unless (gethash key *lens-profile-warned*)
+      (setf (gethash key *lens-profile-warned*) t)
+      (warn 'lens-profile-unavailable
+            :input-pathname input-pathname
+            :message message))))
+
+(defun graph-without-lens-profile (graph)
+  "Return a copy of GRAPH with only the profile-driven optics switched off.
+
+Not the whole optics node. Bypassing it took the hand-set distortion down with
+the profile correction, which is exactly backwards: a lens with no profile —
+a manual mount, an adapted one, anything the database has never heard of — is
+the only lens whose distortion *has* to be set by hand, and it is also the only
+lens whose profile lookup is certain to fail. The retry now drops what could not
+be found and keeps what the photographer typed in."
   (let ((copy (graph-copy graph)))
     (dolist (node (processing-graph-nodes copy))
       (when (eq :optics (graph-node-kind node))
-        (setf (graph-node-bypassed-p node) t)))
+        (setf (graph-node-params node)
+              (list :lens-correction-p nil
+                    :lens-correction-strength
+                    (getf (graph-node-params node) :lens-correction-strength 1.0)
+                    :chromatic-aberration-correction-p nil
+                    :lens-distortion
+                    (getf (graph-node-params node) :lens-distortion 0.0)))))
     copy))
 
 (defun render-native-photo-graph (input-pathname output-pathname graph
@@ -280,10 +310,9 @@ The output is published atomically and INPUT-PATHNAME is never modified."
           (if (and (= 9 (raw-render-error-status condition))
                    (graph-active-optics-p graph))
               (progn
-                (warn 'lens-profile-unavailable
-                      :input-pathname report-input-pathname
-                      :message (raw-render-error-message condition))
-                (invoke (graph-without-optics graph)))
+                (warn-lens-profile-once report-input-pathname
+                                        (raw-render-error-message condition))
+                (invoke (graph-without-lens-profile graph)))
               (error condition)))))))
 
 (defun render-photo (input-pathname output-pathname settings
@@ -463,5 +492,5 @@ Returns the oriented image width and height as two values."
                    (warn 'lens-profile-unavailable
                          :input-pathname input-pathname
                          :message (raw-render-error-message condition))
-                   (invoke (graph-without-optics graph)))
+                   (invoke (graph-without-lens-profile graph)))
                  (error condition)))))))))
