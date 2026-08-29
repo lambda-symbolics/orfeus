@@ -1383,7 +1383,8 @@ new cache entry is published."
            lut-choice wb-choice target-choice
            export-quality export-max-width export-max-height export-metadata
            export-timestamp
-           export-dialog export-dialog-destination export-dialog-scope
+           export-dialog export-dialog-destination export-dialog-filename
+           export-dialog-scope
            export-dialog-format export-dialog-quality
            export-dialog-width export-dialog-height
            export-dialog-metadata export-dialog-timestamp
@@ -5201,6 +5202,28 @@ new cache entry is published."
                              (list :done
                                    (format nil "~D photograph~:P"
                                            completed))))))))))
+           (current-export-filename ()
+             ;; What the current photograph would be written as, so the field
+             ;; opens showing the name it is about to replace rather than blank.
+             (let ((job (selected-job)))
+               (when job
+                 (let ((output (ignore-errors (gui-photo-output-path model job))))
+                   (and output (file-namestring output))))))
+           (apply-export-filename (format)
+             ;; A name only, never a path: the folder has a field of its own,
+             ;; and a relative output path is merged with it by the core. An
+             ;; empty field puts the photograph back on its automatic name.
+             (let ((job (selected-job))
+                   (typed (string-trim '(#\Space #\Tab)
+                                       (lightfast:value export-dialog-filename))))
+               (when job
+                 (setf (orfeus:photo-job-output-path job)
+                       (when (plusp (length typed))
+                         (let ((named (pathname typed)))
+                           (make-pathname
+                            :name (or (pathname-name named) typed)
+                            :type (or (pathname-type named)
+                                      (orfeus:export-format-extension format)))))))))
            (apply-export-dialog ()
              ;; Returns true once the dialog's choices are stored on the
              ;; project, so the caller may start the export.
@@ -5225,6 +5248,10 @@ new cache entry is published."
              (when (apply-export-dialog)
                (lightfast:hide export-dialog)
                (let ((scope (lightfast:value export-dialog-scope)))
+                 (when (string-equal scope "Current photograph")
+                   (apply-export-filename
+                    (export-format-from-caption
+                     (lightfast:value export-dialog-format))))
                  (cond
                    ((string-equal scope "All photographs") (render-all))
                    ((string-equal scope "Selected photographs")
@@ -5288,6 +5315,15 @@ new cache entry is published."
                                                     :height row-height)
                               (button "Browse..."
                                       #'browse-export-destination 88)))
+                 ;; Only the single-photograph scope can honour a name; a batch
+                 ;; has as many names as it has photographs. Left visible and
+                 ;; labelled rather than hidden, so its scope is stated instead
+                 ;; of discovered.
+                 (setf export-dialog-filename
+                       (field (text "File name")
+                              (lightfast:make-input :parent dialog :x 0 :y 0
+                                                    :width 200
+                                                    :height row-height)))
                  (setf export-dialog-scope
                        (field (text "Photographs")
                               (lightfast:make-choice
@@ -5367,6 +5403,8 @@ new cache entry is published."
                      (lightfast:value export-dialog-timestamp)
                      (if (export-settings-timestamp-filenames-p settings)
                          "1" "0")
+                     (lightfast:value export-dialog-filename)
+                     (or (current-export-filename) "")
                      (lightfast:value export-dialog-scope)
                      (or scope
                          (if (selected-job)

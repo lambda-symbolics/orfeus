@@ -578,6 +578,34 @@ diagonally opposite corner — as wrong as a crop can be."
       (check (same (orfeus/gui::rect-through-geometry rect '()) rect)
              "An empty geometry moved the rectangle"))))
 
+(defun test-export-filename-overrides-the-automatic-name ()
+  "A name typed for a single export pins the file, and clearing it lets go.
+
+Stored relative, so the folder field still owns the folder: the core merges a
+relative output path with the project's output directory, and an absolute one
+would silently ignore whatever the Destination field said."
+  (let* ((job (orfeus:make-photo-job :input-path #p"/photos/PB020123.ORF"))
+         (project (orfeus:make-project
+                   :output-directory #p"/exports/"
+                   :photos (list job))))
+    ;; With no override the name comes from the input.
+    (check (string= "PB020123.jpg"
+                    (file-namestring (orfeus::photo-job-render-output project job)))
+           "An unnamed export did not keep the original filename")
+    ;; A bare name gains the format's extension and stays in the folder.
+    (setf (orfeus:photo-job-output-path job)
+          (make-pathname :name "sunset" :type "jpg"))
+    (let ((output (orfeus::photo-job-render-output project job)))
+      (check (string= "sunset.jpg" (file-namestring output))
+             "A typed name was not used")
+      (check (equal '(:absolute "exports") (pathname-directory output))
+             "A typed name escaped the destination folder"))
+    ;; And clearing it returns to the automatic name.
+    (setf (orfeus:photo-job-output-path job) nil)
+    (check (string= "PB020123.jpg"
+                    (file-namestring (orfeus::photo-job-render-output project job)))
+           "Clearing the name did not restore the automatic one")))
+
 (defun test-preset-bulk-application ()
   (let* ((jobs (loop for name in '("one" "two" "three")
                      collect (orfeus:make-photo-job
@@ -1602,6 +1630,7 @@ diagonally opposite corner — as wrong as a crop can be."
   (test-viewport-render-bound)
   (test-draft-preview-covers-the-view)
   (test-crop-rect-follows-downstream-geometry)
+  (test-export-filename-overrides-the-automatic-name)
   (test-curve-spline-shapes)
   (test-preset-bulk-application)
   (test-grade-workflow)
