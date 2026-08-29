@@ -22,7 +22,7 @@ use super::render::{self, DecodedRaw, LensCorrectionOptions, RgbImage};
 const GRAPH_MAGIC: u32 = 0x4746_524F; // "ORFG" little-endian
 // 3 made each curves channel variable length behind a count header;
 // 4 added the rotate node.
-const GRAPH_VERSION: u32 = 6;
+const GRAPH_VERSION: u32 = 7;
 const MAX_GRAPH_NODES: usize = 64;
 
 pub const NODE_WHITE_BALANCE: u32 = 1;
@@ -233,7 +233,7 @@ fn param_arity(kind: u32) -> Result<ParamArity, Error> {
         NODE_EXPOSURE => ParamArity::Exact(1),      // ev
         NODE_NOISE_REDUCTION => ParamArity::Exact(2), // edge-aware, neural
         NODE_TONE => ParamArity::Exact(7),          // blacks..whites
-        NODE_OPTICS => ParamArity::Exact(3),        // distortion?, strength, tca?
+        NODE_OPTICS => ParamArity::Exact(4),        // distortion?, strength, tca?, manual
         NODE_FILM => ParamArity::Exact(3),          // lut strength, grain amount, size
         NODE_BLEND => ParamArity::Exact(1),         // opacity toward input B
         NODE_COLOR_SUBTRACT => ParamArity::Exact(3), // picked colour, per channel
@@ -448,6 +448,7 @@ fn validate_param(kind: u32, index: usize, value: f32) -> Result<(), Error> {
         (NODE_TONE, _) => (-2.0..=2.0).contains(&value),
         (NODE_OPTICS, 0) | (NODE_OPTICS, 2) => value == 0.0 || value == 1.0,
         (NODE_OPTICS, 1) => (0.0..=2.0).contains(&value),
+        (NODE_OPTICS, 3) => (-0.5..=0.5).contains(&value),
         (NODE_FILM, 0) => (0.0..=1.0).contains(&value),
         (NODE_FILM, 1) => (0.0..=1.0).contains(&value),
         (NODE_FILM, 2) => (0.25..=16.0).contains(&value),
@@ -1464,6 +1465,12 @@ fn execute_graph_into(
                 if op.params[2] != 0.0 {
                     flags |= render::FLAG_LENS_TCA;
                 }
+                // The hand-set correction first, so a profile that also has
+                // something to say about this lens works from a frame whose
+                // gross bending is already out. With no profile — a vintage
+                // lens, an adapted one, anything the database has never heard
+                // of — this is the whole of the correction.
+                render::apply_manual_distortion(&mut image, op.params[3]);
                 if flags != 0 {
                     render::apply_lens(
                         &mut image,
@@ -2282,7 +2289,7 @@ mod tests {
                     NODE_FILM => &[0.0, 0.0, 1.0],
                     NODE_NOISE_REDUCTION => &[0.5, 0.0],
                     NODE_CROP => &[0.1, 0.1, 0.8, 0.8, 0.0],
-                    NODE_OPTICS => &[1.0, 1.0, 0.0],
+                    NODE_OPTICS => &[1.0, 1.0, 0.0, 0.0],
                     _ => &[0.0],
                 };
                 builder = builder.node(*kind, index as i32, -1, params, None);

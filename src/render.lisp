@@ -200,6 +200,8 @@ The output is published atomically and INPUT-PATHNAME is never modified."
                 (processing-settings-lens-correction-p effective-settings)
                 :lens-correction-strength
                 (processing-settings-lens-correction-strength effective-settings)
+                :lens-distortion
+                (processing-settings-lens-distortion effective-settings)
                 :lens-profile-model lens-profile
                 :focal-reducer focal-reducer
                 :lens-crop-factor lens-crop-factor

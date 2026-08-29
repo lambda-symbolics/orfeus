@@ -14,7 +14,7 @@
     :tone-blacks :tone-shadows :tone-dark-mids
     :tone-midtones :tone-light-mids :tone-highlights :tone-whites
     :lens-correction-p :lens-correction-strength
-    :chromatic-aberration-correction-p :lut-path :lut-strength
+    :chromatic-aberration-correction-p :lens-distortion :lut-path :lut-strength
     :grain-amount :grain-size)
   "Keys accepted in processing setting S-expressions.")
 
@@ -35,6 +35,9 @@
   (lens-correction-p t)
   (lens-correction-strength 1.0)
   (chromatic-aberration-correction-p t)
+  ;; Hand-set barrel or pincushion correction, for the lenses no database
+  ;; describes. Positive straightens barrel, negative straightens pincushion.
+  (lens-distortion 0.0)
   (lut-path nil)
   (lut-strength 1.0)
   (grain-amount 0.0)
@@ -47,7 +50,7 @@
     (:tone (:tone-blacks :tone-shadows :tone-dark-mids :tone-midtones
             :tone-light-mids :tone-highlights :tone-whites))
     (:optics (:lens-correction-p :lens-correction-strength
-              :chromatic-aberration-correction-p))
+              :chromatic-aberration-correction-p :lens-distortion))
     (:film (:lut-path :lut-strength :grain-amount :grain-size)))
   "The fixed processing pipeline as named stages over setting keys.
 Together the stages partition *PROCESSING-SETTING-KEYS*; frontends present
@@ -60,7 +63,7 @@ them as a copyable node chain.")
     :tone-blacks 0.0 :tone-shadows 0.0 :tone-dark-mids 0.0 :tone-midtones 0.0
     :tone-light-mids 0.0 :tone-highlights 0.0 :tone-whites 0.0
     :lens-correction-p nil :lens-correction-strength 1.0
-    :chromatic-aberration-correction-p nil
+    :chromatic-aberration-correction-p nil :lens-distortion 0.0
     :lut-path nil :lut-strength 0.0 :grain-amount 0.0 :grain-size 1.0)
   "Setting values under which every stage passes pixels through unchanged.")
 

@@ -82,6 +82,9 @@ pub struct RenderSettingsV1 {
     /// The lens to correct for when the container names none of its own.
     /// Appended, so a caller built against an earlier struct still works.
     pub lens_name: *const c_char,
+    /// Hand-set barrel or pincushion correction, for lenses no database
+    /// describes. Positive straightens barrel, negative pincushion.
+    pub lens_distortion: f32,
 }
 
 impl Default for RenderSettingsV1 {
@@ -111,6 +114,7 @@ impl Default for RenderSettingsV1 {
             max_height: 0,
             jpeg_quality: 92,
             lens_correction_strength: 1.0,
+            lens_distortion: 0.0,
             focal_reducer: 1.0,
             lens_crop_factor: 0.0,
             lut_path: std::ptr::null(),
@@ -194,6 +198,7 @@ impl RenderSettingsV1 {
             (self.grain_amount, "grain amount"),
             (self.grain_size, "grain size"),
             (self.lens_correction_strength, "lens correction strength"),
+            (self.lens_distortion, "lens distortion"),
             (self.focal_reducer, "focal reducer"),
             (self.lens_crop_factor, "lens crop factor"),
         ] {
@@ -239,6 +244,7 @@ impl RenderSettingsV1 {
             || !(0.0..=1.0).contains(&self.lut_strength)
             || !(0.0..=1.0).contains(&self.grain_amount)
             || !(0.25..=16.0).contains(&self.grain_size)
+            || !(-0.5..=0.5).contains(&self.lens_distortion)
             || !(0.0..=2.0).contains(&self.lens_correction_strength)
             || !(0.1..=2.0).contains(&self.focal_reducer)
             || self.lens_crop_factor < 0.0
@@ -2260,6 +2266,60 @@ pub(crate) fn apply_lens(
     Ok(())
 }
 
+/// Corrects barrel or pincushion distortion by a stated amount.
+///
+/// For the lenses no database describes — anything old enough, adapted, or
+/// simply unlisted — where the alternative is living with bent horizons.
+///
+/// One term of the usual radial polynomial: a point at radius `r` from the
+/// centre is gathered from `r * (1 + k r^2)`, with `r` measured against the
+/// half-diagonal so that the strength means the same thing whatever the frame's
+/// shape. Positive straightens barrel, negative straightens pincushion. One
+/// term rather than three because a slider a photographer sets by eye against a
+/// straight edge cannot usefully carry more, and the higher terms of a real
+/// profile only matter once the first one is right.
+///
+/// The auto-crop zoom rides along in the same gather, as it does for the
+/// profile correction: resampling twice would soften what one pass keeps.
+pub(crate) fn apply_manual_distortion(image: &mut RgbImage, amount: f32) {
+    let (width, height) = (image.width, image.height);
+    if amount == 0.0 || width < 2 || height < 2 {
+        return;
+    }
+    let center_x = (width - 1) as f32 * 0.5;
+    let center_y = (height - 1) as f32 * 0.5;
+    let normalize = 1.0 / (center_x * center_x + center_y * center_y).sqrt();
+    let gather = |x: f32, y: f32| {
+        let dx = (x - center_x) * normalize;
+        let dy = (y - center_y) * normalize;
+        let factor = 1.0 + amount * (dx * dx + dy * dy);
+        (
+            center_x + (x - center_x) * factor,
+            center_y + (y - center_y) * factor,
+        )
+    };
+    const VALIDITY_STEP: usize = 4;
+    let scale = auto_crop_scale(width, height, VALIDITY_STEP, |x, y| {
+        let (sx, sy) = gather(x as f32, y as f32);
+        inside_frame(sx, sy, width, height)
+    });
+    let inverse_scale = 1.0 / scale;
+    let row_stride = width * 3;
+    let mut output = vec![0.0_f32; width * height * 3];
+    output
+        .par_chunks_mut(row_stride)
+        .enumerate()
+        .for_each(|(y, output_row)| {
+            let v = center_y + (y as f32 - center_y) * inverse_scale;
+            for x in 0..width {
+                let u = center_x + (x as f32 - center_x) * inverse_scale;
+                let (sx, sy) = gather(u, v);
+                output_row[x * 3..x * 3 + 3].copy_from_slice(&bilinear_rgb(image, sx, sy));
+            }
+        });
+    image.data = output;
+}
+
 pub(crate) fn orient(image: RgbImage, orientation: u16) -> RgbImage {
     if orientation <= 1 || orientation > 8 {
         return image;
@@ -4035,6 +4095,8 @@ pub fn render(
                 .map_err(|_| Error::InvalidArgument("lens profile model is not UTF-8"))?,
         )
     };
+    // By hand first, then the profile — the same order the graph applies them.
+    apply_manual_distortion(&mut image, settings.lens_distortion);
     apply_lens(
         &mut image,
         &LensCorrectionOptions {
@@ -4852,6 +4914,68 @@ mod tests {
 
     /// A mirror is a permutation: nothing resampled, nothing lost, and doing
     /// it twice is doing nothing.
+    /// Straight lines that were bent come back straight, and the centre never
+    /// moves.
+    #[test]
+    fn manual_distortion_straightens_and_holds_the_centre() {
+        let (width, height) = (161_usize, 121_usize);
+        // A grid of thin lines, which is what anybody sets this slider against.
+        let mut data = vec![0.0_f32; width * height * 3];
+        for y in 0..height {
+            for x in 0..width {
+                let line = x % 40 == 0 || y % 40 == 0;
+                let value = if line { 1.0 } else { 0.0 };
+                for channel in 0..3 {
+                    data[(y * width + x) * 3 + channel] = value;
+                }
+            }
+        }
+        let straight = RgbImage {
+            width,
+            height,
+            data,
+        };
+        let at = |image: &RgbImage, x: usize, y: usize| image.data[(y * width + x) * 3];
+        // Zero is exactly nothing.
+        let mut untouched = straight.clone();
+        apply_manual_distortion(&mut untouched, 0.0);
+        assert_eq!(untouched.data, straight.data);
+        for amount in [0.15_f32, -0.15] {
+            let mut bent = straight.clone();
+            apply_manual_distortion(&mut bent, amount);
+            // The centre pixel is the fixed point of a radial map, whichever
+            // way it bends.
+            assert!(
+                (at(&bent, width / 2, height / 2) - at(&straight, width / 2, height / 2)).abs()
+                    < 1.0e-4,
+                "the centre moved at {amount}"
+            );
+            // A radial map takes a symmetric picture to a symmetric one. This
+            // is the property worth pinning: it fails the moment the centre is
+            // taken as `width / 2` rather than `(width - 1) / 2`, or the radius
+            // is normalised per axis instead of by the diagonal — both of which
+            // bend the frame in a way no lens does.
+            let worst = (0..height)
+                .flat_map(|y| (0..width).map(move |x| (x, y)))
+                .map(|(x, y)| {
+                    (at(&bent, x, y) - at(&bent, width - 1 - x, height - 1 - y)).abs()
+                })
+                .fold(0.0_f32, f32::max);
+            // A ten-thousandth, not a millionth: the samples either side of a
+            // hard black-to-white edge are averaged with weights that round
+            // differently on the two halves of the frame. A real asymmetry —
+            // an off-by-one centre, a per-axis radius — shows up hundreds of
+            // times larger than this.
+            assert!(worst < 1.0e-4, "{amount} was not radial: {worst}");
+            // And it did something.
+            let moved = (0..height)
+                .flat_map(|y| (0..width).map(move |x| (x, y)))
+                .map(|(x, y)| (at(&bent, x, y) - at(&straight, x, y)).abs())
+                .fold(0.0_f32, f32::max);
+            assert!(moved > 0.25, "{amount} changed nothing: {moved}");
+        }
+    }
+
     #[test]
     fn flipping_mirrors_exactly_and_undoes_itself() {
         for (width, height) in [(7_usize, 4_usize), (4, 7), (8, 8), (1, 5), (5, 1)] {

@@ -6602,7 +6602,14 @@ new cache entry is published."
                           (schedule-edited-preview)))
                        12 108 :fill 26 :page)))
              (push (list :chromatic-aberration-correction-p tca)
-                   controls))))
+                   controls))
+           (register-inspector
+            (lightfast:make-label
+             :parent node-page :x 12 :y 140 :width 292 :height 26
+             :label "By hand, when no profile exists")
+            12 140 :fill 26 :page)
+           (make-number-field :lens-distortion "Distortion" -0.5 0.5 0.01 172
+                              node-page)))
         (build-group
          :film
          (lambda ()

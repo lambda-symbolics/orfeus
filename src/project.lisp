@@ -113,6 +113,8 @@ frontend keep undo snapshots."
           (ignore-errors (<= -2 value 2))))
     (:lens-correction-strength
      (and (realp value) (<= 0 value 2)))
+    (:lens-distortion
+     (and (realp value) (<= -1/2 value 1/2)))
     (:white-balance-temperature
      (or (null value) (and (realp value) (plusp value))))
     ((:lens-correction-p :chromatic-aberration-correction-p)
@@ -150,6 +152,7 @@ frontend keep undo snapshots."
         (processing-settings-lens-correction-strength settings)
         :chromatic-aberration-correction-p
         (processing-settings-chromatic-aberration-correction-p settings)
+        :lens-distortion (processing-settings-lens-distortion settings)
         :lut-path (processing-settings-lut-path settings)
         :lut-strength (processing-settings-lut-strength settings)
         :grain-amount (processing-settings-grain-amount settings)
@@ -327,6 +330,8 @@ frontend keep undo snapshots."
                (:lens-correction-strength
                 (setf (processing-settings-lens-correction-strength result)
                       value))
+               (:lens-distortion
+                (setf (processing-settings-lens-distortion result) value))
                (:chromatic-aberration-correction-p
                 (setf (processing-settings-chromatic-aberration-correction-p
                        result)

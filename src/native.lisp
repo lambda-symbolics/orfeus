@@ -86,7 +86,10 @@ form by hand for each of them buried the call it guards."
   ;; The lens to correct for when the RAW container names none of its own,
   ;; which is every DNG: the description lives in a maker note the decoder
   ;; does not read, though ExifTool does.
-  (lens-name :pointer))
+  (lens-name :pointer)
+  ;; Hand-set barrel or pincushion correction, for lenses lensfun has never
+  ;; heard of. Positive straightens barrel, negative pincushion.
+  (lens-distortion :float))
 
 (defcfun ("orfeus_raw_render_capabilities_v1"
           %raw-render-capabilities-v1) :uint32)
@@ -253,7 +256,7 @@ returns at once, so a caller can spend it during startup instead."
                             lut-path lut-strength grain-amount grain-size
                             (grain-seed 0) (max-width 0) (max-height 0)
                             (jpeg-quality 92) output-format cache-p
-                            neural-noise-reduction)
+                            neural-noise-reduction (lens-distortion 0.0))
   (native-library-load)
   (native-render-require-compatible)
   (labels ((invoke (lut-pointer lens-pointer name-pointer)
@@ -302,7 +305,9 @@ returns at once, so a caller can spend it during startup instead."
                           (float (or lens-crop-factor 0.0) 0.0))
                  (setting 'lut-path lut-pointer)
                  (setting 'lens-profile-model lens-pointer)
-                 (setting 'lens-name name-pointer))
+                 (setting 'lens-name name-pointer)
+                 (setting 'lens-distortion
+                          (float (or lens-distortion 0.0) 0.0)))
                (with-foreign-pointer (error-buffer *native-error-buffer-size*)
                  (let ((status
                          #+sbcl
@@ -426,12 +431,13 @@ the straightening angle in degrees for a crop node."
 (defconstant +graph-program-magic+ #x4746524F
   "Little-endian magic of a serialized graph program, spelling ORFG.")
 
-(defconstant +graph-program-version+ 6
+(defconstant +graph-program-version+ 7
   "Serialized graph program version.
 
 2 added the curves node's luma channel; 3 made each curve channel variable
 length behind a header of four point counts; 4 added the rotate node; 5 added
-the contrast and sharpen nodes; 6 added the flip node.")
+the contrast and sharpen nodes; 6 added the flip node; 7 added
+the optics node's hand-set distortion.")
 
 (defun graph-boolean-parameter (value)
   (if value 1.0 0.0))
@@ -478,7 +484,8 @@ reaches it and there is nothing to keep alive across threads.")
        (values (list (graph-boolean-parameter (parameter :lens-correction-p))
                      (parameter :lens-correction-strength)
                      (graph-boolean-parameter
-                      (parameter :chromatic-aberration-correction-p)))
+                      (parameter :chromatic-aberration-correction-p))
+                     (float (or (parameter :lens-distortion) 0.0) 1.0))
                nil))
       (:film
        (let ((lut-path (parameter :lut-path))
