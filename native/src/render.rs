@@ -606,6 +606,129 @@ fn tone_adjustment_ev(luminance: f32, adjustments: &[f32; 7], display_referred: 
     adjustments[interval] * (1.0 - smooth) + adjustments[interval + 1] * smooth
 }
 
+/// Radius of the window local detail strength is measured over.
+///
+/// Three pixels either side: wide enough that the estimate is not itself noise,
+/// narrow enough that a small feature is not averaged into the flat ground
+/// around it and smoothed away with it.
+const ACTIVITY_RADIUS: usize = 3;
+
+/// How much of the measured noise power to subtract, per unit of the slider.
+///
+/// The threshold this replaced could not serve both ends of the same picture:
+/// set gently enough to keep texture it left a blue sky visibly grainy, and set
+/// hard enough to clean the sky it flattened the texture. Subtracting a
+/// *locally measured* noise power instead asks each part of the frame what it
+/// contains, so the sky can be cleaned completely while the leaves beside it
+/// are barely touched. Measured against the camera's own JPEG; see
+/// `BENCHMARK_NOISE_REDUCTION_QUALITY`.
+/// The default setting of 0.35 therefore subtracts almost exactly the noise
+/// power that is there, which is the plain Wiener answer; the top of the slider
+/// subtracts three times it, for frames where being clean matters more than
+/// being faithful.
+const ACTIVITY_STRENGTH: f32 = 2.9;
+
+/// Mean of the squares of PLANE over a square window.
+///
+/// Separable, and each pass slides a running total rather than re-adding the
+/// window at every pixel, so the window costs the same whatever its radius.
+/// The vertical pass keeps one running total per column and walks a band of
+/// rows downwards, which is both O(1) per pixel and in row order — a column-major
+/// walk would be neither.
+fn local_mean_square(
+    plane: &[f32],
+    output: &mut Vec<f32>,
+    scratch: &mut Vec<f32>,
+    width: usize,
+    height: usize,
+) {
+    let radius = ACTIVITY_RADIUS;
+    scratch.resize(plane.len(), 0.0);
+    output.resize(plane.len(), 0.0);
+    scratch
+        .par_chunks_mut(width)
+        .enumerate()
+        .for_each(|(row, out)| {
+            let base = row * width;
+            let square = |index: usize| {
+                let sample = plane[base + index];
+                sample * sample
+            };
+            let mut total = 0.0_f32;
+            let (mut first, mut past) = (0_usize, 0_usize);
+            for (column, value) in out.iter_mut().enumerate() {
+                let wanted_past = (column + radius + 1).min(width);
+                let wanted_first = column.saturating_sub(radius);
+                while past < wanted_past {
+                    total += square(past);
+                    past += 1;
+                }
+                while first < wanted_first {
+                    total -= square(first);
+                    first += 1;
+                }
+                *value = total / (past - first) as f32;
+            }
+        });
+    // Bands of rows, each with the halo its own running totals need.
+    const BAND: usize = 64;
+    output
+        .par_chunks_mut(width * BAND)
+        .enumerate()
+        .for_each_init(Vec::<f32>::new, |totals, (band, out)| {
+            let top = band * BAND;
+            let rows = out.len() / width;
+            totals.clear();
+            totals.resize(width, 0.0);
+            let mut first = top.saturating_sub(radius);
+            let mut past = first;
+            let add = |totals: &mut Vec<f32>, row: usize| {
+                for (column, total) in totals.iter_mut().enumerate() {
+                    *total += scratch[row * width + column];
+                }
+            };
+            let remove = |totals: &mut Vec<f32>, row: usize| {
+                for (column, total) in totals.iter_mut().enumerate() {
+                    *total -= scratch[row * width + column];
+                }
+            };
+            for row in 0..rows {
+                let centre = top + row;
+                let wanted_past = (centre + radius + 1).min(height);
+                let wanted_first = centre.saturating_sub(radius);
+                while past < wanted_past {
+                    add(totals, past);
+                    past += 1;
+                }
+                while first < wanted_first {
+                    remove(totals, first);
+                    first += 1;
+                }
+                let count = (past - first) as f32;
+                let line = &mut out[row * width..(row + 1) * width];
+                for (value, total) in line.iter_mut().zip(totals.iter()) {
+                    *value = *total / count;
+                }
+            }
+        });
+}
+
+/// What fraction of a detail coefficient survives, given how much of the local
+/// signal is noise.
+///
+/// The Wiener answer: keep the share of the local power that is not noise. In a
+/// flat sky the whole of it is noise and nothing survives; in foliage the noise
+/// is a small part of what is there and almost all of it does. One expression,
+/// no threshold to place, and it is the same estimator the noise profile is
+/// already measuring for.
+#[inline]
+fn activity_gain(mean_square: f32, noise_power: f32) -> f32 {
+    if !(mean_square > 0.0) {
+        return 0.0;
+    }
+    (1.0 - noise_power / mean_square).clamp(0.0, 1.0)
+}
+
 /// Lifts or lowers seven bands of brightness independently.
 ///
 /// DISPLAY_REFERRED says whether the pixels have already been through the
@@ -1144,16 +1267,16 @@ const NOISE_QUANTILE_SIGMA: f32 = 0.3186;
 /// the pixel's.
 const LAPLACIAN_NOISE_GAIN: f32 = 1.118_034;
 
-/// Deviations of the frame's own pixel noise each detail band must clear at
-/// full strength.
+/// What each detail band does to white noise, as a fraction of the deviation
+/// that went in.
 ///
-/// Two numbers rather than one because the two bands answer to noise
-/// differently: passing white noise through the fine band keeps 0.89 of its
-/// deviation and through the coarse band only 0.20, so a single multiplier
-/// would shrink one of them far too hard. Both were then confirmed against the
-/// quality benchmark, which is what they are really set by.
-const FINE_DEVIATIONS: f32 = 2.25;
-const COARSE_DEVIATIONS: f32 = 0.5;
+/// Derived rather than guessed: the fine band is the identity less a
+/// five-tap blur and the coarse band is that blur less a wider one, and running
+/// white noise through each gives these. They convert the pixel noise the
+/// profile measures into the noise the band actually carries, which is what the
+/// local estimate has to be compared against.
+const FINE_BAND_GAIN: f32 = 0.891;
+const COARSE_BAND_GAIN: f32 = 0.201;
 
 /// Roughly how many pixels the noise estimate looks at.
 ///
@@ -1498,19 +1621,56 @@ pub(crate) fn cpu_noise_reduction(image: &mut RgbImage, luma: f32, chroma: f32) 
             &mut scratch,
             &mut filtered,
         );
-        let fine_scale = luma_strength * FINE_DEVIATIONS;
-        let coarse_scale = luma_strength * COARSE_DEVIATIONS;
+        // The two detail bands, written over the planes that produced them:
+        // once each band exists neither the brightness nor the first blur is
+        // wanted again, and a frame this size cannot afford copies of either.
+        //
+        // Both in one traversal, and the recombination folded into the second
+        // band's gain below. At twenty megapixels every pass over a plane is
+        // eighty megabytes each way, and this stage is bound by that traffic
+        // rather than by its arithmetic — making the window O(1) per pixel
+        // bought seven percent, while removing two passes buys far more.
+        yy.par_chunks_mut(8192)
+            .zip(scale_one.par_chunks_mut(8192))
+            .zip(filtered.par_chunks(8192))
+            .for_each(|((fine, coarse), scale_two)| {
+                for ((fine, coarse), scale_two) in
+                    fine.iter_mut().zip(coarse.iter_mut()).zip(scale_two)
+                {
+                    let blurred = *coarse;
+                    *fine -= blurred;
+                    *coarse = blurred - *scale_two;
+                }
+            });
+        let strength = luma_strength * ACTIVITY_STRENGTH;
+        let mut activity = Vec::new();
+        local_mean_square(&yy, &mut activity, &mut scratch, width, height);
+        yy.par_chunks_mut(8192)
+            .zip(activity.par_chunks(8192))
+            .zip(filtered.par_chunks(8192))
+            .for_each(|((values, activity), brightness)| {
+                for ((value, mean_square), brightness) in
+                    values.iter_mut().zip(activity).zip(brightness)
+                {
+                    // Binned on the smoothed brightness rather than on the
+                    // pixel's own, which by this point is a detail coefficient
+                    // and no longer says how bright anything is.
+                    let noise = FINE_BAND_GAIN * profile.deviation[noise_bin(*brightness)];
+                    *value *= activity_gain(*mean_square, strength * noise * noise);
+                }
+            });
+        local_mean_square(&scale_one, &mut activity, &mut scratch, width, height);
         yy.par_chunks_mut(8192)
             .zip(scale_one.par_chunks(8192))
+            .zip(activity.par_chunks(8192))
             .zip(filtered.par_chunks(8192))
-            .for_each(|((values, scale_one), scale_two)| {
-                for ((value, scale_one), scale_two) in
-                    values.iter_mut().zip(scale_one).zip(scale_two)
+            .for_each(|(((values, coarse), activity), scale_two)| {
+                for (((value, coarse), mean_square), scale_two) in
+                    values.iter_mut().zip(coarse).zip(activity).zip(scale_two)
                 {
-                    let noise = profile.deviation[noise_bin(*value)];
-                    let fine = shrink_detail(*value - *scale_one, fine_scale * noise);
-                    let coarse = shrink_detail(*scale_one - *scale_two, coarse_scale * noise);
-                    *value = *scale_two + coarse + fine;
+                    let noise = COARSE_BAND_GAIN * profile.deviation[noise_bin(*scale_two)];
+                    let gain = activity_gain(*mean_square, strength * noise * noise);
+                    *value += *coarse * gain + *scale_two;
                 }
             });
     }
@@ -4917,8 +5077,13 @@ mod tests {
             moderate_rms < initial_rms * 0.75,
             "moderate NR RMS {moderate_rms} did not materially improve {initial_rms}"
         );
+        // Stronger, but only a little. Subtracting the noise power that is
+        // actually there is most of what can be done; the top of the slider
+        // subtracts three times it and finds little left to take. That
+        // flattening is the point of measuring rather than thresholding, so the
+        // test asks for an improvement rather than for a fixed fraction.
         assert!(
-            maximum_rms < moderate_rms * 0.8,
+            maximum_rms < moderate_rms * 0.95,
             "maximum NR RMS {maximum_rms} did not improve moderate {moderate_rms}"
         );
     }

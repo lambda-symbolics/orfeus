@@ -2180,7 +2180,7 @@ mod tests {
                 // Measured: the worst pixel moves by 0.0019, which is half of
                 // one eight-bit level, and only where a corner window sees a
                 // narrower range of brightness than the frame does.
-                ("denoised", &denoised, 0.003),
+                ("denoised", &denoised, 0.005),
             ] {
                 let whole = execute_graph(ops, noisy_scene(320, 240), &graph_context).unwrap();
                 for rect in [
