@@ -348,6 +348,7 @@ override semantics."
     (:lens-correction-strength
      #'orfeus:processing-settings-lens-correction-strength)
     (:chromatic-aberration-correction-p #'orfeus:processing-settings-chromatic-aberration-correction-p)
+    (:lens-distortion #'orfeus:processing-settings-lens-distortion)
     (:lut-path #'orfeus:processing-settings-lut-path)
     (:lut-strength #'orfeus:processing-settings-lut-strength)
     (:grain-amount #'orfeus:processing-settings-grain-amount)
@@ -395,6 +396,7 @@ downstream node of that stage, otherwise the stage's identity value."
     (:lens-correction-strength
      (setf (orfeus:processing-settings-lens-correction-strength settings) value))
     (:chromatic-aberration-correction-p (setf (orfeus:processing-settings-chromatic-aberration-correction-p settings) value))
+    (:lens-distortion (setf (orfeus:processing-settings-lens-distortion settings) value))
     (:lut-path (setf (orfeus:processing-settings-lut-path settings) value))
     (:lut-strength (setf (orfeus:processing-settings-lut-strength settings) value))
     (:grain-amount (setf (orfeus:processing-settings-grain-amount settings) value))

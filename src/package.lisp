@@ -174,6 +174,7 @@
    #:still-store-thumbnail-pathname
    #:processing-settings
    #:processing-settings-chromatic-aberration-correction-p
+   #:processing-settings-lens-distortion
    #:processing-settings-exposure
    #:processing-settings-grain-amount
    #:processing-settings-grain-size
