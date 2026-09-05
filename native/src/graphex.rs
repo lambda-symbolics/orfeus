@@ -21,8 +21,8 @@ use super::render::{self, DecodedRaw, LensCorrectionOptions, RgbImage};
 
 const GRAPH_MAGIC: u32 = 0x4746_524F; // "ORFG" little-endian
 // 3 made each curves channel variable length behind a count header;
-// 4 added the rotate node.
-const GRAPH_VERSION: u32 = 8;
+// 4 added the rotate node; 9 the negative node.
+const GRAPH_VERSION: u32 = 9;
 const MAX_GRAPH_NODES: usize = 64;
 
 pub const NODE_WHITE_BALANCE: u32 = 1;
@@ -39,6 +39,7 @@ pub const NODE_ROTATE: u32 = 11;
 pub const NODE_CONTRAST: u32 = 12;
 pub const NODE_SHARPEN: u32 = 13;
 pub const NODE_FLIP: u32 = 14;
+pub const NODE_NEGATIVE: u32 = 15;
 
 /// Frame-level settings shared by every node of one graph render.
 #[repr(C)]
@@ -249,6 +250,7 @@ fn param_arity(kind: u32) -> Result<ParamArity, Error> {
         NODE_CONTRAST => ParamArity::Exact(2),      // slope, pivot in display terms
         NODE_SHARPEN => ParamArity::Exact(3),       // amount, radius, noise floor
         NODE_FLIP => ParamArity::Exact(2),          // mirror across x?, across y?
+        NODE_NEGATIVE => ParamArity::Exact(5),      // film base, paper gamma, balance
         _ => return Err(Error::InvalidArgument("unknown graph node kind")),
     })
 }
@@ -472,6 +474,10 @@ fn validate_param(kind: u32, index: usize, value: f32) -> Result<(), Error> {
         (NODE_SHARPEN, 1) => (0.3..=5.0).contains(&value),
         (NODE_SHARPEN, 2) => (0.0..=8.0).contains(&value),
         (NODE_FLIP, _) => value == 0.0 || value == 1.0,
+        // Film base per channel, zero meaning measured from the frame.
+        (NODE_NEGATIVE, 0..=2) => (0.0..=4.0).contains(&value),
+        (NODE_NEGATIVE, 3) => (1.0..=4.0).contains(&value),
+        (NODE_NEGATIVE, 4) => (0.0..=1.0).contains(&value),
         // The four leading parameters are point counts, not signal levels.
         (NODE_CURVES, index) if index < CURVE_CHANNELS => {
             (MIN_CURVE_POINTS as f32..=MAX_CURVE_POINTS as f32).contains(&value)
@@ -1004,6 +1010,7 @@ fn node_stage_name(kind: u32) -> &'static str {
         NODE_CURVES => "curves\0",
         NODE_ROTATE => "turning\0",
         NODE_FLIP => "mirroring\0",
+        NODE_NEGATIVE => "inverting\0",
         NODE_CONTRAST => "contrast\0",
         NODE_SHARPEN => "sharpening\0",
         _ => "developing\0",
@@ -1046,7 +1053,10 @@ pub(crate) fn plan_viewport(ops: &[GraphOp]) -> Option<ViewportPlan> {
         .rposition(|op| {
             matches!(
                 op.kind,
-                NODE_OPTICS | NODE_CROP | NODE_ROTATE | NODE_FLIP | NODE_BLEND
+                // A negative measures its film base and its white from the
+                // whole frame, so it runs whole like the geometry does: a
+                // window of sky must not decide the black of the frame.
+                NODE_OPTICS | NODE_CROP | NODE_ROTATE | NODE_FLIP | NODE_BLEND | NODE_NEGATIVE
             )
         })
         .map_or(0, |index| index + 1);
@@ -1390,6 +1400,7 @@ fn execute_graph_into(
                     | NODE_TONE
                     | NODE_FILM
                     | NODE_COLOR_SUBTRACT
+                    | NODE_NEGATIVE
                     | NODE_CROP
                     | NODE_ROTATE
                     | NODE_FLIP
@@ -1441,6 +1452,14 @@ fn execute_graph_into(
             }
             NODE_FLIP => {
                 render::apply_flip(&mut image, op.params[0] != 0.0, op.params[1] != 0.0);
+            }
+            NODE_NEGATIVE => {
+                render::apply_negative(
+                    &mut image,
+                    [op.params[0], op.params[1], op.params[2]],
+                    op.params[3],
+                    op.params[4],
+                );
             }
             NODE_SHARPEN => {
                 // The radius is stated for the photograph, not for whichever
@@ -2557,11 +2576,13 @@ mod tests {
             NODE_EXPOSURE,
             NODE_NOISE_REDUCTION,
             NODE_COLOR_SUBTRACT,
+            NODE_NEGATIVE,
         ] {
             let params: &[f32] = match kind {
                 NODE_WHITE_BALANCE => &[0.0, 0.0],
                 NODE_EXPOSURE => &[0.5],
                 NODE_NOISE_REDUCTION => &[0.5, 0.0],
+                NODE_NEGATIVE => &[0.5, 0.3, 0.2, 2.2, 1.0],
                 _ => &[1.0, 1.0, 1.0],
             };
             assert!(

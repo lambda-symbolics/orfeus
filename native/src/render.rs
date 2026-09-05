@@ -3861,6 +3861,285 @@ pub(crate) fn apply_contrast(image: &mut RgbImage, contrast: f32, pivot: f32) {
     });
 }
 
+/// Bins of the log-spaced histograms the negative inversion measures with, and
+/// the signal they span in octaves: from far below any sensor's noise floor to
+/// a little above full scale.
+const NEGATIVE_BINS: usize = 4096;
+const NEGATIVE_LOG_FLOOR: f32 = -20.0;
+const NEGATIVE_LOG_CEILING: f32 = 4.0;
+/// Entries in each channel's inversion table, spaced on the square root of the
+/// signal so the dense end of the negative, where the positive changes fastest,
+/// is resolved finest.
+const NEGATIVE_LUT_SIZE: usize = 4096;
+/// The fraction of the film base below which a channel is taken to be reading
+/// its own noise floor rather than dye: a density of four.
+const NEGATIVE_DENSITY_FLOOR: f32 = 1.0e-4;
+/// Density above the frame's white over which the paper's toe takes over. A
+/// print runs out of paper before a negative runs out of dye, and a scan's
+/// starved blue channel runs out of photons before either; without this the
+/// last stop of a dense sky came out as speckle a hundred times brighter than
+/// the clouds beside it.
+const NEGATIVE_SHOULDER: f32 = 0.35;
+/// Share of the frame, by luminance, read as the thinnest film when no base was
+/// picked: the unexposed border when there is one, the deepest shadow otherwise.
+const NEGATIVE_BASE_SHARE: f32 = 0.005;
+/// Share of the frame, by green density, read as the brightest tones: where the
+/// white is anchored, and where the channels are made to agree.
+const NEGATIVE_WHITE_SHARE: f32 = 0.01;
+/// Below this fraction of the base in red, a pixel is not film. No colour
+/// negative's cyan layer reaches a density of one and a half; a holder's edge,
+/// a black leader or the light table's frame inside the crop does, and one such
+/// strip a percent wide was enough to anchor the white to itself and print the
+/// whole picture as night.
+const NEGATIVE_FILM_FLOOR: f32 = 0.03;
+/// How far above the frame's median density the white may be anchored. A
+/// printer integrates the frame and lets a small bright sky burn out rather than
+/// print a dark wood as night for its sake; half a density above the median is
+/// about three stops of scene, and a frame whose brightest percent lies further
+/// out than that has its white brought back to there.
+const NEGATIVE_ANCHOR_REACH: f32 = 0.5;
+
+fn negative_bin(value: f32) -> usize {
+    let log = value.max(2.0_f32.powi(NEGATIVE_LOG_FLOOR as i32)).log2();
+    let position = (log - NEGATIVE_LOG_FLOOR) / (NEGATIVE_LOG_CEILING - NEGATIVE_LOG_FLOOR);
+    ((position * (NEGATIVE_BINS - 1) as f32).round().max(0.0) as usize).min(NEGATIVE_BINS - 1)
+}
+
+fn negative_bin_value(bin: usize) -> f32 {
+    2.0_f32.powf(
+        NEGATIVE_LOG_FLOOR
+            + bin as f32 / (NEGATIVE_BINS - 1) as f32 * (NEGATIVE_LOG_CEILING - NEGATIVE_LOG_FLOOR),
+    )
+}
+
+/// The signal below which FRACTION of HISTOGRAM's counts lie.
+fn histogram_quantile(histogram: &[u32], fraction: f32) -> f32 {
+    let total: u64 = histogram.iter().map(|count| *count as u64).sum();
+    if total == 0 {
+        return 0.0;
+    }
+    let target = (total as f64 * fraction as f64) as u64;
+    let mut seen = 0_u64;
+    for (bin, count) in histogram.iter().enumerate() {
+        seen += *count as u64;
+        if seen > target {
+            return negative_bin_value(bin);
+        }
+    }
+    negative_bin_value(NEGATIVE_BINS - 1)
+}
+
+fn add_histograms(mut into: Vec<u32>, from: Vec<u32>) -> Vec<u32> {
+    for (a, b) in into.iter_mut().zip(&from) {
+        *a += *b;
+    }
+    into
+}
+
+/// What the inversion measured from the frame: the film base it divides by and
+/// the density of the brightest tones in each channel.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct NegativeMeasure {
+    pub(crate) base: [f32; 3],
+    pub(crate) white_density: [f32; 3],
+    /// The green density printed as white: the brightest tones', unless they
+    /// lie further above the frame's median than a printer would follow.
+    pub(crate) anchor: f32,
+}
+
+/// Measures the negative: the film base when PICKED gives none, and the density
+/// of the frame's brightest tones per channel.
+///
+/// Three passes of histograms rather than a sort: where the thinnest film lies,
+/// then its colour and where the densest green lies among film, then every
+/// channel over that densest green. Pixels below the film floor in red — a
+/// holder's edge inside the crop — take no part in the white.
+pub(crate) fn measure_negative(image: &RgbImage, picked: [f32; 3]) -> NegativeMeasure {
+    let pixels = image.data.as_chunks::<3>().0;
+    let luminance = |pixel: &[f32; 3]| 0.212_672_9 * pixel[0] + 0.715_152_2 * pixel[1] + 0.072_175 * pixel[2];
+    let first = pixels
+        .par_chunks(8192)
+        .fold(
+            || vec![0_u32; 4 * NEGATIVE_BINS],
+            |mut histograms, chunk| {
+                for pixel in chunk {
+                    for (channel, value) in pixel.iter().enumerate() {
+                        histograms[channel * NEGATIVE_BINS + negative_bin(*value)] += 1;
+                    }
+                    histograms[3 * NEGATIVE_BINS + negative_bin(luminance(pixel))] += 1;
+                }
+                histograms
+            },
+        )
+        .reduce(|| vec![0_u32; 4 * NEGATIVE_BINS], add_histograms);
+    let channel_histogram = |channel: usize| &first[channel * NEGATIVE_BINS..(channel + 1) * NEGATIVE_BINS];
+    let bright_luminance = histogram_quantile(channel_histogram(3), 1.0 - NEGATIVE_BASE_SHARE);
+    let picked_base = picked.iter().all(|value| *value > 0.0);
+    // Second pass: the colour of the thinnest film when no base was picked,
+    // and where the densest green lies among pixels that are film at all. The
+    // film floor is judged against the picked red, or a provisional one from
+    // the brightest red the frame holds; a hundredth of either is not film.
+    let provisional_red = if picked_base {
+        picked[0]
+    } else {
+        histogram_quantile(channel_histogram(0), 1.0 - NEGATIVE_BASE_SHARE)
+    };
+    let film_floor = provisional_red * NEGATIVE_FILM_FLOOR;
+    let second = pixels
+        .par_chunks(8192)
+        .fold(
+            || (vec![0_u32; NEGATIVE_BINS], [0.0_f64; 4]),
+            |(mut histogram, mut sums), chunk| {
+                for pixel in chunk {
+                    if luminance(pixel) >= bright_luminance {
+                        for (channel, value) in pixel.iter().enumerate() {
+                            sums[channel] += *value as f64;
+                        }
+                        sums[3] += 1.0;
+                    }
+                    if pixel[0] >= film_floor {
+                        histogram[negative_bin(pixel[1])] += 1;
+                    }
+                }
+                (histogram, sums)
+            },
+        )
+        .reduce(
+            || (vec![0_u32; NEGATIVE_BINS], [0.0_f64; 4]),
+            |(a, mut sa), (b, sb)| {
+                for (x, y) in sa.iter_mut().zip(&sb) {
+                    *x += *y;
+                }
+                (add_histograms(a, b), sa)
+            },
+        );
+    let mut base = [0.0_f32; 3];
+    for channel in 0..3 {
+        base[channel] = if picked_base {
+            picked[channel]
+        } else if second.1[3] > 0.0 {
+            (second.1[channel] / second.1[3]) as f32
+        } else {
+            histogram_quantile(channel_histogram(channel), 1.0 - NEGATIVE_BASE_SHARE)
+        }
+        .max(1.0e-6);
+    }
+    let dense_green = histogram_quantile(&second.0, NEGATIVE_WHITE_SHARE);
+    let median_green = histogram_quantile(&second.0, 0.5);
+    // Third pass: every channel over the densest green, film only, so the
+    // white is one set of pixels chosen once rather than three chosen per
+    // channel: choosing per channel let a starved blue channel's noise stand
+    // in for its white and made a cloud yellow.
+    let third = pixels
+        .par_chunks(8192)
+        .fold(
+            || vec![0_u32; 3 * NEGATIVE_BINS],
+            |mut histograms, chunk| {
+                for pixel in chunk {
+                    if pixel[0] >= film_floor && pixel[1] <= dense_green {
+                        for (channel, value) in pixel.iter().enumerate() {
+                            histograms[channel * NEGATIVE_BINS + negative_bin(*value)] += 1;
+                        }
+                    }
+                }
+                histograms
+            },
+        )
+        .reduce(|| vec![0_u32; 3 * NEGATIVE_BINS], add_histograms);
+    let mut white_density = [0.0_f32; 3];
+    for channel in 0..3 {
+        let dense = histogram_quantile(
+            &third[channel * NEGATIVE_BINS..(channel + 1) * NEGATIVE_BINS],
+            0.5,
+        )
+        .max(base[channel] * NEGATIVE_DENSITY_FLOOR);
+        white_density[channel] = (base[channel] / dense).log10().max(0.0);
+    }
+    let median_density = (base[1] / median_green.max(base[1] * NEGATIVE_DENSITY_FLOOR))
+        .log10()
+        .max(0.0);
+    let anchor = white_density[1].min(median_density + NEGATIVE_ANCHOR_REACH).max(0.05);
+    NegativeMeasure { base, white_density, anchor }
+}
+
+/// Inverts a scanned colour negative by density, the way a print does.
+///
+/// The film base, PICKED from the border or measured as the thinnest film in
+/// the frame, is divided out channel by channel — the orange mask is a density
+/// the base carries everywhere, so dividing removes it exactly where subtracting
+/// left a colour behind. What remains is dye density, and a print is ten to the
+/// power of that times the paper's GAMMA: about 0.6 for the negative's own
+/// contrast times 2.2 for the paper restores a scene with a little of the punch
+/// a print has. The frame's brightest tones anchor white at 1.0, so gamma turns
+/// the contrast about the highlights rather than sliding the exposure. With
+/// BALANCE the three channels' densities at those tones are made to agree, which
+/// is the per-channel white point a colourist sets by eye against a scope: a
+/// camera scan through the orange mask reads the blue layer with a different
+/// contrast from the red, and no single gain can neutralise both a wall and a
+/// cloud.
+///
+/// Subtracting, the previous inversion, mapped one minus the transmission,
+/// which is nearly flat over the shadows and saturates in the highlights; every
+/// stop of scene the photographer meant to keep had then to be dragged back with
+/// per-channel gains that clipped whatever they reached first.
+pub(crate) fn apply_negative(image: &mut RgbImage, picked: [f32; 3], gamma: f32, balance: f32) {
+    let measure = measure_negative(image, picked);
+    apply_negative_measured(image, &measure, gamma, balance);
+}
+
+pub(crate) fn apply_negative_measured(
+    image: &mut RgbImage,
+    measure: &NegativeMeasure,
+    gamma: f32,
+    balance: f32,
+) {
+    // The channels are brought to green's white; white itself is printed where
+    // the anchor says, which is at those tones unless they are a small bright
+    // sky over a dark frame.
+    let reference = measure.white_density[1].max(0.05);
+    let anchor = measure.anchor;
+    let mut spans = [0.0_f32; 3];
+    let mut tables: [Vec<f32>; 3] = Default::default();
+    for channel in 0..3 {
+        let base = measure.base[channel];
+        let white = measure.white_density[channel];
+        let scale = if white > 0.05 {
+            1.0 + balance * (reference / white - 1.0)
+        } else {
+            1.0
+        };
+        // Twice the base covers anything brighter than the film, which reads
+        // as below black rather than as a fold in the table.
+        spans[channel] = 2.0 * base;
+        tables[channel] = (0..NEGATIVE_LUT_SIZE)
+            .map(|index| {
+                let root = index as f32 / (NEGATIVE_LUT_SIZE - 1) as f32;
+                let signal = (root * root * spans[channel]).max(base * NEGATIVE_DENSITY_FLOOR);
+                let density = (base / signal).log10() * scale;
+                let density = if density > anchor {
+                    anchor + NEGATIVE_SHOULDER * ((density - anchor) / NEGATIVE_SHOULDER).tanh()
+                } else {
+                    density
+                };
+                10.0_f32.powf(gamma * (density - anchor))
+            })
+            .collect();
+    }
+    let last = (NEGATIVE_LUT_SIZE - 1) as f32;
+    image.data.par_chunks_mut(3 * 8192).for_each(|chunk| {
+        for pixel in chunk.as_chunks_mut::<3>().0 {
+            for channel in 0..3 {
+                let position = (pixel[channel].max(0.0) / spans[channel]).sqrt().min(1.0) * last;
+                let index = position as usize;
+                let fraction = position - index as f32;
+                let table = &tables[channel];
+                let next = (index + 1).min(NEGATIVE_LUT_SIZE - 1);
+                pixel[channel] = table[index] * (1.0 - fraction) + table[next] * fraction;
+            }
+        }
+    });
+}
+
 /// The linear ratio between the size a render works at and the whole frame's.
 ///
 /// One for an export. Anything that is measured in pixels — a blur radius, a
@@ -6796,6 +7075,162 @@ mod tests {
         options.crop_factor = 1.0;
         let described = describe_lens_match(&options).unwrap();
         assert_eq!(described.split('\t').last().unwrap(), "2.000");
+    }
+
+    /// A neutral six-stop ramp exposed onto film of contrast 0.6 behind an
+    /// orange base, then inverted by density with the reciprocal gamma.
+    fn film_ramp(base: [f32; 3], contrast: [f32; 3]) -> RgbImage {
+        let width = 512;
+        let height = 4;
+        let mut data = Vec::with_capacity(width * height * 3);
+        for _ in 0..height {
+            for x in 0..width {
+                let exposure = ramp_exposure(x, width);
+                for channel in 0..3 {
+                    data.push(base[channel] * exposure.powf(-contrast[channel]));
+                }
+            }
+        }
+        RgbImage { width, height, data }
+    }
+
+    fn ramp_exposure(x: usize, width: usize) -> f32 {
+        1.0 + 63.0 * x as f32 / (width - 1) as f32
+    }
+
+    #[test]
+    fn negative_inversion_recovers_the_scene_and_anchors_white() {
+        let base = [0.5, 0.3, 0.2];
+        let mut image = film_ramp(base, [0.6; 3]);
+        apply_negative(&mut image, base, 1.0 / 0.6, 0.0);
+        let pixel = |x: usize| &image.data[x * 3..x * 3 + 3];
+        // Scene-linear again, up to one scale, across the ramp below white.
+        let scale = pixel(64)[1] / ramp_exposure(64, 512);
+        for x in (8..480).step_by(16) {
+            let expected = scale * ramp_exposure(x, 512);
+            for channel in 0..3 {
+                let value = pixel(x)[channel];
+                assert!(
+                    (value / expected - 1.0).abs() < 0.02,
+                    "x {x} channel {channel}: {value} against {expected}"
+                );
+            }
+        }
+        // The brightest tones sit at one; the base comes out dark.
+        assert!((pixel(505)[1] - 1.0).abs() < 0.08, "{}", pixel(505)[1]);
+        assert!(pixel(0)[1] < 0.03, "{}", pixel(0)[1]);
+    }
+
+    #[test]
+    fn negative_balance_makes_unequal_layers_agree_at_white() {
+        let base = [0.5, 0.3, 0.2];
+        // The blue layer reads with nearly twice the contrast of the red.
+        let contrast = [0.55, 0.65, 1.0];
+        let mut plain = film_ramp(base, contrast);
+        apply_negative(&mut plain, base, 2.2, 0.0);
+        let mut balanced = film_ramp(base, contrast);
+        apply_negative(&mut balanced, base, 2.2, 1.0);
+        let at = |image: &RgbImage, x: usize| [image.data[x * 3], image.data[x * 3 + 1], image.data[x * 3 + 2]];
+        let bright = at(&balanced, 470);
+        assert!((bright[0] / bright[1] - 1.0).abs() < 0.05, "{bright:?}");
+        assert!((bright[2] / bright[1] - 1.0).abs() < 0.05, "{bright:?}");
+        let mid = at(&balanced, 256);
+        assert!((mid[0] / mid[1] - 1.0).abs() < 0.05, "{mid:?}");
+        assert!((mid[2] / mid[1] - 1.0).abs() < 0.05, "{mid:?}");
+        // Left alone, the layers disagree by the whole of their contrast gap.
+        let unbalanced = at(&plain, 256);
+        assert!(unbalanced[0] / unbalanced[1] < 0.8, "{unbalanced:?}");
+    }
+
+    /// A strip of the holder inside the crop is not film: it is left out of the
+    /// white, so the picture keeps the exposure the film gave it.
+    #[test]
+    fn negative_ignores_a_holder_edge_when_anchoring_white() {
+        let base = [0.5, 0.3, 0.2];
+        let mut clean = film_ramp(base, [0.6; 3]);
+        let mut framed = clean.clone();
+        // The holder: two percent of the frame, black in every channel.
+        for y in 0..framed.height {
+            for x in 0..10 {
+                let offset = (y * framed.width + x) * 3;
+                framed.data[offset..offset + 3].copy_from_slice(&[0.001, 0.0005, 0.0003]);
+            }
+        }
+        apply_negative(&mut clean, base, 2.2, 1.0);
+        apply_negative(&mut framed, base, 2.2, 1.0);
+        for x in (16..500).step_by(32) {
+            let offset = x * 3 + 1;
+            assert!(
+                (framed.data[offset] / clean.data[offset] - 1.0).abs() < 0.03,
+                "x {x}: {} against {}",
+                framed.data[offset],
+                clean.data[offset]
+            );
+        }
+        // The holder itself prints as paper white, the way a print shows it.
+        assert!(framed.data[1] > 1.0);
+    }
+
+    /// A dark wood under a small bright sky: the sky is the brightest percent,
+    /// but the white is not anchored on it alone, so the wood stays visible.
+    #[test]
+    fn negative_anchors_white_within_reach_of_the_median() {
+        let base = [0.5, 0.3, 0.2];
+        // Everything a stop or two above black, then two percent of the frame
+        // seven stops up.
+        let width = 500;
+        let height = 4;
+        let mut data = Vec::with_capacity(width * height * 3);
+        for _ in 0..height {
+            for x in 0..width {
+                let exposure = if x >= 490 { 128.0 } else { 2.0 + 2.0 * x as f32 / 489.0 };
+                for channel in 0..3 {
+                    data.push(base[channel] * exposure.powf(-0.6));
+                }
+            }
+        }
+        let mut image = RgbImage { width, height, data };
+        let measure = measure_negative(&image, base);
+        // The brightest percent is the sky; the anchor stops half a density
+        // above the median, about a stop of negative above the wood.
+        assert!(measure.white_density[1] > 1.2, "{measure:?}");
+        assert!((measure.anchor - (0.6 * 3.0_f32.log10() + 0.5)).abs() < 0.05, "{measure:?}");
+        apply_negative(&mut image, base, 2.2, 1.0);
+        let wood = image.data[250 * 3 + 1];
+        assert!(wood > 0.05 && wood < 0.3, "{wood}");
+        assert!(image.data[495 * 3 + 1] > 1.0);
+    }
+
+    #[test]
+    fn negative_finds_its_own_base_in_the_border() {
+        let base = [0.5, 0.3, 0.2];
+        let mut framed = film_ramp(base, [0.6; 3]);
+        // A border of unexposed film along one edge: two of the four rows'
+        // first sixteen pixels, well over half a percent of the frame.
+        for y in 0..2 {
+            for x in 0..16 {
+                let offset = (y * framed.width + x) * 3;
+                framed.data[offset..offset + 3].copy_from_slice(&base);
+            }
+        }
+        let measured = measure_negative(&framed, [0.0; 3]);
+        for channel in 0..3 {
+            assert!(
+                (measured.base[channel] / base[channel] - 1.0).abs() < 0.02,
+                "{:?}",
+                measured.base
+            );
+        }
+        let mut explicit = framed.clone();
+        apply_negative(&mut explicit, base, 2.2, 1.0);
+        apply_negative(&mut framed, [0.0; 3], 2.2, 1.0);
+        let worst = framed
+            .data
+            .iter()
+            .zip(&explicit.data)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(worst < 0.02, "{worst}");
     }
 
     #[test]
