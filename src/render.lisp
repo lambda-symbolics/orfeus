@@ -166,98 +166,6 @@ The output is published atomically and INPUT-PATHNAME is never modified."
                    (namestring output-pathname)))
      "metadata copy")))
 
-(defun render-native-photo (input-pathname output-pathname settings
-                            &key max-width max-height jpeg-quality grain-seed
-                              cache-p
-                              (report-input-pathname input-pathname))
-  (multiple-value-bind (lens-profile focal-reducer lens-crop-factor focal-length)
-      (photo-lens-resolution report-input-pathname
-                             (processing-settings-lens-profile settings)
-                             (processing-settings-lens-focal-length settings))
-    (labels ((invoke (effective-settings)
-               (native-raw-render
-                input-pathname output-pathname
-                :lens-name (photo-lens-name report-input-pathname)
-                :lens-focal-length focal-length
-              :cache-p cache-p
-              :output-format (render-output-format output-pathname)
-              :exposure (processing-settings-exposure effective-settings)
-              :kelvin
-              (processing-settings-white-balance-temperature effective-settings)
-              :tint (processing-settings-white-balance-tint effective-settings)
-              :noise-reduction
-              (processing-settings-noise-reduction effective-settings)
-              :neural-noise-reduction
-              (processing-settings-neural-noise-reduction effective-settings)
-              :tone-blacks (processing-settings-tone-blacks effective-settings)
-              :tone-shadows (processing-settings-tone-shadows effective-settings)
-              :tone-dark-mids
-              (processing-settings-tone-dark-mids effective-settings)
-              :tone-midtones (processing-settings-tone-midtones effective-settings)
-              :tone-light-mids
-              (processing-settings-tone-light-mids effective-settings)
-              :tone-highlights
-              (processing-settings-tone-highlights effective-settings)
-              :tone-whites (processing-settings-tone-whites effective-settings)
-                :lens-correction-p
-                (processing-settings-lens-correction-p effective-settings)
-                :lens-correction-strength
-                (processing-settings-lens-correction-strength effective-settings)
-                :lens-distortion
-                (processing-settings-lens-distortion effective-settings)
-                :lens-profile-model lens-profile
-                :focal-reducer focal-reducer
-                :lens-crop-factor lens-crop-factor
-                :chromatic-aberration-correction-p
-              (processing-settings-chromatic-aberration-correction-p
-               effective-settings)
-              :chromatic-aberration-source
-              (processing-settings-chromatic-aberration-source effective-settings)
-              :lut-path (processing-settings-lut-path effective-settings)
-              :lut-strength (processing-settings-lut-strength effective-settings)
-              :grain-amount (processing-settings-grain-amount effective-settings)
-              :grain-size (processing-settings-grain-size effective-settings)
-              :grain-seed grain-seed
-              :max-width max-width
-              :max-height max-height
-              :jpeg-quality jpeg-quality)))
-    (flet ((without-profile (settings)
-             ;; Only what the profile drives: fringing measured from the frame
-             ;; needs no profile and stays.
-             (let ((fallback (copy-processing-settings settings)))
-               (setf (processing-settings-lens-correction-p fallback) nil)
-               (when (eq :profile
-                         (processing-settings-chromatic-aberration-source fallback))
-                 (setf (processing-settings-chromatic-aberration-correction-p
-                        fallback)
-                       nil))
-               fallback))
-           (needs-profile-p (settings)
-             (or (processing-settings-lens-correction-p settings)
-                 (and (processing-settings-chromatic-aberration-correction-p
-                       settings)
-                      (eq :profile
-                          (processing-settings-chromatic-aberration-source
-                           settings))))))
-      (let ((settings
-              (if (and (needs-profile-p settings)
-                       (not (photo-lens-profile-known-p
-                             report-input-pathname
-                             (processing-settings-lens-profile settings)
-                             (processing-settings-lens-focal-length settings))))
-                  (without-profile settings)
-                  settings)))
-        (handler-case
-            (invoke settings)
-          (raw-render-error (condition)
-            (if (and (= 9 (raw-render-error-status condition))
-                     (needs-profile-p settings))
-                (progn
-                  (warn-lens-profile-once report-input-pathname
-                                          (raw-render-error-message condition))
-                  (invoke (without-profile settings)))
-                (error condition)))))))))
-
 (defun graph-optics-overrides (graph)
   "Return the profile and focal length GRAPH's optics node chose by hand.
 
@@ -471,14 +379,13 @@ passes one that runs it while the next photograph renders: the metadata copy is
 an ExifTool process that takes most of a second on one core while the render
 has every other core busy, and the two have nothing to say to each other."
   (check-type settings (or null processing-settings))
-  ;; A viewport is only implemented on the graph path, and the graph path
-  ;; renders the same picture — the interface already develops every project
-  ;; photograph through it. Converting here rather than at the call site keeps
-  ;; the rule where the reason for it is, and keeps a caller from asking for a
-  ;; window and silently getting a whole frame back: that mismatch is worse
-  ;; than either answer, because the caller then draws a frame as though it were
-  ;; the part of one it asked for.
-  (when (and viewport (null graph) settings)
+  ;; Every render goes through the graph. Flat settings used to take an older
+  ;; native path of their own that rendered the same picture — measured, byte
+  ;; for byte — until sharpening joined the pipeline as a stage the old path
+  ;; had no room for. Converting here keeps one renderer for both frontends,
+  ;; and a viewport, which only the graph path understands, cannot be asked for
+  ;; and silently answered with a whole frame.
+  (when (and (null graph) settings)
     (setf graph (settings->graph settings)
           settings nil))
   (check-type graph (or null processing-graph))
@@ -523,29 +430,17 @@ has every other core busy, and the two have nothing to say to each other."
                (call-with-render-source
                 input-pathname
                 (lambda (render-input-pathname)
-                  (if graph
-                    (render-native-photo-graph
-                     render-input-pathname temporary graph
-                     :report-input-pathname input-pathname
-                     :grain-seed grain-seed
-                     :max-width (or max-width 0)
-                     :max-height (or max-height 0)
-                     :jpeg-quality jpeg-quality
-                     :cache-p cache-p
-                     ;; Only the graph path can draft; a photograph still on
-                     ;; flat settings goes through the older settings struct,
-                     ;; which has no room to ask.
-                     :draft-p draft-p
-                     :viewport viewport
-                     :progress progress)
-                    (render-native-photo
-                     render-input-pathname temporary settings
-                     :report-input-pathname input-pathname
-                     :grain-seed grain-seed
-                     :max-width (or max-width 0)
-                     :max-height (or max-height 0)
-                     :jpeg-quality jpeg-quality
-                     :cache-p cache-p))))
+                  (render-native-photo-graph
+                   render-input-pathname temporary graph
+                   :report-input-pathname input-pathname
+                   :grain-seed grain-seed
+                   :max-width (or max-width 0)
+                   :max-height (or max-height 0)
+                   :jpeg-quality jpeg-quality
+                   :cache-p cache-p
+                   :draft-p draft-p
+                   :viewport viewport
+                   :progress progress)))
                (setf rendered t))
           ;; A render that did not finish leaves nothing behind; one that did
           ;; hands its temporary to FINISH, which cleans up after itself.

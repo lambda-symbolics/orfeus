@@ -183,6 +183,9 @@
    #:processing-settings
    #:processing-settings-chromatic-aberration-correction-p
    #:processing-settings-chromatic-aberration-source
+   #:processing-settings-sharpen-amount
+   #:processing-settings-sharpen-radius
+   #:processing-settings-sharpen-threshold
    #:processing-settings-lens-distortion
    #:processing-settings-lens-profile
    #:processing-settings-lens-focal-length

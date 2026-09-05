@@ -11,6 +11,7 @@
 (defparameter *processing-setting-keys*
   '(:exposure :white-balance-temperature :white-balance-tint
     :noise-reduction :neural-noise-reduction
+    :sharpen-amount :sharpen-radius :sharpen-threshold
     :tone-blacks :tone-shadows :tone-dark-mids
     :tone-midtones :tone-light-mids :tone-highlights :tone-whites
     :lens-correction-p :lens-correction-strength
@@ -24,8 +25,22 @@
   (exposure 0.0)
   (white-balance-temperature nil)
   (white-balance-tint 0.0)
-  (noise-reduction 0.35)
+  ;; Set together with the sharpening below, against the camera's own JPEG on
+  ;; one flat patch of sky at the camera's preview size: at 0.35 the sharpened
+  ;; default matched the camera's noise there to within two percent, at 0.45 it
+  ;; sits about thirty percent under it in the finest band while the textured
+  ;; parts of the frame keep all but a quarter of a percent of their detail.
+  (noise-reduction 0.45)
   (neural-noise-reduction 0.0)
+  ;; Sharpening by default, by as much as the camera does. Calibrated against
+  ;; the OM-1's own JPEG (Sharpness at Soft, which is how these frames were
+  ;; shot): the spectral gain the camera adds over an unsharpened render, read
+  ;; on textured patches, is matched to within a few percent by an unsharp
+  ;; mask of this amount and radius; see `sharpen-compare` in the session notes.
+  ;; The radius is in pixels of the full frame and scales with a preview.
+  (sharpen-amount 0.5)
+  (sharpen-radius 1.5)
+  (sharpen-threshold 2.0)
   (tone-blacks 0.0)
   (tone-shadows 0.0)
   (tone-dark-mids 0.0)
@@ -59,6 +74,7 @@
   '((:white-balance (:white-balance-temperature :white-balance-tint))
     (:exposure (:exposure))
     (:noise-reduction (:noise-reduction :neural-noise-reduction))
+    (:sharpen (:sharpen-amount :sharpen-radius :sharpen-threshold))
     (:tone (:tone-blacks :tone-shadows :tone-dark-mids :tone-midtones
             :tone-light-mids :tone-highlights :tone-whites))
     (:optics (:lens-correction-p :lens-correction-strength
@@ -73,6 +89,7 @@ them as a copyable node chain.")
   '(:white-balance-temperature nil :white-balance-tint 0.0
     :exposure 0.0
     :noise-reduction 0.0 :neural-noise-reduction 0.0
+    :sharpen-amount 0.0 :sharpen-radius 1.5 :sharpen-threshold 2.0
     :tone-blacks 0.0 :tone-shadows 0.0 :tone-dark-mids 0.0 :tone-midtones 0.0
     :tone-light-mids 0.0 :tone-highlights 0.0 :tone-whites 0.0
     :lens-correction-p nil :lens-correction-strength 1.0
@@ -109,7 +126,7 @@ them as a copyable node chain.")
   "Rotation amounts a rotate node offers, as quarter turns clockwise.")
 
 (defparameter *graph-only-node-kinds*
-  '(:blend :color-subtract :contrast :sharpen :crop :rotate :flip :curves)
+  '(:blend :color-subtract :contrast :crop :rotate :flip :curves)
   "Node kinds that exist only in graphs, beyond the flat pipeline stages.
 
 :COLOR-SUBTRACT computes picked-color minus pixel per channel in scene-linear
@@ -131,10 +148,6 @@ and no amount of turning fixes a mirror.")
 
 (defparameter *contrast-keys* '(:contrast :pivot)
   "Parameters of a contrast node: the slope, and the tone it turns about.")
-
-(defparameter *sharpen-keys* '(:amount :radius :threshold)
-  "Parameters of a sharpen node: how much detail to add back, over what radius,
-and how many deviations of the frame's own noise to leave behind.")
 
 (defparameter *color-subtract-keys* '(:red :green :blue))
 

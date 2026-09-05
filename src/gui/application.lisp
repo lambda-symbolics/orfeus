@@ -624,7 +624,7 @@ channel carries anywhere from its two endpoints to a full film-stock shape."
     (:contrast (/= 1.0 (getf (orfeus:graph-node-params node) :contrast 1.0)))
     (:flip (let ((params (orfeus:graph-node-params node)))
              (or (getf params :horizontal) (getf params :vertical))))
-    (:sharpen (plusp (getf (orfeus:graph-node-params node) :amount 0.0)))
+    (:sharpen (plusp (getf (orfeus:graph-node-params node) :sharpen-amount 0.0)))
     (:crop (let ((params (orfeus:graph-node-params node)))
              (or (plusp (getf params :left 0.0))
                  (plusp (getf params :top 0.0))
@@ -3285,7 +3285,7 @@ new cache entry is published."
                  (when crop-aspect-input
                    (setf (lightfast:value crop-aspect-input)
                          (or (crop-aspect-label crop-aspect) "Free"))))
-               (when (and node (member kind '(:contrast :sharpen)))
+               (when (and node (eq kind :contrast))
                  (let ((params (orfeus:graph-node-params node)))
                    (dolist (entry node-param-controls)
                      (destructuring-bind (key widget default) entry
@@ -7170,14 +7170,14 @@ new cache entry is published."
            (register-inspector
             (lightfast:make-label :parent node-page :x 12 :y 44
                                   :width 292 :height 26
-                                  :label "Unsharp mask on brightness")
+                                  :label "Unsharp mask on brightness, halos held in")
             12 44 :fill 26 :page)
-           (make-node-number-field :amount "Amount" 0.0 3.0 0.05 0.0 76
-                                   node-page)
-           (make-node-number-field :radius "Radius (px)" 0.3 5.0 0.1 1.0 108
-                                   node-page)
-           (make-node-number-field :threshold "Noise floor" 0.0 8.0 0.25 2.0 140
-                                   node-page)))
+           (make-number-field :sharpen-amount "Amount" 0.0 3.0 0.05 76
+                              node-page)
+           (make-number-field :sharpen-radius "Radius (px)" 0.3 5.0 0.1 108
+                              node-page)
+           (make-number-field :sharpen-threshold "Noise floor" 0.0 8.0 0.25 140
+                              node-page)))
         (build-group
          :color-subtract
          (lambda ()

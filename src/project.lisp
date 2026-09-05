@@ -107,6 +107,12 @@ frontend keep undo snapshots."
      (realp value))
     (:neural-noise-reduction
      (and (realp value) (<= 0 value 1)))
+    (:sharpen-amount
+     (and (realp value) (<= 0 value 3)))
+    (:sharpen-radius
+     (and (realp value) (<= 3/10 value 5)))
+    (:sharpen-threshold
+     (and (realp value) (<= 0 value 8)))
     ((:tone-blacks :tone-shadows :tone-dark-mids :tone-midtones
       :tone-light-mids :tone-highlights :tone-whites)
      (and (realp value)
@@ -146,6 +152,9 @@ frontend keep undo snapshots."
         :noise-reduction (processing-settings-noise-reduction settings)
         :neural-noise-reduction
         (processing-settings-neural-noise-reduction settings)
+        :sharpen-amount (processing-settings-sharpen-amount settings)
+        :sharpen-radius (processing-settings-sharpen-radius settings)
+        :sharpen-threshold (processing-settings-sharpen-threshold settings)
         :tone-blacks (processing-settings-tone-blacks settings)
         :tone-shadows (processing-settings-tone-shadows settings)
         :tone-dark-mids (processing-settings-tone-dark-mids settings)
@@ -321,6 +330,12 @@ frontend keep undo snapshots."
                 (setf (processing-settings-noise-reduction result) value))
                (:neural-noise-reduction
                 (setf (processing-settings-neural-noise-reduction result) value))
+               (:sharpen-amount
+                (setf (processing-settings-sharpen-amount result) value))
+               (:sharpen-radius
+                (setf (processing-settings-sharpen-radius result) value))
+               (:sharpen-threshold
+                (setf (processing-settings-sharpen-threshold result) value))
                (:tone-blacks
                 (setf (processing-settings-tone-blacks result) value))
                (:tone-shadows
@@ -389,6 +404,9 @@ frontend keep undo snapshots."
     (:grain-size (let ((amount (getf plist :grain-amount)))
                    (or (null amount) (not (plusp amount)))))
     (:lens-correction-strength (not (getf plist :lens-correction-p)))
+    ((:sharpen-radius :sharpen-threshold)
+     (let ((amount (getf plist :sharpen-amount)))
+       (or (null amount) (not (plusp amount)))))
     (t nil)))
 
 (defun settings-grade-plist (settings &optional (stages (grade-stages)))

@@ -500,13 +500,43 @@ the failure list, and both ON-ERROR modes without needing real RAW files."
                                              :lut-strength 0.0))
          (graph (settings->graph settings '(:noise-reduction)))
          (nodes (processing-graph-nodes graph)))
-    (and (= 2 (length nodes))
-         (eq :exposure (graph-node-kind (first nodes)))
-         (eq :noise-reduction (graph-node-kind (second nodes)))
+    ;; Exposure, the bypassed noise reduction, and the sharpening every
+    ;; photograph gets by default, in pipeline order.
+    (and (= 3 (length nodes))
+         (equal '(:exposure :noise-reduction :sharpen)
+                (mapcar #'graph-node-kind nodes))
          (graph-node-bypassed-p (second nodes))
          (not (graph-node-bypassed-p (first nodes)))
          ;; The bypassed node drops out of the effective plan.
-         (= 1 (length (graph-effective-nodes graph))))))
+         (= 2 (length (graph-effective-nodes graph))))))
+
+(defun default-settings-sharpen-like-the-camera-p ()
+  "Untouched settings sharpen by the calibrated amount, after noise reduction."
+  (let* ((graph (settings->graph (make-processing-settings)))
+         (kinds (mapcar #'graph-node-kind (processing-graph-nodes graph)))
+         (sharpen (find :sharpen (processing-graph-nodes graph)
+                        :key #'graph-node-kind)))
+    (and (equal '(:optics :noise-reduction :sharpen) kinds)
+         (equal '(0.5 1.5 2.0)
+                (orfeus::graph-node-program-parameters sharpen))
+         ;; Turned off, the stage leaves the graph.
+         (equal '(:optics :noise-reduction)
+                (mapcar #'graph-node-kind
+                        (processing-graph-nodes
+                         (settings->graph
+                          (make-processing-settings :sharpen-amount 0.0))))))))
+
+(defun legacy-sharpen-parameters-read-back-p ()
+  "Sharpen nodes saved under the graph-only parameter names still read."
+  (let ((node (orfeus::sexp->graph-node
+               '(:id 3 :kind :sharpen :inputs (2)
+                 :params (:amount 1.0 :radius 0.8 :threshold 3.0)
+                 :kind-states ((:sharpen :params (:amount 0.5)))))))
+    (and (equal '(:sharpen-amount 1.0 :sharpen-radius 0.8 :sharpen-threshold 3.0)
+                (graph-node-params node))
+         (equal '(:sharpen-amount 0.5)
+                (getf (rest (assoc :sharpen (orfeus::graph-node-kind-states node)))
+                      :params)))))
 
 (defun graph-editing-p ()
   (let ((graph (graph-validate
@@ -1843,6 +1873,10 @@ neither way."
              (graph-validation-rejects-p))
       (check "settings convert to equivalent linear graphs"
              (settings-graph-conversion-p))
+      (check "untouched settings sharpen like the camera, after noise reduction"
+             (default-settings-sharpen-like-the-camera-p))
+      (check "sharpen nodes saved under their old parameter names read back"
+             (legacy-sharpen-parameters-read-back-p))
       (check "graph editing inserts, reorders, deletes, and blends"
              (graph-editing-p))
       (check "nodes splice anywhere and invalid wires roll back"

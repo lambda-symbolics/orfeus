@@ -346,6 +346,9 @@ override semantics."
     (:white-balance-tint #'orfeus:processing-settings-white-balance-tint)
     (:noise-reduction #'orfeus:processing-settings-noise-reduction)
     (:neural-noise-reduction #'orfeus:processing-settings-neural-noise-reduction)
+    (:sharpen-amount #'orfeus:processing-settings-sharpen-amount)
+    (:sharpen-radius #'orfeus:processing-settings-sharpen-radius)
+    (:sharpen-threshold #'orfeus:processing-settings-sharpen-threshold)
     (:tone-blacks #'orfeus:processing-settings-tone-blacks)
     (:tone-shadows #'orfeus:processing-settings-tone-shadows)
     (:tone-dark-mids #'orfeus:processing-settings-tone-dark-mids)
@@ -398,6 +401,10 @@ downstream node of that stage, otherwise the stage's identity value."
     (:noise-reduction (setf (orfeus:processing-settings-noise-reduction settings) value))
     (:neural-noise-reduction
      (setf (orfeus:processing-settings-neural-noise-reduction settings) value))
+    (:sharpen-amount (setf (orfeus:processing-settings-sharpen-amount settings) value))
+    (:sharpen-radius (setf (orfeus:processing-settings-sharpen-radius settings) value))
+    (:sharpen-threshold
+     (setf (orfeus:processing-settings-sharpen-threshold settings) value))
     (:tone-blacks (setf (orfeus:processing-settings-tone-blacks settings) value))
     (:tone-shadows (setf (orfeus:processing-settings-tone-shadows settings) value))
     (:tone-dark-mids (setf (orfeus:processing-settings-tone-dark-mids settings) value))

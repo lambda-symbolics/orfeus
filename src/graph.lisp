@@ -46,19 +46,17 @@
       (graph-invalid params "contrast pivot must be within 0.05..0.95")))
   params)
 
-(defun sharpen-params-validate (params)
-  (unless (and (listp params) (plist-known-keys-p params *sharpen-keys*))
-    (graph-invalid params "expected :amount :radius :threshold parameters"))
-  (let ((amount (getf params :amount 0.0))
-        (radius (getf params :radius 1.0))
-        (threshold (getf params :threshold 2.0)))
-    (unless (and (realp amount) (<= 0 amount 3))
-      (graph-invalid params "sharpen amount must be within 0..3"))
-    (unless (and (realp radius) (<= 3/10 radius 5))
-      (graph-invalid params "sharpen radius must be within 0.3..5 pixels"))
-    (unless (and (realp threshold) (<= 0 threshold 8))
-      (graph-invalid params "sharpen threshold must be within 0..8 deviations")))
-  params)
+(defparameter *legacy-sharpen-keys*
+  '((:amount . :sharpen-amount) (:radius . :sharpen-radius)
+    (:threshold . :sharpen-threshold))
+  "The names a sharpen node's parameters carried while sharpening was a graph-only
+correction, mapped to the setting keys they became when it joined the pipeline.")
+
+(defun modernize-sharpen-params (params)
+  "Rename a sharpen node's parameters from their graph-only names, if they carry them."
+  (loop for (key value) on params by #'cddr
+        collect (or (rest (assoc key *legacy-sharpen-keys*)) key)
+        collect value))
 
 (defun curve-points-validate (points key)
   (unless (and (listp points)
@@ -205,7 +203,6 @@ whose frame has already moved, whichever of the two moved it."
     ((eq kind :flip) (flip-params-validate params))
     ((eq kind :curves) (curves-params-validate params))
     ((eq kind :contrast) (contrast-params-validate params))
-    ((eq kind :sharpen) (sharpen-params-validate params))
     ((graph-filter-kind-p kind)
      (graph-node-params-validate
       (make-graph-node :kind kind :params params)))
@@ -312,7 +309,7 @@ while blends stay scene-linear."
            (ecase kind
              (:curves (curves-params-validate (graph-node-params node)))
              (:contrast (contrast-params-validate (graph-node-params node)))
-             (:sharpen (sharpen-params-validate (graph-node-params node))))
+             (:sharpen (graph-node-params-validate node)))
            (when (member (first inputs) display)
              (push id display)))
           ((eq kind :node)
@@ -415,14 +412,26 @@ while blends stay scene-linear."
     ;; error from MAKE-GRAPH-NODE instead of naming the malformed data.
     (unless (and (integerp id) (plusp id))
       (graph-invalid sexp "node id ~S must be a positive integer" id))
-    (make-graph-node :id id
-                     :kind (getf sexp :kind)
-                     :params (getf sexp :params '())
-                     :opacity (getf sexp :opacity 1.0)
-                     :inputs (getf sexp :inputs '())
-                     :bypassed-p (and (getf sexp :bypassed-p) t)
-                     :position (when position (copy-list position))
-                     :kind-states (copy-tree (getf sexp :kind-states '())))))
+    (let ((kind (getf sexp :kind))
+          (params (getf sexp :params '()))
+          (states (copy-tree (getf sexp :kind-states '()))))
+      ;; Sharpen nodes saved while sharpening was graph-only named their
+      ;; parameters differently; they read back under the pipeline's names.
+      (when (and (eq kind :sharpen) (listp params))
+        (setf params (modernize-sharpen-params params)))
+      (dolist (state states)
+        (when (and (consp state) (eq :sharpen (first state)))
+          (let ((tail (member :params (rest state))))
+            (when (and tail (listp (second tail)))
+              (setf (second tail) (modernize-sharpen-params (second tail)))))))
+      (make-graph-node :id id
+                       :kind kind
+                       :params params
+                       :opacity (getf sexp :opacity 1.0)
+                       :inputs (getf sexp :inputs '())
+                       :bypassed-p (and (getf sexp :bypassed-p) t)
+                       :position (when position (copy-list position))
+                       :kind-states states))))
 
 (defun sexp->graph (sexp)
   "Validate and convert a graph S-expression into a PROCESSING-GRAPH."
@@ -435,7 +444,7 @@ while blends stay scene-linear."
     :output (getf sexp :output *graph-source-id*))))
 
 (defparameter *flat-pipeline-stage-order*
-  '(:white-balance :exposure :optics :noise-reduction :tone :film)
+  '(:white-balance :exposure :optics :noise-reduction :sharpen :tone :film)
   "The order the flat pipeline actually executes its stages in.
 Graph conversion must chain nodes this way — notably optics before noise
 reduction — so a converted photograph renders identically.")

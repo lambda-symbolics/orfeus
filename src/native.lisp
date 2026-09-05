@@ -53,67 +53,8 @@ form by hand for each of them buried the call it guards."
            (let ((,pointer (null-pointer)))
              ,@body)))))
 
-(defcstruct render-settings-v1
-  (struct-size :uint32)
-  (version :uint32)
-  (flags :uint32)
-  (output-format :uint32)
-  (kelvin :float)
-  (tint :float)
-  (exposure-ev :float)
-  (chroma-noise-reduction :float)
-  (luma-noise-reduction :float)
-  (tone-blacks :float)
-  (tone-shadows :float)
-  (tone-dark-mids :float)
-  (tone-midtones :float)
-  (tone-light-mids :float)
-  (tone-highlights :float)
-  (tone-whites :float)
-  (lut-strength :float)
-  (grain-amount :float)
-  (grain-size :float)
-  (grain-seed :uint64)
-  (max-width :uint32)
-  (max-height :uint32)
-  (jpeg-quality :uint32)
-  (lens-correction-strength :float)
-  (focal-reducer :float)
-  (lens-crop-factor :float)
-  (lut-path :pointer)
-  (lens-profile-model :pointer)
-  (neural-noise-reduction :float)
-  ;; The lens to correct for when the RAW container names none of its own,
-  ;; which is every DNG: the description lives in a maker note the decoder
-  ;; does not read, though ExifTool does.
-  (lens-name :pointer)
-  ;; Hand-set barrel or pincushion correction, for lenses lensfun has never
-  ;; heard of. Positive straightens barrel, negative pincushion.
-  (lens-distortion :float)
-  ;; The focal length to read the profile at when the photograph records none,
-  ;; in millimetres; zero defers to the file.
-  (focal-length :float)
-  ;; Where colour fringing is corrected from when the flag asks for it:
-  ;; 0 measures the frame, 1 reads the lens profile.
-  (chromatic-aberration-source :uint32))
-
 (defcfun ("orfeus_raw_render_capabilities_v1"
           %raw-render-capabilities-v1) :uint32)
-
-(defcfun ("orfeus_raw_render_v1" %raw-render-v1) :int32
-  (input-path :string)
-  (output-path :string)
-  (settings (:pointer (:struct render-settings-v1)))
-  (error-buffer :pointer)
-  (error-capacity :size))
-
-(defcfun ("orfeus_raw_render_v2" %raw-render-v2) :int32
-  (input-path :string)
-  (output-path :string)
-  (settings (:pointer (:struct render-settings-v1)))
-  (cache-mode :uint32)
-  (error-buffer :pointer)
-  (error-capacity :size))
 
 (defcstruct render-frame-v1
   (struct-size :uint32)
@@ -253,107 +194,6 @@ returns at once, so a caller can spend it during startup instead."
              :message (format nil "capabilities 0x~X lack required mask 0x~X"
                               capabilities *required-render-capabilities*)))
     capabilities))
-
-(defun native-raw-render (input-pathname output-pathname
-                          &key exposure kelvin tint noise-reduction
-                            tone-blacks tone-shadows tone-dark-mids tone-midtones
-                            tone-light-mids tone-highlights tone-whites
-                            lens-correction-p lens-correction-strength
-                            chromatic-aberration-correction-p
-                            lens-profile-model lens-name
-                            focal-reducer lens-crop-factor
-                            lut-path lut-strength grain-amount grain-size
-                            (grain-seed 0) (max-width 0) (max-height 0)
-                            (jpeg-quality 92) output-format cache-p
-                            neural-noise-reduction (lens-distortion 0.0)
-                            lens-focal-length
-                            (chromatic-aberration-source :measured))
-  (native-library-load)
-  (native-render-require-compatible)
-  (labels ((invoke (lut-pointer lens-pointer name-pointer)
-             (with-foreign-object (settings '(:struct render-settings-v1))
-               (flet ((setting (name value)
-                        (setf (foreign-slot-value
-                               settings '(:struct render-settings-v1) name)
-                              value)))
-                 (setting 'struct-size
-                          (foreign-type-size '(:struct render-settings-v1)))
-                 (setting 'version 3)
-                 (setting 'flags
-                          (logior (if lens-correction-p 1 0)
-                                  (if chromatic-aberration-correction-p 2 0)))
-                 (setting 'output-format (ecase output-format
-                                           (:jpeg 1)
-                                           (:tiff 2)))
-                 (setting 'kelvin (float (or kelvin 0.0) 0.0))
-                 (setting 'tint (float tint 0.0))
-                 (setting 'exposure-ev (float exposure 0.0))
-                 (setting 'chroma-noise-reduction
-                          (float noise-reduction 0.0))
-                 (setting 'luma-noise-reduction
-                          (float noise-reduction 0.0))
-                 (setting 'neural-noise-reduction
-                          (float (or neural-noise-reduction 0.0) 0.0))
-                 (setting 'tone-blacks (float tone-blacks 0.0))
-                 (setting 'tone-shadows (float tone-shadows 0.0))
-                 (setting 'tone-dark-mids (float tone-dark-mids 0.0))
-                 (setting 'tone-midtones (float tone-midtones 0.0))
-                 (setting 'tone-light-mids (float tone-light-mids 0.0))
-                 (setting 'tone-highlights (float tone-highlights 0.0))
-                 (setting 'tone-whites (float tone-whites 0.0))
-                 (setting 'lut-strength
-                          (float (if lut-path lut-strength 0.0) 0.0))
-                 (setting 'grain-amount (float grain-amount 0.0))
-                 (setting 'grain-size (float grain-size 0.0))
-                 (setting 'grain-seed grain-seed)
-                 (setting 'max-width max-width)
-                 (setting 'max-height max-height)
-                 (setting 'jpeg-quality jpeg-quality)
-                 (setting 'lens-correction-strength
-                          (float lens-correction-strength 0.0))
-                 (setting 'focal-reducer (float (or focal-reducer 1.0) 0.0))
-                 (setting 'lens-crop-factor
-                          (float (or lens-crop-factor 0.0) 0.0))
-                 (setting 'lut-path lut-pointer)
-                 (setting 'lens-profile-model lens-pointer)
-                 (setting 'lens-name name-pointer)
-                 (setting 'lens-distortion
-                          (float (or lens-distortion 0.0) 0.0))
-                 (setting 'focal-length
-                          (float (or lens-focal-length 0.0) 0.0))
-                 (setting 'chromatic-aberration-source
-                          (if (eq chromatic-aberration-source :profile) 1 0)))
-               (with-foreign-pointer (error-buffer *native-error-buffer-size*)
-                 (let ((status
-                         #+sbcl
-                         (sb-int:with-float-traps-masked
-                             (:invalid :divide-by-zero :overflow
-                              :underflow :inexact)
-                           (%raw-render-v2
-                            (namestring input-pathname)
-                            (namestring output-pathname)
-                            settings (if cache-p 1 0) error-buffer
-                            *native-error-buffer-size*))
-                         #-sbcl
-                         (%raw-render-v2
-                          (namestring input-pathname)
-                          (namestring output-pathname)
-                          settings (if cache-p 1 0) error-buffer
-                          *native-error-buffer-size*)))
-                   (unless (zerop status)
-                     (error 'raw-render-error
-                            :input-pathname input-pathname
-                            :output-pathname output-pathname
-                            :status status
-                            :message (native-error-message error-buffer)))))))
-           (call-with-lens-pointer (lut-pointer)
-             (with-optional-foreign-string (lens-pointer lens-profile-model)
-               (with-optional-foreign-string (name-pointer lens-name)
-                 (invoke lut-pointer lens-pointer name-pointer)))))
-    (with-optional-foreign-string (lut-pointer (and lut-path
-                                                    (namestring lut-path)))
-      (call-with-lens-pointer lut-pointer)))
-  output-pathname)
 
 (defcfun ("orfeus_analyze_negative_frame_v1" %analyze-negative-frame-v1) :int32
   (input-path :string)
@@ -546,9 +386,15 @@ reaches it and there is nothing to keep alive across threads.")
                  nil)))
       (:sharpen
        (let ((params (graph-node-params node)))
-         (values (list (float (getf params :amount 0.0) 1.0)
-                       (float (getf params :radius 1.0) 1.0)
-                       (float (getf params :threshold 2.0) 1.0))
+         (values (list (float (or (getf params :sharpen-amount)
+                                  (getf *stage-identity-plist* :sharpen-amount))
+                              1.0)
+                       (float (or (getf params :sharpen-radius)
+                                  (getf *stage-identity-plist* :sharpen-radius))
+                              1.0)
+                       (float (or (getf params :sharpen-threshold)
+                                  (getf *stage-identity-plist* :sharpen-threshold))
+                              1.0))
                  nil)))
       (:curves
        ;; Four point counts, then the points themselves. Channels are variable
