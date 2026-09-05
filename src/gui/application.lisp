@@ -862,6 +862,25 @@ corner correction land on the sensor's corner at four times its strength."
                                                           :focal-length focal-length)))
     (or (and match (getf match :crop-factor)) 2.0)))
 
+(defun place-dialog-over (dialog owner)
+  "Put DIALOG over the middle of OWNER, the window that asked for it.
+
+Left where the toolkit put it, a dialog opened at the screen's corner, a screen
+away from the button that called it. Before the dialog is shown, so that it
+appears there rather than jumps there."
+  (lightfast:refresh-geometry owner)
+  (lightfast:refresh-geometry dialog)
+  (lightfast:resize-widget
+   dialog
+   :x (max 0 (+ (lightfast:widget-x owner)
+                (floor (- (lightfast:widget-width owner)
+                          (lightfast:widget-width dialog))
+                       2)))
+   :y (max 0 (+ (lightfast:widget-y owner)
+                (floor (- (lightfast:widget-height owner)
+                          (lightfast:widget-height dialog))
+                       2)))))
+
 (defun display-number (value)
   (cond ((null value) "")
         ((integerp value) (format nil "~D" value))
@@ -5379,7 +5398,7 @@ new cache entry is published."
              ;; Laid out by Lightfast's flex engine: rows of label, control and
              ;; trailing button, with the destination field taking the slack.
              ;; No pixel coordinates to keep in sync with one another.
-             (let* ((dialog (lightfast:make-window :width 470 :height 298
+             (let* ((dialog (lightfast:make-window :width 470 :height 390
                                                    :label "Export"))
                     (rows '())
                     (label-width 104)
@@ -5520,6 +5539,7 @@ new cache entry is published."
                          (if (selected-job)
                              "Current photograph"
                              "All photographs"))))
+             (place-dialog-over export-dialog window)
              (lightfast:show export-dialog))
            (selected-lens-profile-status ()
              ;; What the renderer will correct the current photograph with,
@@ -5775,6 +5795,7 @@ new cache entry is published."
                           (lightfast:value lens-picker-remember)
                           (if description "1" "0"))
                     (refresh-lens-picker)
+                    (place-dialog-over lens-picker window)
                     (lightfast:show lens-picker))))))
            (choose-lut ()
              (let ((path (lightfast:choose-file
