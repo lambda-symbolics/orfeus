@@ -65,6 +65,33 @@
                             :lens-profile))
                "The profile did not survive a project round trip")))))
 
+(defun test-modified-flag ()
+  ;; The window title and the close question read one bit: whether the project
+  ;; differs from what is on disk. Every edit sets it, undo and redo included,
+  ;; and only saving or opening another project clears it.
+  (let* ((job (orfeus:make-photo-job :input-path #P"one.orf"))
+         (project (orfeus:make-project :output-directory #P"exports/"
+                                       :photos (list job)))
+         (model (orfeus/gui:make-gui-model :project project)))
+    (check (not (orfeus/gui:gui-model-modified-p model))
+           "A fresh model claimed unsaved edits")
+    (let ((orfeus/gui::*undo-coalesce-seconds* 0))
+      (orfeus/gui:gui-model-set-setting model :exposure 0.5)
+      (check (orfeus/gui:gui-model-modified-p model)
+             "An edit did not mark the project modified")
+      (setf (orfeus/gui:gui-model-modified-p model) nil)
+      (orfeus/gui:gui-model-undo model)
+      (check (orfeus/gui:gui-model-modified-p model)
+             "Undoing after a save did not mark the project modified")
+      (setf (orfeus/gui:gui-model-modified-p model) nil)
+      (orfeus/gui:gui-model-redo model)
+      (check (orfeus/gui:gui-model-modified-p model)
+             "Redoing after a save did not mark the project modified"))
+    (orfeus/gui:gui-model-replace-project
+     model (orfeus:make-project :output-directory #P"exports/" :photos '()))
+    (check (not (orfeus/gui:gui-model-modified-p model))
+           "Opening a project kept the modified mark")))
+
 (defun test-undo-history ()
   (let* ((job (orfeus:make-photo-job :input-path #P"one.orf"
                                      :overrides '(:exposure 1.0)))
@@ -1662,6 +1689,7 @@ would silently ignore whatever the Destination field said."
   (test-lightfast-root-layout-and-export-validation)
   (test-model-settings)
   (test-lens-profile-setting-reaches-the-optics-node)
+  (test-modified-flag)
   (test-undo-history)
   (test-graph-node-placement)
   (test-thumbnail-context-menu)

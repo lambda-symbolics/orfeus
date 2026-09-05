@@ -43,6 +43,7 @@
            #:gui-model-selected-node
            #:gui-model-undo #:gui-model-redo
            #:gui-model-can-undo-p #:gui-model-can-redo-p
+           #:gui-model-modified-p #:gui-model-replace-project
            #:gui-model-checkpoint #:gui-model-clear-history
            #:gui-model-selected-settings #:gui-model-set-selected-indices
            #:gui-model-set-node-params

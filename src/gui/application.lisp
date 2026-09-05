@@ -319,6 +319,11 @@ the same reason.")
   "FLTK FL_CTRL modifier for menu shortcuts.")
 (defconstant +key-f5+ #xffc2
   "FLTK key code for the F5 function key.")
+(defconstant +key-page-up+ #xff55 "FLTK key code for Page Up.")
+(defconstant +key-page-down+ #xff56 "FLTK key code for Page Down.")
+(defconstant +key-home+ #xff50 "FLTK key code for Home.")
+(defconstant +key-end+ #xff57 "FLTK key code for End.")
+(defconstant +key-delete+ #xffff "FLTK key code for Delete.")
 
 (defparameter *fringing-source-choices*
   '(("Measured" . :measured) ("Lens profile" . :profile))
@@ -2852,6 +2857,68 @@ new cache entry is published."
                    (setf after-preview-generation nil
                          curve-histogram nil)))
              (redraw-thumbnails))
+           (current-photo-row ()
+             ;; The drawn row holding the photograph on view; a folded burst is
+             ;; one row for several photographs.
+             (let ((index (gui-model-selected-index model)))
+               (or (position-if (lambda (entry) (member index (car entry)))
+                                (thumbnail-display-rows))
+                   0)))
+           (select-photo-row (row)
+             ;; Keyboard navigation lands on a drawn row and brings it into
+             ;; view, the way a list does when its selection is moved.
+             (let* ((rows (thumbnail-display-rows))
+                    (count (length rows)))
+               (when (plusp count)
+                 (let* ((row (max 0 (min (1- count) row)))
+                        (entry (nth row rows))
+                        (height (thumbnail-row-height))
+                        (visible (if thumbnail-canvas
+                                     (lightfast:widget-height thumbnail-canvas)
+                                     0)))
+                   (apply-thumbnail-selection (copy-list (car entry))
+                                              (first (car entry)) row)
+                   (cond ((< (* row height) thumbnail-scroll)
+                          (setf thumbnail-scroll (* row height)))
+                         ((and (plusp visible)
+                               (> (* (1+ row) height)
+                                  (+ thumbnail-scroll visible)))
+                          (setf thumbnail-scroll
+                                (- (* (1+ row) height) visible))))
+                   (redraw-thumbnails)
+                   (set-status (format nil "Photo ~D of ~D: ~A"
+                                       (1+ row) count
+                                       (file-namestring
+                                        (photo-job-input-path
+                                         (nth (first (car entry))
+                                              (project-photos project))))))))))
+           (step-photo (delta)
+             (select-photo-row (+ (current-photo-row) delta)))
+           (project-title ()
+             (let ((path (gui-model-project-path model)))
+               (if path (file-namestring path) "Untitled")))
+           (sync-window-title ()
+             ;; The document's name and whether it has unsaved edits, where
+             ;; every desktop application of the era put them.
+             (when window
+               (setf (lightfast:label window)
+                     (format nil "~A~:[~;*~] - Orfeus"
+                             (project-title)
+                             (gui-model-modified-p model)))))
+           (confirm-discard (verb)
+             ;; True when it is fine to go ahead: nothing is unsaved, or the
+             ;; user chose to save it or to let it go.
+             (or (not (gui-model-modified-p model))
+                 (case (lightfast:choice-box
+                        (format nil "Save changes to ~A before ~A?"
+                                (project-title) verb)
+                        :button0 "Cancel" :button1 "Don't Save" :button2 "Save")
+                   (1 t)
+                   (2 (and (save-project) t))
+                   (t nil))))
+           (quit-application ()
+             (when (confirm-discard "quitting")
+               (lightfast:quit)))
            (select-all-thumbnails ()
              (let ((indices (loop for index below (length (project-photos project))
                                   collect index))
@@ -4552,7 +4619,8 @@ new cache entry is published."
                                       *fringing-source-choices* :key #'rest))
                          "Measured")))
              (sync-export-controls)
-             (sync-preset-action-label))
+             (sync-preset-action-label)
+             (sync-window-title))
            (refresh-photo-groups ()
              ;; Reading a capture time spawns ExifTool the first time, and a
              ;; card's worth of photographs is a card's worth of spawns, so the
@@ -4657,6 +4725,7 @@ new cache entry is published."
              (set-preview-cursor :default)
              (gui-model-replace-project model new-project path)
              (setf (gui-model-selected-node model) nil)
+             (sync-window-title)
              (refresh-gallery)
              (sync-node-tools)
              (when graph-canvas (lightfast:redraw graph-canvas))
@@ -4713,13 +4782,14 @@ new cache entry is published."
                                            (length removed))))
                      (set-status "Project contains no photographs")))))
            (open-project ()
-             (let ((path (lightfast:choose-file
-                          :title "Open Orfeus project"
-                          :filter (fltk-file-filter "Orfeus project" "*.sexp")
-                          :preset-file (picker-preset))))
-               (when path
-                 (remember-picked-path path)
-                 (replace-project (project-read path) (pathname path)))))
+             (when (confirm-discard "opening another project")
+               (let ((path (lightfast:choose-file
+                            :title "Open Orfeus project"
+                            :filter (fltk-file-filter "Orfeus project" "*.sexp")
+                            :preset-file (picker-preset))))
+                 (when path
+                   (remember-picked-path path)
+                   (replace-project (project-read path) (pathname path))))))
            (new-project ()
              ;; An empty project to import into, named up front so its export
              ;; destination is settled before any photograph arrives.
@@ -4775,14 +4845,17 @@ new cache entry is published."
                    (when moved
                      (gui-model-anchor-export-directory model (pathname path)))
                    (project-write project path)
-                   (setf (gui-model-project-path model) (pathname path))
+                   (setf (gui-model-project-path model) (pathname path)
+                         (gui-model-modified-p model) nil)
                    (sync-export-controls)
+                   (sync-window-title)
                    (set-status
                     (if moved
                         (format nil "Project saved; exports go to ~A"
                                 (namestring
                                  (project-output-directory project)))
-                        "Project saved"))))))
+                        "Project saved"))
+                   path))))
            (neutral-preview-settings ()
              (make-processing-settings
               :noise-reduction 0.0
@@ -5091,6 +5164,9 @@ new cache entry is published."
              (incf preview-generation)
              (setf progress-total 0
                    progress-generation preview-generation)
+             ;; Every edit comes through here, so the title's unsaved mark
+             ;; follows every edit.
+             (sync-window-title)
              (when debounce-id
                (ignore-errors (lightfast:remove-timeout debounce-id)))
              (setf debounce-id
@@ -6239,127 +6315,180 @@ new cache entry is published."
         (lightfast:set-size-range window :min-width 960 :min-height 700)
         (setf menu (lightfast:make-menu-bar :parent window :x 0 :y 0
                                           :width 1280 :height 24))
-        (lightfast:add-menu-item menu "File/New Project"
+        (lightfast:add-menu-item menu "&File/New Project"
                                (lambda (&rest ignored)
                                  (declare (ignore ignored))
                                  (new-project))
                                :shortcut (logior +menu-ctrl+ (char-code #\n)))
-        (lightfast:add-menu-item menu "File/Open Photo" (lambda (&rest ignored)
+        (lightfast:add-menu-item menu "&File/Open Photo" (lambda (&rest ignored)
                                                           (declare (ignore ignored))
                                                           (open-photo))
                                :shortcut (logior +menu-ctrl+ (char-code #\o)))
-        (lightfast:add-menu-item menu "File/Add Photos to Project"
+        (lightfast:add-menu-item menu "&File/Add Photos to Project"
                                (lambda (&rest ignored)
                                  (declare (ignore ignored))
                                  (add-photos))
                                :shortcut (logior +menu-ctrl+ +menu-shift+
                                                  (char-code #\a)))
-        (lightfast:add-menu-item menu "File/Open Project" (lambda (&rest ignored)
+        (lightfast:add-menu-item menu "&File/Open Project" (lambda (&rest ignored)
                                                             (declare (ignore ignored))
                                                             (open-project))
                                :shortcut (logior +menu-ctrl+ +menu-shift+
                                                  (char-code #\o)))
-        (lightfast:add-menu-item menu "File/Save Project" (lambda (&rest ignored)
+        (lightfast:add-menu-item menu "&File/Save Project" (lambda (&rest ignored)
                                                             (declare (ignore ignored))
                                                             (save-project))
                                :shortcut (logior +menu-ctrl+ (char-code #\s)))
-        (lightfast:add-menu-item menu "File/Save Project As" (lambda (&rest ignored)
+        (lightfast:add-menu-item menu "&File/Save Project As" (lambda (&rest ignored)
                                                                (declare (ignore ignored))
                                                                (save-project t))
                                :shortcut (logior +menu-ctrl+ +menu-shift+
                                                  (char-code #\s)))
-        (lightfast:add-menu-item menu "File/Export..."
+        (lightfast:add-menu-item menu "&File/Export..."
                                (lambda (&rest ignored)
                                  (declare (ignore ignored))
                                  (open-export-dialog))
                                :shortcut (logior +menu-ctrl+ (char-code #\e)))
-        (lightfast:add-menu-item menu "File/Export Current Photo"
+        (lightfast:add-menu-item menu "&File/Export Current Photo"
                                (lambda (&rest ignored)
                                  (declare (ignore ignored))
                                  (render-selected))
                                :shortcut (logior +menu-ctrl+ +menu-shift+
                                                  (char-code #\e)))
-        (lightfast:add-menu-item menu "File/Export All Photos"
+        (lightfast:add-menu-item menu "&File/Export All Photos"
                                (lambda (&rest ignored)
                                  (declare (ignore ignored))
                                  (render-all)))
-        (lightfast:add-menu-item menu "File/Quit" (lambda (&rest ignored)
+        (lightfast:add-menu-item menu "&File/Quit" (lambda (&rest ignored)
                                                     (declare (ignore ignored))
-                                                    (lightfast:quit))
+                                                    (quit-application))
                                :shortcut (logior +menu-ctrl+ (char-code #\q)))
-        (lightfast:add-menu-item menu "Edit/Undo"
+        ;; Closing the window asks the same question as quitting does.
+        (lightfast:on window
+                      (lambda (widget event value)
+                        (declare (ignore widget event value))
+                        (unless (confirm-discard "closing")
+                          (lightfast:window-cancel-close window)))
+                      :event lightfast:+event-close+)
+        (lightfast:add-menu-item menu "&Edit/Undo"
                                (lambda (&rest ignored)
                                  (declare (ignore ignored))
                                  (step-history :undo))
                                :shortcut (logior +menu-ctrl+ (char-code #\z)))
-        (lightfast:add-menu-item menu "Edit/Redo"
+        (lightfast:add-menu-item menu "&Edit/Redo"
                                (lambda (&rest ignored)
                                  (declare (ignore ignored))
                                  (step-history :redo))
                                :shortcut (logior +menu-ctrl+ +menu-shift+
                                                  (char-code #\z)))
-        (lightfast:add-menu-item menu "Edit/Copy Grade"
+        (lightfast:add-menu-item menu "&Edit/Copy Grade"
                                (lambda (&rest ignored)
                                  (declare (ignore ignored))
                                  (copy-grade))
                                :shortcut (logior +menu-ctrl+ +menu-shift+
                                                  (char-code #\c)))
-        (lightfast:add-menu-item menu "Edit/Paste Grade to Selected"
+        (lightfast:add-menu-item menu "&Edit/Paste Grade to Selected"
                                (lambda (&rest ignored)
                                  (declare (ignore ignored))
                                  (paste-grade))
                                :shortcut (logior +menu-ctrl+ +menu-shift+
                                                  (char-code #\v)))
-        (lightfast:add-menu-item menu "Edit/Remove Selected Photos"
+        (lightfast:add-menu-item menu "&Edit/Remove Selected Photos"
                                (lambda (&rest ignored)
                                  (declare (ignore ignored))
-                                 (remove-selected-photo)))
-        (lightfast:add-menu-item menu "Edit/Select Blurry Photos"
+                                 (remove-selected-photo-with-confirmation))
+                               :shortcut +key-delete+)
+        (lightfast:add-menu-item menu "&Edit/Select All Photos"
+                               (lambda (&rest ignored)
+                                 (declare (ignore ignored))
+                                 (select-all-thumbnails))
+                               :shortcut (logior +menu-ctrl+ (char-code #\a)))
+        (lightfast:add-menu-item menu "&Edit/Next Photo"
+                               (lambda (&rest ignored)
+                                 (declare (ignore ignored))
+                                 (step-photo 1))
+                               :shortcut +key-page-down+)
+        (lightfast:add-menu-item menu "&Edit/Previous Photo"
+                               (lambda (&rest ignored)
+                                 (declare (ignore ignored))
+                                 (step-photo -1))
+                               :shortcut +key-page-up+)
+        (lightfast:add-menu-item menu "&Edit/First Photo"
+                               (lambda (&rest ignored)
+                                 (declare (ignore ignored))
+                                 (select-photo-row 0))
+                               :shortcut +key-home+)
+        (lightfast:add-menu-item menu "&Edit/Last Photo"
+                               (lambda (&rest ignored)
+                                 (declare (ignore ignored))
+                                 (select-photo-row most-positive-fixnum))
+                               :shortcut +key-end+)
+        (lightfast:add-menu-item menu "&Edit/Select Blurry Photos"
                                  (lambda (&rest ignored)
                                    (declare (ignore ignored))
                                    (find-and-select-blurry-photos)))
-        (lightfast:add-menu-item menu "Edit/Reset Selected Photos"
+        (lightfast:add-menu-item menu "&Edit/Reset Selected Photos"
                                (lambda (&rest ignored)
                                  (declare (ignore ignored))
                                  (gui-model-reset-selected model)
                                  (sync-controls)
                                               (schedule-edited-preview)))
-        (lightfast:add-menu-item menu "Edit/Reset Defaults"
+        (lightfast:add-menu-item menu "&Edit/Reset Defaults"
                                (lambda (&rest ignored)
                                  (declare (ignore ignored))
                                  (setf (project-defaults project)
                                        (gui-default-processing-settings))
                                  (sync-controls)
                                               (schedule-edited-preview)))
-        (lightfast:add-menu-item menu "View/Before and After"
+        (lightfast:add-menu-item menu "&View/Before and After"
                                (lambda (&rest ignored)
                                  (declare (ignore ignored))
                                  (toggle-comparison))
                                :shortcut (logior +menu-ctrl+ (char-code #\b)))
-        (lightfast:add-menu-item menu "View/Refresh Preview"
+        (lightfast:add-menu-item menu "&View/Refresh Preview"
                                (lambda (&rest ignored)
                                  (declare (ignore ignored))
                                  (schedule-initial-preview))
                                :shortcut +key-f5+)
-        (lightfast:add-menu-item menu "View/Rebuild Previews"
+        (lightfast:add-menu-item menu "&View/Rebuild Previews"
                                (lambda (&rest ignored)
                                  (declare (ignore ignored))
                                  (discard-previews))
                                :shortcut (logior +menu-shift+ +key-f5+))
-        (lightfast:add-menu-item menu "View/Expand All Bursts"
+        (lightfast:add-menu-item menu "&View/Expand All Bursts"
                                  (lambda (&rest ignored)
                                    (declare (ignore ignored))
                                    (set-bursts-expanded t)))
-        (lightfast:add-menu-item menu "View/Collapse All Bursts"
+        (lightfast:add-menu-item menu "&View/Zoom In"
+                               (lambda (&rest ignored)
+                                 (declare (ignore ignored))
+                                 (zoom-preview 1.25d0))
+                               :shortcut (logior +menu-ctrl+ (char-code #\=)))
+        (lightfast:add-menu-item menu "&View/Zoom Out"
+                               (lambda (&rest ignored)
+                                 (declare (ignore ignored))
+                                 (zoom-preview .8d0))
+                               :shortcut (logior +menu-ctrl+ (char-code #\-)))
+        (lightfast:add-menu-item menu "&View/Fit Preview"
+                               (lambda (&rest ignored)
+                                 (declare (ignore ignored))
+                                 (reset-preview-view))
+                               :shortcut (logior +menu-ctrl+ (char-code #\0)))
+        (lightfast:add-menu-item menu "&View/Actual Pixels"
+                               (lambda (&rest ignored)
+                                 (declare (ignore ignored))
+                                 (preview-one-to-one))
+                               :shortcut (logior +menu-ctrl+ (char-code #\1)))
+        (lightfast:add-menu-item menu "&View/Collapse All Bursts"
                                  (lambda (&rest ignored)
                                    (declare (ignore ignored))
                                    (set-bursts-expanded nil)))
-        (lightfast:add-menu-item menu "Process/Grab Still"
+        (lightfast:add-menu-item menu "&Process/Grab Still"
                                (lambda (&rest ignored)
                                  (declare (ignore ignored))
                                  (grab-still))
                                :shortcut (logior +menu-ctrl+ (char-code #\g)))
-        (lightfast:add-menu-item menu "Help/About Orfeus"
+        (lightfast:add-menu-item menu "&Help/About Orfeus"
                                (lambda (&rest ignored)
                                  (declare (ignore ignored))
                                  (lightfast:message-box

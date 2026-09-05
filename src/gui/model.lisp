@@ -12,7 +12,11 @@ renumbering, so the selection stays valid across graph edits."
   (selected-node nil)
   project-path
   (undo-stack '() :type list)
-  (redo-stack '() :type list))
+  (redo-stack '() :type list)
+  ;; Whether the project differs from what is on disk. Set by every edit,
+  ;; cleared when the project is saved or another one takes its place; the
+  ;; window title and the close question read it.
+  (modified-p nil))
 
 (defparameter *undo-depth* 64
   "Edits kept for undo. Each entry copies the project, so this bounds memory.")
@@ -71,6 +75,8 @@ one from before the action rather than from halfway through it.")
 Call this immediately before mutating. Consecutive edits sharing COALESCE-KEY
 collapse into the entry already on the stack, so one slider drag is one undo.
 Returns true when a new entry was pushed."
+  (unless *inside-model-edit*
+    (setf (gui-model-modified-p model) t))
   (cond
     (*inside-model-edit* nil)
     ((gui-snapshot-supersedes-p (first (gui-model-undo-stack model)) coalesce-key)
@@ -120,6 +126,7 @@ Returns true when a new entry was pushed."
     (when previous
       (push (gui-model-snapshot model) (gui-model-redo-stack model))
       (gui-model-restore model previous)
+      (setf (gui-model-modified-p model) t)
       t)))
 
 (defun gui-model-redo (model)
@@ -128,6 +135,7 @@ Returns true when a new entry was pushed."
     (when next
       (push (gui-model-snapshot model) (gui-model-undo-stack model))
       (gui-model-restore model next)
+      (setf (gui-model-modified-p model) t)
       t)))
 
 (defun gui-bundled-lut-paths ()
@@ -197,7 +205,8 @@ the project is the user's business."
         (gui-model-selected-index model) 0
         (gui-model-selected-indices model)
         (if (project-photos project) '(0) '())
-        (gui-model-edit-target model) :photo)
+        (gui-model-edit-target model) :photo
+        (gui-model-modified-p model) nil)
   (gui-model-clear-history model)
   model)
 
