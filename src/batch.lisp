@@ -83,7 +83,7 @@ the publishing of the file happen."
   "Render PHOTOS of PROJECT through the shared processing pipeline, in order.
 
 Returns two values: completed output pathnames and `(PHOTO . CONDITION)`
-failures, both in project order. ON-ERROR accepts :ABORT or :CONTINUE.
+failures, both in the order of PHOTOS. ON-ERROR accepts :ABORT or :CONTINUE.
 PROGRESS-CALLBACK, when provided, receives index, total, photo job, and output
 pathname before each render starts.
 

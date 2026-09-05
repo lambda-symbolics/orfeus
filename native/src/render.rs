@@ -89,6 +89,9 @@ pub struct RenderSettingsV1 {
     /// photograph does not say — a manual lens on a dumb adapter records
     /// nothing. Zero defers to the file.
     pub focal_length: f32,
+    /// Where the colour fringing correction comes from when `FLAG_LENS_TCA` is
+    /// set: 0 measures it from the frame, 1 reads the lens profile.
+    pub chromatic_aberration_source: u32,
 }
 
 /// The focal length a correction is read at: what the caller stated when it
@@ -136,6 +139,7 @@ impl Default for RenderSettingsV1 {
             neural_noise_reduction: 0.0,
             lens_name: std::ptr::null(),
             focal_length: 0.0,
+            chromatic_aberration_source: 0,
         }
     }
 }
@@ -2870,7 +2874,298 @@ pub(crate) fn apply_lens(
     Ok(())
 }
 
-/// Corrects barrel or pincushion distortion by a stated amount.
+/// How far the red and blue images of a frame sit from the green one, as
+/// radial scale factors: positive means the channel is magnified against green.
+///
+/// Lateral colour is what a lens does to the size of its image at each
+/// wavelength, so to first order it is one number per channel — the same model
+/// a database's "linear" chromatic aberration entry uses. It is measured from
+/// the photograph itself: the database was measured on somebody else's copy of
+/// the lens, on another body, and on the one frame this was checked against it
+/// prescribed a red shift of two and a half pixels at the corners of a frame
+/// whose red sat within a fiftieth of a pixel of green — the prescription was
+/// the fringe.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct LateralColour {
+    pub(crate) red: f32,
+    pub(crate) blue: f32,
+}
+
+impl LateralColour {
+    pub(crate) fn is_none(&self) -> bool {
+        self.red == 0.0 && self.blue == 0.0
+    }
+}
+
+/// Side of the square patches lateral colour is measured on.
+const COLOUR_PATCH: usize = 64;
+/// How far a channel is searched for its shift, in whole pixels either way.
+const COLOUR_SEARCH: usize = 3;
+/// Patches kept per quadrant, so one busy corner does not speak for the frame.
+const COLOUR_PATCHES_PER_QUADRANT: usize = 16;
+/// Patches a measurement needs before it is believed.
+const COLOUR_MIN_PATCHES: usize = 12;
+/// Patches nearer the centre than this fraction of the half-diagonal are not
+/// read: lateral colour grows with radius and there is nothing to see there.
+const COLOUR_MIN_RADIUS: f32 = 0.35;
+/// A corner shift under this many pixels is left alone: below it the
+/// resampling that would move the channel costs more sharpness than the shift.
+const COLOUR_NEGLIGIBLE: f32 = 0.25;
+/// How uncertain the settled corner shift may be, in pixels, before the frame
+/// is judged not to say: the patches' spread divided by the root of their
+/// number, which is how far the median of them can be expected to be off.
+const COLOUR_MAX_UNCERTAINTY: f32 = 0.12;
+/// A shift with more than this much across the radial direction is not
+/// lateral colour, whatever else it is.
+const COLOUR_MAX_TANGENTIAL: f32 = 0.5;
+
+/// Takes the slow light out of a square plane and scales what is left to unit
+/// power, so two channels of different gain compare shape against shape.
+fn high_pass_normalise(values: &mut [f32], size: usize) {
+    const RADIUS: usize = 4;
+    let mut blurred = vec![0.0_f32; values.len()];
+    let mut rows = vec![0.0_f32; values.len()];
+    for y in 0..size {
+        let line = &values[y * size..(y + 1) * size];
+        for x in 0..size {
+            let (left, right) = (x.saturating_sub(RADIUS), (x + RADIUS).min(size - 1));
+            rows[y * size + x] = line[left..=right].iter().sum::<f32>() / (right - left + 1) as f32;
+        }
+    }
+    for y in 0..size {
+        let (top, bottom) = (y.saturating_sub(RADIUS), (y + RADIUS).min(size - 1));
+        for x in 0..size {
+            let total: f32 = (top..=bottom).map(|yy| rows[yy * size + x]).sum();
+            blurred[y * size + x] = total / (bottom - top + 1) as f32;
+        }
+    }
+    let mut power = 0.0_f32;
+    for (value, blur) in values.iter_mut().zip(&blurred) {
+        *value -= blur;
+        power += *value * *value;
+    }
+    let rms = (power / values.len() as f32).sqrt();
+    if rms > 1e-7 {
+        for value in values.iter_mut() {
+            *value /= rms;
+        }
+    }
+}
+
+/// How far CHANNEL's picture in the patch at (X0, Y0) sits from green's, in
+/// pixels, or None when the patch does not say.
+///
+/// The shift that best lays the channel over green, searched to the whole
+/// pixel and then refined by the parabola through the three nearest costs. A
+/// minimum on the edge of the search, a flat cost surface, or a match no better
+/// than the average shift all mean the patch has nothing to say.
+fn channel_shift(image: &RgbImage, x0: usize, y0: usize, channel: usize) -> Option<(f32, f32)> {
+    let width = image.width;
+    let patch = COLOUR_PATCH;
+    let search = COLOUR_SEARCH;
+    let span = patch + 2 * search;
+    let plane = |ch: usize, ox: usize, oy: usize, size: usize| -> Vec<f32> {
+        let mut values: Vec<f32> = (0..size * size)
+            .map(|i| image.data[((oy + i / size) * width + ox + i % size) * 3 + ch])
+            .collect();
+        high_pass_normalise(&mut values, size);
+        values
+    };
+    // Both channels are read over the same window and filtered alike; the
+    // patch compared is the middle of green's. Filtering each over its own
+    // extent put the box filter's edge in different places on the two, which
+    // read as a quarter-pixel shift on a frame with none.
+    let green = plane(1, x0 - search, y0 - search, span);
+    let other = plane(channel, x0 - search, y0 - search, span);
+    let steps = 2 * search + 1;
+    let cost = |ix: usize, iy: usize| -> f32 {
+        let mut total = 0.0_f32;
+        for y in 0..patch {
+            let row = &other[(y + iy) * span + ix..][..patch];
+            let g = &green[(y + search) * span + search..][..patch];
+            for (o, g) in row.iter().zip(g) {
+                let d = o - g;
+                total += d * d;
+            }
+        }
+        total
+    };
+    let mut costs = vec![0.0_f32; steps * steps];
+    let mut best = (0_usize, 0_usize, f32::INFINITY);
+    for iy in 0..steps {
+        for ix in 0..steps {
+            let c = cost(ix, iy);
+            costs[iy * steps + ix] = c;
+            if c < best.2 {
+                best = (ix, iy, c);
+            }
+        }
+    }
+    let (ix, iy, lowest) = best;
+    if ix == 0 || iy == 0 || ix == steps - 1 || iy == steps - 1 || !lowest.is_finite() {
+        return None;
+    }
+    let mean = costs.iter().sum::<f32>() / costs.len() as f32;
+    if !(lowest < 0.9 * mean) {
+        return None;
+    }
+    let refine = |a: f32, b: f32, c: f32| -> Option<f32> {
+        let curvature = a - 2.0 * b + c;
+        (curvature > 0.0).then(|| ((a - c) / (2.0 * curvature)).clamp(-1.0, 1.0))
+    };
+    let at = |x: usize, y: usize| costs[y * steps + x];
+    let ox = refine(at(ix - 1, iy), lowest, at(ix + 1, iy))?;
+    let oy = refine(at(ix, iy - 1), lowest, at(ix, iy + 1))?;
+    Some((
+        ix as f32 - search as f32 + ox,
+        iy as f32 - search as f32 + oy,
+    ))
+}
+
+/// Measures the frame's lateral colour, or says it cannot.
+///
+/// The busiest patches of each quadrant, away from the centre, each report how
+/// far red and blue sit from green; the radial part of each shift over its
+/// radius is a reading of the scale, and the median of the readings is the
+/// answer, provided enough patches agree closely enough for it to be one. Read
+/// from a quarter of the pixels of every candidate patch and then in full from
+/// sixty-four of them, so an eighty-megapixel frame costs a few tens of
+/// milliseconds.
+pub(crate) fn measure_lateral_colour(image: &RgbImage) -> Option<LateralColour> {
+    let started = Instant::now();
+    let (width, height) = (image.width, image.height);
+    let patch = COLOUR_PATCH;
+    let margin = COLOUR_SEARCH + 1;
+    if width < 2 * (patch + margin) + 8 || height < 2 * (patch + margin) + 8 {
+        return None;
+    }
+    let centre = ((width as f32 - 1.0) * 0.5, (height as f32 - 1.0) * 0.5);
+    let half_diagonal = centre.0.hypot(centre.1);
+    let columns = (width - 2 * margin) / patch;
+    let rows = (height - 2 * margin) / patch;
+    let candidates: Vec<(f32, usize, usize)> = (0..rows)
+        .into_par_iter()
+        .flat_map_iter(|row| {
+            (0..columns).filter_map(move |column| {
+                let (x0, y0) = (margin + column * patch, margin + row * patch);
+                let (cx, cy) = (x0 as f32 + patch as f32 * 0.5, y0 as f32 + patch as f32 * 0.5);
+                if (cx - centre.0).hypot(cy - centre.1) < COLOUR_MIN_RADIUS * half_diagonal {
+                    return None;
+                }
+                let at = |x: usize, y: usize| image.data[(y * width + x) * 3 + 1];
+                let mut texture = 0.0_f32;
+                let mut y = y0 + 1;
+                while y + 1 < y0 + patch {
+                    let mut x = x0 + 1;
+                    while x + 1 < x0 + patch {
+                        texture += (at(x + 1, y) - at(x - 1, y)).abs()
+                            + (at(x, y + 1) - at(x, y - 1)).abs();
+                        x += 4;
+                    }
+                    y += 4;
+                }
+                Some((texture, x0, y0))
+            })
+        })
+        .collect();
+    let best = candidates.iter().map(|c| c.0).fold(0.0_f32, f32::max);
+    if best <= 0.0 {
+        return None;
+    }
+    let mut chosen: Vec<(f32, usize, usize)> = Vec::new();
+    for quadrant in 0..4 {
+        let mut here: Vec<(f32, usize, usize)> = candidates
+            .iter()
+            .copied()
+            .filter(|(texture, x0, y0)| {
+                let right = *x0 as f32 + patch as f32 * 0.5 >= centre.0;
+                let below = *y0 as f32 + patch as f32 * 0.5 >= centre.1;
+                usize::from(right) + 2 * usize::from(below) == quadrant && *texture >= 0.1 * best
+            })
+            .collect();
+        here.sort_by(|a, b| b.0.total_cmp(&a.0));
+        chosen.extend(here.into_iter().take(COLOUR_PATCHES_PER_QUADRANT));
+    }
+    // Each patch's reading of the scale, with the radius it was read at: a
+    // shift measured to a tenth of a pixel is a tenth as uncertain a scale at
+    // the corner as it is a third of the way out.
+    let readings: Vec<(Option<(f32, f32)>, Option<(f32, f32)>)> = chosen
+        .par_iter()
+        .map(|&(_, x0, y0)| {
+            let (cx, cy) = (x0 as f32 + patch as f32 * 0.5, y0 as f32 + patch as f32 * 0.5);
+            let (dx, dy) = (cx - centre.0, cy - centre.1);
+            let radius = dx.hypot(dy);
+            let (ux, uy) = (dx / radius, dy / radius);
+            let scale = |channel: usize| -> Option<(f32, f32)> {
+                let (sx, sy) = channel_shift(image, x0, y0, channel)?;
+                let radial = sx * ux + sy * uy;
+                let tangential = -sx * uy + sy * ux;
+                (tangential.abs() <= COLOUR_MAX_TANGENTIAL).then_some((radial / radius, radius))
+            };
+            (scale(0), scale(2))
+        })
+        .collect();
+    let profiling = std::env::var_os("ORFEUS_PROFILE").is_some();
+    let settle = |mut values: Vec<(f32, f32)>| -> Option<f32> {
+        if values.len() < COLOUR_MIN_PATCHES {
+            if profiling {
+                eprintln!("orfeus-profile lateral-colour readings={} too few", values.len());
+            }
+            return None;
+        }
+        // The median weighted by radius, and how far it may be off: the
+        // spread of the readings over the root of their number.
+        values.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let total: f32 = values.iter().map(|v| v.1).sum();
+        let mut running = 0.0_f32;
+        let mut median = values[values.len() / 2].0;
+        for (value, weight) in &values {
+            running += weight;
+            if running >= 0.5 * total {
+                median = *value;
+                break;
+            }
+        }
+        let mut deviations: Vec<f32> = values.iter().map(|v| (v.0 - median).abs()).collect();
+        deviations.sort_by(f32::total_cmp);
+        let spread = deviations[deviations.len() / 2] * half_diagonal;
+        let uncertainty = spread / (values.len() as f32).sqrt();
+        if profiling {
+            eprintln!(
+                "orfeus-profile lateral-colour readings={} corner-shift={:.3} spread={:.3} uncertainty={:.3}",
+                values.len(),
+                median * half_diagonal,
+                spread,
+                uncertainty
+            );
+        }
+        if uncertainty > COLOUR_MAX_UNCERTAINTY {
+            return None;
+        }
+        Some(if (median * half_diagonal).abs() < COLOUR_NEGLIGIBLE { 0.0 } else { median })
+    };
+    let red = settle(readings.iter().filter_map(|r| r.0).collect());
+    let blue = settle(readings.iter().filter_map(|r| r.1).collect());
+    if std::env::var_os("ORFEUS_PROFILE").is_some() {
+        eprintln!(
+            "orfeus-profile lateral-colour patches={} red={:?} blue={:?} milliseconds={:.3}",
+            chosen.len(),
+            red,
+            blue,
+            started.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+    if red.is_none() && blue.is_none() {
+        return None;
+    }
+    Some(LateralColour {
+        red: red.unwrap_or(0.0),
+        blue: blue.unwrap_or(0.0),
+    })
+}
+
+/// Corrects barrel or pincushion distortion by a stated amount, and lateral
+/// colour by measured or stated scale factors, in one resampling.
 ///
 /// For the lenses no database describes — anything old enough, adapted, or
 /// simply unlisted — where the alternative is living with bent horizons.
@@ -2883,20 +3178,24 @@ pub(crate) fn apply_lens(
 /// straight edge cannot usefully carry more, and the higher terms of a real
 /// profile only matter once the first one is right.
 ///
-/// The auto-crop zoom rides along in the same gather, as it does for the
-/// profile correction: resampling twice would soften what one pass keeps.
-pub(crate) fn apply_manual_distortion(image: &mut RgbImage, amount: f32) {
+/// Red and blue are then gathered from their own radius, scaled by the
+/// measured factor, so a channel that the lens drew a fraction larger is drawn
+/// back onto green. The auto-crop zoom rides along in the same gather, as it
+/// does for the profile correction: resampling twice would soften what one pass
+/// keeps.
+pub(crate) fn apply_radial_corrections(image: &mut RgbImage, amount: f32, colour: LateralColour) {
     let (width, height) = (image.width, image.height);
-    if amount == 0.0 || width < 2 || height < 2 {
+    if (amount == 0.0 && colour.is_none()) || width < 2 || height < 2 {
         return;
     }
     let center_x = (width - 1) as f32 * 0.5;
     let center_y = (height - 1) as f32 * 0.5;
     let normalize = 1.0 / (center_x * center_x + center_y * center_y).sqrt();
-    let gather = |x: f32, y: f32| {
+    let channel_scale = [1.0 + colour.red, 1.0, 1.0 + colour.blue];
+    let gather = |x: f32, y: f32, scale: f32| {
         let dx = (x - center_x) * normalize;
         let dy = (y - center_y) * normalize;
-        let factor = 1.0 + amount * (dx * dx + dy * dy);
+        let factor = (1.0 + amount * (dx * dx + dy * dy)) * scale;
         (
             center_x + (x - center_x) * factor,
             center_y + (y - center_y) * factor,
@@ -2904,8 +3203,10 @@ pub(crate) fn apply_manual_distortion(image: &mut RgbImage, amount: f32) {
     };
     const VALIDITY_STEP: usize = 4;
     let scale = auto_crop_scale(width, height, VALIDITY_STEP, |x, y| {
-        let (sx, sy) = gather(x as f32, y as f32);
-        inside_frame(sx, sy, width, height)
+        channel_scale.iter().all(|scale| {
+            let (sx, sy) = gather(x as f32, y as f32, *scale);
+            inside_frame(sx, sy, width, height)
+        })
     });
     let inverse_scale = 1.0 / scale;
     let row_stride = width * 3;
@@ -2917,12 +3218,20 @@ pub(crate) fn apply_manual_distortion(image: &mut RgbImage, amount: f32) {
             let v = center_y + (y as f32 - center_y) * inverse_scale;
             for x in 0..width {
                 let u = center_x + (x as f32 - center_x) * inverse_scale;
-                let (sx, sy) = gather(u, v);
-                output_row[x * 3..x * 3 + 3].copy_from_slice(&bilinear_rgb(image, sx, sy));
+                if colour.is_none() {
+                    let (sx, sy) = gather(u, v, 1.0);
+                    output_row[x * 3..x * 3 + 3].copy_from_slice(&bilinear_rgb(image, sx, sy));
+                } else {
+                    for (channel, scale) in channel_scale.iter().enumerate() {
+                        let (sx, sy) = gather(u, v, *scale);
+                        output_row[x * 3 + channel] = bilinear(image, sx, sy, channel);
+                    }
+                }
             }
         });
     image.data = output;
 }
+
 
 pub(crate) fn orient(image: RgbImage, orientation: u16) -> RgbImage {
     if orientation <= 1 || orientation > 8 {
@@ -4694,7 +5003,16 @@ pub fn render(
         )
     };
     // By hand first, then the profile — the same order the graph applies them.
-    apply_manual_distortion(&mut image, settings.lens_distortion);
+    // Colour fringing is measured from the frame unless the profile was asked
+    // for by name.
+    let mut flags = settings.flags;
+    let colour = if flags & FLAG_LENS_TCA != 0 && settings.chromatic_aberration_source == 0 {
+        flags &= !FLAG_LENS_TCA;
+        measure_lateral_colour(&image).unwrap_or_default()
+    } else {
+        LateralColour::default()
+    };
+    apply_radial_corrections(&mut image, settings.lens_distortion, colour);
     apply_lens(
         &mut image,
         &LensCorrectionOptions {
@@ -4702,7 +5020,7 @@ pub fn render(
             model: &model,
             lens_name: &lens_name,
             focal,
-            flags: settings.flags,
+            flags,
             strength: settings.lens_correction_strength,
             explicit_profile,
             focal_reducer: settings.focal_reducer,
@@ -5536,11 +5854,11 @@ mod tests {
         let at = |image: &RgbImage, x: usize, y: usize| image.data[(y * width + x) * 3];
         // Zero is exactly nothing.
         let mut untouched = straight.clone();
-        apply_manual_distortion(&mut untouched, 0.0);
+        apply_radial_corrections(&mut untouched, 0.0, LateralColour::default());
         assert_eq!(untouched.data, straight.data);
         for amount in [0.15_f32, -0.15] {
             let mut bent = straight.clone();
-            apply_manual_distortion(&mut bent, amount);
+            apply_radial_corrections(&mut bent, amount, LateralColour::default());
             // The centre pixel is the fixed point of a radial map, whichever
             // way it bends.
             assert!(
@@ -6150,6 +6468,91 @@ mod tests {
         );
         let prime = search_lens_profiles("", "", "distagon 21", 0.0).unwrap();
         assert!(prime.lines().any(|line| line.contains("21mm")), "{prime}");
+    }
+
+    /// A textured, noise-free scene: smooth enough to resample exactly,
+    /// detailed enough everywhere to measure a shift against.
+    fn textured_scene(width: usize, height: usize) -> RgbImage {
+        let cell = 12.0_f32;
+        let value = |x: usize, y: usize, channel: usize| -> f32 {
+            let (fx, fy) = (x as f32 / cell, y as f32 / cell);
+            let (cx, cy) = (fx.floor() as u64, fy.floor() as u64);
+            let corner = |dx: u64, dy: u64| {
+                (splitmix64((cx + dx) << 20 | (cy + dy) << 2 | channel as u64) >> 40) as f32
+                    / 16_777_216.0
+            };
+            let (tx, ty) = (fx - fx.floor(), fy - fy.floor());
+            let (sx, sy) = (tx * tx * (3.0 - 2.0 * tx), ty * ty * (3.0 - 2.0 * ty));
+            let top = corner(0, 0) * (1.0 - sx) + corner(1, 0) * sx;
+            let bottom = corner(0, 1) * (1.0 - sx) + corner(1, 1) * sx;
+            0.15 + 0.6 * (top * (1.0 - sy) + bottom * sy)
+        };
+        let mut data = Vec::with_capacity(width * height * 3);
+        for y in 0..height {
+            for x in 0..width {
+                // One pattern for all three channels, with a colour cast: the
+                // channels have to share their detail for a shift to mean anything.
+                let base = value(x, y, 7);
+                data.extend_from_slice(&[base * 0.8, base, base * 1.1]);
+            }
+        }
+        RgbImage { width, height, data }
+    }
+
+    /// Magnifies the red and blue images about the centre by the given factors,
+    /// which is what a lens with lateral colour does.
+    fn with_lateral_colour(image: &RgbImage, red: f32, blue: f32) -> RgbImage {
+        let (width, height) = (image.width, image.height);
+        let (cx, cy) = ((width - 1) as f32 * 0.5, (height - 1) as f32 * 0.5);
+        let mut out = image.clone();
+        for y in 0..height {
+            for x in 0..width {
+                for (channel, factor) in [(0, red), (2, blue)] {
+                    let sx = cx + (x as f32 - cx) / (1.0 + factor);
+                    let sy = cy + (y as f32 - cy) / (1.0 + factor);
+                    out.data[(y * width + x) * 3 + channel] = bilinear(image, sx, sy, channel);
+                }
+            }
+        }
+        out
+    }
+
+    /// The measurement reads the scale a lens put in, and the correction takes
+    /// it back out.
+    #[test]
+    fn lateral_colour_is_measured_and_removed() {
+        let (width, height) = (1200, 900);
+        let clean = textured_scene(width, height);
+        let fringed = with_lateral_colour(&clean, 0.0008, -0.0005);
+        let measured = measure_lateral_colour(&fringed).expect("a textured frame is measurable");
+        assert!(
+            (measured.red / 0.0008 - 1.0).abs() < 0.2 && (measured.blue / -0.0005 - 1.0).abs() < 0.2,
+            "measured {measured:?} against red 0.0008 blue -0.0005"
+        );
+        let mut corrected = fringed;
+        apply_radial_corrections(&mut corrected, 0.0, measured);
+        let left = measure_lateral_colour(&corrected).unwrap_or_default();
+        let half_diagonal = ((width as f32) * 0.5).hypot(height as f32 * 0.5);
+        assert!(
+            left.red.abs() * half_diagonal < 0.15 && left.blue.abs() * half_diagonal < 0.15,
+            "residual {left:?} at the corner: red {} blue {} px",
+            left.red * half_diagonal,
+            left.blue * half_diagonal
+        );
+    }
+
+    /// A frame whose channels already agree is left exactly alone, and a flat
+    /// one is admitted to say nothing.
+    #[test]
+    fn lateral_colour_leaves_an_aligned_frame_alone() {
+        let clean = textured_scene(900, 700);
+        let measured = measure_lateral_colour(&clean).unwrap_or_default();
+        assert!(measured.is_none(), "an aligned frame measured {measured:?}");
+        let mut copy = clean.clone();
+        apply_radial_corrections(&mut copy, 0.0, measured);
+        assert_eq!(copy.data, clean.data);
+        let flat = RgbImage { width: 400, height: 300, data: vec![0.4; 400 * 300 * 3] };
+        assert!(measure_lateral_colour(&flat).is_none());
     }
 
     #[test]

@@ -348,6 +348,8 @@ override semantics."
     (:lens-correction-strength
      #'orfeus:processing-settings-lens-correction-strength)
     (:chromatic-aberration-correction-p #'orfeus:processing-settings-chromatic-aberration-correction-p)
+    (:chromatic-aberration-source
+     #'orfeus:processing-settings-chromatic-aberration-source)
     (:lens-distortion #'orfeus:processing-settings-lens-distortion)
     (:lens-profile #'orfeus:processing-settings-lens-profile)
     (:lens-focal-length #'orfeus:processing-settings-lens-focal-length)
@@ -398,6 +400,8 @@ downstream node of that stage, otherwise the stage's identity value."
     (:lens-correction-strength
      (setf (orfeus:processing-settings-lens-correction-strength settings) value))
     (:chromatic-aberration-correction-p (setf (orfeus:processing-settings-chromatic-aberration-correction-p settings) value))
+    (:chromatic-aberration-source
+     (setf (orfeus:processing-settings-chromatic-aberration-source settings) value))
     (:lens-distortion (setf (orfeus:processing-settings-lens-distortion settings) value))
     (:lens-profile (setf (orfeus:processing-settings-lens-profile settings) value))
     (:lens-focal-length

@@ -13,6 +13,7 @@
                 #:invalid-project-data
                 #:lens-profile-aliases-read
                 #:lens-profile-alias-save
+                #:processing-settings-chromatic-aberration-source
                 #:resolve-lens-profile-alias
                 #:make-export-settings
                 #:make-photo-job

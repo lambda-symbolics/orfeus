@@ -14,8 +14,8 @@
     :tone-blacks :tone-shadows :tone-dark-mids
     :tone-midtones :tone-light-mids :tone-highlights :tone-whites
     :lens-correction-p :lens-correction-strength
-    :chromatic-aberration-correction-p :lens-distortion
-    :lens-profile :lens-focal-length :lut-path :lut-strength
+    :chromatic-aberration-correction-p :chromatic-aberration-source
+    :lens-distortion :lens-profile :lens-focal-length :lut-path :lut-strength
     :grain-amount :grain-size)
   "Keys accepted in processing setting S-expressions.")
 
@@ -36,6 +36,12 @@
   (lens-correction-p t)
   (lens-correction-strength 1.0)
   (chromatic-aberration-correction-p t)
+  ;; Where the colour fringing correction comes from: :MEASURED reads how far
+  ;; red and blue sit from green in the photograph itself, :PROFILE trusts the
+  ;; lens database. Measured is the default because the database describes
+  ;; somebody else's copy of the lens, and on the one frame this was checked
+  ;; against it prescribed fringing the frame did not have.
+  (chromatic-aberration-source :measured)
   ;; Hand-set barrel or pincushion correction, for the lenses no database
   ;; describes. Positive straightens barrel, negative straightens pincushion.
   (lens-distortion 0.0)
@@ -56,8 +62,8 @@
     (:tone (:tone-blacks :tone-shadows :tone-dark-mids :tone-midtones
             :tone-light-mids :tone-highlights :tone-whites))
     (:optics (:lens-correction-p :lens-correction-strength
-              :chromatic-aberration-correction-p :lens-distortion
-              :lens-profile :lens-focal-length))
+              :chromatic-aberration-correction-p :chromatic-aberration-source
+              :lens-distortion :lens-profile :lens-focal-length))
     (:film (:lut-path :lut-strength :grain-amount :grain-size)))
   "The fixed processing pipeline as named stages over setting keys.
 Together the stages partition *PROCESSING-SETTING-KEYS*; frontends present
@@ -70,8 +76,8 @@ them as a copyable node chain.")
     :tone-blacks 0.0 :tone-shadows 0.0 :tone-dark-mids 0.0 :tone-midtones 0.0
     :tone-light-mids 0.0 :tone-highlights 0.0 :tone-whites 0.0
     :lens-correction-p nil :lens-correction-strength 1.0
-    :chromatic-aberration-correction-p nil :lens-distortion 0.0
-    :lens-profile nil :lens-focal-length nil
+    :chromatic-aberration-correction-p nil :chromatic-aberration-source :measured
+    :lens-distortion 0.0 :lens-profile nil :lens-focal-length nil
     :lut-path nil :lut-strength 0.0 :grain-amount 0.0 :grain-size 1.0)
   "Setting values under which every stage passes pixels through unchanged.")
 

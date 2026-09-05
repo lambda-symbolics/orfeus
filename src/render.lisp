@@ -211,6 +211,8 @@ The output is published atomically and INPUT-PATHNAME is never modified."
                 :chromatic-aberration-correction-p
               (processing-settings-chromatic-aberration-correction-p
                effective-settings)
+              :chromatic-aberration-source
+              (processing-settings-chromatic-aberration-source effective-settings)
               :lut-path (processing-settings-lut-path effective-settings)
               :lut-strength (processing-settings-lut-strength effective-settings)
               :grain-amount (processing-settings-grain-amount effective-settings)
@@ -220,16 +222,25 @@ The output is published atomically and INPUT-PATHNAME is never modified."
               :max-height max-height
               :jpeg-quality jpeg-quality)))
     (flet ((without-profile (settings)
+             ;; Only what the profile drives: fringing measured from the frame
+             ;; needs no profile and stays.
              (let ((fallback (copy-processing-settings settings)))
-               (setf (processing-settings-lens-correction-p fallback) nil
-                     (processing-settings-chromatic-aberration-correction-p
-                      fallback)
-                     nil)
-               fallback)))
+               (setf (processing-settings-lens-correction-p fallback) nil)
+               (when (eq :profile
+                         (processing-settings-chromatic-aberration-source fallback))
+                 (setf (processing-settings-chromatic-aberration-correction-p
+                        fallback)
+                       nil))
+               fallback))
+           (needs-profile-p (settings)
+             (or (processing-settings-lens-correction-p settings)
+                 (and (processing-settings-chromatic-aberration-correction-p
+                       settings)
+                      (eq :profile
+                          (processing-settings-chromatic-aberration-source
+                           settings))))))
       (let ((settings
-              (if (and (or (processing-settings-lens-correction-p settings)
-                           (processing-settings-chromatic-aberration-correction-p
-                            settings))
+              (if (and (needs-profile-p settings)
                        (not (photo-lens-profile-known-p
                              report-input-pathname
                              (processing-settings-lens-profile settings)
@@ -240,9 +251,7 @@ The output is published atomically and INPUT-PATHNAME is never modified."
             (invoke settings)
           (raw-render-error (condition)
             (if (and (= 9 (raw-render-error-status condition))
-                     (or (processing-settings-lens-correction-p settings)
-                         (processing-settings-chromatic-aberration-correction-p
-                          settings)))
+                     (needs-profile-p settings))
                 (progn
                   (warn-lens-profile-once report-input-pathname
                                           (raw-render-error-message condition))
@@ -328,12 +337,18 @@ to pay."
           nil))))
 
 (defun graph-active-optics-p (graph)
-  "True when GRAPH's effective plan applies any lens correction."
+  "True when GRAPH's effective plan applies a correction read from a lens profile.
+
+Colour fringing measured from the frame needs no profile, so an optics node
+that asks only for that does not count."
   (loop for node in (graph-effective-nodes graph)
         thereis (and (eq :optics (graph-node-kind node))
                      (let ((params (graph-node-params node)))
                        (or (getf params :lens-correction-p)
-                           (getf params :chromatic-aberration-correction-p))))))
+                           (and (getf params :chromatic-aberration-correction-p)
+                                (eq :profile
+                                    (getf params :chromatic-aberration-source
+                                          :measured))))))))
 
 (defvar *lens-profile-warned*
   (make-hash-table :test #'equal #+sbcl :synchronized #+sbcl t)
@@ -365,11 +380,17 @@ be found and keeps what the photographer typed in."
     (dolist (node (processing-graph-nodes copy))
       (when (eq :optics (graph-node-kind node))
         (setf (graph-node-params node)
-              (let ((params (graph-node-params node)))
+              (let* ((params (graph-node-params node))
+                     (source (getf params :chromatic-aberration-source :measured)))
                 (list :lens-correction-p nil
                       :lens-correction-strength
                       (getf params :lens-correction-strength 1.0)
-                      :chromatic-aberration-correction-p nil
+                      ;; Fringing measured from the frame needs no profile.
+                      :chromatic-aberration-correction-p
+                      (and (eq source :measured)
+                           (getf params :chromatic-aberration-correction-p)
+                           t)
+                      :chromatic-aberration-source source
                       :lens-distortion (getf params :lens-distortion 0.0)
                       :lens-profile (getf params :lens-profile)
                       :lens-focal-length (getf params :lens-focal-length))))))

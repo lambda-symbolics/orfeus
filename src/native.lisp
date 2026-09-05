@@ -92,7 +92,10 @@ form by hand for each of them buried the call it guards."
   (lens-distortion :float)
   ;; The focal length to read the profile at when the photograph records none,
   ;; in millimetres; zero defers to the file.
-  (focal-length :float))
+  (focal-length :float)
+  ;; Where colour fringing is corrected from when the flag asks for it:
+  ;; 0 measures the frame, 1 reads the lens profile.
+  (chromatic-aberration-source :uint32))
 
 (defcfun ("orfeus_raw_render_capabilities_v1"
           %raw-render-capabilities-v1) :uint32)
@@ -263,7 +266,8 @@ returns at once, so a caller can spend it during startup instead."
                             (grain-seed 0) (max-width 0) (max-height 0)
                             (jpeg-quality 92) output-format cache-p
                             neural-noise-reduction (lens-distortion 0.0)
-                            lens-focal-length)
+                            lens-focal-length
+                            (chromatic-aberration-source :measured))
   (native-library-load)
   (native-render-require-compatible)
   (labels ((invoke (lut-pointer lens-pointer name-pointer)
@@ -316,7 +320,9 @@ returns at once, so a caller can spend it during startup instead."
                  (setting 'lens-distortion
                           (float (or lens-distortion 0.0) 0.0))
                  (setting 'focal-length
-                          (float (or lens-focal-length 0.0) 0.0)))
+                          (float (or lens-focal-length 0.0) 0.0))
+                 (setting 'chromatic-aberration-source
+                          (if (eq chromatic-aberration-source :profile) 1 0)))
                (with-foreign-pointer (error-buffer *native-error-buffer-size*)
                  (let ((status
                          #+sbcl
@@ -440,7 +446,7 @@ the straightening angle in degrees for a crop node."
 (defconstant +graph-program-magic+ #x4746524F
   "Little-endian magic of a serialized graph program, spelling ORFG.")
 
-(defconstant +graph-program-version+ 7
+(defconstant +graph-program-version+ 8
   "Serialized graph program version.
 
 2 added the curves node's luma channel; 3 made each curve channel variable
@@ -490,10 +496,15 @@ reaches it and there is nothing to keep alive across threads.")
                      (parameter :tone-whites))
                nil))
       (:optics
+       ;; The third parameter names where colour fringing is corrected from:
+       ;; 0 nowhere, 1 measured from the frame, 2 read from the lens profile.
        (values (list (graph-boolean-parameter (parameter :lens-correction-p))
                      (parameter :lens-correction-strength)
-                     (graph-boolean-parameter
-                      (parameter :chromatic-aberration-correction-p))
+                     (cond ((not (parameter :chromatic-aberration-correction-p))
+                            0.0)
+                           ((eq :profile (parameter :chromatic-aberration-source))
+                            2.0)
+                           (t 1.0))
                      (float (or (parameter :lens-distortion) 0.0) 1.0))
                nil))
       (:film

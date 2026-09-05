@@ -927,7 +927,8 @@ context menu being opened by hand."
                  :kind :optics
                  :params (list :lens-correction-p t
                                :lens-correction-strength 1.0
-                               :chromatic-aberration-correction-p t)
+                               :chromatic-aberration-correction-p t
+                               :chromatic-aberration-source :measured)
                  :inputs (list *graph-source-id*))
                 (make-graph-node
                  :id 2

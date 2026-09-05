@@ -182,6 +182,7 @@
    #:still-store-thumbnail-pathname
    #:processing-settings
    #:processing-settings-chromatic-aberration-correction-p
+   #:processing-settings-chromatic-aberration-source
    #:processing-settings-lens-distortion
    #:processing-settings-lens-profile
    #:processing-settings-lens-focal-length
@@ -218,8 +219,8 @@
    #:raw-render-error
    #:render-photo
    #:render-photo-job
-   #:render-preview
    #:render-photo-jobs
+   #:render-preview
    #:render-preview-rgb
    #:sexp->project))
 

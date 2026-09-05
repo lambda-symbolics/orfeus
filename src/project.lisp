@@ -115,6 +115,8 @@ frontend keep undo snapshots."
      (and (realp value) (<= 0 value 2)))
     (:lens-distortion
      (and (realp value) (<= -1/2 value 1/2)))
+    (:chromatic-aberration-source
+     (member value '(:measured :profile)))
     (:lens-profile
      (or (null value) (and (stringp value) (plusp (length value)))))
     (:lens-focal-length
@@ -156,6 +158,8 @@ frontend keep undo snapshots."
         (processing-settings-lens-correction-strength settings)
         :chromatic-aberration-correction-p
         (processing-settings-chromatic-aberration-correction-p settings)
+        :chromatic-aberration-source
+        (processing-settings-chromatic-aberration-source settings)
         :lens-distortion (processing-settings-lens-distortion settings)
         :lens-profile (processing-settings-lens-profile settings)
         :lens-focal-length (processing-settings-lens-focal-length settings)
@@ -345,6 +349,9 @@ frontend keep undo snapshots."
                (:chromatic-aberration-correction-p
                 (setf (processing-settings-chromatic-aberration-correction-p
                        result)
+                      value))
+               (:chromatic-aberration-source
+                (setf (processing-settings-chromatic-aberration-source result)
                       value))
                (:lut-path
                 (setf (processing-settings-lut-path result) value))

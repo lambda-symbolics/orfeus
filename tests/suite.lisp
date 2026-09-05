@@ -1254,6 +1254,63 @@ and then quietly relocated them would be lying about where a click puts things."
     (and (string= profile "Carl Zeiss Makro-Planar T* 2/50 ZF.2")
          (= reducer 1.0) (null crop) (= focal 50.0))))
 
+(defun fringing-source-reaches-the-program-p ()
+  "The optics node's third parameter says where colour fringing comes from."
+  (flet ((third-parameter (&rest params)
+           (third (orfeus::graph-node-program-parameters
+                   (make-graph-node :id 1 :kind :optics :params params
+                                    :inputs (list 0))))))
+    (and (= 0.0 (third-parameter :chromatic-aberration-correction-p nil))
+         (= 1.0 (third-parameter :chromatic-aberration-correction-p t))
+         (= 1.0 (third-parameter :chromatic-aberration-correction-p t
+                                 :chromatic-aberration-source :measured))
+         (= 2.0 (third-parameter :chromatic-aberration-correction-p t
+                                 :chromatic-aberration-source :profile)))))
+
+(defun missing-profile-keeps-measured-fringing-p ()
+  "Losing the lens profile drops only what the profile drives."
+  (let* ((graph (make-processing-graph
+                 :nodes (list (make-graph-node
+                               :id 1 :kind :optics
+                               :params (list :lens-correction-p t
+                                             :chromatic-aberration-correction-p t
+                                             :chromatic-aberration-source :measured
+                                             :lens-distortion 0.1)
+                               :inputs (list 0)))
+                 :output 1))
+         (params (graph-node-params
+                  (first (processing-graph-nodes
+                          (orfeus::graph-without-lens-profile graph)))))
+         (settings (make-processing-settings
+                    :lens-correction-p t
+                    :chromatic-aberration-correction-p t
+                    :chromatic-aberration-source :profile)))
+    (and (null (getf params :lens-correction-p))
+         (getf params :chromatic-aberration-correction-p)
+         (= 0.1 (getf params :lens-distortion))
+         ;; Read from the profile, fringing does go with it.
+         (not (orfeus::graph-active-optics-p
+               (make-processing-graph
+                :nodes (list (make-graph-node
+                              :id 1 :kind :optics
+                              :params (list :chromatic-aberration-correction-p t)
+                              :inputs (list 0)))
+                :output 1)))
+         (orfeus::graph-active-optics-p
+          (make-processing-graph
+           :nodes (list (make-graph-node
+                         :id 1 :kind :optics
+                         :params (list :chromatic-aberration-correction-p t
+                                       :chromatic-aberration-source :profile)
+                         :inputs (list 0)))
+           :output 1))
+         (eq :profile (processing-settings-chromatic-aberration-source settings))
+         (equal (getf (orfeus::processing-settings->sexp
+                       (orfeus::sexp->processing-settings
+                        (orfeus::processing-settings->sexp settings)))
+                      :chromatic-aberration-source)
+                :profile))))
+
 (defun processing-overrides-p ()
   (let ((settings
           (processing-settings-with-overrides
@@ -1419,9 +1476,9 @@ and then quietly relocated them would be lying about where a click puts things."
                  :output 1))
          (bytes (orfeus::graph->program-bytes graph)))
     (equalp bytes
-            ;; magic "ORFG", version 7, one node: exposure(2), input 0,
+            ;; magic "ORFG", version 8, one node: exposure(2), input 0,
             ;; no second input, one parameter 0.5f0, no string.
-            (coerce #(#x4F #x52 #x46 #x47  7 0 0 0  1 0 0 0
+            (coerce #(#x4F #x52 #x46 #x47  8 0 0 0  1 0 0 0
                       2 0 0 0  0 0 0 0  #xFF #xFF #xFF #xFF
                       1 0 0 0  0 0 0 #x3F  0 0 0 0)
                     '(simple-array (unsigned-byte 8) (*))))))
@@ -1850,6 +1907,10 @@ neither way."
              (lens-alias-save-round-trip-p))
       (check "a hand-set lens profile replaces the nickname alias"
              (lens-resolution-prefers-the-hand-set-profile-p))
+      (check "the fringing source is encoded in the optics program"
+             (fringing-source-reaches-the-program-p))
+      (check "losing the lens profile keeps measured fringing correction"
+             (missing-profile-keeps-measured-fringing-p))
       (check "per-photo overrides produce effective settings"
              (processing-overrides-p))
       (check "tonal settings default safely and reject invalid ranges"

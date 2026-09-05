@@ -320,6 +320,10 @@ the same reason.")
 (defconstant +key-f5+ #xffc2
   "FLTK key code for the F5 function key.")
 
+(defparameter *fringing-source-choices*
+  '(("Measured" . :measured) ("Lens profile" . :profile))
+  "How the optics panel names the sources of a colour fringing correction.")
+
 (defparameter *node-kind-labels*
   '((:white-balance . "WB")
     (:exposure . "Expo")
@@ -1388,7 +1392,7 @@ new cache entry is published."
            export-dialog-format export-dialog-quality
            export-dialog-width export-dialog-height
            export-dialog-metadata export-dialog-timestamp
-           lens-profile-label lens-picker lens-picker-caption
+           lens-profile-label fringing-source-choice lens-picker lens-picker-caption
            lens-picker-search lens-picker-list lens-picker-focal
            lens-picker-remember lens-picker-records
            gallery-canvas gallery-title preset-name-input
@@ -4541,6 +4545,12 @@ new cache entry is published."
                                  (selected-lens-description) capture)
                          (format nil "Lens: ~A" (selected-lens-description)))))
              (sync-lens-profile-label)
+             (when fringing-source-choice
+               (setf (lightfast:value fringing-source-choice)
+                     (or (first (find (gui-model-setting
+                                       model :chromatic-aberration-source)
+                                      *fringing-source-choices* :key #'rest))
+                         "Measured")))
              (sync-export-controls)
              (sync-preset-action-label))
            (refresh-photo-groups ()
@@ -5189,10 +5199,11 @@ new cache entry is published."
                            :progress-callback #'report-export-progress)
                         (queue-event
                          queue
-                         (if (plusp failures)
+                         (if failures
                              (list :error
                                    (format nil "Exported ~D; ~D failed"
-                                           completed failures))
+                                           (length completed)
+                                           (length failures)))
                              (list :done
                                    (format nil "~D photograph~:P"
                                            (length completed)))))))))))
@@ -6877,8 +6888,8 @@ new cache entry is published."
            (let ((tca (register-inspector
                        (lightfast:make-check-button
                         :parent node-page :x 12 :y 108
-                        :width 292 :height 26
-                        :label "Remove chromatic aberration"
+                        :width 170 :height 26
+                        :label "Remove colour fringing"
                         :callback
                         (lambda (widget event value)
                           (declare (ignore event value))
@@ -6886,9 +6897,33 @@ new cache entry is published."
                            model :chromatic-aberration-correction-p
                            (string/= "0" (lightfast:value widget)))
                           (schedule-edited-preview)))
-                       12 108 :fill 26 :page)))
+                       12 108 170 26 :page)))
+             (lightfast:set-tooltip
+              tca "Draw red and blue back onto green where the lens spread them")
              (push (list :chromatic-aberration-correction-p tca)
                    controls))
+           ;; Where the fringing correction is read from. Measured from the
+           ;; frame by default; the database entry is there for when it is
+           ;; wanted, since it describes somebody else's copy of the lens.
+           (setf fringing-source-choice
+                 (register-inspector
+                  (lightfast:make-choice
+                   :parent node-page :x 190 :y 108 :width 110 :height 26
+                   :items (mapcar #'first *fringing-source-choices*)
+                   :callback
+                   (lambda (widget event value)
+                     (declare (ignore event value))
+                     (let ((source (rest (assoc (lightfast:value widget)
+                                                *fringing-source-choices*
+                                                :test #'string=))))
+                       (when source
+                         (gui-model-set-setting
+                          model :chromatic-aberration-source source)
+                         (schedule-edited-preview)))))
+                  190 108 110 26 :page))
+           (lightfast:set-tooltip
+            fringing-source-choice
+            "Measured: read from this photograph. Lens profile: trust the database entry")
            ;; The hand-set correction, for lenses no profile describes.
            (let ((distortion (make-number-field :lens-distortion "By hand"
                                                 -0.5 0.5 0.01 140 node-page)))
