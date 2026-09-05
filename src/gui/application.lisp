@@ -4645,9 +4645,11 @@ new cache entry is published."
                          ;; value this photograph is already being rendered
                          ;; at, and typing over it starts from the truth.
                          (:white-balance-temperature
-                          (display-number
-                           (or (gui-model-setting model key)
-                               (selected-as-shot-kelvin))))
+                          ;; Whole kelvins: the camera balanced to 4668.18 K
+                          ;; and no eye can tell the .18.
+                          (let ((kelvin (or (gui-model-setting model key)
+                                            (selected-as-shot-kelvin))))
+                            (display-number (and kelvin (round kelvin)))))
                          (otherwise (display-number (gui-model-setting model key)))))))
              (setf (lightfast:value wb-choice)
                    (if (gui-model-setting model :white-balance-temperature)
