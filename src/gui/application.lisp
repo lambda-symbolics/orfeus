@@ -544,6 +544,37 @@ sliders and nothing else has to be recomputed."
     (:node (:rect 2 2 8 8)))
   "Per-kind glyphs for the node graph, drawn beside each node's caption.")
 
+(defparameter *node-kind-icons*
+  '((:white-balance . :white-balance)
+    (:exposure . :exposure)
+    (:noise-reduction . :noise)
+    (:tone . :tone)
+    (:optics . :optics)
+    (:film . :film)
+    (:blend . :blend)
+    (:color-subtract . :color-subtract)
+    (:negative . :negative)
+    (:contrast . :contrast)
+    (:sharpen . :sharpen)
+    (:crop . :crop)
+    (:rotate . :rotate)
+    (:flip . :flip)
+    (:curves . :curves))
+  "The stock icon each node kind wears in the graph, the same sixteen-colour
+pictures the buttons carry, so a node and the button that acts on it read as
+one thing.")
+
+(defun draw-node-icon (kind bypassed x y)
+  "Draw KIND's icon with its corner at X, Y; a kind without one gets its glyph,
+dimmed when BYPASSED, since a bypassed node is still there and still wants
+identifying."
+  (let ((icon (rest (assoc kind *node-kind-icons*))))
+    (cond (icon (lightfast:draw-stock-icon icon x y))
+          (t (if bypassed
+                 (lightfast:draw-color-rgb :red 128 :green 128 :blue 132)
+                 (lightfast:draw-color-rgb :red 58 :green 74 :blue 104))
+             (draw-node-glyph kind (+ x 1) (+ y 2))))))
+
 (defun draw-node-glyph (kind x y)
   "Draw KIND's glyph with its top-left corner at X, Y."
   (dolist (part (rest (assoc kind *node-kind-glyphs*)))
@@ -2831,12 +2862,13 @@ new cache entry is published."
              ;; `sharp' beside every photograph is a row of noise: the useful
              ;; information is the exception.
              (when (eq :soft (photo-focus-verdict job))
+               (lightfast:draw-stock-icon :focus x (- y 13))
                (lightfast:draw-color-rgb :red 240 :green 176 :blue 84)
                (lightfast:draw-text
                 (or (and (orfeus:photo-focus-report-p (photo-focus-of job))
                          (orfeus:focus-description (photo-focus-of job)))
                     "soft")
-                x y)))
+                (+ x 20) y)))
            (thumbnail-scroll-limit ()
              (if thumbnail-canvas
                  (max 0 (- (* (length (thumbnail-display-rows))
@@ -3569,10 +3601,16 @@ new cache entry is published."
                    (when (selected-job)
                      (draw-editor-box (+ ox 18) (+ oy 6)
                                       *graph-node-width* *graph-well-height*
-                                      "RAW" :terminal nil)
+                                      "RAW" :terminal nil 16)
+                     (lightfast:draw-stock-icon
+                      :photo (+ ox 24)
+                      (+ oy 6 (floor (- *graph-well-height* 16) 2)))
                      (draw-editor-box (+ ox out-x) (+ oy out-y)
                                       out-w *graph-well-height*
-                                      "OUT" :terminal nil)))
+                                      "OUT" :terminal nil 16)
+                     (lightfast:draw-stock-icon
+                      :export (+ ox out-x 6)
+                      (+ oy out-y (floor (- *graph-well-height* 16) 2)))))
                  ;; Node boxes.
                  (dolist (node nodes)
                    (multiple-value-bind (x y w h) (graph-node-box node)
@@ -3599,13 +3637,8 @@ new cache entry is published."
                        ;; activity light. Dimmed when the node is bypassed,
                        ;; because a bypassed node is still there and still
                        ;; wants identifying.
-                       (if bypassed
-                           (lightfast:draw-color-rgb :red 128 :green 128
-                                                     :blue 132)
-                           (lightfast:draw-color-rgb :red 58 :green 74
-                                                     :blue 104))
-                       (draw-node-glyph (orfeus:graph-node-kind node)
-                                        (+ bx 7) (+ by (floor h 2) -6))
+                       (draw-node-icon (orfeus:graph-node-kind node) bypassed
+                                       (+ bx 6) (+ by (floor (- h 16) 2)))
                        ;; The input and output port nubs.
                        (lightfast:draw-color-rgb :red 235 :green 235 :blue 240)
                        (lightfast:draw-filled-rect (+ bx (floor w 2) -4)
@@ -5474,8 +5507,10 @@ new cache entry is published."
                               (lightfast:make-input :parent dialog :x 0 :y 0
                                                     :width 200
                                                     :height row-height)
-                              (button "Browse..."
-                                      #'browse-export-destination 88)))
+                              (lightfast:set-stock-icon
+                               (button "Browse..."
+                                       #'browse-export-destination 88)
+                               :folder-open)))
                  ;; Only the single-photograph scope can honour a name; a batch
                  ;; has as many names as it has photographs. Left visible and
                  ;; labelled rather than hidden, so its scope is stated instead
@@ -5534,7 +5569,9 @@ new cache entry is published."
                                        96)
                                :basis 96 :shrink 0)
                               (lightfast:make-layout-item
-                               (button "Export" #'start-dialog-export 100)
+                               (lightfast:set-stock-icon
+                                (button "Export" #'start-dialog-export 100)
+                                :export)
                                :basis 100 :shrink 0)))
                        rows))
                (lightfast:layout-on-resize
@@ -5792,7 +5829,9 @@ new cache entry is published."
                                        96)
                                :basis 96 :shrink 0)
                               (lightfast:make-layout-item
-                               (button "Use Profile" #'accept-lens-picker 120)
+                               (lightfast:set-stock-icon
+                                (button "Use Profile" #'accept-lens-picker 120)
+                                :success)
                                :basis 120 :shrink 0)))
                        rows))
                (lightfast:layout-on-resize
@@ -5928,16 +5967,18 @@ new cache entry is published."
                         (lightfast:set-range spinner 0 100)
                         (lightfast:set-step spinner 0.5)
                         spinner))
-                    (base-button (y label action)
+                    (base-button (y label icon action)
                       (register-inspector
-                       (lightfast:make-button
-                        :parent node-page :x 12 :y y :width 292 :height 26
-                        :label label
-                        :callback
-                        (lambda (&rest ignored)
-                          (declare (ignore ignored))
-                          (let ((node (gui-model-selected-graph-node model)))
-                            (when node (funcall action node)))))
+                       (lightfast:set-stock-icon
+                        (lightfast:make-button
+                         :parent node-page :x 12 :y y :width 292 :height 26
+                         :label label
+                         :callback
+                         (lambda (&rest ignored)
+                           (declare (ignore ignored))
+                           (let ((node (gui-model-selected-graph-node model)))
+                             (when node (funcall action node)))))
+                        icon)
                        12 y :fill 26 :page)))
                (let ((red (channel-field :red "Base red %" top))
                      (green (channel-field :green "Base green %" (+ top 32)))
@@ -5950,13 +5991,13 @@ new cache entry is published."
                               204 top 100 90 :page)))
                  (lightfast:set-box swatch lightfast:+box-flat-box+)
                  (lightfast:set-tooltip swatch tooltip)
-                 (base-button (+ top 96) "Sample Base From Photo"
+                 (base-button (+ top 96) "Sample Base From Photo" :dropper
                               (lambda (node)
                                 (setf pick-color-node node)
                                 (set-preview-cursor :cross)
                                 (set-status
                                  "Click the preview to sample the film base")))
-                 (base-button (+ top 128) "Auto Base From Border"
+                 (base-button (+ top 128) "Auto Base From Border" :film-border
                               #'auto-base-from-border)
                  (values red green blue swatch))))
            (build-group (kind builder)
@@ -6464,6 +6505,7 @@ new cache entry is published."
         ;; FLTK closes a window on Escape unless told otherwise. A dialog wants
         ;; that; the main window, with a project open in it, does not.
         (lightfast:window-escape-closes window nil)
+        (lightfast:window-set-icon window :orfeus-32)
         (lightfast:apply-classic-theme)
         ;; The core keeps focus measurements wherever this points, and only a
         ;; frontend knows where that should be.
@@ -6678,16 +6720,6 @@ new cache entry is published."
                    (lightfast:set-box button lightfast:+box-flat-box+)
                    (lightfast:set-stock-icon button icon)
                    (lightfast:set-tooltip button tooltip)
-                   button))
-               (toolbar-text-button (x width label tooltip action)
-                 (let ((button (lightfast:make-button
-                                :parent toolbar :x x :y 5 :width width :height 28
-                                :label label
-                                :callback (lambda (&rest ignored)
-                                            (declare (ignore ignored))
-                                            (funcall action)))))
-                   (lightfast:set-box button lightfast:+box-flat-box+)
-                   (lightfast:set-tooltip button tooltip)
                    button)))
           (rule 6 10 2 18 130 130 130)
           (rule 10 10 2 18 245 245 245)
@@ -6702,17 +6734,17 @@ new cache entry is published."
                           #'remove-selected-photo)
           (rule 142 7 1 24 150 150 150)
           (toolbar-button 150 :export "Export photographs..." #'open-export-dialog)
-          (toolbar-button 180 :pipeline "Show or hide Before and After"
+          (toolbar-button 180 :compare "Show or hide Before and After"
                           #'toggle-comparison)
           (toolbar-button 210 :focus "Select photographs that look out of focus"
                           #'find-and-select-blurry-photos)
           (rule 244 7 1 24 150 150 150)
           (toolbar-button 252 :zoom-out "Zoom out" (lambda () (zoom-preview .8d0)))
-          (toolbar-text-button 282 38 "Fit" "Fit preview" #'reset-preview-view)
-          (toolbar-button 322 :zoom-in "Zoom in" (lambda () (zoom-preview 1.25d0)))
-          (toolbar-text-button 352 38 "1:1" "Show image pixels at 1:1"
-                               #'preview-one-to-one)
-          (rule 394 7 1 24 150 150 150)
+          (toolbar-button 282 :fit "Fit preview" #'reset-preview-view)
+          (toolbar-button 312 :zoom-in "Zoom in" (lambda () (zoom-preview 1.25d0)))
+          (toolbar-button 342 :actual-pixels "Show image pixels at 1:1"
+                          #'preview-one-to-one)
+          (rule 376 7 1 24 150 150 150)
           (setf toolbar-bottom-rule (rule 0 38 1280 2 145 145 145)))
         (setf lens-name (lightfast:make-label :parent toolbar :x 402 :y 6
                                             :width 852 :height 28
@@ -6925,24 +6957,26 @@ new cache entry is published."
                                               :width 304 :height 18
                                               :label "Node Graph"))
         (lightfast:set-label-font graph-title lightfast:+font-helvetica-bold+)
-        (flet ((grade-button (x label tooltip action)
+        (flet ((grade-button (x label icon tooltip action)
                  (let ((button (lightfast:make-button
                                 :parent graph-pane :x x :y 24
                                 :width 96 :height 22 :label label
                                 :callback (lambda (&rest ignored)
                                             (declare (ignore ignored))
                                             (funcall action)))))
+                   (lightfast:set-stock-icon button icon)
                    (lightfast:set-tooltip button tooltip)
                    button)))
           (setf still-button
-                (grade-button 8 "Still" "Grab a still of the current grade"
+                (grade-button 8 "Still" :camera
+                              "Grab a still of the current grade"
                               #'grab-still)
                 copy-grade-button
-                (grade-button 108 "Copy"
+                (grade-button 108 "Copy" :copy
                               "Copy the current photo's node graph"
                               #'copy-grade)
                 paste-grade-button
-                (grade-button 208 "Paste"
+                (grade-button 208 "Paste" :paste
                               "Paste the copied node graph to the selection"
                               #'paste-grade)))
         (setf graph-canvas
@@ -7060,7 +7094,7 @@ new cache entry is published."
         (setf preset-save-button
               (lightfast:make-button
                :parent gallery-pane :x 8 :y 228 :width 108 :height 26
-               :label "Save current"
+               :label "Save still"
                :callback (lambda (&rest ignored)
                            (declare (ignore ignored))
                            (save-current-preset))))
@@ -7071,6 +7105,8 @@ new cache entry is published."
                :callback (lambda (&rest ignored)
                            (declare (ignore ignored))
                            (apply-current-preset))))
+        (lightfast:set-stock-icon preset-save-button :save)
+        (lightfast:set-stock-icon preset-apply-button :send)
         (refresh-gallery)
         ;; The Node panel: pick a correction, see only that category's
         ;; controls beneath it.
@@ -7248,20 +7284,24 @@ new cache entry is published."
                    :label "")
                   12 172 :fill 26 :page))
            (register-inspector
-            (lightfast:make-button
-             :parent node-page :x 12 :y 204 :width 140 :height 26
-             :label "Choose Profile..."
-             :callback (lambda (&rest ignored)
-                         (declare (ignore ignored))
-                         (open-lens-picker)))
+            (lightfast:set-stock-icon
+             (lightfast:make-button
+              :parent node-page :x 12 :y 204 :width 140 :height 26
+              :label "Choose Profile..."
+              :callback (lambda (&rest ignored)
+                          (declare (ignore ignored))
+                          (open-lens-picker)))
+             :search)
             12 204 140 26 :page)
            (register-inspector
-            (lightfast:make-button
-             :parent node-page :x 160 :y 204 :width 140 :height 26
-             :label "Photograph's Own"
-             :callback (lambda (&rest ignored)
-                         (declare (ignore ignored))
-                         (clear-lens-profile)))
+            (lightfast:set-stock-icon
+             (lightfast:make-button
+              :parent node-page :x 160 :y 204 :width 140 :height 26
+              :label "Photograph's Own"
+              :callback (lambda (&rest ignored)
+                          (declare (ignore ignored))
+                          (clear-lens-profile)))
+             :photo)
             160 204 140 26 :page)))
         (build-group
          :film
@@ -7543,13 +7583,15 @@ new cache entry is published."
              (setf crop-width-input (size-field :width "Width %" 108)
                    crop-height-input (size-field :height "Height %" 140)))
            (register-inspector
-            (lightfast:make-button
-             :parent node-page :x 12 :y 172 :width 292 :height 26
-             :label "Autocrop Negative"
-             :callback (lambda (&rest ignored)
-                         (declare (ignore ignored))
-                         (let ((node (crop-editing-node)))
-                           (when node (autocrop-negative node)))))
+            (lightfast:set-stock-icon
+             (lightfast:make-button
+              :parent node-page :x 12 :y 172 :width 292 :height 26
+              :label "Autocrop Negative"
+              :callback (lambda (&rest ignored)
+                          (declare (ignore ignored))
+                          (let ((node (crop-editing-node)))
+                            (when node (autocrop-negative node)))))
+             :crop)
             12 172 :fill 26 :page)
            (register-inspector
             (lightfast:make-button
@@ -7653,22 +7695,26 @@ new cache entry is published."
           :gap 12
           :children
           (list (lightfast:make-layout-item
-                 (lightfast:make-button
-                  :parent inspector :x 12 :y 674
-                  :width 140 :height 26 :label "Reset selected"
-                  :callback (lambda (&rest ignored)
-                              (declare (ignore ignored))
-                              (gui-model-reset-selected model)
-                              (sync-controls)
-                              (schedule-edited-preview)))
+                 (lightfast:set-stock-icon
+                  (lightfast:make-button
+                   :parent inspector :x 12 :y 674
+                   :width 140 :height 26 :label "Reset selected"
+                   :callback (lambda (&rest ignored)
+                               (declare (ignore ignored))
+                               (gui-model-reset-selected model)
+                               (sync-controls)
+                               (schedule-edited-preview)))
+                  :reload)
                  :basis 0 :grow 1)
                 (lightfast:make-layout-item
-                 (lightfast:make-button
-                  :parent inspector :x 166 :y 674
-                  :width 142 :height 26 :label "Export current"
-                  :callback (lambda (&rest ignored)
-                              (declare (ignore ignored))
-                              (render-selected)))
+                 (lightfast:set-stock-icon
+                  (lightfast:make-button
+                   :parent inspector :x 166 :y 674
+                   :width 142 :height 26 :label "Export current"
+                   :callback (lambda (&rest ignored)
+                               (declare (ignore ignored))
+                               (render-selected)))
+                  :export)
                  :basis 0 :grow 1)))
          '() inspector 12 :action-row 26)
         (setf progress (lightfast:make-progress :parent window :x 0 :y 772
