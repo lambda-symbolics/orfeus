@@ -60,7 +60,8 @@ five — nobody rates anything zero — so it reads as unrated."
   '("-Lens" "-LensModel" "-LensType" "-LensID"
     "-Rating" "-XMP:Rating"
     "-DateTimeOriginal" "-CreateDate"
-    "-Model" "-ISO" "-FNumber" "-ExposureTime")
+    "-Model" "-ISO" "-FNumber" "-ExposureTime"
+    "-Make" "-FocalLength#")
   "Everything read out of a photograph, in one ExifTool run.
 
 Asked for together because the subprocess is the cost, not the tags: the lens,
@@ -76,7 +77,22 @@ output as a dash, which is what keeps the answers positional.")
   (rating nil)
   (timestamp nil)
   (seconds nil)
-  (capture-summary nil))
+  (capture-summary nil)
+  ;; The body and focal length, as the lens database wants them: a profile is
+  ;; looked up for a lens *on a body*, and read at a focal length.
+  (camera-make nil)
+  (camera-model nil)
+  (focal-length nil))
+
+(defun parsed-focal-length (value)
+  "Return VALUE, ExifTool's numeric focal length in millimetres, or NIL."
+  (let ((number (and (usable-metadata-value-p value)
+                     (ignore-errors
+                       (let ((*read-default-float-format* 'single-float)
+                             (*read-eval* nil))
+                         (read-from-string value))))))
+    (when (and (realp number) (plusp number))
+      (float number 1.0))))
 
 (defvar *photo-metadata-cache*
   (make-hash-table :test #'equal #+sbcl :synchronized #+sbcl t)
@@ -111,7 +127,10 @@ otherwise the slowest step of an interactive preview.")
              :timestamp (some #'timestamp-token dates)
              :seconds (some #'capture-universal-time dates)
              :capture-summary (capture-description (field 8) (field 9)
-                                                   (field 10) (field 11)))))
+                                                   (field 10) (field 11))
+             :camera-make (field 12)
+             :camera-model (field 8)
+             :focal-length (parsed-focal-length (nth 13 lines)))))
         (%make-photo-metadata))))
 
 (defun photo-metadata (pathname)
@@ -144,6 +163,18 @@ cost more than it saves."
 Handed to the renderer for containers that carry no lens metadata it can read:
 rawler names the lens in an ORF but not in the DNG converted from it."
   (photo-metadata-lens-name (photo-metadata pathname)))
+
+(defun photo-camera-make (pathname)
+  "Return the make of the body PATHNAME was taken on, or NIL."
+  (photo-metadata-camera-make (photo-metadata pathname)))
+
+(defun photo-camera-model (pathname)
+  "Return the model of the body PATHNAME was taken on, or NIL."
+  (photo-metadata-camera-model (photo-metadata pathname)))
+
+(defun photo-focal-length (pathname)
+  "Return the focal length PATHNAME was taken at in millimetres, or NIL."
+  (photo-metadata-focal-length (photo-metadata pathname)))
 
 (defun photo-rating (pathname)
   "Return the star rating the photographer gave PATHNAME, 1 to 5, or NIL."

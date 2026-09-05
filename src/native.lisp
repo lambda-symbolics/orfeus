@@ -89,7 +89,10 @@ form by hand for each of them buried the call it guards."
   (lens-name :pointer)
   ;; Hand-set barrel or pincushion correction, for lenses lensfun has never
   ;; heard of. Positive straightens barrel, negative pincushion.
-  (lens-distortion :float))
+  (lens-distortion :float)
+  ;; The focal length to read the profile at when the photograph records none,
+  ;; in millimetres; zero defers to the file.
+  (focal-length :float))
 
 (defcfun ("orfeus_raw_render_capabilities_v1"
           %raw-render-capabilities-v1) :uint32)
@@ -132,7 +135,10 @@ form by hand for each of them buried the call it guards."
   (progress-context :pointer)
   ;; The part of the frame to develop, as left, top, width and height in
   ;; fractions of the oriented frame. All zeros means the whole of it.
-  (viewport :float :count 4))
+  (viewport :float :count 4)
+  ;; The focal length to read the profile at when the photograph records none,
+  ;; in millimetres; zero defers to the file.
+  (focal-length :float))
 
 (defcfun ("orfeus_raw_render_v3" %raw-render-v3) :int32
   (input-path :string)
@@ -256,7 +262,8 @@ returns at once, so a caller can spend it during startup instead."
                             lut-path lut-strength grain-amount grain-size
                             (grain-seed 0) (max-width 0) (max-height 0)
                             (jpeg-quality 92) output-format cache-p
-                            neural-noise-reduction (lens-distortion 0.0))
+                            neural-noise-reduction (lens-distortion 0.0)
+                            lens-focal-length)
   (native-library-load)
   (native-render-require-compatible)
   (labels ((invoke (lut-pointer lens-pointer name-pointer)
@@ -307,7 +314,9 @@ returns at once, so a caller can spend it during startup instead."
                  (setting 'lens-profile-model lens-pointer)
                  (setting 'lens-name name-pointer)
                  (setting 'lens-distortion
-                          (float (or lens-distortion 0.0) 0.0)))
+                          (float (or lens-distortion 0.0) 0.0))
+                 (setting 'focal-length
+                          (float (or lens-focal-length 0.0) 0.0)))
                (with-foreign-pointer (error-buffer *native-error-buffer-size*)
                  (let ((status
                          #+sbcl
@@ -590,6 +599,7 @@ reaches it and there is nothing to keep alive across threads.")
 
 (defun native-raw-render-graph (input-pathname output-pathname graph
                                 &key lens-profile-model lens-name focal-reducer
+                                  lens-focal-length
                                   lens-crop-factor (grain-seed 0)
                                   (max-width 0) (max-height 0)
                                   (jpeg-quality 92) output-format cache-p
@@ -642,7 +652,9 @@ by definition."
                    (loop for index below 4
                          for value in values
                          do (setf (mem-aref slot :float index)
-                                  (float value 0.0)))))
+                                  (float value 0.0))))
+                 (setting 'focal-length
+                          (float (or lens-focal-length 0.0) 0.0)))
                (with-foreign-pointer (buffer (length program))
                  (loop for octet across program
                        for index from 0
@@ -682,7 +694,7 @@ by definition."
 
 (defun native-raw-render-graph-rgb (input-pathname graph rgb-buffer capacity
                                     &key lens-profile-model lens-name
-                                      focal-reducer
+                                      focal-reducer lens-focal-length
                                       lens-crop-factor (grain-seed 0)
                                       (max-width 0) (max-height 0) cache-p
                                       draft-p viewport progress)
@@ -727,7 +739,9 @@ image width and height as two values."
                    (loop for index below 4
                          for value in values
                          do (setf (mem-aref slot :float index)
-                                  (float value 0.0)))))
+                                  (float value 0.0))))
+                 (setting 'focal-length
+                          (float (or lens-focal-length 0.0) 0.0)))
                (with-foreign-pointer (program-buffer (length program))
                  (loop for octet across program
                        for index from 0
@@ -870,6 +884,127 @@ when that last one is near zero: a frame of sky says nothing about focus."
           (values (cffi:mem-aref focus :float 0)
                   (cffi:mem-aref focus :float 1)
                   (cffi:mem-aref focus :float 2)))))))
+
+
+(defcfun ("orfeus_lens_profile_match_v1" %lens-profile-match-v1) :int32
+  (make :string)
+  (model :string)
+  (lens-name :string)
+  (focal :float)
+  (explicit-profile :pointer)
+  (focal-reducer :float)
+  (crop-factor :float)
+  (output :pointer)
+  (output-capacity :size)
+  (error-buffer :pointer)
+  (error-capacity :size))
+
+(defcfun ("orfeus_lens_profiles_v1" %lens-profiles-v1) :int32
+  (make :string)
+  (model :string)
+  (query :string)
+  (focal :float)
+  (output :pointer)
+  (output-capacity :size)
+  (error-buffer :pointer)
+  (error-capacity :size))
+
+(defparameter *lens-listing-buffer-size* (* 256 1024)
+  "Where a lens profile listing starts; it grows when the bridge asks.")
+
+(defun lens-profile-record (line)
+  "Parse one tab-separated lens profile LINE from the bridge into a plist."
+  (let ((fields (uiop:split-string line :separator '(#\Tab))))
+    (flet ((field (index) (nth index fields))
+           (number (index)
+             (let ((text (nth index fields)))
+               (and text (plusp (length text))
+                    (ignore-errors
+                      (let ((*read-eval* nil)
+                            (*read-default-float-format* 'single-float))
+                        (float (read-from-string text) 1.0)))))))
+      (let ((letters (or (field 3) "")))
+        (list :model (field 0)
+              :display (field 1)
+              :maker (field 2)
+              :distortion-p (and (find #\D letters) t)
+              :chromatic-aberration-p (and (find #\T letters) t)
+              :vignetting-p (and (find #\V letters) t)
+              :crop-factor (number 4)
+              :focal-min (number 5)
+              :focal-max (number 6)
+              :mounts (field 7)
+              :mountable-p (equal (field 8) "1"))))))
+
+(defun native-lens-profile-match (&key make model lens-name focal profile
+                                    (focal-reducer 1.0) crop-factor)
+  "Return the lens profile the bridge would correct with, or NIL and why not.
+
+The first value is a plist with :MODEL, :DISPLAY, :MAKER, :DISTORTION-P,
+:CHROMATIC-ABERRATION-P, :VIGNETTING-P and :CROP-FACTOR; the second, when the
+first is NIL, is the message a render would have failed with. Asked before a
+render so a photograph on a lens the database does not know is rendered once,
+without the profile, rather than twice."
+  (native-library-load)
+  (when (< (native-bridge-version) 10)
+    (return-from native-lens-profile-match
+      (values nil "the native bridge predates lens profile lookup")))
+  (with-optional-foreign-string (profile-pointer profile)
+    (with-foreign-pointer (output 4096)
+      (with-foreign-pointer (error-buffer *native-error-buffer-size*)
+        (let ((status (with-native-float-traps
+                        (%lens-profile-match-v1
+                         (or make "") (or model "") (or lens-name "")
+                         (float (or focal 0.0) 0.0)
+                         profile-pointer
+                         (float (or focal-reducer 1.0) 0.0)
+                         (float (or crop-factor 0.0) 0.0)
+                         output 4096
+                         error-buffer *native-error-buffer-size*))))
+          (if (zerop status)
+              (lens-profile-record
+               (foreign-string-to-lisp output :encoding :utf-8))
+              (values nil (native-error-message error-buffer))))))))
+
+(defun native-lens-profiles (&key make model query focal)
+  "List lens profiles for a chooser, as plists like NATIVE-LENS-PROFILE-MATCH's
+with :FOCAL-MIN, :FOCAL-MAX, :MOUNTS and :MOUNTABLE-P besides.
+
+With a QUERY, every profile whose maker or name contains all of its words;
+without one, every profile a body of MAKE and MODEL can mount. Profiles the body
+can mount come first, then those that cover FOCAL."
+  (native-library-load)
+  (when (< (native-bridge-version) 10)
+    (return-from native-lens-profiles '()))
+  (loop with capacity = *lens-listing-buffer-size*
+        repeat 6
+        do (with-foreign-pointer (output capacity)
+             (with-foreign-pointer (error-buffer *native-error-buffer-size*)
+               (let ((status (with-native-float-traps
+                               (%lens-profiles-v1
+                                (or make "") (or model "") (or query "")
+                                (float (or focal 0.0) 0.0)
+                                output capacity
+                                error-buffer *native-error-buffer-size*))))
+                 (cond ((zerop status)
+                        (return
+                          (mapcar #'lens-profile-record
+                                  (remove ""
+                                          (uiop:split-string
+                                           (foreign-string-to-lisp
+                                            output :encoding :utf-8)
+                                           :separator '(#\Newline))
+                                          :test #'string=))))
+                       ((= status 7)
+                        ;; The listing did not fit: come back with more room.
+                        (setf capacity (* 4 capacity)))
+                       (t
+                        (error 'raw-render-error
+                               :input-pathname nil
+                               :output-pathname nil
+                               :status status
+                               :message (native-error-message error-buffer)))))))
+        finally (return '())))
 
 (defun dng-original-filename (pathname)
   "Return the embedded original filename recorded by DNG PATHNAME."

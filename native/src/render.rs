@@ -85,6 +85,20 @@ pub struct RenderSettingsV1 {
     /// Hand-set barrel or pincushion correction, for lenses no database
     /// describes. Positive straightens barrel, negative pincushion.
     pub lens_distortion: f32,
+    /// The focal length to read the lens profile at, in millimetres, when the
+    /// photograph does not say — a manual lens on a dumb adapter records
+    /// nothing. Zero defers to the file.
+    pub focal_length: f32,
+}
+
+/// The focal length a correction is read at: what the caller stated when it
+/// stated one, otherwise what the file recorded.
+pub(crate) fn effective_focal(recorded: f32, stated: f32) -> f32 {
+    if stated.is_finite() && stated > 0.0 {
+        stated
+    } else {
+        recorded
+    }
 }
 
 impl Default for RenderSettingsV1 {
@@ -121,6 +135,7 @@ impl Default for RenderSettingsV1 {
             lens_profile_model: std::ptr::null(),
             neural_noise_reduction: 0.0,
             lens_name: std::ptr::null(),
+            focal_length: 0.0,
         }
     }
 }
@@ -2434,22 +2449,39 @@ pub(crate) struct LensCorrectionOptions<'a> {
     pub(crate) crop_factor: f32,
 }
 
-pub(crate) fn apply_lens(
-    image: &mut RgbImage,
-    options: &LensCorrectionOptions<'_>,
-) -> Result<(), Error> {
-    let make = options.make;
-    let model = options.model;
-    let lens_name = options.lens_name;
-    let focal = options.focal;
-    let flags = options.flags;
-    let correction_strength = options.strength;
-    let explicit_profile = options.explicit_profile;
-    let focal_reducer = options.focal_reducer;
-    let crop_factor = options.crop_factor;
-    if flags & KNOWN_FLAGS == 0 || (flags & FLAG_LENS_TCA == 0 && correction_strength == 0.0) {
-        return Ok(());
-    }
+/// The profile a photograph's lens resolves to, and the numbers the correction
+/// is built from.
+pub(crate) struct ResolvedLens<'a> {
+    pub(crate) lens: &'a Lens,
+    /// The focal length the profile is read at: the recorded one, undone by
+    /// any focal reducer between lens and sensor.
+    pub(crate) profile_focal: f32,
+    /// The crop factor of the body the profile is applied on, before the
+    /// reducer.
+    pub(crate) base_crop_factor: f32,
+    pub(crate) display_name: &'a str,
+}
+
+/// Finds the lens profile the correction would use, or says why there is none.
+///
+/// Shared by the correction itself and by the interface, which asks this before
+/// a render so that a lens the database does not know is known not to be known
+/// — rather than discovered by a render that fails and has to be run again
+/// without the profile, which is what used to happen to every photograph taken
+/// on a manual lens.
+pub(crate) fn resolve_lens_profile<'a>(
+    options: &LensCorrectionOptions<'a>,
+) -> Result<ResolvedLens<'a>, Error> {
+    let LensCorrectionOptions {
+        make,
+        model,
+        lens_name,
+        focal,
+        explicit_profile,
+        focal_reducer,
+        crop_factor,
+        ..
+    } = *options;
     if (explicit_profile.is_none() && lens_name.is_empty()) || focal <= 0.0 {
         return Err(Error::LensProfileUnavailable(
             "RAW metadata does not identify a usable lens/focal length".into(),
@@ -2485,6 +2517,159 @@ pub(crate) fn apply_lens(
         })?;
         (lens, camera.crop_factor, lens_name)
     };
+    Ok(ResolvedLens {
+        lens,
+        profile_focal,
+        base_crop_factor,
+        display_name,
+    })
+}
+
+/// The name a lens is shown under: its English name where the database has
+/// one, otherwise its primary name.
+fn lens_display_name(lens: &Lens) -> &str {
+    lens.model_localized
+        .get("en")
+        .map(String::as_str)
+        .unwrap_or(lens.model.as_str())
+}
+
+/// Which corrections a profile can offer at FOCAL on a body of CROP_FACTOR:
+/// "D" for distortion, "T" for chromatic aberration, "V" for vignetting.
+fn lens_calibration_letters(lens: &Lens, focal: f32, crop_factor: f32) -> String {
+    let mut modifier = Modifier::new(lens, focal, crop_factor, 64, 64, false);
+    let mut letters = String::new();
+    if modifier.enable_distortion_correction(lens) {
+        letters.push('D');
+    }
+    if modifier.enable_tca_correction(lens) {
+        letters.push('T');
+    }
+    if !lens.calib_vignetting.is_empty() {
+        letters.push('V');
+    }
+    letters
+}
+
+/// Describes the profile a photograph would be corrected with, one line of
+/// tab-separated fields: primary name, display name, maker, the letters of the
+/// calibrations available at its focal length, and the crop factor in use.
+pub(crate) fn describe_lens_match(options: &LensCorrectionOptions<'_>) -> Result<String, Error> {
+    let resolved = resolve_lens_profile(options)?;
+    let crop = resolved.base_crop_factor * options.focal_reducer;
+    Ok(format!(
+        "{}\t{}\t{}\t{}\t{:.3}",
+        resolved.lens.model,
+        lens_display_name(resolved.lens),
+        resolved.lens.maker,
+        lens_calibration_letters(resolved.lens, resolved.profile_focal, crop),
+        crop
+    ))
+}
+
+/// The most profiles a search hands back; the interface shows a list, not the
+/// database.
+const LENS_SEARCH_LIMIT: usize = 400;
+
+/// Lists lens profiles for the interface to choose from, one per line, in the
+/// fields `describe_lens_match` uses followed by the focal range and mounts.
+///
+/// With a QUERY, every profile whose maker or name contains all of its words,
+/// compared with punctuation and case set aside — "zuiko 21" finds an
+/// "Olympus OM Zuiko Auto-W 21mm f/3.5" however the database punctuates it.
+/// Without one, every profile a body of MAKE and MODEL can mount. Profiles the
+/// body can mount come first, then those covering FOCAL, then the rest
+/// alphabetically, so the likely answer is near the top whatever was typed.
+pub(crate) fn search_lens_profiles(
+    make: &str,
+    model: &str,
+    query: &str,
+    focal: f32,
+) -> Result<String, Error> {
+    let db = lens_database()?;
+    let camera = if make.is_empty() && model.is_empty() {
+        None
+    } else {
+        find_camera_profile(db, make, model)
+    };
+    let words: Vec<String> = query
+        .split_whitespace()
+        .map(normalized_name)
+        .filter(|word| !word.is_empty())
+        .collect();
+    let mut matches: Vec<(bool, bool, &Lens)> = db
+        .lenses
+        .iter()
+        .filter(|lens| {
+            let haystack = normalized_name(&format!(
+                "{} {} {}",
+                lens.maker,
+                lens.model,
+                lens.model_localized.values().cloned().collect::<Vec<_>>().join(" ")
+            ));
+            words.iter().all(|word| haystack.contains(word.as_str()))
+        })
+        .map(|lens| {
+            let mountable = camera.is_none_or(|camera| camera_mount_compatible(db, camera, lens));
+            let covers = focal <= 0.0
+                || ((lens.focal_min <= 0.0 || focal >= lens.focal_min - 0.1)
+                    && (lens.focal_max <= 0.0 || focal <= lens.focal_max + 0.1));
+            (mountable, covers, lens)
+        })
+        .filter(|(mountable, _, _)| !words.is_empty() || *mountable)
+        .collect();
+    matches.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then(b.1.cmp(&a.1))
+            .then_with(|| a.2.maker.to_lowercase().cmp(&b.2.maker.to_lowercase()))
+            .then_with(|| lens_display_name(a.2).to_lowercase().cmp(&lens_display_name(b.2).to_lowercase()))
+    });
+    let crop = camera.map(|camera| camera.crop_factor).unwrap_or(0.0);
+    let mut out = String::new();
+    for (mountable, _, lens) in matches.into_iter().take(LENS_SEARCH_LIMIT) {
+        let at_focal = if focal > 0.0 { focal } else { lens.focal_min.max(1.0) };
+        let letters = lens_calibration_letters(lens, at_focal, if crop > 0.0 { crop } else { lens.crop_factor.max(1.0) });
+        out.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{:.3}\t{}\t{}\t{}\t{}\n",
+            lens.model,
+            lens_display_name(lens),
+            lens.maker,
+            letters,
+            lens.crop_factor,
+            lens.focal_min,
+            lens.focal_max,
+            lens.mounts.join(", "),
+            if mountable { 1 } else { 0 },
+        ));
+    }
+    Ok(out)
+}
+
+pub(crate) fn apply_lens(
+    image: &mut RgbImage,
+    options: &LensCorrectionOptions<'_>,
+) -> Result<(), Error> {
+    let make = options.make;
+    let model = options.model;
+    let lens_name = options.lens_name;
+    let focal = options.focal;
+    let flags = options.flags;
+    let correction_strength = options.strength;
+    let explicit_profile = options.explicit_profile;
+    let focal_reducer = options.focal_reducer;
+    let crop_factor = options.crop_factor;
+    if flags & KNOWN_FLAGS == 0 || (flags & FLAG_LENS_TCA == 0 && correction_strength == 0.0) {
+        return Ok(());
+    }
+    let profiling = std::env::var_os("ORFEUS_PROFILE").is_some();
+    let started = Instant::now();
+    let ResolvedLens {
+        lens,
+        profile_focal,
+        base_crop_factor,
+        display_name,
+    } = resolve_lens_profile(options)?;
+    let _ = (make, model, lens_name, focal, explicit_profile, crop_factor);
     let mut modifier = Modifier::new(
         lens,
         profile_focal,
@@ -4456,7 +4641,7 @@ pub fn render(
         decoded.make.clone(),
         decoded.model.clone(),
         effective_lens_name(&decoded.lens_name, named_lens).to_string(),
-        decoded.focal,
+        effective_focal(decoded.focal, settings.focal_length),
     );
     // Downscaling first commutes with the linear white adaptation and exposure
     // gains; interactive re-renders reuse the cached bounded source.
@@ -5558,6 +5743,100 @@ mod tests {
         );
     }
 
+    /// A plane of nothing but noise, at one brightness.
+    fn noisy_flat_plane(width: usize, height: usize, level: f32, sigma: f32) -> Vec<f32> {
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 40) as f32 / 16_777_216.0 - 0.5
+        };
+        (0..width * height)
+            // Four uniform draws: close enough to Gaussian, variance 4/12.
+            .map(|_| level + sigma * (next() + next() + next() + next()) / (1.0_f32 / 3.0).sqrt())
+            .collect()
+    }
+
+    /// Each band's noise is read off the band itself, so the reading has to
+    /// agree with the power the noise actually put there.
+    #[test]
+    fn band_noise_is_measured_within_a_fifth() {
+        let (width, height) = (512, 384);
+        let mut plane = noisy_flat_plane(width, height, 0.4, 0.02);
+        let (mut residual, mut scratch) = (Vec::new(), Vec::new());
+        let (middle, coarse) = split_luma_bands(&mut plane, &mut residual, &mut scratch, width, height);
+        let bin = noise_bin(0.4);
+        let truth = |band: &[f32]| band.iter().map(|v| v * v).sum::<f32>() / band.len() as f32;
+        let (fine, flat) = fine_band_noise(&plane, &residual, width, height);
+        let readings = [
+            (fine.power[bin], truth(&plane)),
+            (coarse_band_noise(&middle, &residual, width, height, &flat).power[bin], truth(&middle)),
+            (coarse_band_noise(&coarse, &residual, width, height, &flat).power[bin], truth(&coarse)),
+        ];
+        for (index, (measured, actual)) in readings.iter().enumerate() {
+            let ratio = measured / actual;
+            assert!(
+                (0.8..=1.2).contains(&ratio),
+                "band {index}: measured {measured} against actual {actual}, ratio {ratio}"
+            );
+        }
+    }
+
+    /// The rolling window of the shrinkage pass has to agree with the plain
+    /// window it replaced, at every pixel including the edges.
+    #[test]
+    fn rolling_activity_matches_the_plain_window() {
+        let (width, height) = (61, 71);
+        let band = noisy_flat_plane(width, height, 0.5, 0.05);
+        let mut activity = Vec::new();
+        let mut scratch = Vec::new();
+        local_mean_square(&band, &mut activity, &mut scratch, width, height);
+        for index in (0..width * height).step_by(7) {
+            let direct = window_mean_square(&band, width, height, index);
+            assert!(
+                (direct - activity[index]).abs() < 1e-6,
+                "pixel {index}: window {direct} against running {}",
+                activity[index]
+            );
+        }
+        // And the fused shrinkage equals shrinking with the plane of activity.
+        let zeros = vec![0.0_f32; width * height];
+        let noise = BandNoise { power: [0.05 * 0.05; NOISE_BINS] };
+        let mut fused = vec![0.4_f32; width * height];
+        shrink_luma_bands(&mut fused, &band, &zeros, &zeros, [noise; 3], 1.0, width, height);
+        for index in 0..width * height {
+            let expected = 0.4 + band[index] * activity_gain(activity[index], noise.power[noise_bin(0.4)]);
+            assert!(
+                (fused[index] - expected).abs() < 1e-5,
+                "pixel {index}: fused {} against {expected}",
+                fused[index]
+            );
+        }
+    }
+
+    /// A frame with no noise has nothing to lose, whatever the slider says.
+    ///
+    /// The scene's one texture sits alone in its brightness bin, which is the
+    /// case a per-bin noise reading gets wrong: it reads the texture as noise.
+    /// The noise envelope across brightness is what keeps it.
+    #[test]
+    fn a_frame_with_no_noise_keeps_its_texture() {
+        let (width, height) = (800, 600);
+        let clean = denoise_test_scene(width, height);
+        for strength in [0.35_f32, 1.0] {
+            let mut image = RgbImage {
+                width,
+                height,
+                data: clean.clone(),
+            };
+            cpu_noise_reduction(&mut image, strength, strength);
+            let kept = texture_amplitude(&image.data, width, height)
+                / texture_amplitude(&clean, width, height);
+            assert!(kept > 0.98, "slider {strength} kept only {kept} of a clean frame's texture");
+        }
+    }
+
     #[test]
     fn noise_reduction_materially_smooths_a_flat_noisy_patch() {
         let mut original = RgbImage {
@@ -5722,100 +6001,6 @@ mod tests {
         );
         for (index, luminance) in anchors.into_iter().enumerate() {
             if luminance <= 0.0 {
-    /// A plane of nothing but noise, at one brightness.
-    fn noisy_flat_plane(width: usize, height: usize, level: f32, sigma: f32) -> Vec<f32> {
-        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
-        let mut next = || {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            (state >> 40) as f32 / 16_777_216.0 - 0.5
-        };
-        (0..width * height)
-            // Four uniform draws: close enough to Gaussian, variance 4/12.
-            .map(|_| level + sigma * (next() + next() + next() + next()) / (1.0_f32 / 3.0).sqrt())
-            .collect()
-    }
-
-    /// Each band's noise is read off the band itself, so the reading has to
-    /// agree with the power the noise actually put there.
-    #[test]
-    fn band_noise_is_measured_within_a_fifth() {
-        let (width, height) = (512, 384);
-        let mut plane = noisy_flat_plane(width, height, 0.4, 0.02);
-        let (mut residual, mut scratch) = (Vec::new(), Vec::new());
-        let (middle, coarse) = split_luma_bands(&mut plane, &mut residual, &mut scratch, width, height);
-        let bin = noise_bin(0.4);
-        let truth = |band: &[f32]| band.iter().map(|v| v * v).sum::<f32>() / band.len() as f32;
-        let (fine, flat) = fine_band_noise(&plane, &residual, width, height);
-        let readings = [
-            (fine.power[bin], truth(&plane)),
-            (coarse_band_noise(&middle, &residual, width, height, &flat).power[bin], truth(&middle)),
-            (coarse_band_noise(&coarse, &residual, width, height, &flat).power[bin], truth(&coarse)),
-        ];
-        for (index, (measured, actual)) in readings.iter().enumerate() {
-            let ratio = measured / actual;
-            assert!(
-                (0.8..=1.2).contains(&ratio),
-                "band {index}: measured {measured} against actual {actual}, ratio {ratio}"
-            );
-        }
-    }
-
-    /// The rolling window of the shrinkage pass has to agree with the plain
-    /// window it replaced, at every pixel including the edges.
-    #[test]
-    fn rolling_activity_matches_the_plain_window() {
-        let (width, height) = (61, 71);
-        let band = noisy_flat_plane(width, height, 0.5, 0.05);
-        let mut activity = Vec::new();
-        let mut scratch = Vec::new();
-        local_mean_square(&band, &mut activity, &mut scratch, width, height);
-        for index in (0..width * height).step_by(7) {
-            let direct = window_mean_square(&band, width, height, index);
-            assert!(
-                (direct - activity[index]).abs() < 1e-6,
-                "pixel {index}: window {direct} against running {}",
-                activity[index]
-            );
-        }
-        // And the fused shrinkage equals shrinking with the plane of activity.
-        let zeros = vec![0.0_f32; width * height];
-        let noise = BandNoise { power: [0.05 * 0.05; NOISE_BINS] };
-        let mut fused = vec![0.4_f32; width * height];
-        shrink_luma_bands(&mut fused, &band, &zeros, &zeros, [noise; 3], 1.0, width, height);
-        for index in 0..width * height {
-            let expected = 0.4 + band[index] * activity_gain(activity[index], noise.power[noise_bin(0.4)]);
-            assert!(
-                (fused[index] - expected).abs() < 1e-5,
-                "pixel {index}: fused {} against {expected}",
-                fused[index]
-            );
-        }
-    }
-
-    /// A frame with no noise has nothing to lose, whatever the slider says.
-    ///
-    /// The scene's one texture sits alone in its brightness bin, which is the
-    /// case a per-bin noise reading gets wrong: it reads the texture as noise.
-    /// The noise envelope across brightness is what keeps it.
-    #[test]
-    fn a_frame_with_no_noise_keeps_its_texture() {
-        let (width, height) = (800, 600);
-        let clean = denoise_test_scene(width, height);
-        for strength in [0.35_f32, 1.0] {
-            let mut image = RgbImage {
-                width,
-                height,
-                data: clean.clone(),
-            };
-            cpu_noise_reduction(&mut image, strength, strength);
-            let kept = texture_amplitude(&image.data, width, height)
-                / texture_amplitude(&clean, width, height);
-            assert!(kept > 0.98, "slider {strength} kept only {kept} of a clean frame's texture");
-        }
-    }
-
                 continue;
             }
             let mut adjustments = [0.0; 7];
@@ -5873,6 +6058,64 @@ mod tests {
         assert_eq!(12.0, blend_lens_coordinate(10.0, 14.0, 0.5));
         assert_eq!(14.0, blend_lens_coordinate(10.0, 14.0, 1.0));
         assert_eq!(18.0, blend_lens_coordinate(10.0, 14.0, 2.0));
+    }
+
+    fn lens_options<'a>(lens_name: &'a str, focal: f32, explicit: Option<&'a str>) -> LensCorrectionOptions<'a> {
+        LensCorrectionOptions {
+            make: "OM Digital Solutions",
+            model: "OM-1",
+            lens_name,
+            focal,
+            flags: FLAG_LENS_DISTORTION | FLAG_LENS_TCA,
+            strength: 1.0,
+            explicit_profile: explicit,
+            focal_reducer: 1.0,
+            crop_factor: 0.0,
+        }
+    }
+
+    /// The description names the profile a render would use and what it can
+    /// correct, and says no the same way a render does.
+    #[test]
+    fn lens_match_describes_the_profile_a_render_would_use() {
+        let described = describe_lens_match(&lens_options(
+            "Leica DG Macro-Elmarit 45mm F2.8 Asph. Mega OIS",
+            45.0,
+            None,
+        ))
+        .unwrap();
+        let fields: Vec<&str> = described.split('\t').collect();
+        assert_eq!(fields.len(), 5, "{described}");
+        assert!(fields[0].contains("Macro-Elmarit 45mm"), "{described}");
+        assert_eq!(fields[2], "Panasonic");
+        assert!(fields[3].contains('D') && fields[3].contains('T'), "{described}");
+        assert_eq!(fields[4], "2.000");
+        let missing = describe_lens_match(&lens_options("Olympus Zuiko 21mm", 21.0, None));
+        assert!(matches!(missing, Err(Error::LensProfileUnavailable(_))));
+        let manual = describe_lens_match(&lens_options("", 0.0, None));
+        assert!(matches!(manual, Err(Error::LensProfileUnavailable(_))));
+    }
+
+    /// A search matches every word wherever punctuation puts it, puts what the
+    /// body can mount first, and lists the mountable profiles when nothing is
+    /// typed.
+    #[test]
+    fn lens_search_finds_by_words_and_ranks_the_mountable_first() {
+        let listing = search_lens_profiles("OM Digital Solutions", "OM-1", "elmarit 45", 45.0).unwrap();
+        let rows: Vec<Vec<&str>> = listing.lines().map(|line| line.split('\t').collect()).collect();
+        assert!(!rows.is_empty());
+        for row in &rows {
+            assert_eq!(row.len(), 9, "{row:?}");
+            let name = normalized_name(&format!("{} {}", row[2], row[0]));
+            assert!(name.contains("elmarit") && name.contains("45"), "{row:?}");
+        }
+        assert_eq!(rows[0][8], "1", "a Micro Four Thirds lens leads the list");
+        let everything = search_lens_profiles("OM Digital Solutions", "OM-1", "", 0.0).unwrap();
+        let mountable = everything.lines().count();
+        assert!(mountable > 50, "{mountable} mountable profiles");
+        assert!(everything.lines().all(|line| line.ends_with("\t1")));
+        let anywhere = search_lens_profiles("", "", "distagon", 0.0).unwrap();
+        assert!(anywhere.lines().count() >= 2);
     }
 
     #[test]

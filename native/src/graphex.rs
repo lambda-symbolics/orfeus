@@ -76,6 +76,9 @@ pub struct RenderFrameV1 {
     /// tone-mapped and encoded so that 1400 of them could be looked at. Naming
     /// the region turns that back into the work it should have been.
     pub viewport: [f32; 4],
+    /// The focal length to read the lens profile at, in millimetres, when the
+    /// photograph does not record one. Zero defers to the file.
+    pub focal_length: f32,
 }
 
 /// What a render tells its caller as it goes.
@@ -148,6 +151,9 @@ impl RenderFrameV1 {
         }
         if !self.lens_crop_factor.is_finite() || !(0.0..=10.0).contains(&self.lens_crop_factor) {
             return Err(Error::InvalidArgument("lens crop factor must be 0..10"));
+        }
+        if !self.focal_length.is_finite() || !(0.0..=10_000.0).contains(&self.focal_length) {
+            return Err(Error::InvalidArgument("focal length must be 0..10000 mm"));
         }
         Ok(())
     }
@@ -1877,7 +1883,7 @@ fn render_graph_frame(
         decoded.make.clone(),
         decoded.model.clone(),
         render::effective_lens_name(&decoded.lens_name, named_lens).to_string(),
-        decoded.focal,
+        render::effective_focal(decoded.focal, frame.focal_length),
         decoded.orientation,
     );
     let as_shot_kelvin = decoded.as_shot_kelvin;

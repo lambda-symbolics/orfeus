@@ -14,7 +14,8 @@
     :tone-blacks :tone-shadows :tone-dark-mids
     :tone-midtones :tone-light-mids :tone-highlights :tone-whites
     :lens-correction-p :lens-correction-strength
-    :chromatic-aberration-correction-p :lens-distortion :lut-path :lut-strength
+    :chromatic-aberration-correction-p :lens-distortion
+    :lens-profile :lens-focal-length :lut-path :lut-strength
     :grain-amount :grain-size)
   "Keys accepted in processing setting S-expressions.")
 
@@ -38,6 +39,11 @@
   ;; Hand-set barrel or pincushion correction, for the lenses no database
   ;; describes. Positive straightens barrel, negative straightens pincushion.
   (lens-distortion 0.0)
+  ;; A lens profile chosen by hand, by its database name, for a lens the
+  ;; photograph's metadata does not identify; and the focal length to read it
+  ;; at when the file records none. NIL leaves both to the metadata.
+  (lens-profile nil)
+  (lens-focal-length nil)
   (lut-path nil)
   (lut-strength 1.0)
   (grain-amount 0.0)
@@ -50,7 +56,8 @@
     (:tone (:tone-blacks :tone-shadows :tone-dark-mids :tone-midtones
             :tone-light-mids :tone-highlights :tone-whites))
     (:optics (:lens-correction-p :lens-correction-strength
-              :chromatic-aberration-correction-p :lens-distortion))
+              :chromatic-aberration-correction-p :lens-distortion
+              :lens-profile :lens-focal-length))
     (:film (:lut-path :lut-strength :grain-amount :grain-size)))
   "The fixed processing pipeline as named stages over setting keys.
 Together the stages partition *PROCESSING-SETTING-KEYS*; frontends present
@@ -64,6 +71,7 @@ them as a copyable node chain.")
     :tone-light-mids 0.0 :tone-highlights 0.0 :tone-whites 0.0
     :lens-correction-p nil :lens-correction-strength 1.0
     :chromatic-aberration-correction-p nil :lens-distortion 0.0
+    :lens-profile nil :lens-focal-length nil
     :lut-path nil :lut-strength 0.0 :grain-amount 0.0 :grain-size 1.0)
   "Setting values under which every stage passes pixels through unchanged.")
 

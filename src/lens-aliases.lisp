@@ -80,3 +80,40 @@ fail explicitly rather than silently selecting a different Planar 50mm.")
         (values (getf (rest entry) :lensfun-model)
                 (getf (rest entry) :focal-reducer 1.0)
                 (getf (rest entry) :crop-factor))))))
+
+(defun lens-profile-alias-save (nickname model &key (focal-reducer 1.0)
+                                                    crop-factor)
+  "Remember that lenses described as NICKNAME use the profile named MODEL.
+
+Written to the per-user adapted-lens file, replacing any earlier entry for the
+same nickname; the built-in list is never edited. The file is what the picker
+in the optics panel writes when asked to remember a choice, so that the next
+photograph on the same lens gets its profile without being asked."
+  (check-type nickname string)
+  (check-type model string)
+  (let* ((pathname (lens-profile-aliases-pathname))
+         (existing (if (probe-file pathname)
+                       (lens-profile-aliases-read pathname)
+                       '()))
+         (entry (lens-profile-alias-entry-validate
+                 (list* nickname
+                        :lensfun-model model
+                        :focal-reducer (float focal-reducer 1.0)
+                        (when crop-factor
+                          (list :crop-factor (float crop-factor 1.0))))))
+         (aliases (cons entry
+                        (remove nickname existing
+                                :key #'first :test #'string-equal))))
+    (ensure-directories-exist pathname)
+    (with-open-file (stream pathname :direction :output
+                                     :if-exists :supersede
+                                     :if-does-not-exist :create)
+      (with-standard-io-syntax
+        (let ((*print-readably* nil)
+              (*print-pretty* t)
+              (*print-case* :downcase))
+          (format stream ";;; Adapted lenses: (nickname :lensfun-model ...)~%")
+          (format stream ";;; Written by Orfeus; edit freely.~%")
+          (prin1 aliases stream)
+          (terpri stream))))
+    entry))

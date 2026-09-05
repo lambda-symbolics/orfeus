@@ -164,28 +164,21 @@ The output is published atomically and INPUT-PATHNAME is never modified."
                    "-Olympus:ColorSpace=sRGB"
                    "-Olympus:RawDevColorSpace=sRGB"
                    (namestring output-pathname)))
-     "metadata copy")
-    ;; ExifTool copies Olympus maker notes as one block, so normalize their
-    ;; output-space tags in a second pass after the block exists in the export.
-    (run-exiftool
-     (list "exiftool"
-           "-overwrite_original"
-           "-Olympus:ColorSpace=sRGB"
-           "-Olympus:RawDevColorSpace=sRGB"
-           (namestring output-pathname))
-     "metadata color-space normalization")))
+     "metadata copy")))
 
 (defun render-native-photo (input-pathname output-pathname settings
                             &key max-width max-height jpeg-quality grain-seed
                               cache-p
                               (report-input-pathname input-pathname))
-  (multiple-value-bind (lens-profile focal-reducer lens-crop-factor)
-      (resolve-lens-profile-alias
-       (photo-lens-description report-input-pathname))
+  (multiple-value-bind (lens-profile focal-reducer lens-crop-factor focal-length)
+      (photo-lens-resolution report-input-pathname
+                             (processing-settings-lens-profile settings)
+                             (processing-settings-lens-focal-length settings))
     (labels ((invoke (effective-settings)
                (native-raw-render
                 input-pathname output-pathname
                 :lens-name (photo-lens-name report-input-pathname)
+                :lens-focal-length focal-length
               :cache-p cache-p
               :output-format (render-output-format output-pathname)
               :exposure (processing-settings-exposure effective-settings)
@@ -226,24 +219,109 @@ The output is published atomically and INPUT-PATHNAME is never modified."
               :max-width max-width
               :max-height max-height
               :jpeg-quality jpeg-quality)))
-    (handler-case
-        (invoke settings)
-      (raw-render-error (condition)
-        (if (and (= 9 (raw-render-error-status condition))
-                 (or (processing-settings-lens-correction-p settings)
+    (flet ((without-profile (settings)
+             (let ((fallback (copy-processing-settings settings)))
+               (setf (processing-settings-lens-correction-p fallback) nil
                      (processing-settings-chromatic-aberration-correction-p
-                      settings)))
-            (progn
-              (warn 'lens-profile-unavailable
-                    :input-pathname report-input-pathname
-                    :message (raw-render-error-message condition))
-              (let ((fallback (copy-processing-settings settings)))
-                (setf (processing-settings-lens-correction-p fallback) nil
-                      (processing-settings-chromatic-aberration-correction-p
-                       fallback)
-                      nil)
-                (invoke fallback)))
-            (error condition)))))))
+                      fallback)
+                     nil)
+               fallback)))
+      (let ((settings
+              (if (and (or (processing-settings-lens-correction-p settings)
+                           (processing-settings-chromatic-aberration-correction-p
+                            settings))
+                       (not (photo-lens-profile-known-p
+                             report-input-pathname
+                             (processing-settings-lens-profile settings)
+                             (processing-settings-lens-focal-length settings))))
+                  (without-profile settings)
+                  settings)))
+        (handler-case
+            (invoke settings)
+          (raw-render-error (condition)
+            (if (and (= 9 (raw-render-error-status condition))
+                     (or (processing-settings-lens-correction-p settings)
+                         (processing-settings-chromatic-aberration-correction-p
+                          settings)))
+                (progn
+                  (warn-lens-profile-once report-input-pathname
+                                          (raw-render-error-message condition))
+                  (invoke (without-profile settings)))
+                (error condition)))))))))
+
+(defun graph-optics-overrides (graph)
+  "Return the profile and focal length GRAPH's optics node chose by hand.
+
+Two values, either NIL when the node leaves them to the photograph's metadata.
+Read from the first optics node that is not bypassed; a graph has one."
+  (let ((node (find-if (lambda (node)
+                         (and (eq :optics (graph-node-kind node))
+                              (not (graph-node-bypassed-p node))))
+                       (processing-graph-nodes graph))))
+    (when node
+      (let ((params (graph-node-params node)))
+        (values (getf params :lens-profile)
+                (getf params :lens-focal-length))))))
+
+(defun photo-lens-resolution (pathname profile focal-length)
+  "How PATHNAME's lens profile is to be looked up, given hand-set overrides.
+
+Returns the profile name to ask for, the focal reducer and crop factor that go
+with it, and the focal length to read it at — each NIL where the photograph's
+own metadata is to decide. A PROFILE chosen by hand replaces the nickname
+alias, reducer and all: the alias describes an adapter the chooser knows
+nothing about."
+  (multiple-value-bind (alias-profile focal-reducer crop-factor)
+      (resolve-lens-profile-alias (photo-lens-description pathname))
+    (if profile
+        (values profile 1.0 nil focal-length)
+        (values alias-profile focal-reducer crop-factor focal-length))))
+
+(defvar *lens-profile-status-cache*
+  (make-hash-table :test #'equal #+sbcl :synchronized #+sbcl t)
+  "What the lens database said about each photograph, by everything it was
+asked with: a drag asks on every tick.")
+
+(defun photo-lens-profile-status (pathname &key profile focal-length)
+  "Return the lens profile PATHNAME would be corrected with, or NIL and why not.
+
+The first value is the profile as a plist from NATIVE-LENS-PROFILE-MATCH; the
+second, when there is none, is the reason a render would give. PROFILE and
+FOCAL-LENGTH are the hand-set overrides from the optics node, if any.
+
+Asked before every render that applies a lens profile, so a lens the database
+does not know costs one render without the profile rather than one that fails
+and a second without it — which is what every photograph on a manual lens used
+to pay."
+  (multiple-value-bind (chosen focal-reducer crop-factor focal)
+      (photo-lens-resolution pathname profile focal-length)
+    (let* ((lookup (list :make (photo-camera-make pathname)
+                         :model (photo-camera-model pathname)
+                         :lens-name (photo-lens-name pathname)
+                         :focal (or focal (photo-focal-length pathname))
+                         :profile chosen
+                         :focal-reducer focal-reducer
+                         :crop-factor crop-factor))
+           (key (cons (namestring (pathname pathname)) lookup)))
+      (multiple-value-bind (cached present-p)
+          (gethash key *lens-profile-status-cache*)
+        (if present-p
+            (values-list cached)
+            (let ((answer (multiple-value-list
+                           (apply #'native-lens-profile-match lookup))))
+              (setf (gethash key *lens-profile-status-cache*) answer)
+              (values-list answer)))))))
+
+(defun photo-lens-profile-known-p (pathname profile focal-length)
+  "True when PATHNAME's lens has a profile to correct with; warns once when not."
+  (multiple-value-bind (status message)
+      (photo-lens-profile-status pathname :profile profile
+                                          :focal-length focal-length)
+    (or (and status t)
+        (progn
+          (warn-lens-profile-once pathname
+                                  (or message "no lens profile was found"))
+          nil))))
 
 (defun graph-active-optics-p (graph)
   "True when GRAPH's effective plan applies any lens correction."
@@ -283,25 +361,28 @@ be found and keeps what the photographer typed in."
     (dolist (node (processing-graph-nodes copy))
       (when (eq :optics (graph-node-kind node))
         (setf (graph-node-params node)
-              (list :lens-correction-p nil
-                    :lens-correction-strength
-                    (getf (graph-node-params node) :lens-correction-strength 1.0)
-                    :chromatic-aberration-correction-p nil
-                    :lens-distortion
-                    (getf (graph-node-params node) :lens-distortion 0.0)))))
+              (let ((params (graph-node-params node)))
+                (list :lens-correction-p nil
+                      :lens-correction-strength
+                      (getf params :lens-correction-strength 1.0)
+                      :chromatic-aberration-correction-p nil
+                      :lens-distortion (getf params :lens-distortion 0.0)
+                      :lens-profile (getf params :lens-profile)
+                      :lens-focal-length (getf params :lens-focal-length))))))
     copy))
 
 (defun render-native-photo-graph (input-pathname output-pathname graph
                                   &key max-width max-height jpeg-quality
                                     grain-seed cache-p draft-p viewport progress
                                     (report-input-pathname input-pathname))
-  (multiple-value-bind (lens-profile focal-reducer lens-crop-factor)
-      (resolve-lens-profile-alias
-       (photo-lens-description report-input-pathname))
+  (multiple-value-bind (chosen-profile chosen-focal) (graph-optics-overrides graph)
+   (multiple-value-bind (lens-profile focal-reducer lens-crop-factor focal-length)
+      (photo-lens-resolution report-input-pathname chosen-profile chosen-focal)
     (flet ((invoke (effective-graph)
              (native-raw-render-graph
               input-pathname output-pathname effective-graph
               :lens-name (photo-lens-name report-input-pathname)
+              :lens-focal-length focal-length
               :cache-p cache-p
               :draft-p draft-p
               :viewport viewport
@@ -314,16 +395,22 @@ be found and keeps what the photographer typed in."
               :max-width max-width
               :max-height max-height
               :jpeg-quality jpeg-quality)))
-      (handler-case
-          (invoke graph)
-        (raw-render-error (condition)
-          (if (and (= 9 (raw-render-error-status condition))
-                   (graph-active-optics-p graph))
-              (progn
-                (warn-lens-profile-once report-input-pathname
-                                        (raw-render-error-message condition))
-                (invoke (graph-without-lens-profile graph)))
-              (error condition)))))))
+      (let ((graph (if (and (graph-active-optics-p graph)
+                            (not (photo-lens-profile-known-p
+                                  report-input-pathname chosen-profile
+                                  chosen-focal)))
+                       (graph-without-lens-profile graph)
+                       graph)))
+        (handler-case
+            (invoke graph)
+          (raw-render-error (condition)
+            (if (and (= 9 (raw-render-error-status condition))
+                     (graph-active-optics-p graph))
+                (progn
+                  (warn-lens-profile-once report-input-pathname
+                                          (raw-render-error-message condition))
+                  (invoke (graph-without-lens-profile graph)))
+                (error condition)))))))))
 
 (defun render-photo (input-pathname output-pathname settings
                      &key (if-exists :error)
@@ -473,11 +560,12 @@ reported, because that render will fail again and say so properly."
 The interactive hot path: no JPEG encode, no file, no metadata copy.
 Returns the oriented image width and height as two values."
   (check-type graph processing-graph)
-  (multiple-value-bind (lens-profile focal-reducer lens-crop-factor)
+  (multiple-value-bind (chosen-profile chosen-focal) (graph-optics-overrides graph)
+   (multiple-value-bind (lens-profile focal-reducer lens-crop-factor focal-length)
       (with-decoded-while
           (input-pathname :max-width max-width :max-height max-height
                           :draft-p t :cache-p cache-p)
-        (resolve-lens-profile-alias (photo-lens-description input-pathname)))
+        (photo-lens-resolution input-pathname chosen-profile chosen-focal))
     (call-with-render-source
      input-pathname
      (lambda (render-input-pathname)
@@ -485,6 +573,7 @@ Returns the oriented image width and height as two values."
                 (native-raw-render-graph-rgb
                  render-input-pathname effective-graph rgb-buffer capacity
                  :lens-name (photo-lens-name input-pathname)
+                 :lens-focal-length focal-length
                  :cache-p cache-p
                  :draft-p t
                  :lens-profile-model lens-profile
@@ -493,14 +582,18 @@ Returns the oriented image width and height as two values."
                  :grain-seed grain-seed
                  :max-width max-width
                  :max-height max-height)))
-         (handler-case
-             (invoke graph)
-           (raw-render-error (condition)
-             (if (and (= 9 (raw-render-error-status condition))
-                      (graph-active-optics-p graph))
-                 (progn
-                   (warn 'lens-profile-unavailable
-                         :input-pathname input-pathname
-                         :message (raw-render-error-message condition))
-                   (invoke (graph-without-lens-profile graph)))
-                 (error condition)))))))))
+         (let ((graph (if (and (graph-active-optics-p graph)
+                               (not (photo-lens-profile-known-p
+                                     input-pathname chosen-profile chosen-focal)))
+                          (graph-without-lens-profile graph)
+                          graph)))
+           (handler-case
+               (invoke graph)
+             (raw-render-error (condition)
+               (if (and (= 9 (raw-render-error-status condition))
+                        (graph-active-optics-p graph))
+                   (progn
+                     (warn-lens-profile-once input-pathname
+                                             (raw-render-error-message condition))
+                     (invoke (graph-without-lens-profile graph)))
+                   (error condition)))))))))))

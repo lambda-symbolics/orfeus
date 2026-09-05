@@ -62,6 +62,13 @@
    #:photo-extract-embedded-preview
    #:photo-lens-description
    #:photo-lens-name
+   #:photo-camera-make
+   #:photo-camera-model
+   #:photo-focal-length
+   #:photo-lens-profile-status
+   #:lens-profile-alias-save
+   #:native-lens-profiles
+   #:native-lens-profile-match
    #:photo-metadata-known-p
    #:photo-as-shot-kelvin
    #:photo-rating
@@ -175,6 +182,8 @@
    #:processing-settings
    #:processing-settings-chromatic-aberration-correction-p
    #:processing-settings-lens-distortion
+   #:processing-settings-lens-profile
+   #:processing-settings-lens-focal-length
    #:processing-settings-exposure
    #:processing-settings-grain-amount
    #:processing-settings-grain-size

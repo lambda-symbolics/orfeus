@@ -491,10 +491,13 @@ where
 /// Version 2 added `orfeus_raw_render_v2` with an opt-in decode cache.
 /// Version 3 adds `orfeus_raw_render_v3`, which executes a serialized
 /// processing node graph. Version 4 adds `orfeus_raw_decode_v1`, which fills
-/// the decode cache without rendering. Every earlier entry point is unchanged.
+/// the decode cache without rendering. Version 10 adds
+/// `orfeus_lens_profile_match_v1` and `orfeus_lens_profiles_v1`, which answer
+/// about lens profiles without rendering. Every earlier entry point is
+/// unchanged.
 #[unsafe(no_mangle)]
 pub extern "C" fn orfeus_bridge_abi_version() -> u32 {
-    9
+    10
 }
 
 /// Write a 64-bit perceptual signature of the image at PATH.
@@ -577,6 +580,107 @@ pub unsafe extern "C" fn orfeus_image_focus_v1(
             out[1] = report.typical_blur;
             out[2] = report.judgeable;
             Ok(())
+        })
+    }
+}
+
+/// Report the lens profile a photograph would be corrected with.
+///
+/// Writes one line of tab-separated fields into `output`: the profile's
+/// primary name, its display name, its maker, the letters of the calibrations
+/// it offers at this focal length (D distortion, T chromatic aberration,
+/// V vignetting), and the crop factor the correction would use. Returns the
+/// lens-profile-unavailable status, with the same message a render would give,
+/// when there is no profile — so a caller can know that before rendering
+/// rather than by a render that fails.
+///
+/// # Safety
+///
+/// `make`, `model` and `lens_name` must be readable NUL-terminated strings,
+/// `explicit_profile` null or one, and `output` and the error buffer writable
+/// for their stated capacities.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn orfeus_lens_profile_match_v1(
+    make: *const c_char,
+    model: *const c_char,
+    lens_name: *const c_char,
+    focal: f32,
+    explicit_profile: *const c_char,
+    focal_reducer: f32,
+    crop_factor: f32,
+    output: *mut c_char,
+    output_capacity: usize,
+    error_buffer: *mut c_char,
+    error_capacity: usize,
+) -> i32 {
+    // SAFETY: Pointer validation and dereferences remain inside the boundary.
+    unsafe {
+        ffi_result(error_buffer, error_capacity, || {
+            let text = |pointer: *const c_char, what: &'static str| -> Result<&str, Error> {
+                if pointer.is_null() {
+                    return Err(Error::InvalidArgument(what));
+                }
+                CStr::from_ptr(pointer)
+                    .to_str()
+                    .map_err(|_| Error::InvalidArgument(what))
+            };
+            let options = render::LensCorrectionOptions {
+                make: text(make, "camera make is not a string")?,
+                model: text(model, "camera model is not a string")?,
+                lens_name: text(lens_name, "lens name is not a string")?,
+                focal,
+                flags: render::FLAG_LENS_DISTORTION | render::FLAG_LENS_TCA,
+                strength: 1.0,
+                explicit_profile: if explicit_profile.is_null() {
+                    None
+                } else {
+                    Some(text(explicit_profile, "lens profile is not a string")?)
+                },
+                focal_reducer: if focal_reducer > 0.0 { focal_reducer } else { 1.0 },
+                crop_factor: crop_factor.max(0.0),
+            };
+            let description = render::describe_lens_match(&options)?;
+            write_c_buffer(description.as_bytes(), output, output_capacity)
+        })
+    }
+}
+
+/// List lens profiles for a chooser: see `render::search_lens_profiles`.
+///
+/// Every string may be empty; `query` empty lists what the body can mount.
+/// Writes newline-separated records of tab-separated fields into `output`, and
+/// returns the buffer-too-small status naming the size needed when it does not
+/// fit.
+///
+/// # Safety
+///
+/// `make`, `model` and `query` must be readable NUL-terminated strings, and
+/// `output` and the error buffer writable for their stated capacities.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn orfeus_lens_profiles_v1(
+    make: *const c_char,
+    model: *const c_char,
+    query: *const c_char,
+    focal: f32,
+    output: *mut c_char,
+    output_capacity: usize,
+    error_buffer: *mut c_char,
+    error_capacity: usize,
+) -> i32 {
+    // SAFETY: Pointer validation and dereferences remain inside the boundary.
+    unsafe {
+        ffi_result(error_buffer, error_capacity, || {
+            let text = |pointer: *const c_char| -> Result<&str, Error> {
+                if pointer.is_null() {
+                    return Ok("");
+                }
+                CStr::from_ptr(pointer)
+                    .to_str()
+                    .map_err(|_| Error::InvalidArgument("lens search text is not UTF-8"))
+            };
+            let listing =
+                render::search_lens_profiles(text(make)?, text(model)?, text(query)?, focal)?;
+            write_c_buffer(listing.as_bytes(), output, output_capacity)
         })
     }
 }
@@ -1125,7 +1229,7 @@ mod tests {
 
     #[test]
     fn reports_current_abi_version() {
-        assert_eq!(orfeus_bridge_abi_version(), 9);
+        assert_eq!(orfeus_bridge_abi_version(), 10);
         assert_eq!(orfeus_raw_render_capabilities_v1(), 1 | 2 | 4 | 16);
     }
 
