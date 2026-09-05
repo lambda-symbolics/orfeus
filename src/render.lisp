@@ -312,6 +312,10 @@ to pay."
               (setf (gethash key *lens-profile-status-cache*) answer)
               (values-list answer)))))))
 
+(defun lens-profile-status-forget ()
+  "Forget every cached lens profile answer; the adapted-lens file changed."
+  (clrhash *lens-profile-status-cache*))
+
 (defun photo-lens-profile-known-p (pathname profile focal-length)
   "True when PATHNAME's lens has a profile to correct with; warns once when not."
   (multiple-value-bind (status message)

@@ -1219,6 +1219,41 @@ and then quietly relocated them would be lying about where a click puts things."
       (when (probe-file pathname)
         (delete-file pathname)))))
 
+(defun lens-alias-save-round-trip-p ()
+  "Saving a nickname writes a file the reader accepts and the resolver honours."
+  (let ((pathname (test-temporary-pathname "sexp"))
+        (previous (uiop:getenv "ORFEUS_LENS_ALIASES")))
+    (unwind-protect
+         (progn
+           (setf (uiop:getenv "ORFEUS_LENS_ALIASES") (namestring pathname))
+           (lens-profile-alias-save "Olympus Zuiko 21mm"
+                                    "Olympus OM Zuiko Auto-W 21mm f/3.5" 2.0)
+           ;; A second save of the same nickname replaces, not appends.
+           (lens-profile-alias-save "Olympus Zuiko 21mm"
+                                    "Olympus OM Zuiko Auto-W 21mm f/2" 2.0)
+           (let ((aliases (lens-profile-aliases-read pathname)))
+             (and (= 1 (length aliases))
+                  (multiple-value-bind (model reducer crop-factor)
+                      (resolve-lens-profile-alias "olympus zuiko 21MM")
+                    (and (string= model "Olympus OM Zuiko Auto-W 21mm f/2")
+                         (= reducer 1.0)
+                         (= crop-factor 2.0)))
+                  ;; The built-in list still answers behind the file.
+                  (adapted-lens-aliases-p))))
+      (if previous
+          (setf (uiop:getenv "ORFEUS_LENS_ALIASES") previous)
+          (sb-posix:unsetenv "ORFEUS_LENS_ALIASES"))
+      (when (probe-file pathname)
+        (delete-file pathname)))))
+
+(defun lens-resolution-prefers-the-hand-set-profile-p ()
+  "A profile chosen by hand replaces the nickname alias, reducer and all."
+  (multiple-value-bind (profile reducer crop focal)
+      (orfeus::photo-lens-resolution #P"/nonexistent/photo.orf"
+                             "Carl Zeiss Makro-Planar T* 2/50 ZF.2" 50.0)
+    (and (string= profile "Carl Zeiss Makro-Planar T* 2/50 ZF.2")
+         (= reducer 1.0) (null crop) (= focal 50.0))))
+
 (defun processing-overrides-p ()
   (let ((settings
           (processing-settings-with-overrides
@@ -1811,6 +1846,10 @@ neither way."
              (adapted-lens-aliases-p))
       (check "lens alias reads disable reader evaluation"
              (lens-alias-reader-evaluation-disabled-p))
+      (check "saving a lens alias writes a readable file the resolver honours"
+             (lens-alias-save-round-trip-p))
+      (check "a hand-set lens profile replaces the nickname alias"
+             (lens-resolution-prefers-the-hand-set-profile-p))
       (check "per-photo overrides produce effective settings"
              (processing-overrides-p))
       (check "tonal settings default safely and reject invalid ranges"

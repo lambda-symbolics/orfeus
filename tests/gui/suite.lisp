@@ -24,6 +24,47 @@
     (orfeus/gui:gui-model-reset-selected model)
     (check (null (orfeus:photo-job-overrides job)) "Reset did not clear overrides")))
 
+(defun test-lens-profile-setting-reaches-the-optics-node ()
+  ;; The picker writes a profile name and a focal length as settings; on a
+  ;; graph-graded photograph they have to land on the optics node, where the
+  ;; renderer reads them from, and clear back to the metadata with NIL.
+  (let* ((job (orfeus:make-photo-job :input-path #P"one.orf"))
+         (project (orfeus:make-project :output-directory #P"exports/"
+                                       :photos (list job)))
+         (model (orfeus/gui:make-gui-model :project project)))
+    (setf (orfeus:photo-job-graph job) (orfeus:default-processing-graph))
+    (orfeus/gui:gui-model-set-setting model :lens-profile
+                                      "Olympus OM Zuiko Auto-W 21mm f/3.5")
+    (orfeus/gui:gui-model-set-setting model :lens-focal-length 21.0)
+    (let ((optics (find :optics (orfeus:processing-graph-nodes
+                                 (orfeus:photo-job-graph job))
+                        :key #'orfeus:graph-node-kind)))
+      (check optics "The default graph lost its optics node")
+      (check (string= "Olympus OM Zuiko Auto-W 21mm f/3.5"
+                      (getf (orfeus:graph-node-params optics) :lens-profile))
+             "The profile did not reach the optics node")
+      (check (= 21.0 (getf (orfeus:graph-node-params optics) :lens-focal-length))
+             "The focal length did not reach the optics node")
+      (multiple-value-bind (profile focal) (orfeus::graph-optics-overrides
+                                            (orfeus:photo-job-graph job))
+        (check (and (string= profile "Olympus OM Zuiko Auto-W 21mm f/3.5")
+                    (= focal 21.0))
+               "The renderer would not see the hand-set profile"))
+      (orfeus/gui:gui-model-set-setting model :lens-profile nil)
+      (check (null (orfeus/gui:gui-model-setting model :lens-profile))
+             "Clearing the profile did not return to the metadata")
+      ;; The graph still serialises and reads back with the profile in it.
+      (orfeus/gui:gui-model-set-setting model :lens-profile "Zeiss 21mm f/2.8 Distagon")
+      (let ((copy (orfeus:sexp->project (orfeus:project->sexp project))))
+        (check (equal "Zeiss 21mm f/2.8 Distagon"
+                      (getf (orfeus:graph-node-params
+                             (find :optics (orfeus:processing-graph-nodes
+                                            (orfeus:photo-job-graph
+                                             (first (orfeus:project-photos copy))))
+                                   :key #'orfeus:graph-node-kind))
+                            :lens-profile))
+               "The profile did not survive a project round trip")))))
+
 (defun test-undo-history ()
   (let* ((job (orfeus:make-photo-job :input-path #P"one.orf"
                                      :overrides '(:exposure 1.0)))
@@ -1620,6 +1661,7 @@ would silently ignore whatever the Destination field said."
 (defun run-tests ()
   (test-lightfast-root-layout-and-export-validation)
   (test-model-settings)
+  (test-lens-profile-setting-reaches-the-optics-node)
   (test-undo-history)
   (test-graph-node-placement)
   (test-thumbnail-context-menu)

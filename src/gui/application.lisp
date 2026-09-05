@@ -1388,6 +1388,9 @@ new cache entry is published."
            export-dialog-format export-dialog-quality
            export-dialog-width export-dialog-height
            export-dialog-metadata export-dialog-timestamp
+           lens-profile-label lens-picker lens-picker-caption
+           lens-picker-search lens-picker-list lens-picker-focal
+           lens-picker-remember lens-picker-records
            gallery-canvas gallery-title preset-name-input
            preset-apply-button preset-save-button
            (gallery-scroll 0)
@@ -4537,6 +4540,7 @@ new cache entry is published."
                          (format nil "Lens: ~A   |   ~A"
                                  (selected-lens-description) capture)
                          (format nil "Lens: ~A" (selected-lens-description)))))
+             (sync-lens-profile-label)
              (sync-export-controls)
              (sync-preset-action-label))
            (refresh-photo-groups ()
@@ -5411,6 +5415,260 @@ new cache entry is published."
                              "Current photograph"
                              "All photographs"))))
              (lightfast:show export-dialog))
+           (selected-lens-profile-status ()
+             ;; What the renderer will correct the current photograph with,
+             ;; honouring a profile chosen by hand on its optics node.
+             (let ((job (selected-job)))
+               (when job
+                 (handler-case
+                     (photo-lens-profile-status
+                      (photo-job-input-path job)
+                      :profile (gui-model-setting model :lens-profile)
+                      :focal-length (gui-model-setting model :lens-focal-length))
+                   (error (condition)
+                     (values nil (princ-to-string condition)))))))
+           (lens-profile-summary (record)
+             (format nil "~A~@[  (~{~A~^, ~})~]"
+                     (getf record :display)
+                     (remove nil
+                             (list (and (getf record :distortion-p) "distortion")
+                                   (and (getf record :chromatic-aberration-p)
+                                        "colour fringing")
+                                   (and (getf record :vignetting-p)
+                                        "vignetting")))))
+           (sync-lens-profile-label ()
+             (when lens-profile-label
+               (multiple-value-bind (text tooltip)
+                   (let ((job (selected-job)))
+                     (cond ((null job)
+                            (values "No photograph selected" ""))
+                           (t
+                            (multiple-value-bind (record message)
+                                (selected-lens-profile-status)
+                              (cond (record
+                                     (let ((summary (lens-profile-summary record)))
+                                       (values
+                                        (let ((prefix (if (gui-model-setting
+                                                           model :lens-profile)
+                                                          "Chosen profile: "
+                                                          "Profile: ")))
+                                          (format nil "~A~A" prefix
+                                                  (if (> (+ (length prefix)
+                                                            (length summary))
+                                                         46)
+                                                      (format nil "~A..."
+                                                              (subseq summary 0
+                                                                      (- 43 (length prefix))))
+                                                      summary)))
+                                        (format nil "~A~%~A" summary
+                                                (or (getf record :maker) "")))))
+                                    (t
+                                     (values "Profile: none found for this lens"
+                                             (or message ""))))))))
+                 (setf (lightfast:label lens-profile-label) text)
+                 (lightfast:set-tooltip lens-profile-label tooltip))))
+           (clear-lens-profile ()
+             (when (selected-job)
+               (gui-model-set-setting model :lens-profile nil)
+               (gui-model-set-setting model :lens-focal-length nil)
+               (sync-controls)
+               (schedule-edited-preview)
+               (set-status "Lens profile follows the photograph's metadata")))
+           (refresh-lens-picker ()
+             ;; Everything the search names, mountable on this body first.
+             (let* ((job (selected-job))
+                    (path (and job (photo-job-input-path job)))
+                    (focal (or (ignore-errors
+                                 (parse-number (lightfast:value lens-picker-focal)))
+                               (and path (ignore-errors (photo-focal-length path)))
+                               0.0))
+                    (records (handler-case
+                                 (native-lens-profiles
+                                  :make (and path (ignore-errors (photo-camera-make path)))
+                                  :model (and path (ignore-errors (photo-camera-model path)))
+                                  :query (lightfast:value lens-picker-search)
+                                  :focal focal)
+                               (error (condition)
+                                 (set-status (princ-to-string condition))
+                                 '())))
+                    (chosen (gui-model-setting model :lens-profile)))
+               (setf lens-picker-records records)
+               (lightfast:clear lens-picker-list)
+               (loop for record in records
+                     for index from 0
+                     do (lightfast:add-item
+                         lens-picker-list
+                         (format nil "~A~C~A~C~A~A~A"
+                                 (getf record :display) #\Tab
+                                 (getf record :maker) #\Tab
+                                 (if (getf record :distortion-p) "D" "-")
+                                 (if (getf record :chromatic-aberration-p) "T" "-")
+                                 (if (getf record :vignetting-p) "V" "-")))
+                        (when (and chosen (string= chosen (getf record :model)))
+                          (lightfast:browser-select lens-picker-list index)))
+               (setf (lightfast:label lens-picker-caption)
+                     (format nil "~D profile~:P~@[ for ~A~]~@[; searching \"~A\"~]"
+                             (length records)
+                             (and path (ignore-errors (photo-camera-model path)))
+                             (let ((query (lightfast:value lens-picker-search)))
+                               (and (plusp (length query)) query))))))
+           (accept-lens-picker ()
+             (let* ((indices (lightfast:browser-selected-indices lens-picker-list))
+                    (record (and indices (nth (first indices) lens-picker-records)))
+                    (job (selected-job)))
+               (cond ((null job)
+                      (set-status "Select a photograph first"))
+                     ((null record)
+                      (set-status "Select a lens profile in the list"))
+                     (t
+                      (let* ((focal (ignore-errors
+                                      (parse-number
+                                       (lightfast:value lens-picker-focal))))
+                             (path (photo-job-input-path job))
+                             (description (ignore-errors
+                                            (photo-lens-description path))))
+                        (gui-model-set-setting model :lens-profile
+                                               (getf record :model))
+                        (gui-model-set-setting model :lens-focal-length
+                                               (and focal (plusp focal)
+                                                    (float focal 1.0)))
+                        (when (and description
+                                   (string/= "0"
+                                             (lightfast:value lens-picker-remember)))
+                          ;; The crop factor on file is the body's when the
+                          ;; database knows the body, else the lens's own.
+                          (handler-case
+                              (progn
+                                (lens-profile-alias-save description
+                                                         (getf record :model)
+                                                         (or (getf record :crop-factor)
+                                                             2.0))
+                                (lens-profile-status-forget))
+                            (error (condition)
+                              (set-status (princ-to-string condition)))))
+                        (lightfast:hide lens-picker)
+                        (sync-controls)
+                        (schedule-edited-preview)
+                        (set-status (format nil "Lens profile: ~A"
+                                            (getf record :display))))))))
+           (build-lens-picker ()
+             ;; A search box over the lens database, the matches beneath it,
+             ;; and the two facts the profile needs that the photograph may
+             ;; not carry: the focal length, and whether to remember the choice
+             ;; for every photograph whose metadata describes the lens the same
+             ;; way. Laid out by the flex engine like the export dialog.
+             (let* ((dialog (lightfast:make-window :width 640 :height 470
+                                                   :label "Choose Lens Profile"))
+                    (rows '())
+                    (row-height 26)
+                    (label-width 130))
+               (setf lens-picker dialog)
+               (labels ((text (caption &optional (width label-width))
+                          (lightfast:make-label :parent dialog :x 0 :y 0
+                                                :width width :height row-height
+                                                :label caption))
+                        (field (label control)
+                          (push (lightfast:make-layout-row
+                                 :basis row-height :shrink 0 :gap 8
+                                 :children
+                                 (list (lightfast:make-layout-item
+                                        label :basis label-width :shrink 0)
+                                       (lightfast:make-layout-item
+                                        control :basis 0 :grow 1)))
+                                rows)
+                          control)
+                        (button (caption action width)
+                          (lightfast:make-button
+                           :parent dialog :x 0 :y 0 :width width
+                           :height row-height :label caption
+                           :callback (lambda (&rest ignored)
+                                       (declare (ignore ignored))
+                                       (funcall action)))))
+                 (setf lens-picker-caption (text "" 600))
+                 (push (lightfast:make-layout-item lens-picker-caption
+                                                   :basis row-height :shrink 0)
+                       rows)
+                 (setf lens-picker-search
+                       (field (text "Search")
+                              (lightfast:make-input
+                               :parent dialog :x 0 :y 0 :width 300
+                               :height row-height
+                               :callback (lambda (&rest ignored)
+                                           (declare (ignore ignored))
+                                           (refresh-lens-picker)))))
+                 (setf lens-picker-list
+                       (lightfast:make-browser :parent dialog :x 0 :y 0
+                                               :width 600 :height 200
+                                               :column-widths '(370 150 60)
+                                               :callback
+                                               (lambda (&rest ignored)
+                                                 (declare (ignore ignored)))))
+                 (push (lightfast:make-layout-item lens-picker-list
+                                                   :basis 0 :grow 1)
+                       rows)
+                 (push (lightfast:make-layout-item
+                        (text (format nil "D distortion, T colour fringing, V vignetting. ~
+                                           Profiles this body can mount come first.")
+                              600)
+                        :basis 20 :shrink 0)
+                       rows)
+                 (setf lens-picker-focal
+                       (field (text "Focal length (mm)")
+                              (lightfast:make-input
+                               :parent dialog :x 0 :y 0 :width 120
+                               :height row-height)))
+                 (setf lens-picker-remember
+                       (lightfast:make-check-button
+                        :parent dialog :x 0 :y 0 :width 600 :height 24
+                        :label "Remember for every photograph of this lens"))
+                 (push (lightfast:make-layout-item lens-picker-remember
+                                                   :basis 24 :shrink 0)
+                       rows)
+                 (push (lightfast:make-layout-row
+                        :basis 28 :shrink 0 :gap 8 :justify :end
+                        :children
+                        (list (lightfast:make-layout-item
+                               (button "Cancel"
+                                       (lambda () (lightfast:hide lens-picker))
+                                       96)
+                               :basis 96 :shrink 0)
+                              (lightfast:make-layout-item
+                               (button "Use Profile" #'accept-lens-picker 120)
+                               :basis 120 :shrink 0)))
+                       rows))
+               (lightfast:layout-on-resize
+                dialog
+                (lightfast:make-layout-column :padding 12 :gap 8
+                                              :children (nreverse rows)))
+               dialog))
+           (open-lens-picker ()
+             (let ((job (selected-job)))
+               (cond
+                 ((null job)
+                  (set-status "Select a photograph to choose a lens profile for"))
+                 (t
+                  (unless lens-picker
+                    (build-lens-picker))
+                  (let* ((path (photo-job-input-path job))
+                         (description (ignore-errors (photo-lens-description path)))
+                         (focal (or (gui-model-setting model :lens-focal-length)
+                                    (ignore-errors (photo-focal-length path)))))
+                    ;; Start the search from what the camera wrote down: the
+                    ;; words of its description usually appear in the profile's
+                    ;; name, however differently the two are punctuated.
+                    (setf (lightfast:value lens-picker-search)
+                          (or description "")
+                          (lightfast:value lens-picker-focal)
+                          (if focal (display-number focal) "")
+                          (lightfast:label lens-picker-remember)
+                          (if description
+                              (format nil "Remember for every photograph described as ~S"
+                                      description)
+                              "This photograph names no lens, so the choice is its own")
+                          (lightfast:value lens-picker-remember)
+                          (if description "1" "0"))
+                    (refresh-lens-picker)
+                    (lightfast:show lens-picker))))))
            (choose-lut ()
              (let ((path (lightfast:choose-file
                           :title "Choose 3D LUT"
@@ -6641,13 +6899,37 @@ new cache entry is published."
                        12 108 :fill 26 :page)))
              (push (list :chromatic-aberration-correction-p tca)
                    controls))
+           ;; The hand-set correction, for lenses no profile describes.
+           (let ((distortion (make-number-field :lens-distortion "By hand"
+                                                -0.5 0.5 0.01 140 node-page)))
+             (lightfast:set-tooltip
+              distortion
+              "Barrel or pincushion correction set by eye, for a lens no profile describes"))
+           ;; Which profile the corrections above read, and a way to pick one
+           ;; when the photograph's metadata names a lens the database does not
+           ;; know by that name — or names none at all.
+           (setf lens-profile-label
+                 (register-inspector
+                  (lightfast:make-label
+                   :parent node-page :x 12 :y 172 :width 292 :height 26
+                   :label "")
+                  12 172 :fill 26 :page))
            (register-inspector
-            (lightfast:make-label
-             :parent node-page :x 12 :y 140 :width 292 :height 26
-             :label "By hand, when no profile exists")
-            12 140 :fill 26 :page)
-           (make-number-field :lens-distortion "Distortion" -0.5 0.5 0.01 172
-                              node-page)))
+            (lightfast:make-button
+             :parent node-page :x 12 :y 204 :width 140 :height 26
+             :label "Choose Profile..."
+             :callback (lambda (&rest ignored)
+                         (declare (ignore ignored))
+                         (open-lens-picker)))
+            12 204 140 26 :page)
+           (register-inspector
+            (lightfast:make-button
+             :parent node-page :x 160 :y 204 :width 140 :height 26
+             :label "Photograph's Own"
+             :callback (lambda (&rest ignored)
+                         (declare (ignore ignored))
+                         (clear-lens-profile)))
+            160 204 140 26 :page)))
         (build-group
          :film
          (lambda ()

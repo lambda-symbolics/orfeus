@@ -81,26 +81,29 @@ fail explicitly rather than silently selecting a different Planar 50mm.")
                 (getf (rest entry) :focal-reducer 1.0)
                 (getf (rest entry) :crop-factor))))))
 
-(defun lens-profile-alias-save (nickname model &key (focal-reducer 1.0)
-                                                    crop-factor)
+(defun lens-profile-alias-save (nickname model crop-factor
+                                &key (focal-reducer 1.0))
   "Remember that lenses described as NICKNAME use the profile named MODEL.
 
-Written to the per-user adapted-lens file, replacing any earlier entry for the
-same nickname; the built-in list is never edited. The file is what the picker
-in the optics panel writes when asked to remember a choice, so that the next
-photograph on the same lens gets its profile without being asked."
+CROP-FACTOR is the sensor crop of the body the profile is applied on, before
+any focal reducer; an entry carries it because an adapted lens says nothing
+about the body it is on. Written to the per-user adapted-lens file, replacing
+any earlier entry for the same nickname; the built-in list is never edited. The
+file is what the picker in the optics panel writes when asked to remember a
+choice, so that the next photograph on the same lens gets its profile without
+being asked."
   (check-type nickname string)
   (check-type model string)
+  (check-type crop-factor real)
   (let* ((pathname (lens-profile-aliases-pathname))
          (existing (if (probe-file pathname)
                        (lens-profile-aliases-read pathname)
                        '()))
          (entry (lens-profile-alias-entry-validate
-                 (list* nickname
-                        :lensfun-model model
-                        :focal-reducer (float focal-reducer 1.0)
-                        (when crop-factor
-                          (list :crop-factor (float crop-factor 1.0))))))
+                 (list nickname
+                       :lensfun-model model
+                       :focal-reducer (float focal-reducer 1.0)
+                       :crop-factor (float crop-factor 1.0))))
          (aliases (cons entry
                         (remove nickname existing
                                 :key #'first :test #'string-equal))))

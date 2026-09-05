@@ -12,6 +12,7 @@
                 #:export-settings-timestamp-filenames-p
                 #:invalid-project-data
                 #:lens-profile-aliases-read
+                #:lens-profile-alias-save
                 #:resolve-lens-profile-alias
                 #:make-export-settings
                 #:make-photo-job
