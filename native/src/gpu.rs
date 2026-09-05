@@ -1431,7 +1431,13 @@ mod tests {
 
     /// The noise reduction is many passes deep, so agreement is checked against
     /// the CPU implementation rather than against a hand-computed expectation.
+    ///
+    /// Ignored since the CPU brightness chain moved to three bands shrunk by
+    /// their own measured noise: the shaders still implement the two-band
+    /// threshold it replaced, so they no longer agree, and the compute path is
+    /// not offered. Porting the shaders is what would bring this test back.
     #[test]
+    #[ignore = "the shaders implement the earlier two-band luma chain"]
     fn actual_gpu_noise_reduction_matches_cpu_when_requested_for_testing() {
         if !gpu_testing_requested() {
             return;

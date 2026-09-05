@@ -634,13 +634,42 @@ const ACTIVITY_RADIUS: usize = 3;
 /// being faithful.
 const ACTIVITY_STRENGTH: f32 = 2.9;
 
+/// Grows PLANE to LEN elements, zeroing the new ones on every thread at once.
+///
+/// `resize` zero-fills serially, and with the allocator told to keep large
+/// buffers on the heap (see `tune_allocator`) there are no fresh kernel pages
+/// to lean on: a twenty-megapixel plane is an eighty-megabyte memset on one
+/// core, and the denoiser used to grow five of them. Filling in parallel also
+/// faults the pages in from the threads that will use them.
+fn ensure_plane_len(plane: &mut Vec<f32>, len: usize) {
+    if plane.len() >= len {
+        plane.truncate(len);
+        return;
+    }
+    let missing = len - plane.len();
+    plane.reserve(missing);
+    plane.spare_capacity_mut()[..missing]
+        .par_chunks_mut(1 << 16)
+        .for_each(|chunk| {
+            for slot in chunk {
+                slot.write(0.0);
+            }
+        });
+    // SAFETY: Every element up to LEN was just written.
+    unsafe { plane.set_len(len) };
+}
+
 /// Mean of the squares of PLANE over a square window.
+///
+/// Kept as the plain statement of what the shrinkage pass computes with its
+/// rolling window, and checked against it.
 ///
 /// Separable, and each pass slides a running total rather than re-adding the
 /// window at every pixel, so the window costs the same whatever its radius.
 /// The vertical pass keeps one running total per column and walks a band of
 /// rows downwards, which is both O(1) per pixel and in row order — a column-major
 /// walk would be neither.
+#[cfg(test)]
 fn local_mean_square(
     plane: &[f32],
     output: &mut Vec<f32>,
@@ -649,8 +678,8 @@ fn local_mean_square(
     height: usize,
 ) {
     let radius = ACTIVITY_RADIUS;
-    scratch.resize(plane.len(), 0.0);
-    output.resize(plane.len(), 0.0);
+    ensure_plane_len(scratch, plane.len());
+    ensure_plane_len(output, plane.len());
     scratch
         .par_chunks_mut(width)
         .enumerate()
@@ -733,6 +762,458 @@ fn activity_gain(mean_square: f32, noise_power: f32) -> f32 {
         return 0.0;
     }
     (1.0 - noise_power / mean_square).clamp(0.0, 1.0)
+}
+
+/// The brightness plane is split at these steps, finest first. Each blur
+/// reaches twice its step, so the bands hold detail around one, two and four
+/// pixels across. Three rather than two because the noise a demosaic leaves is
+/// correlated over a pixel or two, and what a two-band split left behind in its
+/// smooth residual was exactly the low, blotchy grain that read as film in a
+/// blue sky.
+const LUMA_BAND_STEPS: [usize; 3] = [1, 2, 4];
+
+/// The lower quartile of a band's local power where the band holds nothing but
+/// noise, as a fraction of that noise's power.
+///
+/// A seven-by-seven window of independent samples has forty-nine degrees of
+/// freedom and its quartile sits at 0.86 of its mean; noise a demosaic has been
+/// through is correlated over a pixel or two, which lowers the count and with
+/// it the quartile. `BAND_NOISE_IS_MEASURED_WITHIN_A_FIFTH` checks the number.
+const FLAT_QUARTILE_OF_POWER: f32 = 0.84;
+
+/// The median of a band's local power over flat pixels, as a fraction of the
+/// noise power there. Just under one, because the distribution leans right.
+const FLAT_MEDIAN_OF_POWER: f32 = 0.97;
+
+/// Noise power per brightness bin of one detail band.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct BandNoise {
+    power: [f32; NOISE_BINS],
+}
+
+/// One brightness bin's reading of a band's noise: the power measured there,
+/// the mean brightness of the pixels it was read from, and how many there were.
+#[derive(Clone, Copy, Debug, Default)]
+struct BinReading {
+    power: f32,
+    brightness: f32,
+    count: usize,
+}
+
+/// How far above the fitted noise line a bin may sit and still be believed to
+/// have been read from flat pixels rather than from texture.
+const NOISE_ENVELOPE_TOLERANCE: f32 = 1.08;
+
+impl BandNoise {
+    /// Fits sensor noise to what the bins read, and answers for every bin from
+    /// the fit.
+    ///
+    /// Photon noise has a variance that is linear in scene brightness — a read
+    /// floor plus a term proportional to the light — and every stage before this
+    /// one scales brightness and noise together, so the line survives exposure
+    /// and white balance. The line is fitted as a *lower envelope*: the one that
+    /// sits at or under every bin's reading and as close to them as it can. A
+    /// bin has to sit above the envelope by more than noise itself would put it
+    /// to be left out, and what puts it there is texture — a brightness the
+    /// frame shows only as foliage or fabric reads its own detail as noise, and
+    /// with no envelope that detail would have been shrunk away as noise. On a
+    /// synthetic scene whose one texture sat alone in its brightness bin, the
+    /// per-bin reading alone kept 62% of it on a frame with no noise at all;
+    /// the envelope keeps all of it.
+    ///
+    /// The bins that were read too thinly to say anything are answered from the
+    /// same line, so a sparsely occupied brightness is neither shrunk on no
+    /// evidence nor left untouched on none.
+    fn fit(readings: &[BinReading; NOISE_BINS]) -> Self {
+        let measured: Vec<&BinReading> = readings.iter().filter(|r| r.count > 0).collect();
+        let mut power = [0.0_f32; NOISE_BINS];
+        if measured.is_empty() {
+            return BandNoise { power };
+        }
+        // Every line through two readings, level with one, or through the
+        // origin and one; keep those under every reading, take the one that
+        // hugs them closest, weighted by how many pixels each reading speaks for.
+        let mut candidates: Vec<(f32, f32)> = Vec::new();
+        for (i, a) in measured.iter().enumerate() {
+            candidates.push((a.power, 0.0));
+            if a.brightness > 1e-4 {
+                candidates.push((0.0, a.power / a.brightness));
+            }
+            for b in &measured[i + 1..] {
+                let span = b.brightness - a.brightness;
+                if span.abs() > 1e-4 {
+                    let slope = (b.power - a.power) / span;
+                    let floor = a.power - slope * a.brightness;
+                    if slope >= 0.0 && floor >= 0.0 {
+                        candidates.push((floor, slope));
+                    }
+                }
+            }
+        }
+        let feasible = |(floor, slope): &(f32, f32)| {
+            measured
+                .iter()
+                .all(|r| floor + slope * r.brightness <= r.power * NOISE_ENVELOPE_TOLERANCE + 1e-12)
+        };
+        let closeness = |(floor, slope): &(f32, f32)| {
+            measured
+                .iter()
+                .map(|r| (floor + slope * r.brightness) * r.count as f32)
+                .sum::<f32>()
+        };
+        let (floor, slope) = candidates
+            .into_iter()
+            .filter(feasible)
+            .max_by(|a, b| closeness(a).total_cmp(&closeness(b)))
+            .unwrap_or((0.0, 0.0));
+        for (bin, value) in power.iter_mut().enumerate() {
+            let brightness = readings[bin].brightness;
+            let brightness = if readings[bin].count > 0 {
+                brightness
+            } else {
+                // The middle of the bin's own brightness range.
+                let edge = (bin as f32 + 0.5) / NOISE_BINS as f32;
+                edge * edge
+            };
+            *value = (floor + slope * brightness).max(0.0);
+        }
+        BandNoise { power }
+    }
+}
+
+/// How far apart the pixels the noise estimate reads are, for a frame of this
+/// many pixels; see `NOISE_TARGET_SAMPLES`.
+fn noise_sample_stride(pixels: usize) -> usize {
+    (pixels / NOISE_TARGET_SAMPLES).isqrt().max(1)
+}
+
+/// The mean square of PLANE over the activity window centred on INDEX.
+///
+/// What the shrinkage pass computes for every pixel with running sums, done
+/// here for one pixel at a time: the noise estimate only needs it at a hundred
+/// thousand sampled points, and reading forty-nine values at each of those is
+/// far cheaper than a whole plane of them written out and read back.
+fn window_mean_square(plane: &[f32], width: usize, height: usize, index: usize) -> f32 {
+    let (row, column) = (index / width, index % width);
+    let top = row.saturating_sub(ACTIVITY_RADIUS);
+    let bottom = (row + ACTIVITY_RADIUS).min(height - 1);
+    let left = column.saturating_sub(ACTIVITY_RADIUS);
+    let right = (column + ACTIVITY_RADIUS).min(width - 1);
+    let mut total = 0.0_f32;
+    for y in top..=bottom {
+        for value in &plane[y * width + left..=y * width + right] {
+            total += value * value;
+        }
+    }
+    total / ((bottom - top + 1) * (right - left + 1)) as f32
+}
+
+/// Measures the finest band's noise from its own local power, and names the
+/// pixels it found flat.
+///
+/// Noise is in every pixel and texture only in some, and at a scale of one
+/// pixel texture is rare besides, so the lower quartile of the band's local
+/// power is a settled reading of its noise. The quarter of the samples under
+/// that quartile are the flat ones: they are handed back as (index, bin) pairs
+/// for the coarser bands to measure themselves over, since a pixel with no fine
+/// detail is the best place to ask what a band's noise looks like undisturbed.
+///
+/// This replaced deriving every band's noise from one Laplacian reading through
+/// the gains a *white* noise would show. Demosaiced noise is not white: it is
+/// correlated over a pixel or two, so it carries more power at the coarser
+/// steps than white noise would, and the derived figure came out low there — by
+/// enough that the default setting left a blue sky 1.7 times as noisy as the
+/// camera's own JPEG while the flat sky should have come out clean. Measuring
+/// each band directly has no assumption to be wrong about.
+fn fine_band_noise(
+    band: &[f32],
+    brightness: &[f32],
+    width: usize,
+    height: usize,
+) -> (BandNoise, Vec<(usize, usize)>) {
+    let stride = noise_sample_stride(width * height);
+    let rows: Vec<usize> = (0..height).step_by(stride).collect();
+    let sampled: Vec<(f32, usize)> = rows
+        .par_iter()
+        .flat_map_iter(|row| {
+            (0..width).step_by(stride).map(move |column| {
+                let index = row * width + column;
+                (window_mean_square(band, width, height, index), index)
+            })
+        })
+        .collect();
+    let mut samples: Vec<Vec<(f32, usize)>> = vec![Vec::new(); NOISE_BINS];
+    for (power, index) in sampled {
+        samples[noise_bin(brightness[index])].push((power, index));
+    }
+    let mut readings = [BinReading::default(); NOISE_BINS];
+    let mut flat = Vec::new();
+    for (bin, samples) in samples.iter_mut().enumerate() {
+        if samples.len() < NOISE_BIN_MINIMUM {
+            continue;
+        }
+        let rank = ((samples.len() as f32 * NOISE_QUANTILE) as usize).min(samples.len() - 1);
+        let (below, quartile, _) =
+            samples.select_nth_unstable_by(rank, |a, b| a.0.total_cmp(&b.0));
+        let flat_here: Vec<usize> = below
+            .iter()
+            .chain(std::iter::once(&*quartile))
+            .map(|(_, index)| *index)
+            .collect();
+        readings[bin] = BinReading {
+            power: quartile.0 / FLAT_QUARTILE_OF_POWER,
+            brightness: flat_here.iter().map(|index| brightness[*index]).sum::<f32>()
+                / flat_here.len() as f32,
+            count: flat_here.len(),
+        };
+        flat.extend(flat_here.into_iter().map(|index| (index, bin)));
+    }
+    (BandNoise::fit(&readings), flat)
+}
+
+/// Measures a coarser band's noise over the pixels the finest band found flat.
+///
+/// The median rather than the mean, so the few flat-looking pixels that carry
+/// a soft texture the fine band could not see do not pull the figure up and
+/// have that texture smoothed away.
+fn coarse_band_noise(
+    band: &[f32],
+    brightness: &[f32],
+    width: usize,
+    height: usize,
+    flat: &[(usize, usize)],
+) -> BandNoise {
+    let powers: Vec<f32> = flat
+        .par_iter()
+        .map(|(index, _)| window_mean_square(band, width, height, *index))
+        .collect();
+    let mut samples: Vec<Vec<f32>> = vec![Vec::new(); NOISE_BINS];
+    let mut light = [0.0_f32; NOISE_BINS];
+    for ((index, bin), power) in flat.iter().zip(powers) {
+        samples[*bin].push(power);
+        light[*bin] += brightness[*index];
+    }
+    let mut readings = [BinReading::default(); NOISE_BINS];
+    for (bin, samples) in samples.iter_mut().enumerate() {
+        if samples.len() < NOISE_BIN_MINIMUM / 2 {
+            continue;
+        }
+        let rank = samples.len() / 2;
+        let (_, median, _) = samples.select_nth_unstable_by(rank, f32::total_cmp);
+        readings[bin] = BinReading {
+            power: *median / FLAT_MEDIAN_OF_POWER,
+            brightness: light[bin] / samples.len() as f32,
+            count: samples.len(),
+        };
+    }
+    BandNoise::fit(&readings)
+}
+
+/// Splits PLANE into its three detail bands and the smooth residual under them.
+///
+/// Each blur follows edges in the original brightness, so a band never holds
+/// the far side of an edge. On return PLANE holds the finest band, the two
+/// vectors returned the next two, and RESIDUAL what is left.
+fn split_luma_bands(
+    plane: &mut [f32],
+    residual: &mut Vec<f32>,
+    scratch: &mut Vec<f32>,
+    width: usize,
+    height: usize,
+) -> (Vec<f32>, Vec<f32>) {
+    let mut middle = Vec::new();
+    let mut coarse = Vec::new();
+    edge_guided_blur_into(plane, plane, width, height, LUMA_BAND_STEPS[0], 1.0, scratch, &mut middle);
+    edge_guided_blur_into(&middle, plane, width, height, LUMA_BAND_STEPS[1], 1.0, scratch, &mut coarse);
+    edge_guided_blur_into(&coarse, plane, width, height, LUMA_BAND_STEPS[2], 1.0, scratch, residual);
+    // The three bands, written over the planes that produced them, in one
+    // traversal: once a band exists neither the brightness nor the blur under
+    // it is wanted again, and at eighty megapixels a plane is a third of a
+    // gigabyte.
+    plane
+        .par_chunks_mut(8192)
+        .zip(middle.par_chunks_mut(8192))
+        .zip(coarse.par_chunks_mut(8192))
+        .zip(residual.par_chunks(8192))
+        .for_each(|(((fine, middle), coarse), residual)| {
+            for (((fine, middle), coarse), residual) in
+                fine.iter_mut().zip(middle.iter_mut()).zip(coarse.iter_mut()).zip(residual)
+            {
+                let one = *middle;
+                let two = *coarse;
+                *fine -= one;
+                *middle = one - two;
+                *coarse = two - *residual;
+            }
+        });
+    (middle, coarse)
+}
+
+/// Rows a shrinkage band covers; the running window needs three more above and
+/// below it.
+const SHRINK_BAND_ROWS: usize = 32;
+
+/// Rebuilds the brightness from its bands, each shrunk by how much of its local
+/// power is noise, in one pass.
+///
+/// The three activity maps used to be written out as whole planes and read
+/// back, and each band's gain was applied in its own pass — nine traversals of
+/// eighty megabytes at twenty megapixels for arithmetic that fits in a few
+/// rows. Here each band of rows keeps a seven-row ring of horizontal window
+/// sums per detail band and rolls a vertical total down it, so a pixel's local
+/// power costs a handful of adds and nothing is stored beyond the ring. OUT is
+/// the residual coming in and the denoised brightness going out.
+#[allow(clippy::too_many_arguments)]
+fn shrink_luma_bands(
+    out: &mut [f32],
+    fine: &[f32],
+    middle: &[f32],
+    coarse: &[f32],
+    noise: [BandNoise; 3],
+    strength: f32,
+    width: usize,
+    height: usize,
+) {
+    let radius = ACTIVITY_RADIUS;
+    let window = 2 * radius + 1;
+    let bands = [fine, middle, coarse];
+    out.par_chunks_mut(width * SHRINK_BAND_ROWS)
+        .enumerate()
+        .for_each_init(
+            || (vec![0.0_f32; 3 * window * width], vec![0.0_f32; 3 * width]),
+            |(ring, totals), (band_index, out)| {
+                let top = band_index * SHRINK_BAND_ROWS;
+                let rows = out.len() / width;
+                totals.fill(0.0);
+                // Horizontal window sums of one row of one band, into a ring slot.
+                let row_sums = |ring: &mut [f32], band: usize, y: usize, slot: usize| {
+                    let source = &bands[band][y * width..(y + 1) * width];
+                    let target = &mut ring[(band * window + slot) * width..(band * window + slot + 1) * width];
+                    let square = |x: usize| source[x] * source[x];
+                    let mut total = 0.0_f32;
+                    let (mut first, mut past) = (0_usize, 0_usize);
+                    for (x, value) in target.iter_mut().enumerate() {
+                        let wanted_past = (x + radius + 1).min(width);
+                        let wanted_first = x.saturating_sub(radius);
+                        while past < wanted_past {
+                            total += square(past);
+                            past += 1;
+                        }
+                        while first < wanted_first {
+                            total -= square(first);
+                            first += 1;
+                        }
+                        *value = total / (past - first) as f32;
+                    }
+                };
+                // The rows the window over the band's first row reaches, rolled
+                // in before any output; then one row in and one out per line.
+                let mut first_row = top.saturating_sub(radius);
+                let mut past_row = first_row;
+                let add_row = |ring: &mut [f32], totals: &mut [f32], y: usize| {
+                    for band in 0..3 {
+                        let slot = y % window;
+                        row_sums(ring, band, y, slot);
+                        let sums = &ring[(band * window + slot) * width..(band * window + slot + 1) * width];
+                        for (total, sum) in totals[band * width..(band + 1) * width].iter_mut().zip(sums) {
+                            *total += sum;
+                        }
+                    }
+                };
+                let remove_row = |ring: &[f32], totals: &mut [f32], y: usize| {
+                    for band in 0..3 {
+                        let slot = y % window;
+                        let sums = &ring[(band * window + slot) * width..(band * window + slot + 1) * width];
+                        for (total, sum) in totals[band * width..(band + 1) * width].iter_mut().zip(sums) {
+                            *total -= sum;
+                        }
+                    }
+                };
+                for row in 0..rows {
+                    let y = top + row;
+                    let wanted_past = (y + radius + 1).min(height);
+                    let wanted_first = y.saturating_sub(radius);
+                    // The row leaving the window goes first: the row arriving
+                    // takes over its slot in the ring.
+                    while first_row < wanted_first {
+                        remove_row(ring, totals, first_row);
+                        first_row += 1;
+                    }
+                    while past_row < wanted_past {
+                        add_row(ring, totals, past_row);
+                        past_row += 1;
+                    }
+                    let count = (past_row - first_row) as f32;
+                    let line = &mut out[row * width..(row + 1) * width];
+                    let (fine, middle, coarse) = (
+                        &fine[y * width..(y + 1) * width],
+                        &middle[y * width..(y + 1) * width],
+                        &coarse[y * width..(y + 1) * width],
+                    );
+                    let (totals_fine, rest) = totals.split_at(width);
+                    let (totals_middle, totals_coarse) = rest.split_at(width);
+                    for x in 0..width {
+                        // Binned on the smooth residual under the bands: the
+                        // pixel's own value is by now a detail coefficient and
+                        // says nothing about how bright anything is.
+                        let bin = noise_bin(line[x]);
+                        let shrink = |band: usize, total: f32, value: f32| {
+                            value * activity_gain(total / count, strength * noise[band].power[bin])
+                        };
+                        line[x] += shrink(0, totals_fine[x], fine[x])
+                            + shrink(1, totals_middle[x], middle[x])
+                            + shrink(2, totals_coarse[x], coarse[x]);
+                    }
+                }
+            },
+        );
+}
+
+/// Denoises the brightness plane in place by local Wiener shrinkage of three
+/// detail bands, each against the noise power measured in that band.
+///
+/// RESIDUAL is left holding the finest band afterwards, which the caller may
+/// reuse as scratch. STRENGTH is the slider, nought to one.
+fn denoise_luma(
+    plane: &mut Vec<f32>,
+    residual: &mut Vec<f32>,
+    scratch: &mut Vec<f32>,
+    width: usize,
+    height: usize,
+    strength: f32,
+) {
+    let profiling = std::env::var_os("ORFEUS_PROFILE").is_some();
+    let mut step_started = Instant::now();
+    let mut profile_step = |name: &str| {
+        if profiling {
+            let now = Instant::now();
+            eprintln!(
+                "orfeus-profile luma-step={name} milliseconds={:.3}",
+                now.duration_since(step_started).as_secs_f64() * 1000.0
+            );
+            step_started = now;
+        }
+    };
+    let (middle, coarse) = split_luma_bands(plane, residual, scratch, width, height);
+    profile_step("bands");
+    let strength = strength * ACTIVITY_STRENGTH;
+    // The finest band says where the frame is flat; the others measure there.
+    let (fine_noise, flat) = fine_band_noise(plane, residual, width, height);
+    let middle_noise = coarse_band_noise(&middle, residual, width, height, &flat);
+    let coarse_noise = coarse_band_noise(&coarse, residual, width, height, &flat);
+    profile_step("estimate");
+    shrink_luma_bands(
+        residual,
+        plane,
+        &middle,
+        &coarse,
+        [fine_noise, middle_noise, coarse_noise],
+        strength,
+        width,
+        height,
+    );
+    std::mem::swap(plane, residual);
+    profile_step("shrink");
 }
 
 /// Lifts or lowers seven bands of brightness independently.
@@ -964,7 +1445,7 @@ fn edge_guided_blur_into(
     // Grow to fit without clearing first. Every element is written below, so
     // clearing would only force the whole plane to be re-zeroed on each call
     // and throw away the point of reusing the buffer.
-    output.resize(source.len(), 0.0);
+    ensure_plane_len(output, source.len());
     let use_avx = super::nn::fma_available();
     let reach = 2 * step;
     let kernel = [1.0_f32, 4.0, 6.0, 4.0, 1.0];
@@ -1273,17 +1754,6 @@ const NOISE_QUANTILE_SIGMA: f32 = 0.3186;
 /// the pixel's.
 const LAPLACIAN_NOISE_GAIN: f32 = 1.118_034;
 
-/// What each detail band does to white noise, as a fraction of the deviation
-/// that went in.
-///
-/// Derived rather than guessed: the fine band is the identity less a
-/// five-tap blur and the coarse band is that blur less a wider one, and running
-/// white noise through each gives these. They convert the pixel noise the
-/// profile measures into the noise the band actually carries, which is what the
-/// local estimate has to be compared against.
-const FINE_BAND_GAIN: f32 = 0.891;
-const COARSE_BAND_GAIN: f32 = 0.201;
-
 /// Roughly how many pixels the noise estimate looks at.
 ///
 /// A quartile of a hundred thousand samples is a settled number, and spending
@@ -1540,7 +2010,6 @@ pub(crate) fn cpu_noise_reduction(image: &mut RgbImage, luma: f32, chroma: f32) 
     if (luma == 0.0 && chroma == 0.0) || image.width < 3 || image.height < 3 {
         return;
     }
-    let profile = measure_noise_profile(image);
     let profiling = std::env::var_os("ORFEUS_PROFILE").is_some();
     let mut step_started = Instant::now();
     macro_rules! profile_step {
@@ -1606,79 +2075,7 @@ pub(crate) fn cpu_noise_reduction(image: &mut RgbImage, luma: f32, chroma: f32) 
     let mut filtered = Vec::new();
     let luma_strength = luma.clamp(0.0, 1.0);
     if luma_strength > 0.0 {
-        let mut scale_one = Vec::new();
-        edge_guided_blur_into(
-            &yy,
-            &yy,
-            image.width,
-            image.height,
-            1,
-            1.0,
-            &mut scratch,
-            &mut scale_one,
-        );
-        edge_guided_blur_into(
-            &scale_one,
-            &yy,
-            image.width,
-            image.height,
-            2,
-            1.0,
-            &mut scratch,
-            &mut filtered,
-        );
-        // The two detail bands, written over the planes that produced them:
-        // once each band exists neither the brightness nor the first blur is
-        // wanted again, and a frame this size cannot afford copies of either.
-        //
-        // Both in one traversal, and the recombination folded into the second
-        // band's gain below. At twenty megapixels every pass over a plane is
-        // eighty megabytes each way, and this stage is bound by that traffic
-        // rather than by its arithmetic — making the window O(1) per pixel
-        // bought seven percent, while removing two passes buys far more.
-        yy.par_chunks_mut(8192)
-            .zip(scale_one.par_chunks_mut(8192))
-            .zip(filtered.par_chunks(8192))
-            .for_each(|((fine, coarse), scale_two)| {
-                for ((fine, coarse), scale_two) in
-                    fine.iter_mut().zip(coarse.iter_mut()).zip(scale_two)
-                {
-                    let blurred = *coarse;
-                    *fine -= blurred;
-                    *coarse = blurred - *scale_two;
-                }
-            });
-        let strength = luma_strength * ACTIVITY_STRENGTH;
-        let mut activity = Vec::new();
-        local_mean_square(&yy, &mut activity, &mut scratch, width, height);
-        yy.par_chunks_mut(8192)
-            .zip(activity.par_chunks(8192))
-            .zip(filtered.par_chunks(8192))
-            .for_each(|((values, activity), brightness)| {
-                for ((value, mean_square), brightness) in
-                    values.iter_mut().zip(activity).zip(brightness)
-                {
-                    // Binned on the smoothed brightness rather than on the
-                    // pixel's own, which by this point is a detail coefficient
-                    // and no longer says how bright anything is.
-                    let noise = FINE_BAND_GAIN * profile.deviation[noise_bin(*brightness)];
-                    *value *= activity_gain(*mean_square, strength * noise * noise);
-                }
-            });
-        local_mean_square(&scale_one, &mut activity, &mut scratch, width, height);
-        yy.par_chunks_mut(8192)
-            .zip(scale_one.par_chunks(8192))
-            .zip(activity.par_chunks(8192))
-            .zip(filtered.par_chunks(8192))
-            .for_each(|(((values, coarse), activity), scale_two)| {
-                for (((value, coarse), mean_square), scale_two) in
-                    values.iter_mut().zip(coarse).zip(activity).zip(scale_two)
-                {
-                    let noise = COARSE_BAND_GAIN * profile.deviation[noise_bin(*scale_two)];
-                    let gain = activity_gain(*mean_square, strength * noise * noise);
-                    *value += *coarse * gain + *scale_two;
-                }
-            });
+        denoise_luma(&mut yy, &mut filtered, &mut scratch, width, height, luma_strength);
     }
 
     profile_step!("luma");
@@ -2058,8 +2455,6 @@ pub(crate) fn apply_lens(
             "RAW metadata does not identify a usable lens/focal length".into(),
         ));
     }
-    let profiling = std::env::var_os("ORFEUS_PROFILE").is_some();
-    let started = Instant::now();
     let db = lens_database()?;
     let profile_focal = focal / focal_reducer;
     let camera = find_camera_profile(db, make, model);
@@ -5333,6 +5728,100 @@ mod tests {
         );
         for (index, luminance) in anchors.into_iter().enumerate() {
             if luminance <= 0.0 {
+    /// A plane of nothing but noise, at one brightness.
+    fn noisy_flat_plane(width: usize, height: usize, level: f32, sigma: f32) -> Vec<f32> {
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 40) as f32 / 16_777_216.0 - 0.5
+        };
+        (0..width * height)
+            // Four uniform draws: close enough to Gaussian, variance 4/12.
+            .map(|_| level + sigma * (next() + next() + next() + next()) / (1.0_f32 / 3.0).sqrt())
+            .collect()
+    }
+
+    /// Each band's noise is read off the band itself, so the reading has to
+    /// agree with the power the noise actually put there.
+    #[test]
+    fn band_noise_is_measured_within_a_fifth() {
+        let (width, height) = (512, 384);
+        let mut plane = noisy_flat_plane(width, height, 0.4, 0.02);
+        let (mut residual, mut scratch) = (Vec::new(), Vec::new());
+        let (middle, coarse) = split_luma_bands(&mut plane, &mut residual, &mut scratch, width, height);
+        let bin = noise_bin(0.4);
+        let truth = |band: &[f32]| band.iter().map(|v| v * v).sum::<f32>() / band.len() as f32;
+        let (fine, flat) = fine_band_noise(&plane, &residual, width, height);
+        let readings = [
+            (fine.power[bin], truth(&plane)),
+            (coarse_band_noise(&middle, &residual, width, height, &flat).power[bin], truth(&middle)),
+            (coarse_band_noise(&coarse, &residual, width, height, &flat).power[bin], truth(&coarse)),
+        ];
+        for (index, (measured, actual)) in readings.iter().enumerate() {
+            let ratio = measured / actual;
+            assert!(
+                (0.8..=1.2).contains(&ratio),
+                "band {index}: measured {measured} against actual {actual}, ratio {ratio}"
+            );
+        }
+    }
+
+    /// The rolling window of the shrinkage pass has to agree with the plain
+    /// window it replaced, at every pixel including the edges.
+    #[test]
+    fn rolling_activity_matches_the_plain_window() {
+        let (width, height) = (61, 71);
+        let band = noisy_flat_plane(width, height, 0.5, 0.05);
+        let mut activity = Vec::new();
+        let mut scratch = Vec::new();
+        local_mean_square(&band, &mut activity, &mut scratch, width, height);
+        for index in (0..width * height).step_by(7) {
+            let direct = window_mean_square(&band, width, height, index);
+            assert!(
+                (direct - activity[index]).abs() < 1e-6,
+                "pixel {index}: window {direct} against running {}",
+                activity[index]
+            );
+        }
+        // And the fused shrinkage equals shrinking with the plane of activity.
+        let zeros = vec![0.0_f32; width * height];
+        let noise = BandNoise { power: [0.05 * 0.05; NOISE_BINS] };
+        let mut fused = vec![0.4_f32; width * height];
+        shrink_luma_bands(&mut fused, &band, &zeros, &zeros, [noise; 3], 1.0, width, height);
+        for index in 0..width * height {
+            let expected = 0.4 + band[index] * activity_gain(activity[index], noise.power[noise_bin(0.4)]);
+            assert!(
+                (fused[index] - expected).abs() < 1e-5,
+                "pixel {index}: fused {} against {expected}",
+                fused[index]
+            );
+        }
+    }
+
+    /// A frame with no noise has nothing to lose, whatever the slider says.
+    ///
+    /// The scene's one texture sits alone in its brightness bin, which is the
+    /// case a per-bin noise reading gets wrong: it reads the texture as noise.
+    /// The noise envelope across brightness is what keeps it.
+    #[test]
+    fn a_frame_with_no_noise_keeps_its_texture() {
+        let (width, height) = (800, 600);
+        let clean = denoise_test_scene(width, height);
+        for strength in [0.35_f32, 1.0] {
+            let mut image = RgbImage {
+                width,
+                height,
+                data: clean.clone(),
+            };
+            cpu_noise_reduction(&mut image, strength, strength);
+            let kept = texture_amplitude(&image.data, width, height)
+                / texture_amplitude(&clean, width, height);
+            assert!(kept > 0.98, "slider {strength} kept only {kept} of a clean frame's texture");
+        }
+    }
+
                 continue;
             }
             let mut adjustments = [0.0; 7];
