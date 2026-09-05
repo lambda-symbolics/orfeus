@@ -1,7 +1,7 @@
 (in-package #:orfeus)
 
 (defun photo-job-automatic-output-stem (project photo)
-  (let* ((base (pathname-name (photo-job-input-path photo)))
+  (let* ((base (photo-display-stem (photo-job-input-path photo)))
          (timestamp (and (export-settings-timestamp-filenames-p
                           (project-export-settings project))
                          (photo-capture-timestamp

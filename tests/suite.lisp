@@ -1276,6 +1276,21 @@ and then quietly relocated them would be lying about where a click puts things."
       (when (probe-file pathname)
         (delete-file pathname)))))
 
+(defun interned-display-names-drop-the-digest-p ()
+  "The filmstrip and the export show the card's filename, not the store's."
+  (let ((interned #P"/store/0123456789ab-_6040106.ORF"))
+    (and (string= "_6040106.ORF"
+                  (orfeus:photo-display-name interned :interned-p t))
+         (string= "_6040106"
+                  (orfeus:photo-display-stem interned :interned-p t))
+         ;; Not interned: a name that merely looks like one is left alone.
+         (string= "0123456789ab-_6040106.ORF"
+                  (orfeus:photo-display-name interned :interned-p nil))
+         ;; Interned under a name no digest was put ahead of.
+         (string= "P9054674.ORF"
+                  (orfeus:photo-display-name #P"/store/P9054674.ORF"
+                                             :interned-p t)))))
+
 (defun missing-lens-profile-warning-can-be-switched-off-p ()
   "The once-per-photograph warning obeys the switch the interface throws."
   (let ((pathname (format nil "/nowhere/~D.ORF" (get-universal-time))))
@@ -1974,6 +1989,8 @@ neither way."
              (lens-alias-reader-evaluation-disabled-p))
       (check "saving a lens alias writes a readable file the resolver honours"
              (lens-alias-save-round-trip-p))
+      (check "interned photographs are shown under the card's filename"
+             (interned-display-names-drop-the-digest-p))
       (check "a missing lens profile is reported once, and not at all when told not to"
              (missing-lens-profile-warning-can-be-switched-off-p))
       (check "a lens listing names the calibration crop apart from the body's"

@@ -171,6 +171,8 @@
    #:interned-raw-directory
    #:interned-raw-pathname
    #:photo-interned-p
+   #:photo-display-name
+   #:photo-display-stem
    #:intern-raw-file
    #:intern-photo-job
    #:still-store-directory

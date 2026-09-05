@@ -817,6 +817,36 @@ across saves, reloads, and files removed from the store behind our back."
        (equal (uiop:pathname-directory-pathname (truename* pathname))
               (uiop:pathname-directory-pathname (truename* directory)))))
 
+(defun interned-name-digest-p (name)
+  "True when NAME starts the way an interned copy's does: twelve hex digits and
+a dash ahead of the card's own filename."
+  (and (> (length name) 13)
+       (char= #\- (char name 12))
+       (every (lambda (character) (digit-char-p character 16))
+              (subseq name 0 12))))
+
+(defun photo-display-stem (pathname &key (interned-p (photo-interned-p pathname)))
+  "PATHNAME's name without its type, as the photographer knows it.
+
+The store puts a content digest ahead of an interned copy's name so that two
+cards' _6040106.ORF can live side by side; the filmstrip and the export are
+not the store, and there the digest only pushed the name the photographer
+looks for off the end of the row. Dropped when PATHNAME is interned — the
+caller may say so with INTERNED-P where it already knows — and left alone
+otherwise, however much a name may resemble one."
+  (let ((stem (or (pathname-name pathname) "")))
+    (if (and interned-p (interned-name-digest-p stem))
+        (subseq stem 13)
+        stem)))
+
+(defun photo-display-name (pathname &key (interned-p (photo-interned-p pathname)))
+  "PATHNAME's filename as the photographer knows it: see PHOTO-DISPLAY-STEM."
+  (let ((stem (photo-display-stem pathname :interned-p interned-p))
+        (type (pathname-type pathname)))
+    (if (and type (not (eq type :unspecific)))
+        (format nil "~A.~A" stem type)
+        stem)))
+
 (defun truename* (pathname)
   "Resolve PATHNAME when it exists, else return it unchanged."
   (or (ignore-errors (truename pathname)) pathname))

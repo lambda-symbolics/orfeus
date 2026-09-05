@@ -2661,7 +2661,9 @@ new cache entry is published."
                (format nil "Developing~@[ ~A~]~@[ · ~A~]~@[ · ~D px~]~:[~; · window~]"
                        (and render-stage (string-downcase render-stage))
                        (let ((job (selected-job)))
-                         (and job (file-namestring (photo-job-input-path job))))
+                         (and job (orfeus:photo-display-name
+                                   (photo-job-input-path job)
+                                   :interned-p (photo-interned-cached-p job))))
                        (and (plusp bound) bound)
                        window)))
            (set-status (text)
@@ -6643,7 +6645,9 @@ new cache entry is published."
                                 (draw-burst-bar job x row-y row-height)
                                 (lightfast:draw-color-rgb :red 235 :green 235 :blue 235)
                                 (lightfast:draw-text
-                                 (file-namestring (photo-job-input-path job))
+                                 (orfeus:photo-display-name
+                                  (photo-job-input-path job)
+                                  :interned-p (photo-interned-cached-p job))
                                  (+ x 102) (+ row-y 30))
                                 ;; Filename, then the stars beneath it, then the
                                 ;; focus mark, then the burst line: a star is
