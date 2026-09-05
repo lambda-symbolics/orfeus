@@ -6363,6 +6363,9 @@ new cache entry is published."
         (setf window (lightfast:make-window :width 1280 :height 800
                                           :label "Orfeus"
                                           :app-id "org.orfeus.Orfeus"))
+        ;; FLTK closes a window on Escape unless told otherwise. A dialog wants
+        ;; that; the main window, with a project open in it, does not.
+        (lightfast:window-escape-closes window nil)
         (lightfast:apply-classic-theme)
         ;; The core keeps focus measurements wherever this points, and only a
         ;; frontend knows where that should be.
