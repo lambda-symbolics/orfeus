@@ -143,6 +143,9 @@
    #:*graph-source-id*
    #:*curve-channel-keys*
    #:*quarter-turn-labels*
+   #:*negative-keys*
+   #:*negative-default-gamma*
+   #:*negative-default-balance*
    #:*rotate-keys*
    #:*identity-curve-points*
    #:*minimum-curve-points*

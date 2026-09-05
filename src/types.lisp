@@ -126,11 +126,15 @@ them as a copyable node chain.")
   "Rotation amounts a rotate node offers, as quarter turns clockwise.")
 
 (defparameter *graph-only-node-kinds*
-  '(:blend :color-subtract :contrast :crop :rotate :flip :curves)
+  '(:blend :color-subtract :negative :contrast :crop :rotate :flip :curves)
   "Node kinds that exist only in graphs, beyond the flat pipeline stages.
 
 :COLOR-SUBTRACT computes picked-color minus pixel per channel in scene-linear
-space, the film-negative inversion primitive. :CROP keeps a normalized
+space, the linear inversion a colourist builds from a layer mixer. :NEGATIVE
+inverts by density instead, the way a print does: the film base is divided out
+channel by channel, which removes the orange mask exactly, and ten to the power
+of the remaining dye density times a paper gamma restores the scene, white
+anchored at the frame's brightest tones. :CROP keeps a normalized
 rectangle given in display (oriented) coordinates, so one graph fits both
 previews and full-resolution exports. :ROTATE turns the frame by whole quarter
 turns, which is the part of orientation a crop's -45..45 degree angle cannot
@@ -150,6 +154,19 @@ and no amount of turning fixes a mirror.")
   "Parameters of a contrast node: the slope, and the tone it turns about.")
 
 (defparameter *color-subtract-keys* '(:red :green :blue))
+
+(defparameter *negative-keys* '(:red :green :blue :gamma :balance)
+  "Parameters of a negative node: the film base per channel, zero for measured
+from the frame; the paper gamma the dye density is printed through; and how far
+the channels' densities at the brightest tones are made to agree.")
+
+(defparameter *negative-default-gamma* 2.2
+  "Paper contrast a fresh negative node prints through. A colour negative holds
+the scene at about 0.6; 2.2 gives back a little more than the scene, as a print
+does.")
+
+(defparameter *negative-default-balance* 1.0
+  "A fresh negative node neutralises the brightest tones across channels.")
 
 (defparameter *crop-keys* '(:left :top :width :height :angle))
 

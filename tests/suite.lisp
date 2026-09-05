@@ -1548,6 +1548,54 @@ cannot be mistaken for the body's the way the picker once did."
                                :id 2 :kind :color-subtract
                                :params '(:red 1.0) :inputs '(1)))))))))
 
+(defun negative-node-validates-and-encodes-p ()
+  "A negative node carries a film base, a paper gamma and a balance, refuses
+what a print cannot mean, and reaches the executor as kind 15 with its defaults
+filled in."
+  (flet ((rejected-p (params &optional (input-kind :crop))
+           (handler-case
+               (progn
+                 (graph-validate
+                  (make-processing-graph
+                   :nodes (list (make-graph-node
+                                 :id 1 :kind input-kind
+                                 :params (if (eq input-kind :film)
+                                             '(:grain-amount 0.2)
+                                             '(:left 0.1 :top 0.1
+                                               :width 0.8 :height 0.8))
+                                 :inputs '(0))
+                                (make-graph-node
+                                 :id 2 :kind :negative
+                                 :params params :inputs '(1)))
+                   :output 2))
+                 nil)
+             (invalid-project-data () t))))
+    (let* ((graph (graph-validate
+                   (make-processing-graph
+                    :nodes (list (make-graph-node
+                                  :id 1 :kind :negative
+                                  :params '(:red 0.31 :green 0.11 :blue 0.06)
+                                  :inputs '(0)))
+                    :output 1)))
+           (decoded (sexp->graph (graph->sexp graph)))
+           (bytes (orfeus::graph->program-bytes decoded)))
+      (and (equal '(:red 0.31 :green 0.11 :blue 0.06)
+                  (graph-node-params (graph-find-node decoded 1)))
+           ;; Wire code 15, five parameters: the base and the two defaults.
+           (= 15 (elt bytes 12))
+           (= 5 (elt bytes 24))
+           (member :negative (graph-node-kinds))
+           (not (rejected-p '(:red 0.31 :green 0.11 :blue 0.06 :gamma 2.2
+                              :balance 1.0)))
+           ;; Zero base means measured; nothing else about it is optional.
+           (not (rejected-p '(:gamma 1.6)))
+           (rejected-p '(:gamma 0.5))
+           (rejected-p '(:balance 1.5))
+           (rejected-p '(:red 5.0))
+           (rejected-p '(:hue 0.5))
+           ;; Like any inversion, it works on the scene, not on a film look.
+           (rejected-p '(:gamma 2.2) :film)))))
+
 (defun graph-program-bytes-p ()
   (let* ((graph (make-processing-graph
                  :nodes (list (make-graph-node :id 1 :kind :exposure
@@ -1556,9 +1604,9 @@ cannot be mistaken for the body's the way the picker once did."
                  :output 1))
          (bytes (orfeus::graph->program-bytes graph)))
     (equalp bytes
-            ;; magic "ORFG", version 8, one node: exposure(2), input 0,
+            ;; magic "ORFG", version 9, one node: exposure(2), input 0,
             ;; no second input, one parameter 0.5f0, no string.
-            (coerce #(#x4F #x52 #x46 #x47  8 0 0 0  1 0 0 0
+            (coerce #(#x4F #x52 #x46 #x47  9 0 0 0  1 0 0 0
                       2 0 0 0  0 0 0 0  #xFF #xFF #xFF #xFF
                       1 0 0 0  0 0 0 #x3F  0 0 0 0)
                     '(simple-array (unsigned-byte 8) (*))))))
@@ -1970,6 +2018,8 @@ neither way."
              (graph-render-rejects-input-as-output-p))
       (check "negative-inversion graphs validate and serialize"
              (negative-workflow-graph-p))
+      (check "a negative node validates its print and encodes with defaults"
+             (negative-node-validates-and-encodes-p))
       (check "timestamped output names format and round trip"
              (timestamped-output-names-p))
       (check "old projects receive export defaults" (old-project-export-defaults-p))

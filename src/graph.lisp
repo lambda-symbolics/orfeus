@@ -27,6 +27,24 @@
                             key))
   params)
 
+(defun negative-params-validate (params)
+  (unless (and (listp params) (plist-known-keys-p params *negative-keys*))
+    (graph-invalid params "expected :red :green :blue :gamma :balance parameters"))
+  (loop for (key value) on params by #'cddr
+        do (unless (realp value)
+             (graph-invalid params "negative parameter ~S must be a number" key))
+           (case key
+             ((:red :green :blue)
+              (unless (<= 0 value 4)
+                (graph-invalid params "film base ~S must be within 0..4" key)))
+             (:gamma
+              (unless (<= 1 value 4)
+                (graph-invalid params "paper gamma must be within 1..4")))
+             (:balance
+              (unless (<= 0 value 1)
+                (graph-invalid params "balance must be within 0..1")))))
+  params)
+
 (defun flip-params-validate (params)
   (unless (and (listp params) (plist-known-keys-p params *flip-keys*))
     (graph-invalid params "expected :horizontal and :vertical parameters"))
@@ -198,6 +216,7 @@ whose frame has already moved, whichever of the two moved it."
      (when params
        (graph-invalid datum "node kind ~S cannot carry parameters" kind)))
     ((eq kind :color-subtract) (color-subtract-params-validate params))
+    ((eq kind :negative) (negative-params-validate params))
     ((eq kind :crop) (crop-params-validate params))
     ((eq kind :rotate) (rotate-params-validate params))
     ((eq kind :flip) (flip-params-validate params))
@@ -274,10 +293,12 @@ while blends stay scene-linear."
              (when (member input display)
                (graph-invalid node
                               "blend node ~S cannot consume film output" id))))
-          ((eq kind :color-subtract)
+          ((member kind '(:color-subtract :negative))
            (unless (= 1 (length inputs))
              (graph-invalid node "filter node ~S needs exactly one input" id))
-           (color-subtract-params-validate (graph-node-params node))
+           (if (eq kind :negative)
+               (negative-params-validate (graph-node-params node))
+               (color-subtract-params-validate (graph-node-params node)))
            (when (member (first inputs) display)
              (graph-invalid node "node ~S cannot process film output" id)))
           ((eq kind :crop)

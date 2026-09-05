@@ -280,19 +280,20 @@ the straightening angle in degrees for a crop node."
   '((:white-balance . 1) (:exposure . 2) (:noise-reduction . 3)
     (:tone . 4) (:optics . 5) (:film . 6) (:blend . 7)
     (:color-subtract . 8) (:crop . 9) (:curves . 10) (:rotate . 11)
-    (:contrast . 12) (:sharpen . 13) (:flip . 14))
+    (:contrast . 12) (:sharpen . 13) (:flip . 14) (:negative . 15))
   "Wire codes of graph node kinds in the native program format.")
 
 (defconstant +graph-program-magic+ #x4746524F
   "Little-endian magic of a serialized graph program, spelling ORFG.")
 
-(defconstant +graph-program-version+ 8
+(defconstant +graph-program-version+ 9
   "Serialized graph program version.
 
 2 added the curves node's luma channel; 3 made each curve channel variable
 length behind a header of four point counts; 4 added the rotate node; 5 added
 the contrast and sharpen nodes; 6 added the flip node; 7 added
-the optics node's hand-set distortion.")
+the optics node's hand-set distortion; 8 the optics node's fringing source and
+the sharpen node's own parameters; 9 the negative node.")
 
 (defun graph-boolean-parameter (value)
   (if value 1.0 0.0))
@@ -361,6 +362,15 @@ reaches it and there is nothing to keep alive across threads.")
          (values (list (getf params :red 1.0)
                        (getf params :green 1.0)
                        (getf params :blue 1.0))
+                 nil)))
+      (:negative
+       ;; A base left at zero is measured from the frame by the executor.
+       (let ((params (graph-node-params node)))
+         (values (list (getf params :red 0.0)
+                       (getf params :green 0.0)
+                       (getf params :blue 0.0)
+                       (getf params :gamma *negative-default-gamma*)
+                       (getf params :balance *negative-default-balance*))
                  nil)))
       (:crop
        (let ((params (graph-node-params node)))
