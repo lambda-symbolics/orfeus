@@ -295,8 +295,7 @@ pub(crate) fn sample_linear(
     let center_x = (point[0] * decoded.width.saturating_sub(1) as f32).round() as isize;
     let center_y = (point[1] * decoded.height.saturating_sub(1) as f32).round() as isize;
     let pixel_radius = ((radius * decoded.width.min(decoded.height) as f32) as isize).max(0);
-    let mut sum = [0.0_f64; 3];
-    let mut count = 0_u64;
+    let mut patch: Vec<[f32; 3]> = Vec::new();
     for sample_y in center_y - pixel_radius..=center_y + pixel_radius {
         if sample_y < 0 || sample_y >= decoded.height as isize {
             continue;
@@ -306,23 +305,41 @@ pub(crate) fn sample_linear(
                 continue;
             }
             let offset = (sample_y as usize * decoded.width + sample_x as usize) * 3;
-            for (channel, total) in sum.iter_mut().enumerate() {
-                *total += decoded.data[offset + channel] as f64;
-            }
-            count += 1;
+            patch.push([
+                decoded.data[offset],
+                decoded.data[offset + 1],
+                decoded.data[offset + 2],
+            ]);
         }
     }
-    if count == 0 {
+    if patch.is_empty() {
         return Err(Error::InvalidArgument("sample point is outside the image"));
     }
-    Ok([
-        (sum[0] / count as f64) as f32,
-        (sum[1] / count as f64) as f32,
-        (sum[2] / count as f64) as f32,
-    ])
+    Ok(brightest_half_median(&mut patch))
 }
 
-/// Runs negative-frame analysis for a RAW file through the decode cache.
+/// The colour of the thinnest film in a patch: the per-channel median of the
+/// brighter half of its pixels, by luminance.
+///
+/// A mean read whatever the patch covered. The film border a base is picked
+/// from is a strip a few dozen pixels wide between the black of the holder and
+/// the picture, and a patch that strayed onto either pulled the average dark or
+/// coloured, so the base had to be corrected by hand afterwards. The base is by
+/// definition the brightest thing in such a patch, and a median over the bright
+/// half reads it through the holder, the frame edge, and the odd noisy pixel.
+fn brightest_half_median(patch: &mut [[f32; 3]]) -> [f32; 3] {
+    let luminance = |pixel: &[f32; 3]| 0.2127 * pixel[0] + 0.7152 * pixel[1] + 0.0722 * pixel[2];
+    patch.sort_by(|a, b| luminance(b).total_cmp(&luminance(a)));
+    let bright = &patch[..patch.len().div_ceil(2)];
+    let mut colour = [0.0_f32; 3];
+    for (channel, value) in colour.iter_mut().enumerate() {
+        let mut values: Vec<f32> = bright.iter().map(|pixel| pixel[channel]).collect();
+        values.sort_by(f32::total_cmp);
+        *value = values[values.len() / 2];
+    }
+    colour
+}
+
 pub(crate) fn analyze_negative_frame_file(
     input: &Path,
     cache_mode: u32,
@@ -348,6 +365,27 @@ pub(crate) fn sample_linear_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A patch half on the border and half on the picture reads the border:
+    /// the base is the brightest film in it, whatever else the patch covers.
+    #[test]
+    fn sampling_reads_the_film_base_through_the_frame_edge() {
+        let decoded = synthetic_negative(1);
+        // The tile begins at x = 50 of 200; a patch of radius 8 centred on
+        // the edge is half tile, half border.
+        let colour = sample_linear(&decoded, 50.0 / 199.0, 60.0 / 119.0, 8.0 / 120.0).unwrap();
+        for (value, base) in colour.iter().zip([0.82, 0.51, 0.33]) {
+            assert!((value - base).abs() < 1.0e-6, "{colour:?}");
+        }
+        // One noisy pixel in the middle of the border does not move it either.
+        let mut noisy = decoded;
+        let offset = (10 * noisy.width + 10) * 3;
+        noisy.data[offset..offset + 3].copy_from_slice(&[0.2, 0.9, 0.1]);
+        let colour = sample_linear(&noisy, 10.0 / 199.0, 10.0 / 119.0, 3.0 / 120.0).unwrap();
+        for (value, base) in colour.iter().zip([0.82, 0.51, 0.33]) {
+            assert!((value - base).abs() < 1.0e-6, "{colour:?}");
+        }
+    }
 
     fn synthetic_negative(orientation: u16) -> DecodedRaw {
         // A bright orange film base with a dark exposed tile from 25%..75%
