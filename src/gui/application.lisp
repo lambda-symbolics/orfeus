@@ -338,6 +338,7 @@ the same reason.")
     (:film . "Film")
     (:blend . "Blend")
     (:color-subtract . "Subtr")
+    (:negative . "Negative")
     (:contrast . "Contr")
     (:sharpen . "Sharp")
     (:crop . "Crop")
@@ -357,6 +358,7 @@ the same reason.")
     ("Film" . :film)
     ("Blend" . :blend)
     ("Color Subtract" . :color-subtract)
+    ("Negative" . :negative)
     ("Contrast" . :contrast)
     ("Sharpen" . :sharpen)
     ("Crop" . :crop)
@@ -530,6 +532,8 @@ sliders and nothing else has to be recomputed."
            (:rect 10 2 2 2) (:rect 10 7 2 2))
     (:blend (:rect 1 1 7 7) (:rect 4 4 7 7))
     (:color-subtract (:rect 1 1 10 10) (:rect 3 5 6 2))
+    (:negative (:rect 1 1 10 1) (:rect 1 10 10 1) (:rect 1 1 1 10)
+               (:rect 10 1 1 10) (:rect 4 4 4 4))
     (:contrast (:rect 1 1 10 10) (:rect 6 2 4 8))
     (:sharpen (:line 6 0 1 11) (:line 6 0 11 11) (:line 1 11 11 11))
     (:crop (:line 3 0 3 9) (:line 0 3 9 3) (:line 8 2 8 11) (:line 2 8 11 8))
@@ -626,7 +630,7 @@ channel carries anywhere from its two endpoints to a full film-stock shape."
   "True when NODE visibly changes the image, for the panel's indicator."
   (case (orfeus:graph-node-kind node)
     (:blend t)
-    (:color-subtract t)
+    ((:color-subtract :negative) t)
     (:contrast (/= 1.0 (getf (orfeus:graph-node-params node) :contrast 1.0)))
     (:flip (let ((params (orfeus:graph-node-params node)))
              (or (getf params :horizontal) (getf params :vertical))))
@@ -1417,6 +1421,8 @@ new cache entry is published."
            blend-opacity-input crop-angle-input rotate-turn-input flip-axis-input
            (crop-angle-controls '())
            base-red-input base-green-input base-blue-input base-swatch
+           negative-red-input negative-green-input negative-blue-input
+           negative-swatch
            crop-aspect-input crop-width-input crop-height-input
            ;; NIL is a free crop; otherwise an entry from
            ;; *CROP-ASPECT-CHOICES*. An editing mode, not a render parameter:
@@ -3330,7 +3336,7 @@ new cache entry is published."
                  (when crop-aspect-input
                    (setf (lightfast:value crop-aspect-input)
                          (or (crop-aspect-label crop-aspect) "Free"))))
-               (when (and node (eq kind :contrast))
+               (when (and node (member kind '(:contrast :negative)))
                  (let ((params (orfeus:graph-node-params node)))
                    (dolist (entry node-param-controls)
                      (destructuring-bind (key widget default) entry
@@ -3346,17 +3352,17 @@ new cache entry is published."
                        (quarter-turn-label
                         (getf (orfeus:graph-node-params node)
                               :quarter-turns 0))))
-               (when (and node (eq kind :color-subtract))
-                 (let ((params (orfeus:graph-node-params node)))
-                   (loop for (key input) in (list (list :red base-red-input)
-                                                  (list :green base-green-input)
-                                                  (list :blue base-blue-input))
-                         do (when input
-                              (setf (lightfast:value input)
-                                    (format nil "~,1F"
-                                            (* 100 (srgb-encode-component
-                                                    (getf params key 1.0))))))))
-                 (sync-base-swatch node))))
+               (when (and node (member kind '(:color-subtract :negative)))
+                 (multiple-value-bind (inputs swatch) (base-controls kind)
+                   (let ((params (orfeus:graph-node-params node)))
+                     (loop for (key input) in inputs
+                           do (when input
+                                (setf (lightfast:value input)
+                                      (format nil "~,1F"
+                                              (* 100 (srgb-encode-component
+                                                      (getf params key
+                                                            (base-default kind)))))))))
+                   (sync-base-swatch node swatch)))))
            (graph-node-box (node)
              (let ((place (orfeus:graph-node-position node)))
                (values (round (first place)) (round (second place))
@@ -3716,7 +3722,7 @@ new cache entry is published."
                                  model node (default-crop-params))
                                 (setf crop-aspect nil)
                                 (after-graph-edit "Crop reset")))))
-                (when (eq kind :color-subtract)
+                (when (member kind '(:color-subtract :negative))
                   (list (cons "-" nil)
                         (cons "Sample Base From Photo"
                               (lambda ()
@@ -4081,35 +4087,53 @@ new cache entry is published."
              ;; colour rather than acted on as a pan or a crop drag.
              (when after-canvas
                (ignore-errors (lightfast:set-cursor after-canvas shape))))
+           (base-default (kind)
+             ;; What an unset base channel stands for: full scale to a
+             ;; subtraction, "measure it from the frame" to a negative.
+             (if (eq kind :negative) 0.0 1.0))
+           (base-controls (kind)
+             ;; The three channel fields and the swatch of KIND's panel, as
+             ;; (values ((key input)...) swatch).
+             (if (eq kind :negative)
+                 (values (list (list :red negative-red-input)
+                               (list :green negative-green-input)
+                               (list :blue negative-blue-input))
+                         negative-swatch)
+                 (values (list (list :red base-red-input)
+                               (list :green base-green-input)
+                               (list :blue base-blue-input))
+                         base-swatch)))
            (set-base-channel (node key percent)
              ;; The fields read in encoded percent, which is how the colour
              ;; looks; the node keeps it scene-linear, which is where the
-             ;; subtraction happens.
+             ;; inversion happens.
              (let* ((params (orfeus:graph-node-params node))
+                    (default (base-default (orfeus:graph-node-kind node)))
                     (value (srgb-decode-component
                             (max 0.0 (min 1.0 (/ percent 100.0))))))
                (handler-case
                    (progn
                      (gui-model-set-node-params
                       model node
-                      (list :red (getf params :red 1.0)
-                            :green (getf params :green 1.0)
-                            :blue (getf params :blue 1.0)
+                      (list :red (getf params :red default)
+                            :green (getf params :green default)
+                            :blue (getf params :blue default)
                             key value))
                      (sync-node-tools)
                      (schedule-edited-preview))
                  (error (condition) (set-status (princ-to-string condition))))))
-           (sync-base-swatch (node)
-             (when base-swatch
-               (let ((params (orfeus:graph-node-params node)))
+           (sync-base-swatch (node swatch)
+             (when swatch
+               (let ((params (orfeus:graph-node-params node))
+                     (default (base-default (orfeus:graph-node-kind node))))
                  (flet ((channel (key)
                           (round (* 255 (srgb-encode-component
-                                         (getf params key 1.0))))))
-                   (lightfast:set-color-rgb base-swatch
+                                         (getf params key default))))))
+                   (lightfast:set-color-rgb swatch
                                             :red (channel :red)
                                             :green (channel :green)
                                             :blue (channel :blue))
-                   (lightfast:redraw base-swatch)))))
+                   (lightfast:redraw swatch)))))
            (sample-base-at (canvas x y)
              ;; The eyedropper: map the click through the current fit and pan
              ;; to normalized image coordinates, then sample linear color.
@@ -5869,6 +5893,72 @@ new cache entry is published."
               (lightfast:widget-parent (lightfast:field-label field))
               (if (eq basis :page) 12 8) y 26 basis)
              field)
+           (build-base-panel (top tooltip)
+             ;; The film base as three editable channels rather than behind a
+             ;; modal chooser: it is the value being graded, so it belongs on
+             ;; the panel where it can be nudged and read at a glance. Shared
+             ;; by both inversions; returns the three fields and the swatch.
+             (flet ((channel-field (key label y)
+                      (register-inspector
+                       (lightfast:make-label :parent node-page :x 12 :y y
+                                             :width 88 :height 26 :label label)
+                       12 y 88 26 :page)
+                      (let ((spinner
+                              (register-inspector
+                               (lightfast:make-spinner
+                                :parent node-page :x 110 :y y
+                                :width 84 :height 26
+                                :callback
+                                (lambda (widget event value)
+                                  (declare (ignore event value))
+                                  (let ((node (gui-model-selected-graph-node
+                                               model)))
+                                    (when node
+                                      (handler-case
+                                          (set-base-channel
+                                           node key
+                                           (parse-number
+                                            (lightfast:value widget)))
+                                        (error (condition)
+                                          (set-status
+                                           (princ-to-string condition))))))))
+                               110 y 84 26 :page)))
+                        ;; Displayed encoded, the way the colour reads to the
+                        ;; eye, while the node stores it scene-linear.
+                        (lightfast:set-range spinner 0 100)
+                        (lightfast:set-step spinner 0.5)
+                        spinner))
+                    (base-button (y label action)
+                      (register-inspector
+                       (lightfast:make-button
+                        :parent node-page :x 12 :y y :width 292 :height 26
+                        :label label
+                        :callback
+                        (lambda (&rest ignored)
+                          (declare (ignore ignored))
+                          (let ((node (gui-model-selected-graph-node model)))
+                            (when node (funcall action node)))))
+                       12 y :fill 26 :page)))
+               (let ((red (channel-field :red "Base red %" top))
+                     (green (channel-field :green "Base green %" (+ top 32)))
+                     (blue (channel-field :blue "Base blue %" (+ top 64)))
+                     (swatch (register-inspector
+                              (lightfast:make-box :parent node-page
+                                                  :x 204 :y top
+                                                  :width 100 :height 90
+                                                  :label "")
+                              204 top 100 90 :page)))
+                 (lightfast:set-box swatch lightfast:+box-flat-box+)
+                 (lightfast:set-tooltip swatch tooltip)
+                 (base-button (+ top 96) "Sample Base From Photo"
+                              (lambda (node)
+                                (setf pick-color-node node)
+                                (set-preview-cursor :cross)
+                                (set-status
+                                 "Click the preview to sample the film base")))
+                 (base-button (+ top 128) "Auto Base From Border"
+                              #'auto-base-from-border)
+                 (values red green blue swatch))))
            (build-group (kind builder)
              ;; Collects everything BUILDER registers into one Node panel
              ;; visibility group; SYNC-NODE-TOOLS shows exactly one of them.
@@ -7270,69 +7360,24 @@ new cache entry is published."
         (build-group
          :color-subtract
          (lambda ()
-           ;; The base colour as three editable channels rather than behind a
-           ;; modal chooser: it is the value being graded, so it belongs on the
-           ;; panel where it can be nudged and read at a glance.
-           (flet ((channel-field (key label y)
-                    (register-inspector
-                     (lightfast:make-label :parent node-page :x 12 :y y
-                                         :width 88 :height 26 :label label)
-                     12 y 88 26 :page)
-                    (let ((spinner
-                            (register-inspector
-                             (lightfast:make-spinner
-                              :parent node-page :x 110 :y y
-                              :width 84 :height 26
-                              :callback
-                              (lambda (widget event value)
-                                (declare (ignore event value))
-                                (let ((node (gui-model-selected-graph-node
-                                             model)))
-                                  (when node
-                                    (handler-case
-                                        (set-base-channel
-                                         node key
-                                         (parse-number
-                                          (lightfast:value widget)))
-                                      (error (condition)
-                                        (set-status
-                                         (princ-to-string condition))))))))
-                             110 y 84 26 :page)))
-                      ;; Displayed encoded, the way the colour reads to the eye,
-                      ;; while the node stores it scene-linear.
-                      (lightfast:set-range spinner 0 100)
-                      (lightfast:set-step spinner 0.5)
-                      spinner))
-                  (subtract-button (y label action)
-                    (register-inspector
-                     (lightfast:make-button
-                      :parent node-page :x 12 :y y :width 292 :height 26
-                      :label label
-                      :callback
-                      (lambda (&rest ignored)
-                        (declare (ignore ignored))
-                        (let ((node (gui-model-selected-graph-node
-                                     model)))
-                          (when node (funcall action node)))))
-                     12 y :fill 26 :page)))
-             (setf base-red-input (channel-field :red "Base red %" 44)
-                   base-green-input (channel-field :green "Base green %" 76)
-                   base-blue-input (channel-field :blue "Base blue %" 108))
-             (setf base-swatch
-                   (register-inspector
-                    (lightfast:make-box :parent node-page :x 204 :y 44
-                                      :width 100 :height 90 :label "")
-                    204 44 100 90 :page))
-             (lightfast:set-box base-swatch lightfast:+box-flat-box+)
-             (lightfast:set-tooltip base-swatch "The film base being subtracted")
-             (subtract-button 140 "Sample Base From Photo"
-                              (lambda (node)
-                                (setf pick-color-node node)
-                                (set-preview-cursor :cross)
-                                (set-status
-                                 "Click the preview to sample the film base")))
-             (subtract-button 172 "Auto Base From Border"
-                              #'auto-base-from-border))))
+           (multiple-value-setq (base-red-input base-green-input
+                                 base-blue-input base-swatch)
+             (build-base-panel 44 "The film base being subtracted"))))
+        (build-group
+         :negative
+         (lambda ()
+           ;; The print's controls first, the film base under them: the base
+           ;; is picked once from the border and then left alone, while the
+           ;; print is what gets adjusted.
+           (make-node-number-field :gamma "Print contrast" 1.0 4.0 0.05
+                                   orfeus:*negative-default-gamma* 44 node-page)
+           (make-node-number-field :balance "Neutral whites" 0.0 1.0 0.05
+                                   orfeus:*negative-default-balance* 76
+                                   node-page)
+           (multiple-value-setq (negative-red-input negative-green-input
+                                 negative-blue-input negative-swatch)
+             (build-base-panel
+              108 "The film base divided out; zero measures it from the frame"))))
         (build-group
          :rotate
          (lambda ()
