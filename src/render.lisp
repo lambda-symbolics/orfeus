@@ -234,15 +234,24 @@ to pay."
   (clrhash *lens-profile-status-cache*))
 
 (defun photo-lens-profile-known-p (pathname profile focal-length)
-  "True when PATHNAME's lens has a profile to correct with; warns once when not."
+  "True when PATHNAME's lens has a profile to correct with; warns once when not.
+
+Not a word when the photograph names no lens and none was chosen for it, by
+hand or by nickname: an adapted lens leaves the maker note empty, and a
+photographer who mostly shoots adapted glass was otherwise told, for nearly
+every frame, that nothing had been found for nothing."
   (multiple-value-bind (status message)
       (photo-lens-profile-status pathname :profile profile
                                           :focal-length focal-length)
-    (or (and status t)
-        (progn
-          (warn-lens-profile-once pathname
-                                  (or message "no lens profile was found"))
-          nil))))
+    (cond (status t)
+          ((and (null (photo-lens-resolution pathname profile focal-length))
+                (let ((name (photo-lens-name pathname)))
+                  (or (null name) (string= "" (string-trim " " name)))))
+           nil)
+          (t
+           (warn-lens-profile-once pathname
+                                   (or message "no lens profile was found"))
+           nil))))
 
 (defun graph-active-optics-p (graph)
   "True when GRAPH's effective plan applies a correction read from a lens profile.
@@ -266,10 +275,18 @@ An interactive drag renders on every tick, and a lens the database does not
 know will not come to know itself between two of them. Saying so once per
 photograph is information; saying it forty times a second is noise.")
 
+(defvar *report-missing-lens-profiles* t
+  "Whether a lens profile that could not be found is reported as a warning.
+
+The interface switches this off: its optics panel states what the database
+said about the photograph's lens, and a warning on the terminal beside it
+repeated the panel to nobody.")
+
 (defun warn-lens-profile-once (input-pathname message)
   "Report a missing lens profile for INPUT-PATHNAME, at most once."
   (let ((key (cons (namestring (pathname input-pathname)) message)))
-    (unless (gethash key *lens-profile-warned*)
+    (unless (or (not *report-missing-lens-profiles*)
+                (gethash key *lens-profile-warned*))
       (setf (gethash key *lens-profile-warned*) t)
       (warn 'lens-profile-unavailable
             :input-pathname input-pathname

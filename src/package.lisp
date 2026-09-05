@@ -67,6 +67,7 @@
    #:photo-focal-length
    #:photo-lens-profile-status
    #:lens-profile-status-forget
+   #:*report-missing-lens-profiles*
    #:lens-profile-alias-save
    #:native-lens-profiles
    #:native-lens-profile-match

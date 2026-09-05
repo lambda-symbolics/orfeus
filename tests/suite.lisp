@@ -1276,6 +1276,24 @@ and then quietly relocated them would be lying about where a click puts things."
       (when (probe-file pathname)
         (delete-file pathname)))))
 
+(defun missing-lens-profile-warning-can-be-switched-off-p ()
+  "The once-per-photograph warning obeys the switch the interface throws."
+  (let ((pathname (format nil "/nowhere/~D.ORF" (get-universal-time))))
+    (flet ((warned-p (report-p)
+             (let ((orfeus::*report-missing-lens-profiles* report-p)
+                   (warned nil))
+               (handler-bind ((orfeus::lens-profile-unavailable
+                                (lambda (condition)
+                                  (setf warned t)
+                                  (muffle-warning condition))))
+                 (orfeus::warn-lens-profile-once pathname "no such lens"))
+               warned)))
+      (and (not (warned-p nil))
+           ;; Switched off, nothing was recorded either: the first report
+           ;; with the switch on still gets through, and only the first.
+           (warned-p t)
+           (not (warned-p t))))))
+
 (defun lens-listing-keeps-the-calibration-crop-apart-p ()
   "A listing's crop is the profile's calibration crop, named as such, so that it
 cannot be mistaken for the body's the way the picker once did."
@@ -1956,6 +1974,8 @@ neither way."
              (lens-alias-reader-evaluation-disabled-p))
       (check "saving a lens alias writes a readable file the resolver honours"
              (lens-alias-save-round-trip-p))
+      (check "a missing lens profile is reported once, and not at all when told not to"
+             (missing-lens-profile-warning-can-be-switched-off-p))
       (check "a lens listing names the calibration crop apart from the body's"
              (lens-listing-keeps-the-calibration-crop-apart-p))
       (check "a hand-set lens profile replaces the nickname alias"

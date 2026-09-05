@@ -1306,6 +1306,10 @@ new cache entry is published."
   "Open Orfeus. PROJECT-OR-PATH may be NIL, a PROJECT, project file, ORF, or DNG."
   (multiple-value-bind (initial-project initial-path)
       (initial-gui-project project-or-path)
+    ;; The optics panel states what the database said about each lens; the
+    ;; warning that said it again on the terminal, once per photograph, is
+    ;; switched off for the whole session, workers included.
+    (setf orfeus:*report-missing-lens-profiles* nil)
     ;; Load both CFFI bridges before workers can race to initialize them.
     (orfeus:native-bridge-version)
     (load-gui-preview-library)
