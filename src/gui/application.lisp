@@ -365,6 +365,12 @@ the same reason.")
     ("Curves" . :curves))
   "Correction picker entries for the Node panel, in menu order.")
 
+(defun node-kind-full-name (kind)
+  "The name a menu shows for KIND: the picker's full one, not the node box's
+abbreviation, which is sized for a box and reads as a typo in a menu."
+  (or (car (rassoc kind *node-kind-choices*))
+      (node-kind-label kind)))
+
 (defparameter *graph-node-width* 132
   "Width of a node box on the graph editor canvas.")
 
@@ -3777,7 +3783,7 @@ new cache entry is published."
                       (cons "-" nil))
                 (mapcar
                  (lambda (kind)
-                   (cons (format nil "Add ~A" (node-kind-label kind))
+                   (cons (format nil "Add ~A" (node-kind-full-name kind))
                          (lambda ()
                            (handler-case
                                (progn
@@ -6514,10 +6520,6 @@ new cache entry is published."
                                  (declare (ignore ignored))
                                  (discard-previews))
                                :shortcut (logior +menu-shift+ +key-f5+))
-        (lightfast:add-menu-item menu "&View/Expand All Bursts"
-                                 (lambda (&rest ignored)
-                                   (declare (ignore ignored))
-                                   (set-bursts-expanded t)))
         (lightfast:add-menu-item menu "&View/Zoom In"
                                (lambda (&rest ignored)
                                  (declare (ignore ignored))
@@ -6538,6 +6540,10 @@ new cache entry is published."
                                  (declare (ignore ignored))
                                  (preview-one-to-one))
                                :shortcut (logior +menu-ctrl+ (char-code #\1)))
+        (lightfast:add-menu-item menu "&View/Expand All Bursts"
+                                 (lambda (&rest ignored)
+                                   (declare (ignore ignored))
+                                   (set-bursts-expanded t)))
         (lightfast:add-menu-item menu "&View/Collapse All Bursts"
                                  (lambda (&rest ignored)
                                    (declare (ignore ignored))
