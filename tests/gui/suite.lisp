@@ -924,7 +924,10 @@ would silently ignore whatever the Destination field said."
            "Preview status did not use one literal percent sign")
     (check (null (search "100%%" text))
            "Preview status contains a C-style doubled percent sign")
-    (check (search "NR: edge-aware 35%" text)
+    (check (search (format nil "NR: edge-aware ~D%"
+                           (round (* 100 (orfeus::processing-settings-noise-reduction
+                                          settings))))
+                   text)
            "Preview status does not name the denoiser that ran")
     ;; The two denoisers are exclusive, so the status names one of them.
     (let* ((neural (orfeus:make-processing-settings
