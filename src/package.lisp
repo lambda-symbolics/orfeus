@@ -219,6 +219,7 @@
    #:render-photo
    #:render-photo-job
    #:render-preview
+   #:render-photo-jobs
    #:render-preview-rgb
    #:sexp->project))
 

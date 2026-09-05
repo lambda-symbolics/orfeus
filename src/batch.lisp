@@ -58,8 +58,12 @@ one-based suffix. Explicit :output paths are never rewritten."
                                   (project-export-settings project))))
            (project-output-directory project))))))
 
-(defun render-photo-job (project photo &key (if-exists :error))
-  "Render PHOTO using PROJECT's processing and export settings."
+(defun render-photo-job (project photo &key (if-exists :error)
+                                            (finisher #'funcall))
+  "Render PHOTO using PROJECT's processing and export settings.
+
+FINISHER is passed on to RENDER-PHOTO: it decides when the metadata copy and
+the publishing of the file happen."
   (let ((export (project-export-settings project)))
     (render-photo
      (photo-job-input-path photo)
@@ -70,11 +74,13 @@ one-based suffix. Explicit :output paths are never rewritten."
      :jpeg-quality (export-settings-jpeg-quality export)
      :max-width (export-settings-max-width export)
      :max-height (export-settings-max-height export)
-     :preserve-metadata-p (export-settings-preserve-metadata-p export))))
+     :preserve-metadata-p (export-settings-preserve-metadata-p export)
+     :finisher finisher)))
 
-(defun project-render (project &key (if-exists :error) (on-error :abort)
-                                  progress-callback)
-  "Render every photo in PROJECT through the shared processing pipeline.
+(defun render-photo-jobs (project photos &key (if-exists :error)
+                                              (on-error :abort)
+                                              progress-callback)
+  "Render PHOTOS of PROJECT through the shared processing pipeline, in order.
 
 Returns two values: completed output pathnames and `(PHOTO . CONDITION)`
 failures, both in project order. ON-ERROR accepts :ABORT or :CONTINUE.
@@ -86,23 +92,73 @@ Renders run one at a time on purpose. Overlapping them was measured on a
 One render already saturates the machine, and what it is short of is memory
 bandwidth, which a second render competes for rather than adding to. An
 apparent gain in a first round of measurements was the page cache warming
-across runs, and disappeared when the order was reversed."
+across runs, and disappeared when the order was reversed.
+
+What does overlap is the finishing of one photograph with the rendering of the
+next. Copying the metadata is an ExifTool process — most of a second on one
+core for a 20 MP frame, against a render of about the same length that has
+every other core busy — so it runs on a thread of its own while the next render
+starts, one such thread at a time. A photograph's outcome is settled when its
+finisher has been joined, which is before the one after it is spawned and
+before this function returns."
   (check-type project project)
   (check-type on-error (member :abort :continue))
-  (let ((completed '())
-        (failures '())
-        (photos (project-photos project)))
-    (loop for photo in photos
-          for index from 1
-          for output = (photo-job-render-output project photo)
-          do (when progress-callback
-               (funcall progress-callback index (length photos) photo output))
-             (handler-case
-                 (progn
-                   (render-photo-job project photo :if-exists if-exists)
-                   (push output completed))
-               (error (condition)
-                 (push (cons photo condition) failures)
-                 (when (eq on-error :abort)
-                   (error condition)))))
-    (values (nreverse completed) (nreverse failures))))
+  (let* ((photos (coerce photos 'list))
+         (total (length photos))
+         (outcomes (make-array total :initial-element nil))
+         (pending nil))
+    (labels ((join-pending ()
+               ;; The one finisher in flight, if any, and what became of it.
+               (when pending
+                 (destructuring-bind (index . thread) pending
+                   (setf pending nil)
+                   (let ((result (sb-thread:join-thread thread :default nil)))
+                     (setf (aref outcomes index)
+                           (if (typep result 'condition)
+                               result
+                               :done))
+                     (when (and (typep result 'condition)
+                                (eq on-error :abort))
+                       (error result))))))
+             (finish-later (index thunk)
+               (join-pending)
+               (setf pending
+                     (cons index
+                           (sb-thread:make-thread
+                            (lambda ()
+                              (handler-case (progn (funcall thunk) :done)
+                                (error (condition) condition)))
+                            :name "Orfeus export finish")))))
+      (loop for photo in photos
+            for index from 0
+            for output = (photo-job-render-output project photo)
+            do (when progress-callback
+                 (funcall progress-callback (1+ index) total photo output))
+               (handler-case
+                   (render-photo-job project photo
+                                     :if-exists if-exists
+                                     :finisher (lambda (thunk)
+                                                 (finish-later index thunk)))
+                 (error (condition)
+                   (setf (aref outcomes index) condition)
+                   (when (eq on-error :abort)
+                     (join-pending)
+                     (error condition)))))
+      (join-pending))
+    (let ((completed '())
+          (failures '()))
+      (loop for photo in photos
+            for index from 0
+            for outcome = (aref outcomes index)
+            do (if (typep outcome 'condition)
+                   (push (cons photo outcome) failures)
+                   (push (photo-job-render-output project photo) completed)))
+      (values (nreverse completed) (nreverse failures)))))
+
+(defun project-render (project &key (if-exists :error) (on-error :abort)
+                                  progress-callback)
+  "Render every photo in PROJECT; see RENDER-PHOTO-JOBS for the contract."
+  (render-photo-jobs project (project-photos project)
+                     :if-exists if-exists
+                     :on-error on-error
+                     :progress-callback progress-callback))

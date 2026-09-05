@@ -5182,21 +5182,11 @@ new cache entry is published."
                       (queue-event queue
                                    (list :status nil
                                          (format nil "Exporting ~A..." label)))
-                      (let ((completed 0)
-                            (failures 0)
-                            (total (length jobs))
-                            (index 0))
-                        (dolist (job jobs)
-                          (incf index)
-                          (report-export-progress
-                           index total job
-                           (photo-job-render-output project job))
-                          (handler-case
-                              (progn
-                                (render-photo-job project job
-                                                  :if-exists :supersede)
-                                (incf completed))
-                            (error () (incf failures))))
+                      (multiple-value-bind (completed failures)
+                          (render-photo-jobs
+                           project jobs
+                           :if-exists :supersede :on-error :continue
+                           :progress-callback #'report-export-progress)
                         (queue-event
                          queue
                          (if (plusp failures)
@@ -5205,7 +5195,7 @@ new cache entry is published."
                                            completed failures))
                              (list :done
                                    (format nil "~D photograph~:P"
-                                           completed))))))))))
+                                           (length completed)))))))))))
            (current-export-filename ()
              ;; What the current photograph would be written as, so the field
              ;; opens showing the name it is about to replace rather than blank.

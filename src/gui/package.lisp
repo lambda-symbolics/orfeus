@@ -22,7 +22,7 @@
                 #:project #:project-defaults #:project-export-settings
                 #:project-output-directory #:project-photos #:project-presets
                 #:project-read #:project-render #:project-write
-                #:render-photo-job #:render-preview
+                #:render-photo-job #:render-photo-jobs #:render-preview
                 #:render-preview-rgb)
   (:export #:gui-model #:gui-model-add-photos #:gui-model-add-node
            #:*default-crop-inset* #:default-crop-params

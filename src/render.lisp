@@ -421,7 +421,7 @@ be found and keeps what the photographer typed in."
                        (max-width 0) (max-height 0)
                        (jpeg-quality 92) (grain-seed 0)
                        (preserve-metadata-p t) cache-p graph draft-p viewport
-                       progress)
+                       progress (finisher #'funcall))
   "Render INPUT-PATHNAME to JPEG or TIFF using PROCESSING-SETTINGS.
 
 This frontend-independent operation is shared by the CLI and GUI. It renders
@@ -441,7 +441,14 @@ off screen; an export is the whole photograph by definition.
 PROGRESS, when given, is called with a stage name and a fraction as the render
 passes each stage, on this thread. A render takes anywhere from forty
 milliseconds to half a minute depending on which nodes are in it, and this is
-what lets a frontend say which one it is waiting on."
+what lets a frontend say which one it is waiting on.
+
+FINISHER is handed the work that follows the render — copying the metadata and
+publishing the file — as a function of no arguments, and decides when to run
+it. The default runs it at once, so OUTPUT-PATHNAME exists on return. A batch
+passes one that runs it while the next photograph renders: the metadata copy is
+an ExifTool process that takes most of a second on one core while the render
+has every other core busy, and the two have nothing to say to each other."
   (check-type settings (or null processing-settings))
   ;; A viewport is only implemented on the graph path, and the graph path
   ;; renders the same picture — the interface already develops every project
@@ -477,13 +484,25 @@ what lets a frontend say which one it is waiting on."
              (setf publish-policy :supersede))))
         (:supersede nil)))
     (ensure-directories-exist output-pathname)
-    (let ((temporary (render-temporary-pathname output-pathname)))
-      (unwind-protect
-           (progn
-             (call-with-render-source
-              input-pathname
-              (lambda (render-input-pathname)
-                (if graph
+    (let ((temporary (render-temporary-pathname output-pathname))
+          (rendered nil))
+      (flet ((finish ()
+               ;; The temporary is removed however this ends: published, it
+               ;; has been renamed away; failed, it must not be left behind.
+               (unwind-protect
+                    (progn
+                      (when preserve-metadata-p
+                        (render-copy-metadata input-pathname temporary))
+                      (render-publish temporary output-pathname publish-policy)
+                      output-pathname)
+                 (when (probe-file temporary)
+                   (delete-file temporary)))))
+        (unwind-protect
+             (progn
+               (call-with-render-source
+                input-pathname
+                (lambda (render-input-pathname)
+                  (if graph
                     (render-native-photo-graph
                      render-input-pathname temporary graph
                      :report-input-pathname input-pathname
@@ -506,12 +525,14 @@ what lets a frontend say which one it is waiting on."
                      :max-height (or max-height 0)
                      :jpeg-quality jpeg-quality
                      :cache-p cache-p))))
-             (when preserve-metadata-p
-               (render-copy-metadata input-pathname temporary))
-             (render-publish temporary output-pathname publish-policy)
-             output-pathname)
-        (when (probe-file temporary)
-          (delete-file temporary))))))
+               (setf rendered t))
+          ;; A render that did not finish leaves nothing behind; one that did
+          ;; hands its temporary to FINISH, which cleans up after itself.
+          (unless rendered
+            (when (probe-file temporary)
+              (delete-file temporary))))
+        (funcall finisher #'finish)
+        output-pathname))))
 
 (defun render-preview (input-pathname output-pathname settings
                        &key (if-exists :error)
