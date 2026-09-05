@@ -680,15 +680,15 @@ fn ensure_plane_len(plane: &mut Vec<f32>, len: usize) {
 
 /// Mean of the squares of PLANE over a square window.
 ///
-/// Kept as the plain statement of what the shrinkage pass computes with its
-/// rolling window, and checked against it.
+/// The plain statement of what the denoiser's shrinkage pass computes with its
+/// rolling window, and checked against it; the sharpener, with one band to
+/// judge, uses it as it stands.
 ///
 /// Separable, and each pass slides a running total rather than re-adding the
 /// window at every pixel, so the window costs the same whatever its radius.
 /// The vertical pass keeps one running total per column and walks a band of
 /// rows downwards, which is both O(1) per pixel and in row order — a column-major
 /// walk would be neither.
-#[cfg(test)]
 fn local_mean_square(
     plane: &[f32],
     output: &mut Vec<f32>,
@@ -824,6 +824,27 @@ struct BinReading {
 const NOISE_ENVELOPE_TOLERANCE: f32 = 1.08;
 
 impl BandNoise {
+    /// Answers each bin with its own reading, and a bin nothing landed in with
+    /// the nearest bin's.
+    ///
+    /// For noise that is no longer photon noise. After the denoiser has been
+    /// over a frame, what is left in a flat sky is far less than what is left
+    /// in foliage of the same brightness, so the residue no longer follows
+    /// brightness at all and a line fitted across the bins says nothing; one
+    /// bin cleaned nearly to nothing dragged the fitted line flat at its
+    /// level, and a sharpener reading it took the whole sky for signal. The
+    /// quartile of each bin on its own is the flat part of *that* brightness.
+    fn from_readings(readings: &[BinReading; NOISE_BINS]) -> Self {
+        let mut power = [0.0_f32; NOISE_BINS];
+        for bin in 0..NOISE_BINS {
+            let near = (0..NOISE_BINS)
+                .filter(|other| readings[*other].count > 0)
+                .min_by_key(|other| other.abs_diff(bin));
+            power[bin] = near.map(|near| readings[near].power).unwrap_or(0.0);
+        }
+        BandNoise { power }
+    }
+
     /// Fits sensor noise to what the bins read, and answers for every bin from
     /// the fit.
     ///
@@ -950,6 +971,24 @@ fn fine_band_noise(
     width: usize,
     height: usize,
 ) -> (BandNoise, Vec<(usize, usize)>) {
+    let (readings, flat) = fine_band_readings(band, brightness, width, height);
+    (BandNoise::fit(&readings), flat)
+}
+
+/// The finest band's noise as each brightness bin read it, unfitted: what a
+/// stage running after the denoiser has to work from.
+fn fine_band_noise_by_bin(band: &[f32], brightness: &[f32], width: usize, height: usize) -> BandNoise {
+    BandNoise::from_readings(&fine_band_readings(band, brightness, width, height).0)
+}
+
+/// Reads the finest band's local power at sampled pixels, bin by bin, and names
+/// the flat quarter of each bin; see `fine_band_noise` for what it means.
+fn fine_band_readings(
+    band: &[f32],
+    brightness: &[f32],
+    width: usize,
+    height: usize,
+) -> ([BinReading; NOISE_BINS], Vec<(usize, usize)>) {
     let stride = noise_sample_stride(width * height);
     let rows: Vec<usize> = (0..height).step_by(stride).collect();
     let sampled: Vec<(f32, usize)> = rows
@@ -987,7 +1026,7 @@ fn fine_band_noise(
         };
         flat.extend(flat_here.into_iter().map(|index| (index, bin)));
     }
-    (BandNoise::fit(&readings), flat)
+    (readings, flat)
 }
 
 /// Measures a coarser band's noise over the pixels the finest band found flat.
@@ -1963,24 +2002,6 @@ fn median_filter_3x3_into(
         });
 }
 
-/// Shrinks a detail coefficient towards zero, keeping the ones that stand well
-/// clear of the noise.
-///
-/// The non-negative garrote rather than a soft threshold. Soft thresholding
-/// subtracts the threshold from *everything* it does not delete, so a strong
-/// edge or a real piece of texture comes back weaker than it went in, and the
-/// whole frame reads soft. This leaves anything much larger than the threshold
-/// alone — the correction falls off as the square — while still deleting what
-/// is comparable to it. Same noise removed, far less detail spent.
-#[inline]
-fn shrink_detail(value: f32, threshold: f32) -> f32 {
-    if !(threshold > 0.0) {
-        return value;
-    }
-    let ratio = threshold / value;
-    let scale = 1.0 - ratio * ratio;
-    if scale > 0.0 { value * scale } else { 0.0 }
-}
 
 /// Brightness bins the frame's noise is measured in.
 ///
@@ -1997,14 +2018,8 @@ const NOISE_BINS: usize = 8;
 /// of them, and it is much larger. Taking the lower quarter therefore measures
 /// the noise even where over half a region is detail, and when it is wrong it
 /// is wrong towards *less* smoothing — which is the direction a denoiser should
-/// err in. For a half-normal the lower quarter sits at 0.3186 deviations.
+/// err in.
 const NOISE_QUANTILE: f32 = 0.25;
-const NOISE_QUANTILE_SIGMA: f32 = 0.3186;
-
-/// What the five-tap Laplacian below does to white noise: it sums one centre
-/// and four quarter-weighted neighbours, so its variance is `1 + 4/16` times
-/// the pixel's.
-const LAPLACIAN_NOISE_GAIN: f32 = 1.118_034;
 
 /// Roughly how many pixels the noise estimate looks at.
 ///
@@ -2034,113 +2049,6 @@ fn noise_bin(value: f32) -> usize {
     (position as usize).min(NOISE_BINS - 1)
 }
 
-/// The pixel noise a frame carries, per brightness.
-///
-/// Measured from the image the stage is about to filter, so the threshold is
-/// always in the units of the pixels it thresholds. That matters more than it
-/// sounds: an exposure node before this one scales signal and noise together,
-/// and a threshold measured anywhere else would be wrong by the gain.
-///
-/// The cost is that a render of part of a frame measures part of a frame, so
-/// panning a zoomed preview re-measures. It is a per-brightness lower quartile
-/// over some hundred thousand samples, so what moves is a few percent of a
-/// threshold — `A_WINDOWED_RENDER_MATCHES_THE_WHOLE_ONE` in `graphex` measures
-/// exactly how much, and it is far below anything visible.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct NoiseProfile {
-    deviation: [f32; NOISE_BINS],
-}
-
-/// Returns the lower-quartile magnitude of SAMPLES as a deviation, or `None`
-/// when there are too few of them to say.
-fn quantile_deviation(samples: &mut [f32]) -> Option<f32> {
-    if samples.len() < NOISE_BIN_MINIMUM {
-        return None;
-    }
-    let rank = ((samples.len() as f32 * NOISE_QUANTILE) as usize).min(samples.len() - 1);
-    let (_, value, _) = samples.select_nth_unstable_by(rank, |a, b| a.total_cmp(b));
-    Some(*value / NOISE_QUANTILE_SIGMA)
-}
-
-/// Measures how much noise IMAGE actually carries, per brightness.
-///
-/// This is the whole point of the stage's rewrite. The threshold used to be a
-/// fixed curve — a guess at what photon noise looks like — which meant a
-/// base-ISO frame with nothing to remove was shrunk exactly as hard as a frame
-/// at ISO 6400. Measured against a clean test scene it kept 63% of the fine
-/// texture at the default setting and 28% at full, on an image whose noise was
-/// identically zero. Measuring the frame instead makes the threshold vanish
-/// when there is nothing to threshold.
-///
-/// Read through a five-tap Laplacian at sampled points rather than from the
-/// filter's own detail bands. Cheaper, by the square of the stride — but the
-/// reason is that it is a property of the pixels and not of the filter, so the
-/// same number is available before the filter runs and can be measured on a
-/// whole frame for the benefit of a render of part of one.
-pub(crate) fn measure_noise_profile(image: &RgbImage) -> NoiseProfile {
-    let (width, height) = (image.width, image.height);
-    let mut samples: Vec<Vec<f32>> = vec![Vec::new(); NOISE_BINS];
-    let mut all = Vec::new();
-    let mut deviation = [0.0_f32; NOISE_BINS];
-    if width < 3 || height < 3 {
-        return NoiseProfile { deviation };
-    }
-    let luma = |row: usize, column: usize| {
-        let pixel = &image.data[(row * width + column) * 3..];
-        0.2126 * pixel[0] + 0.7152 * pixel[1] + 0.0722 * pixel[2]
-    };
-    let stride = (width * height / NOISE_TARGET_SAMPLES).isqrt().max(1);
-    let mut row = 1;
-    while row + 1 < height {
-        let mut column = 1;
-        while column + 1 < width {
-            let centre = luma(row, column);
-            let laplacian = centre
-                - 0.25
-                    * (luma(row, column - 1)
-                        + luma(row, column + 1)
-                        + luma(row - 1, column)
-                        + luma(row + 1, column));
-            let magnitude = laplacian.abs();
-            samples[noise_bin(centre)].push(magnitude);
-            all.push(magnitude);
-            column += stride;
-        }
-        row += stride;
-    }
-    let mut measured = [false; NOISE_BINS];
-    for bin in 0..NOISE_BINS {
-        if let Some(value) = quantile_deviation(&mut samples[bin]) {
-            deviation[bin] = value / LAPLACIAN_NOISE_GAIN;
-            measured[bin] = true;
-        }
-    }
-    // A frame too small to fill any bin — a thumbnail, a proxy — is measured
-    // whole rather than not at all.
-    if !measured.iter().any(|bin| *bin) {
-        if let Some(value) = quantile_deviation(&mut all) {
-            return NoiseProfile {
-                deviation: [value / LAPLACIAN_NOISE_GAIN; NOISE_BINS],
-            };
-        }
-        return NoiseProfile { deviation };
-    }
-    // A bin nothing landed in — an empty shadow, a frame with no highlights —
-    // borrows the nearest bin that has an answer rather than inventing one, so
-    // a sparsely occupied brightness cannot be shrunk on no evidence.
-    for bin in 0..NOISE_BINS {
-        if measured[bin] {
-            continue;
-        }
-        if let Some(near) = (0..NOISE_BINS)
-            .filter(|other| measured[*other])
-            .min_by_key(|other| other.abs_diff(bin))
-        {
-            deviation[bin] = deviation[near];
-        }
-    }
-    NoiseProfile { deviation }
-}
 
 /// Edge-aware noise reduction. Set `ORFEUS_GPU_NOISE=1` for the compute path.
 ///
@@ -3151,6 +3059,37 @@ const COLOUR_MAX_UNCERTAINTY: f32 = 0.12;
 /// A shift with more than this much across the radial direction is not
 /// lateral colour, whatever else it is.
 const COLOUR_MAX_TANGENTIAL: f32 = 0.5;
+/// The correlation a channel must reach with green at its best shift, and how
+/// far that best must stand above the average shift, for the patch to count.
+const COLOUR_MIN_CORRELATION: f32 = 0.3;
+const COLOUR_MIN_PROMINENCE: f32 = 0.05;
+
+/// Softens a square plane with a five-tap binomial in each direction, so that
+/// nothing finer than about four pixels is left to compare.
+///
+/// Red and blue are sampled at every other photosite, so anything in them above
+/// a quarter cycle per pixel is the demosaic's guess, guided by green. Below it
+/// all three channels are real, and a shift read there is the lens's; the
+/// guess above it is left out of the comparison rather than trusted.
+fn soften_for_comparison(values: &mut [f32], size: usize) {
+    let kernel = [1.0_f32 / 16.0, 4.0 / 16.0, 6.0 / 16.0, 4.0 / 16.0, 1.0 / 16.0];
+    let mut rows = vec![0.0_f32; values.len()];
+    for y in 0..size {
+        let line = &values[y * size..(y + 1) * size];
+        for x in 0..size {
+            rows[y * size + x] = (0..5)
+                .map(|tap| kernel[tap] * line[(x + tap).saturating_sub(2).min(size - 1)])
+                .sum();
+        }
+    }
+    for y in 0..size {
+        for x in 0..size {
+            values[y * size + x] = (0..5)
+                .map(|tap| kernel[tap] * rows[(y + tap).saturating_sub(2).min(size - 1) * size + x])
+                .sum();
+        }
+    }
+}
 
 /// Takes the slow light out of a square plane and scales what is left to unit
 /// power, so two channels of different gain compare shape against shape.
@@ -3189,9 +3128,22 @@ fn high_pass_normalise(values: &mut [f32], size: usize) {
 /// pixels, or None when the patch does not say.
 ///
 /// The shift that best lays the channel over green, searched to the whole
-/// pixel and then refined by the parabola through the three nearest costs. A
-/// minimum on the edge of the search, a flat cost surface, or a match no better
-/// than the average shift all mean the patch has nothing to say.
+/// pixel and then refined by the parabola through the three nearest scores. A
+/// maximum on the edge of the search, a flat score surface, or a match barely
+/// better than the average shift all mean the patch has nothing to say.
+///
+/// The score is the normalised correlation of the two windows, each divided by
+/// its own energy, rather than their squared difference: the energy of a real
+/// texture is not spread evenly, so a plain difference can fall by sliding the
+/// window onto a quieter part of it as well as by lining the channels up.
+/// Correlation asks about shape alone.
+///
+/// Checked against the frame itself, not against another estimate. Phase
+/// correlation of demosaiced channels reports no shift whatever the lens did,
+/// because red and blue are interpolated from green and so carry green's noise
+/// at zero lag; the check that settles it is the position of isolated edges per
+/// channel, which on a 21 mm frame this read as 2.8 px moved by 1.7 to 2.2 px
+/// of red and blue at the corners, to within 0.4 px after the correction.
 fn channel_shift(image: &RgbImage, x0: usize, y0: usize, channel: usize) -> Option<(f32, f32)> {
     let width = image.width;
     let patch = COLOUR_PATCH;
@@ -3201,6 +3153,7 @@ fn channel_shift(image: &RgbImage, x0: usize, y0: usize, channel: usize) -> Opti
         let mut values: Vec<f32> = (0..size * size)
             .map(|i| image.data[((oy + i / size) * width + ox + i % size) * 3 + ch])
             .collect();
+        soften_for_comparison(&mut values, size);
         high_pass_normalise(&mut values, size);
         values
     };
@@ -3211,44 +3164,51 @@ fn channel_shift(image: &RgbImage, x0: usize, y0: usize, channel: usize) -> Opti
     let green = plane(1, x0 - search, y0 - search, span);
     let other = plane(channel, x0 - search, y0 - search, span);
     let steps = 2 * search + 1;
-    let cost = |ix: usize, iy: usize| -> f32 {
-        let mut total = 0.0_f32;
+    let green_energy: f32 = (0..patch)
+        .flat_map(|y| green[(y + search) * span + search..][..patch].iter())
+        .map(|g| g * g)
+        .sum();
+    if green_energy <= 1e-9 {
+        return None;
+    }
+    let score = |ix: usize, iy: usize| -> f32 {
+        let (mut dot, mut energy) = (0.0_f32, 0.0_f32);
         for y in 0..patch {
             let row = &other[(y + iy) * span + ix..][..patch];
             let g = &green[(y + search) * span + search..][..patch];
             for (o, g) in row.iter().zip(g) {
-                let d = o - g;
-                total += d * d;
+                dot += o * g;
+                energy += o * o;
             }
         }
-        total
+        dot / (energy * green_energy).sqrt().max(1e-9)
     };
-    let mut costs = vec![0.0_f32; steps * steps];
-    let mut best = (0_usize, 0_usize, f32::INFINITY);
+    let mut scores = vec![0.0_f32; steps * steps];
+    let mut best = (0_usize, 0_usize, f32::NEG_INFINITY);
     for iy in 0..steps {
         for ix in 0..steps {
-            let c = cost(ix, iy);
-            costs[iy * steps + ix] = c;
-            if c < best.2 {
-                best = (ix, iy, c);
+            let s = score(ix, iy);
+            scores[iy * steps + ix] = s;
+            if s > best.2 {
+                best = (ix, iy, s);
             }
         }
     }
-    let (ix, iy, lowest) = best;
-    if ix == 0 || iy == 0 || ix == steps - 1 || iy == steps - 1 || !lowest.is_finite() {
+    let (ix, iy, highest) = best;
+    if ix == 0 || iy == 0 || ix == steps - 1 || iy == steps - 1 || !highest.is_finite() {
         return None;
     }
-    let mean = costs.iter().sum::<f32>() / costs.len() as f32;
-    if !(lowest < 0.9 * mean) {
+    let mean = scores.iter().sum::<f32>() / scores.len() as f32;
+    if highest < COLOUR_MIN_CORRELATION || highest - mean < COLOUR_MIN_PROMINENCE {
         return None;
     }
     let refine = |a: f32, b: f32, c: f32| -> Option<f32> {
         let curvature = a - 2.0 * b + c;
-        (curvature > 0.0).then(|| ((a - c) / (2.0 * curvature)).clamp(-1.0, 1.0))
+        (curvature < 0.0).then(|| ((a - c) / (2.0 * curvature)).clamp(-1.0, 1.0))
     };
-    let at = |x: usize, y: usize| costs[y * steps + x];
-    let ox = refine(at(ix - 1, iy), lowest, at(ix + 1, iy))?;
-    let oy = refine(at(ix, iy - 1), lowest, at(ix, iy + 1))?;
+    let at = |x: usize, y: usize| scores[y * steps + x];
+    let ox = refine(at(ix - 1, iy), highest, at(ix + 1, iy))?;
+    let oy = refine(at(ix, iy - 1), highest, at(ix, iy + 1))?;
     Some((
         ix as f32 - search as f32 + ox,
         iy as f32 - search as f32 + oy,
@@ -3965,9 +3925,22 @@ fn gaussian_kernel(radius: f32) -> Vec<f32> {
     weights.into_iter().map(|weight| weight / total).collect()
 }
 
-/// Unsharp masking on brightness alone, with the noise floor kept out of it.
+/// How far past the neighbourhood's own brightest and darkest value a
+/// sharpened pixel may go, as a fraction of the distance between them.
 ///
-/// Three things make this a photographic sharpener rather than a filter that
+/// An unsharp mask makes an edge steeper by overshooting on both sides of it,
+/// and the overshoot is the halo: a bright line along the dark side of every
+/// roof and a dark one along the sky. Holding each pixel to the range its
+/// neighbourhood already spans keeps the steepening and takes the lines away;
+/// a fifth of the range is left, because a little overshoot is what reads as
+/// crisp and none reads as flat. The window is the blur's own radius, since
+/// that is how far the overshoot reaches.
+const SHARPEN_HALO_ALLOWANCE: f32 = 0.2;
+
+/// Unsharp masking on brightness alone, with the noise floor kept out of it
+/// and the halos held in.
+///
+/// Four things make this a photographic sharpener rather than a filter that
 /// happens to raise contrast at edges.
 ///
 /// It works on **brightness only**, and puts the result back as a gain on the
@@ -3978,18 +3951,21 @@ fn gaussian_kernel(radius: f32) -> Vec<f32> {
 /// unsharp mask spends most of its correction on the brightest pixels, which is
 /// where a halo is most visible and least wanted.
 ///
-/// And the detail it adds back is **shrunk against the frame's own noise**
-/// before it is amplified, by the same garrote the denoiser uses. Sharpening
-/// without that is a grain amplifier: the finest scale of a photograph is where
-/// its noise lives, and THRESHOLD says how many deviations of it to leave
-/// behind.
-pub(crate) fn apply_sharpen(
-    image: &mut RgbImage,
-    amount: f32,
-    radius: f32,
-    threshold: f32,
-    profile: &NoiseProfile,
-) {
+/// The detail it adds back is **gated by how much of it is signal**, the way
+/// the denoiser judges a band: the local power of the detail against the
+/// noise power the flattest parts of the frame carry at that brightness.
+/// Where the detail is at that floor nothing is added; where it is texture,
+/// all of it is. THRESHOLD is how many times the floor to subtract, in halves:
+/// two is the plain Wiener answer. The gate is a floor, not a judge of every
+/// sky: after the denoiser the residue left in a sky is more than the residue
+/// left in a smooth wall of the same brightness, so a sky still gains a little
+/// grain from the mask — about a fifth in the finest band on an ISO 200
+/// frame — and the default denoising is set with that in mind.
+///
+/// And the result is **held to what its neighbourhood already spans**, plus
+/// `SHARPEN_HALO_ALLOWANCE` of it, so edges get steeper without growing the
+/// light and dark lines a camera's sharpening draws along them.
+pub(crate) fn apply_sharpen(image: &mut RgbImage, amount: f32, radius: f32, threshold: f32) {
     let (width, height) = (image.width, image.height);
     if amount <= 0.0 || width < 3 || height < 3 {
         return;
@@ -4011,30 +3987,81 @@ pub(crate) fn apply_sharpen(
     transpose_plane(&blurred, &mut turned, width, height);
     blur_rows(&turned, &mut turned_blur, height, width, &kernel);
     transpose_plane(&turned_blur, &mut blurred, height, width);
+    // The detail band and how much of it is noise, judged as the denoiser
+    // judges its bands: local power against the power flat areas carry.
+    let mut detail = blurred;
+    detail
+        .par_chunks_mut(8192)
+        .zip(encoded.par_chunks(8192))
+        .for_each(|(detail, encoded)| {
+            for (d, e) in detail.iter_mut().zip(encoded) {
+                *d = e - *d;
+            }
+        });
+    let noise = fine_band_noise_by_bin(&detail, &luma, width, height);
+    let mut activity = Vec::new();
+    let mut scratch = Vec::new();
+    local_mean_square(&detail, &mut activity, &mut scratch, width, height);
+    let noise_share = 0.5 * threshold;
+    if std::env::var_os("ORFEUS_PROFILE").is_some() {
+        let mut gated = 0_usize;
+        let mut total_gain = 0.0_f64;
+        for (index, (mean_square, luma)) in activity.iter().zip(&luma).enumerate() {
+            if index % 97 != 0 {
+                continue;
+            }
+            let gain = activity_gain(*mean_square, noise_share * noise.power[noise_bin(*luma)]);
+            total_gain += f64::from(gain);
+            gated += usize::from(gain == 0.0);
+        }
+        let sampled = activity.len() / 97 + 1;
+        eprintln!(
+            "orfeus-profile sharpen-gate mean-gain={:.3} fully-gated={:.1}% noise-power={:?}",
+            total_gain / sampled as f64,
+            100.0 * gated as f64 / sampled as f64,
+            noise.power
+        );
+    }
+    // The darkest and brightest value along each row within the blur's reach;
+    // the column direction is folded into the pass below, a few rows at a time.
+    let reach = (radius.ceil() as usize).clamp(1, 3);
+    let (mut lowest, mut highest) = (turned, turned_blur);
+    lowest
+        .par_chunks_mut(width)
+        .zip(highest.par_chunks_mut(width))
+        .zip(encoded.par_chunks(width))
+        .for_each(|((lowest, highest), row)| {
+            for x in 0..width {
+                let window = &row[x.saturating_sub(reach)..=(x + reach).min(width - 1)];
+                lowest[x] = window.iter().copied().fold(f32::INFINITY, f32::min);
+                highest[x] = window.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            }
+        });
     image
         .data
-        .par_chunks_mut(3 * 8192)
-        .zip(luma.par_chunks(8192))
-        .zip(encoded.par_chunks(8192))
-        .zip(blurred.par_chunks(8192))
-        .for_each(|(((pixels, luma), encoded), blurred)| {
-            for (pixel, ((luma, encoded), blurred)) in pixels
-                .as_chunks_mut::<3>()
-                .0
-                .iter_mut()
-                .zip(luma.iter().zip(encoded).zip(blurred))
-            {
-                if *luma <= 1.0e-5 {
+        .par_chunks_mut(3 * width)
+        .enumerate()
+        .for_each(|(y, pixels)| {
+            let rows = y.saturating_sub(reach)..=(y + reach).min(height - 1);
+            for (x, pixel) in pixels.as_chunks_mut::<3>().0.iter_mut().enumerate() {
+                let index = y * width + x;
+                let luma = luma[index];
+                if luma <= 1.0e-5 {
                     continue;
                 }
-                // The noise profile measures linear light; the square root
-                // halves its slope, so the same noise is this much of a
-                // deviation here.
-                let floor = threshold * profile.deviation[noise_bin(*luma)]
-                    / (2.0 * encoded.max(1.0e-3));
-                let detail = shrink_detail(*encoded - *blurred, floor);
-                let sharpened = (*encoded + amount * detail).max(0.0);
-                let gain = (sharpened * sharpened) / *luma;
+                let encoded = encoded[index];
+                let detail = detail[index]
+                    * activity_gain(activity[index], noise_share * noise.power[noise_bin(luma)]);
+                let (mut low, mut high) = (f32::INFINITY, f32::NEG_INFINITY);
+                for row in rows.clone() {
+                    low = low.min(lowest[row * width + x]);
+                    high = high.max(highest[row * width + x]);
+                }
+                let slack = SHARPEN_HALO_ALLOWANCE * (high - low);
+                let sharpened = (encoded + amount * detail)
+                    .clamp(low - slack, high + slack)
+                    .max(0.0);
+                let gain = (sharpened * sharpened) / luma;
                 for channel in pixel.iter_mut() {
                     *channel *= gain;
                 }
@@ -6234,12 +6261,11 @@ mod tests {
             height,
             data,
         };
-        let profile = measure_noise_profile(&original);
         let mut image = original.clone();
-        apply_sharpen(&mut image, 0.0, 1.0, 0.0, &profile);
+        apply_sharpen(&mut image, 0.0, 1.0, 0.0);
         assert_eq!(image.data, original.data, "no amount still changed the image");
         let mut image = original.clone();
-        apply_sharpen(&mut image, 1.5, 1.2, 0.0, &profile);
+        apply_sharpen(&mut image, 1.5, 1.2, 0.0);
         let at = |image: &RgbImage, x: usize| {
             let index = ((height / 2) * width + x) * 3;
             [image.data[index], image.data[index + 1], image.data[index + 2]]
@@ -6276,6 +6302,35 @@ mod tests {
         }
     }
 
+    /// A sharpened edge gets steeper, and gets no lines drawn along it.
+    #[test]
+    fn sharpening_steepens_an_edge_without_a_halo() {
+        let (width, height) = (64, 16);
+        let mut data = Vec::with_capacity(width * height * 3);
+        for _ in 0..height {
+            for x in 0..width {
+                // A soft step: three pixels from dark to bright.
+                let value = 0.2 + 0.5 * ((x as f32 - 30.0) / 3.0).clamp(0.0, 1.0);
+                data.extend_from_slice(&[value, value, value]);
+            }
+        }
+        let original = RgbImage { width, height, data };
+        let mut sharpened = original.clone();
+        apply_sharpen(&mut sharpened, 2.0, 1.5, 0.0);
+        let row = |image: &RgbImage, x: usize| image.data[(8 * width + x) * 3 + 1];
+        let steepest = |image: &RgbImage| {
+            (1..width).map(|x| (row(image, x) - row(image, x - 1)).abs()).fold(0.0_f32, f32::max)
+        };
+        assert!(steepest(&sharpened) > steepest(&original) * 1.3, "the edge did not get steeper");
+        let (brightest, darkest) = sharpened.data.iter().fold((0.0_f32, 1.0_f32), |(hi, lo), v| {
+            (hi.max(*v), lo.min(*v))
+        });
+        // Unheld, an amount of two overshoots to about 1.0 and undershoots
+        // below 0.1 on this edge. Held, the overshoot is a fifth of the step in
+        // the square-root domain, which is under 0.09 of linear light here.
+        assert!(brightest < 0.79 && darkest > 0.13, "halo: {darkest}..{brightest}");
+    }
+
     #[test]
     fn sharpening_leaves_the_noise_floor_where_it_is() {
         let (width, height) = (96, 64);
@@ -6292,7 +6347,6 @@ mod tests {
             height,
             data,
         };
-        let profile = measure_noise_profile(&noisy);
         let deviation = |image: &RgbImage| {
             let mean: f32 = image.data.iter().sum::<f32>() / image.data.len() as f32;
             (image.data.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>()
@@ -6301,9 +6355,9 @@ mod tests {
         };
         let before = deviation(&noisy);
         let mut uncored = noisy.clone();
-        apply_sharpen(&mut uncored, 1.5, 1.0, 0.0, &profile);
+        apply_sharpen(&mut uncored, 1.5, 1.0, 0.0);
         let mut cored = noisy;
-        apply_sharpen(&mut cored, 1.5, 1.0, 3.0, &profile);
+        apply_sharpen(&mut cored, 1.5, 1.0, 3.0);
         let uncored = deviation(&uncored);
         let cored = deviation(&cored);
         assert!(

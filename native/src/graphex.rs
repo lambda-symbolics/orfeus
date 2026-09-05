@@ -1446,14 +1446,7 @@ fn execute_graph_into(
                 // The radius is stated for the photograph, not for whichever
                 // reduction of it is on screen, so it shrinks with the render.
                 let ratio = render::scale_ratio(context.scaled_pixels, context.full_pixels);
-                let profile = render::measure_noise_profile(&image);
-                render::apply_sharpen(
-                    &mut image,
-                    op.params[0],
-                    op.params[1] * ratio,
-                    op.params[2],
-                    &profile,
-                );
+                render::apply_sharpen(&mut image, op.params[0], op.params[1] * ratio, op.params[2]);
             }
             NODE_TONE => {
                 let adjustments: [f32; 7] = op.params[..7]
