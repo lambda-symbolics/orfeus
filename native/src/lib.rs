@@ -35,6 +35,7 @@ mod focus;
 mod color;
 mod gpu;
 mod graphex;
+mod jpeg;
 mod nn;
 mod render;
 mod tone;

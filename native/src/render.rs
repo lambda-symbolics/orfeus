@@ -3393,27 +3393,21 @@ fn encode_to<W: Write + Seek>(
                 .par_iter()
                 .map(|v| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8)
                 .collect();
-            let width = u16::try_from(image.width)
-                .map_err(|_| Error::Render("JPEG output is wider than 65535 pixels".into()))?;
-            let height = u16::try_from(image.height)
-                .map_err(|_| Error::Render("JPEG output is taller than 65535 pixels".into()))?;
-            let mut encoded = Vec::with_capacity(bytes.len() / 4);
-            let mut encoder = jpeg_encoder::Encoder::new(&mut encoded, quality as u8);
-            encoder.set_sampling_factor(jpeg_encoder::SamplingFactor::F_2_2);
-            for (chunk_index, chunk) in SRGB_ICC.chunks(65_519).enumerate() {
-                let chunk_count = SRGB_ICC.len().div_ceil(65_519);
-                let mut segment = Vec::with_capacity(chunk.len() + 14);
-                segment.extend_from_slice(b"ICC_PROFILE\0");
-                segment.push(chunk_index as u8 + 1);
-                segment.push(chunk_count as u8);
-                segment.extend_from_slice(chunk);
-                encoder
-                    .add_app_segment(2, segment)
-                    .map_err(|e| Error::Render(format!("JPEG ICC profile: {e}")))?;
-            }
-            encoder
-                .encode(&bytes, width, height, jpeg_encoder::ColorType::Rgb)
-                .map_err(|e| Error::Render(format!("JPEG encoding failed: {e}")))?;
+            let segments: Vec<(u8, Vec<u8>)> = SRGB_ICC
+                .chunks(65_519)
+                .enumerate()
+                .map(|(chunk_index, chunk)| {
+                    let chunk_count = SRGB_ICC.len().div_ceil(65_519);
+                    let mut segment = Vec::with_capacity(chunk.len() + 14);
+                    segment.extend_from_slice(b"ICC_PROFILE\0");
+                    segment.push(chunk_index as u8 + 1);
+                    segment.push(chunk_count as u8);
+                    segment.extend_from_slice(chunk);
+                    (2, segment)
+                })
+                .collect();
+            let encoded = super::jpeg::encode_rgb(&bytes, image.width, image.height, quality as u8, &segments)
+                .map_err(Error::Render)?;
             let mut writer = writer;
             return writer
                 .write_all(&encoded)
