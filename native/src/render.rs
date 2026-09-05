@@ -2571,10 +2571,34 @@ pub(crate) fn describe_lens_match(options: &LensCorrectionOptions<'_>) -> Result
 /// database.
 const LENS_SEARCH_LIMIT: usize = 400;
 
+/// The words of a lens name as a search sees them: runs of letters and digits,
+/// lower-cased, with everything between them dropped.
+fn lens_name_words(text: &str) -> Vec<String> {
+    text.split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect()
+}
+
+/// Whether one typed word is found among a lens's words.
+///
+/// A word of letters may sit inside a longer one — "elmarit" is in
+/// "macroelmarit" once the hyphen is gone. A word with a digit in it has to
+/// begin one of the lens's words: "21" should find "21mm" and not the "12-100"
+/// zoom whose digits happen to run "1 2 1 0 0", which a plain substring search
+/// returned as the one match for a 21mm prime.
+fn lens_word_matches(word: &str, lens_words: &[String], joined: &str) -> bool {
+    if word.chars().any(|c| c.is_ascii_digit()) {
+        lens_words.iter().any(|candidate| candidate.starts_with(word))
+    } else {
+        joined.contains(word)
+    }
+}
+
 /// Lists lens profiles for the interface to choose from, one per line, in the
 /// fields `describe_lens_match` uses followed by the focal range and mounts.
 ///
-/// With a QUERY, every profile whose maker or name contains all of its words,
+/// With a QUERY, every profile whose maker or name has all of its words,
 /// compared with punctuation and case set aside — "zuiko 21" finds an
 /// "Olympus OM Zuiko Auto-W 21mm f/3.5" however the database punctuates it.
 /// Without one, every profile a body of MAKE and MODEL can mount. Profiles the
@@ -2592,22 +2616,22 @@ pub(crate) fn search_lens_profiles(
     } else {
         find_camera_profile(db, make, model)
     };
-    let words: Vec<String> = query
-        .split_whitespace()
-        .map(normalized_name)
-        .filter(|word| !word.is_empty())
-        .collect();
+    let words = lens_name_words(query);
     let mut matches: Vec<(bool, bool, &Lens)> = db
         .lenses
         .iter()
         .filter(|lens| {
-            let haystack = normalized_name(&format!(
+            let names = format!(
                 "{} {} {}",
                 lens.maker,
                 lens.model,
                 lens.model_localized.values().cloned().collect::<Vec<_>>().join(" ")
-            ));
-            words.iter().all(|word| haystack.contains(word.as_str()))
+            );
+            let lens_words = lens_name_words(&names);
+            let joined = lens_words.join("");
+            words
+                .iter()
+                .all(|word| lens_word_matches(word, &lens_words, &joined))
         })
         .map(|lens| {
             let mountable = camera.is_none_or(|camera| camera_mount_compatible(db, camera, lens));
@@ -6116,6 +6140,16 @@ mod tests {
         assert!(everything.lines().all(|line| line.ends_with("\t1")));
         let anywhere = search_lens_profiles("", "", "distagon", 0.0).unwrap();
         assert!(anywhere.lines().count() >= 2);
+        // Digits begin a word of the name; they are not found inside one.
+        let zoom = search_lens_profiles("OM Digital Solutions", "OM-1", "zuiko 21", 21.0).unwrap();
+        assert!(
+            zoom.lines().all(|line| lens_name_words(line.split('\t').next().unwrap())
+                .iter()
+                .any(|word| word.starts_with("21"))),
+            "{zoom}"
+        );
+        let prime = search_lens_profiles("", "", "distagon 21", 0.0).unwrap();
+        assert!(prime.lines().any(|line| line.contains("21mm")), "{prime}");
     }
 
     #[test]
