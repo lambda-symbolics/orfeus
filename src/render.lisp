@@ -145,6 +145,11 @@ The output is published atomically and INPUT-PATHNAME is never modified."
                         :status status
                         :message (format nil "~A failed: ~A"
                                          operation error-output))))))
+    ;; ExifTool copies Olympus maker notes as one block, so their output-space
+    ;; tags are normalized in a second pass after the block exists in the
+    ;; export. Both passes run in one ExifTool process, separated by -execute:
+    ;; starting the interpreter twice cost half a second of the 1.3 s an export
+    ;; used to spend here, and the two produce a byte-identical file.
     (run-exiftool
      (append (list "exiftool"
                    "-overwrite_original"
@@ -153,6 +158,11 @@ The output is published atomically and INPUT-PATHNAME is never modified."
              *metadata-copy-exclusions*
              (list "-Orientation#=1"
                    "-ColorSpace#=1"
+                   (namestring output-pathname)
+                   "-execute"
+                   "-overwrite_original"
+                   "-Olympus:ColorSpace=sRGB"
+                   "-Olympus:RawDevColorSpace=sRGB"
                    (namestring output-pathname)))
      "metadata copy")
     ;; ExifTool copies Olympus maker notes as one block, so normalize their
