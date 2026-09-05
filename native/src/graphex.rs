@@ -822,6 +822,9 @@ struct PrefixSnapshot {
     image: RgbImage,
     domain: Domain,
     oriented: bool,
+    /// What the sensor's noise was before any denoiser, for a sharpener that
+    /// resumes past the denoiser and would otherwise measure a cleaned frame.
+    sensor: Option<render::SensorNoise>,
 }
 
 /// The live registers captured at op boundaries of the last interactive
@@ -1230,6 +1233,7 @@ fn execute_graph_into(
                             image: snapshot.image.clone(),
                             domain: snapshot.domain,
                             oriented: snapshot.oriented,
+                            sensor: snapshot.sensor,
                         })
                         .collect(),
                 ));
@@ -1298,6 +1302,7 @@ fn execute_graph_into(
     let mut registers: Vec<Option<RgbImage>> = (0..=count).map(|_| None).collect();
     let mut domains = vec![Domain::Linear; count + 1];
     let mut oriented = vec![false; count + 1];
+    let mut sensors: Vec<Option<render::SensorNoise>> = vec![None; count + 1];
     let mut film_ordinal = 0_u64;
     match resume {
         Some((_, snapshots)) => {
@@ -1306,6 +1311,7 @@ fn execute_graph_into(
                     registers[snapshot.register] = Some(snapshot.image);
                     domains[snapshot.register] = snapshot.domain;
                     oriented[snapshot.register] = snapshot.oriented;
+                    sensors[snapshot.register] = snapshot.sensor;
                 }
             }
             if uses[0] > 0 && registers[0].is_none() {
@@ -1339,7 +1345,7 @@ fn execute_graph_into(
         };
         if stage == STAGE_ENTRY
             && capture_points.contains(&(index, STAGE_ENTRY))
-            && let Some(snapshots) = collect_snapshots(&registers, &domains, &oriented)
+            && let Some(snapshots) = collect_snapshots(&registers, &domains, &oriented, &sensors)
         {
             captured.push(((index, STAGE_ENTRY), snapshots));
         }
@@ -1387,6 +1393,18 @@ fn execute_graph_into(
             let image = take(&mut registers, &mut uses, op.input_a)?;
             domains[slot] = domains[op.input_a];
             oriented[slot] = oriented[op.input_a];
+            // The sensor's noise travels with the picture through anything
+            // that keeps brightness as it was, follows an exposure, and is
+            // lost to anything that reshapes tone: a sharpener after a curve
+            // measures its floor itself, as it always did.
+            sensors[slot] = match op.kind {
+                NODE_EXPOSURE => {
+                    sensors[op.input_a].map(|sensor| sensor.scaled(2.0_f32.powf(op.params[0])))
+                }
+                NODE_WHITE_BALANCE | NODE_OPTICS | NODE_NOISE_REDUCTION | NODE_CROP | NODE_ROTATE
+                | NODE_FLIP | NODE_SHARPEN => sensors[op.input_a],
+                _ => None,
+            };
             image
         } else {
             take(&mut registers, &mut uses, slot)?
@@ -1436,6 +1454,9 @@ fn execute_graph_into(
                     context.full_pixels,
                 );
                 let neural = op.params[1];
+                if edge > 0.0 || neural > 0.0 {
+                    sensors[slot] = render::measure_sensor_noise(&image);
+                }
                 if neural > 0.0 {
                     super::nn::apply_neural_noise_reduction(
                         &mut image.data,
@@ -1465,7 +1486,13 @@ fn execute_graph_into(
                 // The radius is stated for the photograph, not for whichever
                 // reduction of it is on screen, so it shrinks with the render.
                 let ratio = render::scale_ratio(context.scaled_pixels, context.full_pixels);
-                render::apply_sharpen(&mut image, op.params[0], op.params[1] * ratio, op.params[2]);
+                render::apply_sharpen(
+                    &mut image,
+                    op.params[0],
+                    op.params[1] * ratio,
+                    op.params[2],
+                    sensors[slot].as_ref(),
+                );
             }
             NODE_TONE => {
                 let adjustments: [f32; 7] = op.params[..7]
@@ -1536,7 +1563,7 @@ fn execute_graph_into(
                         && (index, STAGE_FILM_GRAIN) != (boundary, entry_stage)
                     {
                         registers[slot] = Some(image);
-                        if let Some(snapshots) = collect_snapshots(&registers, &domains, &oriented)
+                        if let Some(snapshots) = collect_snapshots(&registers, &domains, &oriented, &sensors)
                         {
                             captured.push(((index, STAGE_FILM_GRAIN), snapshots));
                         }
@@ -1626,7 +1653,7 @@ fn execute_graph_into(
         registers[slot] = Some(image);
     }
     if capture_points.contains(&(count, STAGE_ENTRY))
-        && let Some(snapshots) = collect_snapshots(&registers, &domains, &oriented)
+        && let Some(snapshots) = collect_snapshots(&registers, &domains, &oriented, &sensors)
     {
         captured.push(((count, STAGE_ENTRY), snapshots));
     }
@@ -1730,6 +1757,7 @@ fn collect_snapshots(
     registers: &[Option<RgbImage>],
     domains: &[Domain],
     oriented: &[bool],
+    sensors: &[Option<render::SensorNoise>],
 ) -> Option<Vec<PrefixSnapshot>> {
     let mut snapshots = Vec::new();
     for (register, image) in registers.iter().enumerate() {
@@ -1739,6 +1767,7 @@ fn collect_snapshots(
                 image: image.clone(),
                 domain: domains[register],
                 oriented: oriented[register],
+                sensor: sensors[register],
             });
             if snapshots.len() > PREFIX_SNAPSHOT_LIMIT {
                 return None; // Degenerate fan-outs are not worth the memory.

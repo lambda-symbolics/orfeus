@@ -810,6 +810,114 @@ struct BandNoise {
     power: [f32; NOISE_BINS],
 }
 
+/// A per-bin figure read at BRIGHTNESS, between the two nearest bins. The bins
+/// are centred in the square root of brightness, as `noise_bin` places them.
+fn interpolate_bins(power: &[f32; NOISE_BINS], brightness: f32) -> f32 {
+    let position = brightness.clamp(0.0, 1.0).sqrt() * NOISE_BINS as f32 - 0.5;
+    let lower = position.floor().clamp(0.0, (NOISE_BINS - 1) as f32);
+    let fraction = (position - lower).clamp(0.0, 1.0);
+    let lower = lower as usize;
+    let upper = (lower + 1).min(NOISE_BINS - 1);
+    power[lower] * (1.0 - fraction) + power[upper] * fraction
+}
+
+/// The radius of the detail band a frame's sensor noise is measured in for the
+/// sharpener: the default sharpening radius, so the common case needs no
+/// conversion at all.
+const SENSOR_NOISE_REFERENCE_RADIUS: f32 = 1.5;
+
+/// The sensor's noise as the sharpener's gate needs it: the power of the
+/// reference detail band of the square-root brightness, per brightness bin,
+/// read *before* any denoiser ran.
+///
+/// A sharpener judging texture against the noise it can still see was fooled
+/// by every denoiser ahead of it. The flattest parts of a denoised frame are
+/// cleaned nearly to nothing, so the floor read from them is a few percent of
+/// the sensor's; what the denoiser left in a blurred background — a blotchy
+/// residue at a fraction of the original grain — then stands a hundred times
+/// over that floor and is sharpened as texture. On a photograph of mushrooms
+/// the gate stood open on two thirds of the frame with the denoiser on and on
+/// a tenth with it off, and the bokeh came out a third grainier, in
+/// seven-pixel patches. The denoiser therefore hands down what the sensor's
+/// noise was, and the sharpener refuses to amplify anything below it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct SensorNoise {
+    power: [f32; NOISE_BINS],
+}
+
+impl SensorNoise {
+    fn power_at(&self, brightness: f32) -> f32 {
+        interpolate_bins(&self.power, brightness)
+    }
+
+    /// The same noise after the brightness it was read on is multiplied by
+    /// GAIN, as an exposure node does: photon noise in the square-root domain
+    /// scales with the gain, and every bin's brightness moves with it.
+    pub(crate) fn scaled(&self, gain: f32) -> SensorNoise {
+        if !(gain > 0.0) || (gain - 1.0).abs() < 1.0e-6 {
+            return *self;
+        }
+        let mut power = [0.0_f32; NOISE_BINS];
+        for (bin, value) in power.iter_mut().enumerate() {
+            // This bin's centre, in square-root brightness, came from a
+            // brightness GAIN times smaller.
+            let centre = (bin as f32 + 0.5) / NOISE_BINS as f32;
+            let source = (centre * centre / gain).min(1.0);
+            *value = self.power_at(source) * gain;
+        }
+        SensorNoise { power }
+    }
+}
+
+/// The power white noise of unit variance keeps in the detail band a
+/// separable blur of KERNEL leaves behind: the sum of squares of the
+/// two-dimensional high-pass, `delta - kernel x kernel`.
+fn detail_band_noise_gain(kernel: &[f32]) -> f32 {
+    let centre = kernel[kernel.len() / 2];
+    let sum_of_squares: f32 = kernel.iter().map(|k| k * k).sum();
+    1.0 - 2.0 * centre * centre + sum_of_squares * sum_of_squares
+}
+
+/// Reads the sensor's noise off IMAGE for a sharpener downstream: the flat
+/// quartile of the reference detail band of square-root brightness, per
+/// brightness bin. None for a frame too small to read.
+pub(crate) fn measure_sensor_noise(image: &RgbImage) -> Option<SensorNoise> {
+    let (width, height) = (image.width, image.height);
+    if width < 8 || height < 8 {
+        return None;
+    }
+    let luma: Vec<f32> = image
+        .data
+        .as_chunks::<3>()
+        .0
+        .par_iter()
+        .map(|pixel| 0.2126 * pixel[0] + 0.7152 * pixel[1] + 0.0722 * pixel[2])
+        .collect();
+    let encoded: Vec<f32> = luma.par_iter().map(|value| value.max(0.0).sqrt()).collect();
+    let kernel = gaussian_kernel(SENSOR_NOISE_REFERENCE_RADIUS);
+    let mut blurred = vec![0.0_f32; width * height];
+    let mut turned = vec![0.0_f32; width * height];
+    let mut turned_blur = vec![0.0_f32; width * height];
+    blur_rows(&encoded, &mut blurred, width, height, &kernel);
+    transpose_plane(&blurred, &mut turned, width, height);
+    blur_rows(&turned, &mut turned_blur, height, width, &kernel);
+    transpose_plane(&turned_blur, &mut blurred, height, width);
+    let mut detail = blurred;
+    detail
+        .par_chunks_mut(8192)
+        .zip(encoded.par_chunks(8192))
+        .for_each(|(detail, encoded)| {
+            for (d, e) in detail.iter_mut().zip(encoded) {
+                *d = e - *d;
+            }
+        });
+    let noise = fine_band_noise_by_bin(&detail, &luma, width, height);
+    if noise.power.iter().all(|power| !(*power > 0.0)) {
+        return None;
+    }
+    Some(SensorNoise { power: noise.power })
+}
+
 /// One brightness bin's reading of a band's noise: the power measured there,
 /// the mean brightness of the pixels it was read from, and how many there were.
 #[derive(Clone, Copy, Debug, Default)]
@@ -843,6 +951,14 @@ impl BandNoise {
             power[bin] = near.map(|near| readings[near].power).unwrap_or(0.0);
         }
         BandNoise { power }
+    }
+
+    /// The noise power at BRIGHTNESS, read between the two nearest bins so
+    /// that a gate does not step where a gradient crosses from one bin to the
+    /// next. The bins are centred in the square root of brightness, as
+    /// `noise_bin` places them.
+    fn power_at(&self, brightness: f32) -> f32 {
+        interpolate_bins(&self.power, brightness)
     }
 
     /// Fits sensor noise to what the bins read, and answers for every bin from
@@ -4222,6 +4338,19 @@ fn gaussian_kernel(radius: f32) -> Vec<f32> {
 /// that is how far the overshoot reaches.
 const SHARPEN_HALO_ALLOWANCE: f32 = 0.2;
 
+/// How far above the measured noise power the sharpening gate's floor sits.
+///
+/// The floor is read as the flat quartile of seven-by-seven windows, and a
+/// window of nothing but noise then lands anywhere within about a fifth of it
+/// either way. A plain Wiener gate — keep whatever exceeds the floor — opened
+/// on the upper half of those windows and laid the grain it let through in
+/// seven-pixel patches. A quarter over the floor takes most of that spread: the
+/// gate stays shut on nearly every window of noise alone and opens on texture a
+/// little later than the textbook says. It is not asked to make up for a
+/// denoiser ahead of it — `SensorNoise` does that.
+const SHARPEN_GATE_MARGIN: f32 = 1.25;
+
+
 /// Unsharp masking on brightness alone, with the noise floor kept out of it
 /// and the halos held in.
 ///
@@ -4238,19 +4367,26 @@ const SHARPEN_HALO_ALLOWANCE: f32 = 0.2;
 ///
 /// The detail it adds back is **gated by how much of it is signal**, the way
 /// the denoiser judges a band: the local power of the detail against the
-/// noise power the flattest parts of the frame carry at that brightness.
-/// Where the detail is at that floor nothing is added; where it is texture,
-/// all of it is. THRESHOLD is how many times the floor to subtract, in halves:
-/// two is the plain Wiener answer. The gate is a floor, not a judge of every
-/// sky: after the denoiser the residue left in a sky is more than the residue
-/// left in a smooth wall of the same brightness, so a sky still gains a little
-/// grain from the mask — about a fifth in the finest band on an ISO 200
-/// frame — and the default denoising is set with that in mind.
+/// noise power the flattest parts of the frame carry at that brightness — or
+/// against what the sensor put there before a denoiser cleaned it, when SENSOR
+/// says, since a denoiser's leavings are not texture however far they stand
+/// over what it left elsewhere. Where the detail is at that floor nothing is
+/// added; where it is texture, all of it is. THRESHOLD is how many times the floor to subtract, in halves:
+/// two is the Wiener answer with the floor's own spread allowed for, see
+/// `SHARPEN_GATE_MARGIN`. The floor is read between brightness bins rather than
+/// stepped from one to the next, so a gradient does not change grain where it
+/// crosses a bin.
 ///
 /// And the result is **held to what its neighbourhood already spans**, plus
 /// `SHARPEN_HALO_ALLOWANCE` of it, so edges get steeper without growing the
 /// light and dark lines a camera's sharpening draws along them.
-pub(crate) fn apply_sharpen(image: &mut RgbImage, amount: f32, radius: f32, threshold: f32) {
+pub(crate) fn apply_sharpen(
+    image: &mut RgbImage,
+    amount: f32,
+    radius: f32,
+    threshold: f32,
+    sensor: Option<&SensorNoise>,
+) {
     let (width, height) = (image.width, image.height);
     if amount <= 0.0 || width < 3 || height < 3 {
         return;
@@ -4284,10 +4420,24 @@ pub(crate) fn apply_sharpen(image: &mut RgbImage, amount: f32, radius: f32, thre
             }
         });
     let noise = fine_band_noise_by_bin(&detail, &luma, width, height);
+    // What the sensor put there, when a denoiser ahead of us measured it,
+    // brought to this radius's band from the reference one; whichever of it
+    // and the floor read here is higher is the floor.
+    let sensor_scale = sensor.map(|_| {
+        detail_band_noise_gain(&kernel)
+            / detail_band_noise_gain(&gaussian_kernel(SENSOR_NOISE_REFERENCE_RADIUS))
+    });
+    let floor_at = |luma: f32| {
+        let own = noise.power_at(luma);
+        match (sensor, sensor_scale) {
+            (Some(sensor), Some(scale)) => own.max(sensor.power_at(luma) * scale),
+            _ => own,
+        }
+    };
     let mut activity = Vec::new();
     let mut scratch = Vec::new();
     local_mean_square(&detail, &mut activity, &mut scratch, width, height);
-    let noise_share = 0.5 * threshold;
+    let noise_share = 0.5 * threshold * SHARPEN_GATE_MARGIN;
     if std::env::var_os("ORFEUS_PROFILE").is_some() {
         let mut gated = 0_usize;
         let mut total_gain = 0.0_f64;
@@ -4295,7 +4445,7 @@ pub(crate) fn apply_sharpen(image: &mut RgbImage, amount: f32, radius: f32, thre
             if index % 97 != 0 {
                 continue;
             }
-            let gain = activity_gain(*mean_square, noise_share * noise.power[noise_bin(*luma)]);
+            let gain = activity_gain(*mean_square, noise_share * floor_at(*luma));
             total_gain += f64::from(gain);
             gated += usize::from(gain == 0.0);
         }
@@ -4336,7 +4486,7 @@ pub(crate) fn apply_sharpen(image: &mut RgbImage, amount: f32, radius: f32, thre
                 }
                 let encoded = encoded[index];
                 let detail = detail[index]
-                    * activity_gain(activity[index], noise_share * noise.power[noise_bin(luma)]);
+                    * activity_gain(activity[index], noise_share * floor_at(luma));
                 let (mut low, mut high) = (f32::INFINITY, f32::NEG_INFINITY);
                 for row in rows.clone() {
                     low = low.min(lowest[row * width + x]);
@@ -6547,10 +6697,10 @@ mod tests {
             data,
         };
         let mut image = original.clone();
-        apply_sharpen(&mut image, 0.0, 1.0, 0.0);
+        apply_sharpen(&mut image, 0.0, 1.0, 0.0, None);
         assert_eq!(image.data, original.data, "no amount still changed the image");
         let mut image = original.clone();
-        apply_sharpen(&mut image, 1.5, 1.2, 0.0);
+        apply_sharpen(&mut image, 1.5, 1.2, 0.0, None);
         let at = |image: &RgbImage, x: usize| {
             let index = ((height / 2) * width + x) * 3;
             [image.data[index], image.data[index + 1], image.data[index + 2]]
@@ -6601,7 +6751,7 @@ mod tests {
         }
         let original = RgbImage { width, height, data };
         let mut sharpened = original.clone();
-        apply_sharpen(&mut sharpened, 2.0, 1.5, 0.0);
+        apply_sharpen(&mut sharpened, 2.0, 1.5, 0.0, None);
         let row = |image: &RgbImage, x: usize| image.data[(8 * width + x) * 3 + 1];
         let steepest = |image: &RgbImage| {
             (1..width).map(|x| (row(image, x) - row(image, x - 1)).abs()).fold(0.0_f32, f32::max)
@@ -6640,9 +6790,9 @@ mod tests {
         };
         let before = deviation(&noisy);
         let mut uncored = noisy.clone();
-        apply_sharpen(&mut uncored, 1.5, 1.0, 0.0);
+        apply_sharpen(&mut uncored, 1.5, 1.0, 0.0, None);
         let mut cored = noisy;
-        apply_sharpen(&mut cored, 1.5, 1.0, 3.0);
+        apply_sharpen(&mut cored, 1.5, 1.0, 2.0, None);
         let uncored = deviation(&uncored);
         let cored = deviation(&cored);
         assert!(
@@ -6655,6 +6805,162 @@ mod tests {
             "with a floor, the grain should have been left alone: \
              {before} became {cored}"
         );
+    }
+
+    /// A blurred background is a gradient with the sensor's noise on it, the
+    /// noise growing with the light. The default sharpening leaves its grain
+    /// as it found it, across every brightness the gradient passes through,
+    /// while a texture standing four deviations above the noise still gets
+    /// sharpened.
+    #[test]
+    fn sharpening_leaves_a_blurred_gradient_its_grain() {
+        let (width, height) = (384, 96);
+        let mut state = 0x2545_F491_4F6C_DD1D_u64;
+        let mut noise = || {
+            let mut sum = 0.0_f32;
+            for _ in 0..4 {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                sum += (state >> 40) as f32 / 16_777_216.0 - 0.5;
+            }
+            sum / (1.0_f32 / 3.0).sqrt()
+        };
+        let level = |x: usize| 0.05 + 0.6 * x as f32 / (width - 1) as f32;
+        let sigma = |x: usize| 0.012 * (level(x) / 0.3).sqrt();
+        let mut clean = Vec::with_capacity(width * height * 3);
+        let mut data = Vec::with_capacity(width * height * 3);
+        for y in 0..height {
+            for x in 0..width {
+                // The bottom quarter carries a texture well above the noise.
+                let texture = if y >= 72 {
+                    4.0 * sigma(x) * ((x as f32) * std::f32::consts::TAU / 6.0).sin()
+                } else {
+                    0.0
+                };
+                let value = level(x) + texture;
+                clean.extend_from_slice(&[value; 3]);
+                let noisy = value + sigma(x) * noise();
+                data.extend_from_slice(&[noisy; 3]);
+            }
+        }
+        let mut image = RgbImage { width, height, data };
+        let before = image.clone();
+        apply_sharpen(&mut image, 0.5, 1.5, 2.0, None);
+        let grain = |image: &RgbImage, rows: std::ops::Range<usize>, columns: std::ops::Range<usize>| {
+            let mut total = 0.0_f32;
+            let mut count = 0_usize;
+            for y in rows {
+                for x in columns.clone() {
+                    let index = (y * width + x) * 3 + 1;
+                    let residue = image.data[index] - clean[index];
+                    total += residue * residue;
+                    count += 1;
+                }
+            }
+            (total / count as f32).sqrt()
+        };
+        // Dark, middle and bright thirds of the smooth part.
+        for columns in [8..128, 128..256, 256..376] {
+            let ratio = grain(&image, 4..68, columns.clone()) / grain(&before, 4..68, columns.clone());
+            assert!(ratio < 1.05, "grain grew by {ratio} over columns {columns:?}");
+        }
+        // The texture is sharpened: its residue against the smooth level grows.
+        let amplitude = |image: &RgbImage| {
+            let mut total = 0.0_f32;
+            let mut count = 0_usize;
+            for y in 76..92 {
+                for x in 128..256 {
+                    let index = (y * width + x) * 3 + 1;
+                    let residue = image.data[index] - level(x);
+                    total += residue * residue;
+                    count += 1;
+                }
+            }
+            (total / count as f32).sqrt()
+        };
+        let ratio = amplitude(&image) / amplitude(&before);
+        assert!(ratio > 1.15, "the texture was not sharpened: {ratio}");
+    }
+
+    /// Photon-like noise on a gradient: brightness across, noise growing with
+    /// the light, the way a blurred background carries the sensor's grain.
+    fn noisy_gradient(width: usize, height: usize, seed: u64) -> RgbImage {
+        let mut state = seed;
+        let mut noise = || {
+            let mut sum = 0.0_f32;
+            for _ in 0..4 {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                sum += (state >> 40) as f32 / 16_777_216.0 - 0.5;
+            }
+            sum / (1.0_f32 / 3.0).sqrt()
+        };
+        let mut data = Vec::with_capacity(width * height * 3);
+        for _ in 0..height {
+            for x in 0..width {
+                let level = gradient_level(x, width);
+                let value = (level + 0.02 * (level / 0.3).sqrt() * noise()).max(0.0);
+                data.extend_from_slice(&[value; 3]);
+            }
+        }
+        RgbImage { width, height, data }
+    }
+
+    fn gradient_level(x: usize, width: usize) -> f32 {
+        0.08 + 0.5 * x as f32 / (width - 1) as f32
+    }
+
+    fn grain_against_gradient(image: &RgbImage) -> f32 {
+        let total: f32 = image
+            .data
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .enumerate()
+            .map(|(index, pixel)| {
+                let level = gradient_level(index % image.width, image.width);
+                (pixel[1] - level) * (pixel[1] - level)
+            })
+            .sum();
+        (total / (image.width * image.height) as f32).sqrt()
+    }
+
+    /// What the denoiser leaves in a smooth field is not texture. Told what the
+    /// sensor's noise was, the sharpener leaves it alone; reading the floor off
+    /// the denoised frame, as it used to, it took the leavings for detail.
+    #[test]
+    fn sensor_noise_keeps_the_denoisers_leavings_out_of_the_sharpening() {
+        let noisy = noisy_gradient(384, 128, 0x9E37_79B9_7F4A_7C15);
+        let sensor = measure_sensor_noise(&noisy).expect("a frame this size is readable");
+        let mut denoised = noisy.clone();
+        cpu_noise_reduction(&mut denoised, 0.45, 0.45);
+        let residue = grain_against_gradient(&denoised);
+        let mut blind = denoised.clone();
+        apply_sharpen(&mut blind, 0.5, 1.5, 2.0, None);
+        let mut told = denoised.clone();
+        apply_sharpen(&mut told, 0.5, 1.5, 2.0, Some(&sensor));
+        let blind = grain_against_gradient(&blind) / residue;
+        let told = grain_against_gradient(&told) / residue;
+        assert!(blind > 1.08, "the blind sharpener should have amplified the leavings: {blind}");
+        assert!(told < 1.02, "told the sensor's noise, the sharpener still added grain: {told}");
+    }
+
+    /// An exposure between the denoiser and the sharpener moves every bin and
+    /// scales the noise; the figure handed down follows it.
+    #[test]
+    fn sensor_noise_follows_an_exposure_change() {
+        let noisy = noisy_gradient(384, 128, 0x2545_F491_4F6C_DD1D);
+        let before = measure_sensor_noise(&noisy).unwrap();
+        let mut brighter = noisy.clone();
+        apply_exposure(&mut brighter, 1.0);
+        let after = measure_sensor_noise(&brighter).unwrap();
+        let predicted = before.scaled(2.0);
+        for brightness in [0.2, 0.4, 0.7] {
+            let ratio = predicted.power_at(brightness) / after.power_at(brightness);
+            assert!((0.8..1.25).contains(&ratio), "at {brightness}: predicted/measured {ratio}");
+        }
     }
 
     /// A plane of nothing but noise, at one brightness.
