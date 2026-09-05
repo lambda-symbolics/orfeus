@@ -1380,7 +1380,7 @@ new cache entry is published."
            thumbnail-canvas thumbnail-scrollbar photo-selection-label
            before-canvas after-canvas before-caption after-caption
            still-button copy-grade-button paste-grade-button
-           right-column graph-pane graph-canvas graph-title
+           right-column graph-pane graph-canvas graph-scrollbar graph-title
            (graph-scroll-x 0)
            (graph-scroll-y 0)
            pick-color-node crop-drag node-drag
@@ -3436,7 +3436,7 @@ new cache entry is published."
                     (nodes (ensure-graph-node-positions (editor-nodes)))
                     (selected (gui-model-selected-graph-node model))
                     (ox (- wx graph-scroll-x))
-                    (oy (- wy graph-scroll-y)))
+                    (oy (- wy (synced-graph-scroll-y height))))
                (lightfast:draw-push-clip wx wy width height)
                (lightfast:draw-color-rgb :red 52 :green 54 :blue 58)
                (lightfast:draw-filled-rect wx wy width height)
@@ -3804,6 +3804,19 @@ new cache entry is published."
                          (sync-node-tools)
                          (when graph-canvas (lightfast:redraw graph-canvas))
                          (set-status (princ-to-string condition)))))))))
+           (synced-graph-scroll-y (height)
+             ;; The vertical scroll clamped to what a canvas HEIGHT tall
+             ;; cannot show, and the bar beside the canvas told the same;
+             ;; every draw passes through here, so the bar is never stale.
+             (multiple-value-bind (right bottom) (graph-content-extent)
+               (declare (ignore right))
+               (let ((limit (max 0 (- (+ bottom 12) height))))
+                 (setf graph-scroll-y (max 0 (min limit graph-scroll-y)))
+                 (when graph-scrollbar
+                   (lightfast:set-range graph-scrollbar 0 limit)
+                   (setf (lightfast:value graph-scrollbar)
+                         (format nil "~D" graph-scroll-y)))
+                 graph-scroll-y)))
            (graph-content-extent ()
              ;; (values right bottom) of everything drawn, in graph space.
              (let ((nodes (ensure-graph-node-positions (editor-nodes))))
@@ -3887,7 +3900,6 @@ new cache entry is published."
              (declare (ignore widget))
              (multiple-value-bind (x y button dx dy) (parse-preview-event
                                                       value)
-               (declare (ignore dx))
                (when (and x (selected-job))
                  (let ((gx (+ x graph-scroll-x))
                        (gy (+ y graph-scroll-y)))
@@ -3997,12 +4009,9 @@ new cache entry is published."
                              (unless (getf (rest drag) :moved-p)
                                (deselect-graph-node)))))))
                      (#.lightfast:+event-wheel+
-                      (multiple-value-bind (right bottom)
-                          (graph-content-extent)
-                        (declare (ignore right))
-                        (setf graph-scroll-y
-                              (max 0 (min (max 0 (- bottom 60))
-                                          (+ graph-scroll-y (* dy 32))))))
+                      ;; Clamped when drawn, against the canvas's own height.
+                      (setf graph-scroll-y (max 0 (+ graph-scroll-y (* dy 32)))
+                            graph-scroll-x (max 0 (+ graph-scroll-x (* dx 32))))
                       (lightfast:redraw graph-canvas)))))))
            (autocrop-negative (node)
              (let ((job (selected-job)))
@@ -6020,7 +6029,12 @@ new cache entry is published."
                                         :width button-width :height 22))
                (when graph-canvas
                  (lightfast:resize-widget graph-canvas :x 2 :y 52
-                                        :width (- width 4)
+                                        :width (max 40 (- width 22))
+                                        :height (max 60 (- height 54))))
+               (when graph-scrollbar
+                 (lightfast:resize-widget graph-scrollbar
+                                        :x (max 42 (- width 18)) :y 52
+                                        :width 16
                                         :height (max 60 (- height 54))))
                (lightfast:redraw graph-pane)))
            (layout-gallery-pane (&optional ignored)
@@ -6824,6 +6838,26 @@ new cache entry is published."
                              lightfast:+event-release+
                              lightfast:+event-wheel+))
           (lightfast:on graph-canvas #'handle-graph-mouse :event event))
+        ;; The default graph alone is seven nodes tall and the canvas shows
+        ;; four: without a bar the output well simply was not there, and the
+        ;; wheel that would have found it was nothing anyone was told about.
+        (setf graph-scrollbar
+              (lightfast:make-scrollbar
+               :parent graph-pane :x 302 :y 52 :width 16 :height 229
+               :value "0"
+               :callback
+               (lambda (widget event value)
+                 (declare (ignore event))
+                 (let ((position (ignore-errors
+                                   (round (parse-number
+                                           (if (plusp (length (or value "")))
+                                               value
+                                               (lightfast:value widget)))))))
+                   (when position
+                     (setf graph-scroll-y (max 0 position))
+                     (lightfast:redraw graph-canvas))))))
+        (lightfast:scrollbar-set-orientation graph-scrollbar :vertical)
+        (lightfast:set-step graph-scrollbar 32)
         ;; The inspector lays its children out manually, so it must paint its
         ;; own background; a boxless group smears stale pixels during tile
         ;; drags and window resizes.
