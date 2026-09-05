@@ -2641,15 +2641,21 @@ pub(crate) fn resolve_lens_profile<'a>(
                 "no exact lensfun profile for adapted-lens mapping {profile}"
             ))
         })?;
-        let base_crop = if crop_factor > 0.0 {
-            crop_factor
-        } else {
-            camera.map(|matched| matched.crop_factor).ok_or_else(|| {
+        // The body's crop factor is the body's: when the database knows the
+        // camera, its figure wins over one stored with an adapted-lens mapping.
+        // A stored figure is for bodies the database has never heard of — and
+        // for a while the picker stored the lens's own calibration crop there,
+        // which put a full-frame Nokton's corner correction on a Four Thirds
+        // frame at four times its strength and bent every straight line.
+        let base_crop = camera
+            .map(|matched| matched.crop_factor)
+            .filter(|crop| *crop > 0.0)
+            .or_else(|| (crop_factor > 0.0).then_some(crop_factor))
+            .ok_or_else(|| {
                 Error::LensProfileUnavailable(format!(
                     "adapted-lens mapping for {profile} requires a crop factor"
                 ))
-            })?
-        };
+            })?;
         (lens, base_crop, profile)
     } else {
         let camera = camera.ok_or_else(|| {
@@ -6748,6 +6754,50 @@ mod tests {
 
     /// The description names the profile a render would use and what it can
     /// correct, and says no the same way a render does.
+    /// A full-frame lens on a Four Thirds body is corrected for the part of
+    /// its image circle the sensor sees: a few pixels at most for this lens,
+    /// whose moustache distortion nearly vanishes within that crop. Treating
+    /// the frame as full-frame put the lens's corner correction on the sensor's
+    /// corner instead and bent straight lines into pincushion.
+    #[test]
+    fn full_frame_profile_is_scaled_to_the_body_that_wears_it() {
+        let db = lens_database().unwrap();
+        let nokton = "Voigtlander Nokton 28mm F1.5 Aspherical";
+        let lens = find_explicit_lens_profile(db, nokton, 28.0).unwrap();
+        assert_eq!(lens.crop_factor, 1.0);
+        let corner_shift = |crop: f32| {
+            let mut modifier = Modifier::new(lens, 28.0, crop, 5184, 3888, false);
+            assert!(modifier.enable_distortion_correction(lens));
+            let mut source = [0.0_f32; 2];
+            modifier.apply_geometry_distortion(0.0, 0.0, 1, 1, &mut source);
+            source[0].hypot(source[1])
+        };
+        assert!(corner_shift(2.0) < 10.0, "{}", corner_shift(2.0));
+        assert!(corner_shift(1.0) > 25.0, "{}", corner_shift(1.0));
+
+        // The body the database knows decides the crop, whatever an
+        // adapted-lens mapping stored; the stored figure serves only a body
+        // the database does not know.
+        let mut options = lens_options("", 28.0, Some(nokton));
+        options.crop_factor = 1.0;
+        assert_eq!(resolve_lens_profile(&options).unwrap().base_crop_factor, 2.0);
+        options.make = "Nobody";
+        options.model = "Unknown";
+        assert_eq!(resolve_lens_profile(&options).unwrap().base_crop_factor, 1.0);
+        options.crop_factor = 0.0;
+        assert!(matches!(
+            resolve_lens_profile(&options),
+            Err(Error::LensProfileUnavailable(message)) if message.contains("requires a crop factor")
+        ));
+        // The description reports the crop the correction would use, which
+        // is what the picker records for the next photograph on the lens.
+        options.make = "OM Digital Solutions";
+        options.model = "OM-1";
+        options.crop_factor = 1.0;
+        let described = describe_lens_match(&options).unwrap();
+        assert_eq!(described.split('\t').last().unwrap(), "2.000");
+    }
+
     #[test]
     fn lens_match_describes_the_profile_a_render_would_use() {
         let described = describe_lens_match(&lens_options(
