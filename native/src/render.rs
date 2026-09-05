@@ -1028,43 +1028,277 @@ fn coarse_band_noise(
     BandNoise::fit(&readings)
 }
 
+/// Tile the three stacked blurs are computed in. The intermediates of a tile
+/// stay in cache: 284 by 92 floats a buffer, four buffers, just over 400 KB.
+const LUMA_TILE_WIDTH: usize = 256;
+const LUMA_TILE_HEIGHT: usize = 64;
+/// Rows and columns of neighbourhood a tile needs beyond its own: each blur
+/// reaches twice its step, and the three stack.
+const LUMA_TILE_HALO: usize = 2 * (LUMA_BAND_STEPS[0] + LUMA_BAND_STEPS[1] + LUMA_BAND_STEPS[2]);
+
+/// One bilateral span, eight lanes at a time where the machine allows.
+///
+/// # Safety
+///
+/// Every pointer must stay readable for `output.len()` lanes.
+unsafe fn bilateral_span(
+    output: &mut [f32],
+    guide_center: *const f32,
+    taps: [*const f32; 5],
+    guides: [*const f32; 5],
+    use_avx: bool,
+) {
+    #[cfg(target_arch = "x86_64")]
+    if use_avx {
+        // SAFETY: Forwarded from the caller's guarantee.
+        unsafe { bilateral_span_avx(output, guide_center, taps, guides) };
+        return;
+    }
+    let _ = use_avx;
+    let kernel = [1.0_f32, 4.0, 6.0, 4.0, 1.0];
+    for (lane, value) in output.iter_mut().enumerate() {
+        // SAFETY: Within the caller's readable span.
+        unsafe {
+            let center = *guide_center.add(lane);
+            let sigma = 0.012 + 0.055 * center.max(0.0).sqrt();
+            let inverse = 1.0 / (sigma * sigma);
+            let mut sum = 0.0;
+            let mut weight_sum = 0.0;
+            for tap in 0..5 {
+                let distance = *guides[tap].add(lane) - center;
+                let weight = kernel[tap] * (1.0 / (1.0 + distance * distance * inverse));
+                sum += *taps[tap].add(lane) * weight;
+                weight_sum += weight;
+            }
+            *value = sum / weight_sum;
+        }
+    }
+}
+
+/// Where a tile's local buffers sit against the image.
+///
+/// Local coordinates run over the tile and its halo; `image` says which of them
+/// lie inside the frame, since a tile at an edge has halo cells that do not.
+struct TileGeometry {
+    stride: usize,
+    /// Local columns and rows that map to real pixels, as half-open ranges.
+    image_columns: (usize, usize),
+    image_rows: (usize, usize),
+}
+
+/// One directional bilateral pass over a region of a tile, followed by the
+/// replication that stands in for clamping at the frame's edge.
+///
+/// The whole-plane blurs read their input at clamped coordinates, so a tap that
+/// falls off the frame reads the edge pixel of *that stage's* input. A tile
+/// reproduces that by computing only the cells inside the frame and copying the
+/// edge cell outwards over the rest of the region: the next stage then finds the
+/// edge value wherever it looks off the frame, exactly as clamping gave it.
+#[allow(clippy::too_many_arguments)]
+unsafe fn tile_pass(
+    out: &mut [f32],
+    input: &[f32],
+    guide: &[f32],
+    geometry: &TileGeometry,
+    rows: std::ops::Range<usize>,
+    columns: std::ops::Range<usize>,
+    step: usize,
+    horizontal: bool,
+    use_avx: bool,
+) {
+    let stride = geometry.stride;
+    let (r0, r1) = (rows.start.max(geometry.image_rows.0), rows.end.min(geometry.image_rows.1));
+    let (c0, c1) = (
+        columns.start.max(geometry.image_columns.0),
+        columns.end.min(geometry.image_columns.1),
+    );
+    debug_assert!(r0 < r1 && c0 < c1);
+    for row in r0..r1 {
+        let base = row * stride;
+        // SAFETY: Regions are laid out so every tap of every stage lies inside
+        // the tile's buffers; `LUMA_TILE_HALO` is the stacked reach.
+        unsafe {
+            let at = |plane: &[f32], tap: usize| {
+                if horizontal {
+                    plane.as_ptr().add(base + c0 + tap * step - 2 * step)
+                } else {
+                    plane.as_ptr().add((row + tap * step - 2 * step) * stride + c0)
+                }
+            };
+            let taps: [*const f32; 5] = std::array::from_fn(|tap| at(input, tap));
+            let guides: [*const f32; 5] = std::array::from_fn(|tap| at(guide, tap));
+            bilateral_span(
+                &mut out[base + c0..base + c1],
+                guide.as_ptr().add(base + c0),
+                taps,
+                guides,
+                use_avx,
+            );
+        }
+        let left = out[base + c0];
+        out[base + columns.start..base + c0].fill(left);
+        let right = out[base + c1 - 1];
+        out[base + c1..base + columns.end].fill(right);
+    }
+    for row in rows.start..r0 {
+        for column in columns.clone() {
+            out[row * stride + column] = out[r0 * stride + column];
+        }
+    }
+    for row in r1..rows.end {
+        for column in columns.clone() {
+            out[row * stride + column] = out[(r1 - 1) * stride + column];
+        }
+    }
+}
+
+/// A plane written by many tiles at once, each to its own cells.
+#[derive(Clone, Copy)]
+struct SharedPlane(*mut f32);
+
+// SAFETY: Every tile writes a disjoint rectangle; see `split_luma_bands`.
+unsafe impl Sync for SharedPlane {}
+unsafe impl Send for SharedPlane {}
+
+impl SharedPlane {
+    /// # Safety
+    ///
+    /// INDEX must lie inside the plane and be written by this caller alone.
+    #[inline]
+    unsafe fn write(self, index: usize, value: f32) {
+        // SAFETY: Forwarded from the caller.
+        unsafe { *self.0.add(index) = value };
+    }
+}
+
+/// The four planes a tile writes into.
+struct BandPlanes {
+    fine: SharedPlane,
+    middle: SharedPlane,
+    coarse: SharedPlane,
+    residual: SharedPlane,
+}
+
 /// Splits PLANE into its three detail bands and the smooth residual under them.
 ///
 /// Each blur follows edges in the original brightness, so a band never holds
 /// the far side of an edge. On return PLANE holds the finest band, the two
 /// vectors returned the next two, and RESIDUAL what is left.
+///
+/// Done in tiles rather than as three passes over the whole plane. The blurs
+/// stack — the second reads the first, the third the second — and at twenty
+/// megapixels each pass read two planes and wrote one, 240 MB a blur, with the
+/// intermediate never in cache when it was wanted again. A tile of 256 by 64
+/// copies its neighbourhood in once, runs the three blurs on four buffers that
+/// fit in one core's cache, and writes the four bands straight out; the halo it
+/// recomputes for its neighbours costs about forty percent more arithmetic and
+/// removes two thirds of the traffic, which is what this stage was bound by.
 fn split_luma_bands(
-    plane: &mut [f32],
+    plane: &mut Vec<f32>,
     residual: &mut Vec<f32>,
-    scratch: &mut Vec<f32>,
     width: usize,
     height: usize,
 ) -> (Vec<f32>, Vec<f32>) {
+    let pixels = width * height;
+    let mut fine = Vec::new();
     let mut middle = Vec::new();
     let mut coarse = Vec::new();
-    edge_guided_blur_into(plane, plane, width, height, LUMA_BAND_STEPS[0], 1.0, scratch, &mut middle);
-    edge_guided_blur_into(&middle, plane, width, height, LUMA_BAND_STEPS[1], 1.0, scratch, &mut coarse);
-    edge_guided_blur_into(&coarse, plane, width, height, LUMA_BAND_STEPS[2], 1.0, scratch, residual);
-    // The three bands, written over the planes that produced them, in one
-    // traversal: once a band exists neither the brightness nor the blur under
-    // it is wanted again, and at eighty megapixels a plane is a third of a
-    // gigabyte.
-    plane
-        .par_chunks_mut(8192)
-        .zip(middle.par_chunks_mut(8192))
-        .zip(coarse.par_chunks_mut(8192))
-        .zip(residual.par_chunks(8192))
-        .for_each(|(((fine, middle), coarse), residual)| {
-            for (((fine, middle), coarse), residual) in
-                fine.iter_mut().zip(middle.iter_mut()).zip(coarse.iter_mut()).zip(residual)
-            {
-                let one = *middle;
-                let two = *coarse;
-                *fine -= one;
-                *middle = one - two;
-                *coarse = two - *residual;
-            }
-        });
+    ensure_plane_len(&mut fine, pixels);
+    ensure_plane_len(&mut middle, pixels);
+    ensure_plane_len(&mut coarse, pixels);
+    ensure_plane_len(residual, pixels);
+    let use_avx = super::nn::fma_available();
+    let halo = LUMA_TILE_HALO;
+    let (tile_width, tile_height) = (LUMA_TILE_WIDTH, LUMA_TILE_HEIGHT);
+    let (stride, rows) = (tile_width + 2 * halo, tile_height + 2 * halo);
+    let tiles_across = width.div_ceil(tile_width);
+    let tiles_down = height.div_ceil(tile_height);
+    let planes = BandPlanes {
+        fine: SharedPlane(fine.as_mut_ptr()),
+        middle: SharedPlane(middle.as_mut_ptr()),
+        coarse: SharedPlane(coarse.as_mut_ptr()),
+        residual: SharedPlane(residual.as_mut_ptr()),
+    };
+    let source: &[f32] = plane;
+    (0..tiles_across * tiles_down)
+        .into_par_iter()
+        .for_each_init(
+            || {
+                (
+                    vec![0.0_f32; stride * rows],
+                    vec![0.0_f32; stride * rows],
+                    vec![0.0_f32; stride * rows],
+                    vec![0.0_f32; stride * rows],
+                    vec![0.0_f32; tile_width],
+                )
+            },
+            |(local, scratch, first, second, line), tile| {
+                let x0 = (tile % tiles_across) * tile_width;
+                let y0 = (tile / tiles_across) * tile_height;
+                let own_width = tile_width.min(width - x0);
+                let own_height = tile_height.min(height - y0);
+                // Local column `c` is image column `x0 - halo + c`.
+                let column_of = |c: usize| (x0 + c).saturating_sub(halo).min(width - 1);
+                let row_of = |r: usize| (y0 + r).saturating_sub(halo).min(height - 1);
+                let geometry = TileGeometry {
+                    stride,
+                    image_columns: (halo.saturating_sub(x0), (halo + width - x0).min(stride)),
+                    image_rows: (halo.saturating_sub(y0), (halo + height - y0).min(rows)),
+                };
+                // The neighbourhood, clamped at the frame's edge like every tap
+                // of the whole-plane blurs was.
+                for r in 0..rows {
+                    let image_row = row_of(r) * width;
+                    let target = &mut local[r * stride..(r + 1) * stride];
+                    let (c0, c1) = geometry.image_columns;
+                    target[c0..c1].copy_from_slice(&source[image_row + column_of(c0)..image_row + column_of(c0) + (c1 - c0)]);
+                    target[..c0].fill(source[image_row + column_of(c0)]);
+                    let last = source[image_row + column_of(c1 - 1)];
+                    target[c1..].fill(last);
+                }
+                // Each stage is computed over exactly the region the next one
+                // reads: the first blur's reach in from the buffer's edge, then
+                // the second's, then the third's own.
+                let [one, two, four] = LUMA_BAND_STEPS;
+                let (edge_one, edge_two) = (2 * one, 2 * one + 2 * two);
+                // SAFETY: Region bounds keep every tap inside the buffers.
+                unsafe {
+                    tile_pass(scratch, local, local, &geometry, 0..rows, edge_one..stride - edge_one, one, true, use_avx);
+                    tile_pass(first, scratch, local, &geometry, edge_one..rows - edge_one, edge_one..stride - edge_one, one, false, use_avx);
+                    tile_pass(scratch, first, local, &geometry, edge_one..rows - edge_one, edge_two..stride - edge_two, two, true, use_avx);
+                    tile_pass(second, scratch, local, &geometry, edge_two..rows - edge_two, edge_two..stride - edge_two, two, false, use_avx);
+                    // The third blur's vertical pass is done a row at a time
+                    // below, straight into the output.
+                    tile_pass(scratch, second, local, &geometry, edge_two..rows - edge_two, halo..stride - halo, four, true, use_avx);
+                }
+                for r in 0..own_height {
+                    let row = halo + r;
+                    let base = row * stride + halo;
+                    let out_row = (y0 + r) * width + x0;
+                    // SAFETY: Tap rows sit within the region the third
+                    // horizontal pass filled; the output pointers address this
+                    // tile's own cells, which no other tile writes.
+                    unsafe {
+                        let taps: [*const f32; 5] = std::array::from_fn(|tap| {
+                            scratch.as_ptr().add((row + tap * four - 2 * four) * stride + halo)
+                        });
+                        let guides: [*const f32; 5] = std::array::from_fn(|tap| {
+                            local.as_ptr().add((row + tap * four - 2 * four) * stride + halo)
+                        });
+                        bilateral_span(&mut line[..own_width], local.as_ptr().add(base), taps, guides, use_avx);
+                        for c in 0..own_width {
+                            let (value, one, two, three) =
+                                (local[base + c], first[base + c], second[base + c], line[c]);
+                            planes.fine.write(out_row + c, value - one);
+                            planes.middle.write(out_row + c, one - two);
+                            planes.coarse.write(out_row + c, two - three);
+                            planes.residual.write(out_row + c, three);
+                        }
+                    }
+                }
+            },
+        );
+    std::mem::swap(plane, &mut fine);
     (middle, coarse)
 }
 
@@ -1196,7 +1430,6 @@ fn shrink_luma_bands(
 fn denoise_luma(
     plane: &mut Vec<f32>,
     residual: &mut Vec<f32>,
-    scratch: &mut Vec<f32>,
     width: usize,
     height: usize,
     strength: f32,
@@ -1213,7 +1446,7 @@ fn denoise_luma(
             step_started = now;
         }
     };
-    let (middle, coarse) = split_luma_bands(plane, residual, scratch, width, height);
+    let (middle, coarse) = split_luma_bands(plane, residual, width, height);
     profile_step("bands");
     let strength = strength * ACTIVITY_STRENGTH;
     // The finest band says where the frame is flat; the others measure there.
@@ -2094,7 +2327,7 @@ pub(crate) fn cpu_noise_reduction(image: &mut RgbImage, luma: f32, chroma: f32) 
     let mut filtered = Vec::new();
     let luma_strength = luma.clamp(0.0, 1.0);
     if luma_strength > 0.0 {
-        denoise_luma(&mut yy, &mut filtered, &mut scratch, width, height, luma_strength);
+        denoise_luma(&mut yy, &mut filtered, width, height, luma_strength);
     }
 
     profile_step!("luma");
@@ -6100,14 +6333,57 @@ mod tests {
             .collect()
     }
 
+    /// The tiled split has to give the bands the three whole-plane blurs give,
+    /// tile seams, frame edges and odd sizes included.
+    #[test]
+    fn tiled_band_split_matches_the_plain_blurs() {
+        for (width, height) in [(613, 389), (61, 71), (300, 64), (256, 128), (1030, 70)] {
+            let mut scene: Vec<f32> = noisy_flat_plane(width, height, 0.4, 0.05);
+            // Edges and a ramp, so the guide has structure to follow.
+            for y in 0..height {
+                for x in 0..width {
+                    let ramp = x as f32 / width as f32 * 0.3;
+                    let edge = if (x / 37 + y / 23) % 2 == 0 { 0.2 } else { 0.0 };
+                    scene[y * width + x] += ramp + edge;
+                }
+            }
+            let mut expected_fine = scene.clone();
+            let (mut scratch, mut one, mut two, mut three) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+            edge_guided_blur_into(&scene, &scene, width, height, 1, 1.0, &mut scratch, &mut one);
+            edge_guided_blur_into(&one, &scene, width, height, 2, 1.0, &mut scratch, &mut two);
+            edge_guided_blur_into(&two, &scene, width, height, 4, 1.0, &mut scratch, &mut three);
+            for index in 0..width * height {
+                expected_fine[index] -= one[index];
+                one[index] -= two[index];
+                two[index] -= three[index];
+            }
+            let mut plane = scene.clone();
+            let mut residual = Vec::new();
+            let (middle, coarse) = split_luma_bands(&mut plane, &mut residual, width, height);
+            let worst = |a: &[f32], b: &[f32]| {
+                a.iter().zip(b).map(|(a, b)| (a - b).abs()).fold(0.0_f32, f32::max)
+            };
+            let differences = [
+                worst(&plane, &expected_fine),
+                worst(&middle, &one),
+                worst(&coarse, &two),
+                worst(&residual, &three),
+            ];
+            assert!(
+                differences.iter().all(|d| *d < 2e-5),
+                "{width}x{height}: bands differ by {differences:?}"
+            );
+        }
+    }
+
     /// Each band's noise is read off the band itself, so the reading has to
     /// agree with the power the noise actually put there.
     #[test]
     fn band_noise_is_measured_within_a_fifth() {
         let (width, height) = (512, 384);
         let mut plane = noisy_flat_plane(width, height, 0.4, 0.02);
-        let (mut residual, mut scratch) = (Vec::new(), Vec::new());
-        let (middle, coarse) = split_luma_bands(&mut plane, &mut residual, &mut scratch, width, height);
+        let mut residual = Vec::new();
+        let (middle, coarse) = split_luma_bands(&mut plane, &mut residual, width, height);
         let bin = noise_bin(0.4);
         let truth = |band: &[f32]| band.iter().map(|v| v * v).sum::<f32>() / band.len() as f32;
         let (fine, flat) = fine_band_noise(&plane, &residual, width, height);
