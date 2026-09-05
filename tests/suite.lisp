@@ -1276,6 +1276,23 @@ and then quietly relocated them would be lying about where a click puts things."
       (when (probe-file pathname)
         (delete-file pathname)))))
 
+(defun lens-listing-keeps-the-calibration-crop-apart-p ()
+  "A listing's crop is the profile's calibration crop, named as such, so that it
+cannot be mistaken for the body's the way the picker once did."
+  (let ((listed (orfeus::lens-profile-record
+                 (format nil "Nokton~CNokton 28~CVoigtländer~CDT~C1.000~C28~C28~CLeica M~C0"
+                         #\Tab #\Tab #\Tab #\Tab #\Tab #\Tab #\Tab #\Tab)
+                 :crop-factor-key :calibration-crop-factor))
+        (matched (orfeus::lens-profile-record
+                  (format nil "Nokton~CNokton 28~CVoigtländer~CDT~C2.000"
+                          #\Tab #\Tab #\Tab #\Tab))))
+    (and (= 1.0 (getf listed :calibration-crop-factor))
+         (null (getf listed :crop-factor))
+         (= 2.0 (getf matched :crop-factor))
+         (getf matched :distortion-p)
+         (getf matched :chromatic-aberration-p)
+         (not (getf matched :vignetting-p)))))
+
 (defun lens-resolution-prefers-the-hand-set-profile-p ()
   "A profile chosen by hand replaces the nickname alias, reducer and all."
   (multiple-value-bind (profile reducer crop focal)
@@ -1939,6 +1956,8 @@ neither way."
              (lens-alias-reader-evaluation-disabled-p))
       (check "saving a lens alias writes a readable file the resolver honours"
              (lens-alias-save-round-trip-p))
+      (check "a lens listing names the calibration crop apart from the body's"
+             (lens-listing-keeps-the-calibration-crop-apart-p))
       (check "a hand-set lens profile replaces the nickname alias"
              (lens-resolution-prefers-the-hand-set-profile-p))
       (check "the fringing source is encoded in the optics program"

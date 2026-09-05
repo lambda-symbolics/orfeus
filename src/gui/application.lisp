@@ -848,6 +848,20 @@ removed, or replaced photograph can never leave a stale graph on screen."
   "Build FLTK's LABEL<TAB>PATTERN native file chooser syntax."
   (format nil "~A~C~A" label #\Tab pattern))
 
+(defun alias-body-crop-factor (pathname model focal-length)
+  "The crop factor an adapted-lens mapping for PATHNAME's body should carry.
+
+The database's figure for the body, read back through the same lookup a render
+makes with MODEL chosen by hand; two when the database does not know the body,
+which is the crop of every body Orfeus reads. Never the profile's own
+calibration crop: that is the sensor the lens was measured on, and for a
+full-frame lens on a Four Thirds body the two differ by exactly the factor the
+correction has to allow for — written down as the body's, it had the lens's
+corner correction land on the sensor's corner at four times its strength."
+  (let ((match (orfeus:photo-lens-profile-status pathname :profile model
+                                                          :focal-length focal-length)))
+    (or (and match (getf match :crop-factor)) 2.0)))
+
 (defun display-number (value)
   (cond ((null value) "")
         ((integerp value) (format nil "~D" value))
@@ -5612,14 +5626,15 @@ new cache entry is published."
                         (when (and description
                                    (string/= "0"
                                              (lightfast:value lens-picker-remember)))
-                          ;; The crop factor on file is the body's when the
-                          ;; database knows the body, else the lens's own.
                           (handler-case
                               (progn
-                                (lens-profile-alias-save description
+                                (lens-profile-alias-save
+                                 description
+                                 (getf record :model)
+                                 (alias-body-crop-factor path
                                                          (getf record :model)
-                                                         (or (getf record :crop-factor)
-                                                             2.0))
+                                                         (and focal (plusp focal)
+                                                              focal)))
                                 (lens-profile-status-forget))
                             (error (condition)
                               (set-status (princ-to-string condition)))))

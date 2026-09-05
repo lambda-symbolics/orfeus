@@ -769,8 +769,12 @@ when that last one is near zero: a frame of sky says nothing about focus."
 (defparameter *lens-listing-buffer-size* (* 256 1024)
   "Where a lens profile listing starts; it grows when the bridge asks.")
 
-(defun lens-profile-record (line)
-  "Parse one tab-separated lens profile LINE from the bridge into a plist."
+(defun lens-profile-record (line &key (crop-factor-key :crop-factor))
+  "Parse one tab-separated lens profile LINE from the bridge into a plist.
+
+The fifth field is stored under CROP-FACTOR-KEY: a match reports the crop the
+correction would use, a listing the crop the profile was calibrated on, and the
+two are not the same number for a full-frame lens on a Four Thirds body."
   (let ((fields (uiop:split-string line :separator '(#\Tab))))
     (flet ((field (index) (nth index fields))
            (number (index)
@@ -787,7 +791,7 @@ when that last one is near zero: a frame of sky says nothing about focus."
               :distortion-p (and (find #\D letters) t)
               :chromatic-aberration-p (and (find #\T letters) t)
               :vignetting-p (and (find #\V letters) t)
-              :crop-factor (number 4)
+              crop-factor-key (number 4)
               :focal-min (number 5)
               :focal-max (number 6)
               :mounts (field 7)
@@ -825,7 +829,10 @@ without the profile, rather than twice."
 
 (defun native-lens-profiles (&key make model query focal)
   "List lens profiles for a chooser, as plists like NATIVE-LENS-PROFILE-MATCH's
-with :FOCAL-MIN, :FOCAL-MAX, :MOUNTS and :MOUNTABLE-P besides.
+with :FOCAL-MIN, :FOCAL-MAX, :MOUNTS and :MOUNTABLE-P besides — and
+:CALIBRATION-CROP-FACTOR, the crop of the body the profile was measured on, in
+place of :CROP-FACTOR: a listing has no body to apply the profile to, and the
+picker once wrote a full-frame lens's 1.0 down as the body's.
 
 With a QUERY, every profile whose maker or name contains all of its words;
 without one, every profile a body of MAKE and MODEL can mount. Profiles the body
@@ -845,7 +852,10 @@ can mount come first, then those that cover FOCAL."
                                 error-buffer *native-error-buffer-size*))))
                  (cond ((zerop status)
                         (return
-                          (mapcar #'lens-profile-record
+                          (mapcar (lambda (line)
+                                    (lens-profile-record
+                                     line
+                                     :crop-factor-key :calibration-crop-factor))
                                   (remove ""
                                           (uiop:split-string
                                            (foreign-string-to-lisp
