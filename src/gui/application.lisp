@@ -3473,7 +3473,10 @@ new cache entry is published."
                  (lightfast:draw-color-rgb :red 225 :green 225 :blue 230)
                  (lightfast:draw-color-rgb :red 10 :green 10 :blue 12))
              (lightfast:draw-font :size 12)
-             (lightfast:draw-text label (+ x 10 indent) (+ y (floor h 2) 5))
+             ;; Two below the arithmetic centre: the caption's capitals stand
+             ;; on the baseline and reach nine up, so centring the baseline's
+             ;; offset left them sitting a pixel and a half above the icon.
+             (lightfast:draw-text label (+ x 10 indent) (+ y (floor h 2) 7))
              (lightfast:draw-font :size 12))
            (draw-graph-wire (fx fy tx ty red green blue)
              ;; Wires leave the bottom of a node and enter the top of the
