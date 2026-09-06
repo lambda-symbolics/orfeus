@@ -1471,7 +1471,9 @@ new cache entry is published."
            ;; *CROP-ASPECT-CHOICES*. An editing mode, not a render parameter:
            ;; the rectangle itself is what the graph stores and what the render
            ;; needs, and the lock only governs how a drag reshapes it.
-           (crop-aspect nil)
+           ;; The proportions a crop keeps while it is dragged. The frame's own
+           ;; by default: most crops trim a picture rather than reshape it.
+           (crop-aspect :original)
            curve-canvas curve-drag scope-canvas
            (curve-channel :master-points)
            (curve-channel-buttons '())
@@ -3809,7 +3811,7 @@ new cache entry is published."
                               (lambda ()
                                 (gui-model-set-node-params
                                  model node (default-crop-params))
-                                (setf crop-aspect nil)
+                                (setf crop-aspect :original)
                                 (after-graph-edit "Crop reset")))))
                 (when (member kind '(:color-subtract :negative))
                   (list (cons "-" nil)
@@ -7765,7 +7767,7 @@ new cache entry is published."
                              ;; the picture cannot be grabbed to start with.
                              (gui-model-set-node-params
                               model node (default-crop-params))
-                             (setf crop-aspect nil)
+                             (setf crop-aspect :original)
                              (after-graph-edit "Crop reset")))))
             12 204 :fill 26 :page)
            (register-inspector
