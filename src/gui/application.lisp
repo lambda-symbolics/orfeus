@@ -1429,11 +1429,12 @@ new cache entry is published."
            render-stage
            (render-stage-fraction 0.0)
            (photo-groups (make-hash-table :test #'eq))
-           ;; Which bursts the photographer has opened. Stored the way round
-           ;; that makes closed the default without a pass to close them:
-           ;; absence is closed, so a burst that has only just been discovered
-           ;; is already folded when it first draws.
-           (expanded-bursts (make-hash-table :test #'eq))
+           ;; Which bursts the photographer has folded. Stored the way round
+           ;; that makes open the default without a pass to open them: absence
+           ;; is open, so a burst that has only just been discovered shows every
+           ;; frame when it first draws, and culling with the arrows walks
+           ;; through the frames instead of over them.
+           (collapsed-bursts (make-hash-table :test #'eq))
            ;; Photograph -> focus report, from a background pass of its own.
            ;; Measuring means developing the frame, so this arrives slowly and
            ;; the filmstrip draws whatever has arrived.
@@ -2790,7 +2791,7 @@ new cache entry is published."
              (let ((place (photo-group-of job)))
                (and place (eql 0 (second place)) (> (third place) 1))))
            (burst-collapsed-p (job)
-             (and (burst-leader-p job) (not (gethash job expanded-bursts))))
+             (and (burst-leader-p job) (gethash job collapsed-bursts)))
            (thumbnail-display-rows ()
              ;; What the filmstrip actually shows: one entry per drawn row,
              ;; (INDICES . LEADER), where INDICES are places in the project and
@@ -2822,16 +2823,16 @@ new cache entry is published."
                           (t (push (cons (list index) nil) rows))))
                (nreverse rows)))
            (toggle-burst (leader)
-             (if (gethash leader expanded-bursts)
-                 (remhash leader expanded-bursts)
-                 (setf (gethash leader expanded-bursts) t))
+             (if (gethash leader collapsed-bursts)
+                 (remhash leader collapsed-bursts)
+                 (setf (gethash leader collapsed-bursts) t))
              (redraw-thumbnails))
            (set-bursts-expanded (expanded-p)
-             (clrhash expanded-bursts)
-             (when expanded-p
+             (clrhash collapsed-bursts)
+             (unless expanded-p
                (dolist (job (project-photos project))
                  (when (burst-leader-p job)
-                   (setf (gethash job expanded-bursts) t))))
+                   (setf (gethash job collapsed-bursts) t))))
              (redraw-thumbnails)
              (set-status (if expanded-p "Bursts expanded" "Bursts collapsed")))
            (photo-focus-of (job) (gethash job photo-focus-reports))
@@ -4917,7 +4918,7 @@ new cache entry is published."
                                   (let ((leader (nth (- index (second place))
                                                      photos)))
                                     (when (and leader (burst-leader-p leader))
-                                      (setf (gethash leader expanded-bursts) t)))))
+                                      (remhash leader collapsed-bursts)))))
                      ;; A selection the interface built for the photographer
                      ;; is theirs to walk past with the arrows, like one they
                      ;; marked out by hand.
