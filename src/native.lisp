@@ -202,6 +202,15 @@ returns at once, so a caller can spend it during startup instead."
   (error-buffer :pointer)
   (error-capacity :size))
 
+(defcfun ("orfeus_embedded_preview_v1" %embedded-preview-v1) :int32
+  (input-path :string)
+  (output-path :string)
+  (max-edge :uint32)
+  (quality :uint32)
+  (results :pointer)
+  (error-buffer :pointer)
+  (error-capacity :size))
+
 (defcfun ("orfeus_analyze_level_v1" %analyze-level-v1) :int32
   (input-path :string)
   (cache-mode :uint32)
@@ -252,6 +261,40 @@ the straightening angle in degrees for a crop node."
                 (loop for index from 4 below 7
                       collect (mem-aref results :float index))
                 (mem-aref results :float 7))))))
+
+(defun photo-embedded-preview (input-pathname output-pathname
+                               &key (max-edge 320) (quality 82))
+  "Write the camera's own JPEG preview of INPUT-PATHNAME to OUTPUT-PATHNAME.
+
+No sensor data is developed: the JPEG the camera wrote into the container is
+found, decoded, bounded to MAX-EDGE pixels on its longer side and turned the
+way the file's orientation says, so it stands the way a develop would. Tens of
+milliseconds where a develop is a second; the picture is the camera's
+rendering, not Orfeus's. Returns the written width and height."
+  (native-library-load)
+  (with-foreign-pointer (results (* 2 4))
+    (with-foreign-pointer (error-buffer *native-error-buffer-size*)
+      (let ((status
+              #+sbcl
+              (sb-int:with-float-traps-masked
+                  (:invalid :divide-by-zero :overflow :underflow :inexact)
+                (%embedded-preview-v1
+                 (namestring input-pathname) (namestring output-pathname)
+                 max-edge quality
+                 results error-buffer *native-error-buffer-size*))
+              #-sbcl
+              (%embedded-preview-v1
+               (namestring input-pathname) (namestring output-pathname)
+               max-edge quality
+               results error-buffer *native-error-buffer-size*)))
+        (unless (zerop status)
+          (error 'raw-render-error
+                 :input-pathname input-pathname
+                 :output-pathname output-pathname
+                 :status status
+                 :message (native-error-message error-buffer)))
+        (values (mem-aref results :uint32 0)
+                (mem-aref results :uint32 1))))))
 
 (defun analyze-level (input-pathname &key cache-p)
   "Read the tilt of INPUT-PATHNAME's picture from its own straight edges.

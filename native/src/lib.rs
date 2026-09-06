@@ -31,6 +31,7 @@ use md5::{Digest, Md5};
 
 mod analyze;
 mod demosaic;
+mod embedded;
 mod focus;
 mod color;
 mod gpu;
@@ -1032,6 +1033,45 @@ pub unsafe extern "C" fn orfeus_analyze_negative_frame_v1(
                 frame.angle,
             ];
             ptr::copy_nonoverlapping(values.as_ptr(), results, values.len());
+            Ok(())
+        })
+    }
+}
+
+/// Write the camera's embedded JPEG preview of a RAW file as a thumbnail.
+///
+/// No sensor data is developed: the preview JPEG the camera wrote into the
+/// container is found by its markers, decoded, box-filtered down so its
+/// longer side is at most `max_edge` pixels, turned the way the file's
+/// orientation says, and written to `output_path` as a JPEG of `quality`.
+/// `results`, when non-null, receives the written width and height.
+///
+/// # Safety
+///
+/// `input_path` and `output_path` must be readable NUL-terminated paths,
+/// `results` null or writable for two unsigned integers, and the error
+/// buffer, when non-null, writable for its stated capacity.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn orfeus_embedded_preview_v1(
+    input_path: *const c_char,
+    output_path: *const c_char,
+    max_edge: u32,
+    quality: u32,
+    results: *mut u32,
+    error_buffer: *mut c_char,
+    error_capacity: usize,
+) -> i32 {
+    // SAFETY: Pointer validation and dereferences remain inside the panic boundary.
+    unsafe {
+        ffi_result(error_buffer, error_capacity, || {
+            let input = path_from_c(input_path)?;
+            let output = path_from_c(output_path)?;
+            let quality = u8::try_from(quality.clamp(1, 100)).unwrap_or(82);
+            let (width, height) =
+                embedded::embedded_preview_file(input, output, max_edge, quality)?;
+            if !results.is_null() {
+                ptr::copy_nonoverlapping([width, height].as_ptr(), results, 2);
+            }
             Ok(())
         })
     }

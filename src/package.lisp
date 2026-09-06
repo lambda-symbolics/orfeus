@@ -60,6 +60,7 @@
    #:output-file-exists
    #:photo-capture-description
    #:photo-extract-embedded-preview
+   #:photo-embedded-preview
    #:photo-lens-description
    #:photo-lens-name
    #:photo-camera-make
