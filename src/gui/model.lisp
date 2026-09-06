@@ -11,6 +11,9 @@ renumbering, so the selection stays valid across graph edits."
   ;; True when the selection was made on purpose — Space, control or shift,
   ;; Select All — and so is to be left alone while the cursor walks past it.
   (marked-p nil)
+  ;; The order the filmstrip keeps its photographs in, and whether backwards.
+  (sort-key :capture-time :type (member :capture-time :name :rating))
+  (sort-reverse-p nil)
   (edit-target :photo :type (member :photo :defaults))
   (selected-node nil)
   project-path
@@ -285,6 +288,80 @@ the project is the user's business."
               (if remaining (list next-index) '())
               (gui-model-marked-p model) nil)))
     removed))
+
+(defparameter *photo-sort-keys* '(:capture-time :name :rating)
+  "The orders the filmstrip can be put in.")
+
+(defun sort-photo-jobs (jobs key &key reverse-p
+                                   (seconds (lambda (job)
+                                              (orfeus:photo-capture-seconds
+                                               (photo-job-input-path job))))
+                                   (ratings (lambda (job)
+                                              (orfeus:photo-rating
+                                               (photo-job-input-path job)))))
+  "Return JOBS in the order KEY names, stably, and backwards when REVERSE-P.
+
+:CAPTURE-TIME is when the shutter fired — the order the card was shot in, and
+the one the filmstrip defaults to; photographs whose time is not known come
+last, in name order. :NAME is the card's filename. :RATING puts the stars the
+photographer gave in the camera first, five before one and unrated last, ties
+in capture order. SECONDS and RATINGS read those from a job; the interface
+passes readers over what its background pass already fetched, since reading
+metadata spawns ExifTool the first time."
+  (let ((names (make-hash-table :test #'eq))
+        (times (make-hash-table :test #'eq))
+        (stars (make-hash-table :test #'eq)))
+    (dolist (job jobs)
+      (let ((input (photo-job-input-path job)))
+        (setf (gethash job names)
+              (string-downcase (or (ignore-errors (orfeus:photo-display-stem input))
+                                   (pathname-name input)
+                                   ""))
+              (gethash job times) (ignore-errors (funcall seconds job))
+              (gethash job stars) (and (eq key :rating)
+                                       (ignore-errors (funcall ratings job))))))
+    (labels ((name-before-p (a b)
+               (string< (gethash a names) (gethash b names)))
+             (time-before-p (a b)
+               (let ((ta (gethash a times))
+                     (tb (gethash b times)))
+                 (cond ((and ta tb)
+                        (or (< ta tb) (and (= ta tb) (name-before-p a b))))
+                       (ta t)
+                       (tb nil)
+                       (t (name-before-p a b)))))
+             (rating-before-p (a b)
+               (let ((ra (or (gethash a stars) 0))
+                     (rb (or (gethash b stars) 0)))
+                 (or (> ra rb) (and (= ra rb) (time-before-p a b))))))
+      (let ((sorted (stable-sort (copy-list jobs)
+                                 (ecase key
+                                   (:capture-time #'time-before-p)
+                                   (:name #'name-before-p)
+                                   (:rating #'rating-before-p)))))
+        (if reverse-p (nreverse sorted) sorted)))))
+
+(defun gui-model-reorder-photos (model jobs &key (checkpoint t))
+  "Put MODEL's photographs in the order of JOBS, a permutation of them, with the
+cursor and the selection staying on the photographs they were on. Returns true
+when the order changed. CHECKPOINT nil is for an order the interface imposes
+on the photographer's behalf, which is not theirs to undo."
+  (let* ((project (gui-model-project model))
+         (photos (project-photos project)))
+    (unless (or (equal jobs photos)
+                (/= (length jobs) (length photos))
+                (set-difference jobs photos :test #'eq)
+                (set-difference photos jobs :test #'eq))
+      (let ((cursor (nth (gui-model-selected-index model) photos))
+            (selected (gui-model-selected-jobs model)))
+        (when checkpoint
+          (gui-model-checkpoint model))
+        (setf (project-photos project) jobs)
+        (gui-model-set-selected-indices
+         model (mapcar (lambda (job) (position job jobs :test #'eq)) selected))
+        (when cursor
+          (setf (gui-model-selected-index model) (position cursor jobs :test #'eq)))
+        t))))
 
 (defun gui-model-move-cursor (model index &optional (row-indices (list index)))
   "Put the preview on photograph INDEX without disturbing a selection made on

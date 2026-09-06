@@ -337,6 +337,70 @@ the last mark out hands the selection back to the cursor."
     (check (equal '(2 3) (orfeus/gui::gui-model-selected-indices model))
            "Marking a folded row did not select every frame of it")))
 
+(defun test-photographs-sort-and-keep-their-places ()
+  "The filmstrip sorts by capture time, name or rating, defaulting to the order
+the card was shot in, and a sort leaves the cursor and the marks on the
+photographs they were on."
+  (let* ((photos (loop for name in '("c3" "c1" "c2" "c0")
+                       collect (orfeus:make-photo-job
+                                :input-path (make-pathname :name name
+                                                           :type "orf"))))
+         (project (orfeus:make-project :output-directory #P"exports/"
+                                       :photos photos))
+         (model (orfeus/gui:make-gui-model :project project))
+         ;; c3 was shot last, c1 first, c2 between; c0's time is unknown.
+         (times (let ((table (make-hash-table :test #'eq)))
+                  (setf (gethash (first photos) table) 300
+                        (gethash (second photos) table) 100
+                        (gethash (third photos) table) 200)
+                  table))
+         (seconds (lambda (job) (gethash job times)))
+         ;; Stars: c3 none, c1 one, c2 two, c0 three.
+         (ratings (lambda (job) (let ((stars (position job photos)))
+                                  (and (plusp stars) stars)))))
+    (flet ((stems (jobs)
+             (mapcar (lambda (job) (pathname-name (orfeus:photo-job-input-path job)))
+                     jobs)))
+      (check (equal '("c0" "c1" "c2" "c3")
+                    (stems (orfeus/gui::sort-photo-jobs photos :name)))
+             "Sorting by name did not order the names")
+      (check (equal '("c1" "c2" "c3" "c0")
+                    (stems (orfeus/gui::sort-photo-jobs photos :capture-time
+                                                        :seconds seconds)))
+             "Sorting by capture time did not put the unknown time last")
+      (check (equal '("c0" "c3" "c2" "c1")
+                    (stems (orfeus/gui::sort-photo-jobs photos :capture-time
+                                                        :seconds seconds
+                                                        :reverse-p t)))
+             "Reversing did not reverse the whole order")
+      (check (equal '("c0" "c2" "c1" "c3")
+                    (stems (orfeus/gui::sort-photo-jobs photos :rating
+                                                        :seconds seconds
+                                                        :ratings ratings)))
+             "Sorting by rating did not put the most stars first")
+      (check (eq :capture-time (orfeus/gui::gui-model-sort-key model))
+             "The filmstrip does not default to capture order")
+      ;; Cursor on c2, marked; cursor walks to c3; then the project is sorted
+      ;; by name. Both stay on their photographs.
+      (orfeus/gui::gui-model-move-cursor model 2)
+      (orfeus/gui::gui-model-toggle-mark model)
+      (orfeus/gui::gui-model-move-cursor model 0)
+      (check (orfeus/gui::gui-model-reorder-photos
+              model (orfeus/gui::sort-photo-jobs photos :name))
+             "Reordering reported no change")
+      (check (equal '("c0" "c1" "c2" "c3") (stems (orfeus:project-photos project)))
+             "The project did not take the sorted order")
+      (check (= 3 (orfeus/gui::gui-model-selected-index model))
+             "The cursor did not follow its photograph")
+      (check (equal '(2) (orfeus/gui::gui-model-selected-indices model))
+             "The mark did not follow its photograph")
+      (check (not (orfeus/gui::gui-model-reorder-photos
+                   model (orfeus:project-photos project)))
+             "Reordering into the same order reported a change")
+      (check (not (orfeus/gui::gui-model-reorder-photos
+                   model (rest (orfeus:project-photos project))))
+             "Reordering accepted a list that was not a permutation"))))
+
 (defun test-export-destination-anchor ()
   "Exports go beside the photographs until a project says otherwise.
 
@@ -1744,6 +1808,7 @@ would silently ignore whatever the Destination field said."
   (test-model-settings)
   (test-lens-profile-setting-reaches-the-optics-node)
   (test-cursor-walks-past-a-marked-selection)
+  (test-photographs-sort-and-keep-their-places)
   (test-modified-flag)
   (test-undo-history)
   (test-graph-node-placement)

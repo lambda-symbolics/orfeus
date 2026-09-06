@@ -1449,6 +1449,12 @@ new cache entry is published."
            (graph-scroll-x 0)
            (graph-scroll-y 0)
            pick-color-node crop-drag node-drag
+           ;; A sort waiting for the next pass over the photographs' metadata:
+           ;; :AUTOMATIC when the photographs have just arrived and take the
+           ;; default order, :CHOSEN when the photographer asked from the menu.
+           (pending-sort (and (null initial-path)
+                              (project-photos initial-project)
+                              :automatic))
            (node-click (cons 0 nil))
            grade-clipboard
            inspector tabs node-page export-page
@@ -4792,26 +4798,72 @@ new cache entry is published."
                              (maphash (lambda (job path)
                                         (setf (gethash job copy) path))
                                       thumbnail-files)
-                             copy)))
+                             copy))
+                   (sorting pending-sort)
+                   (key (gui-model-sort-key model))
+                   (reverse-p (gui-model-sort-reverse-p model)))
                (enqueue-gui-task
                 background-queue :groups
                 (lambda ()
-                  (let ((entries
-                          (mapcar
-                           (lambda (job)
-                             (let ((input (photo-job-input-path job))
-                                   (thumb (gethash job thumbs)))
-                               (list job
-                                     (ignore-errors
-                                       (orfeus:photo-capture-seconds input))
-                                     (and thumb
-                                          (ignore-errors
-                                            (orfeus:photo-signature thumb))))))
-                           jobs)))
+                  (let* ((entries
+                           (mapcar
+                            (lambda (job)
+                              (let ((input (photo-job-input-path job))
+                                    (thumb (gethash job thumbs)))
+                                (list job
+                                      (ignore-errors
+                                        (orfeus:photo-capture-seconds input))
+                                      (and thumb
+                                           (ignore-errors
+                                             (orfeus:photo-signature thumb))))))
+                            jobs))
+                         ;; The same pass that reads every capture time is
+                         ;; the one to sort by them: the bursts are then found
+                         ;; in the order the filmstrip will show, which for a
+                         ;; card shot in sequence is the only order they are
+                         ;; consecutive in.
+                         (order (when sorting
+                                  (sort-photo-jobs
+                                   jobs key
+                                   :reverse-p reverse-p
+                                   :seconds (lambda (job) (second (assoc job entries))))))
+                         (entries (if order
+                                      (mapcar (lambda (job) (assoc job entries)) order)
+                                      entries)))
                     (queue-event queue
                                  (list :photo-groups
                                        (orfeus:group-index-of
-                                        (orfeus:group-captures entries)))))))))
+                                        (orfeus:group-captures entries))
+                                       order
+                                       sorting)))))))
+           (sort-photos (key)
+             (setf (gui-model-sort-key model) key
+                   pending-sort :chosen)
+             (refresh-photo-groups))
+           (reverse-photo-order ()
+             (setf (gui-model-sort-reverse-p model)
+                   (not (gui-model-sort-reverse-p model))
+                   pending-sort :chosen)
+             (refresh-photo-groups))
+           (apply-photo-order (order how)
+             ;; The order the background pass arrived at, put on the project
+             ;; with the cursor and the marks staying on their photographs.
+             ;; An order the photographer asked for is theirs to undo; the
+             ;; default one a fresh card takes is not an edit.
+             (when (gui-model-reorder-photos model order
+                                             :checkpoint (eq how :chosen))
+               (setf thumbnail-anchor (current-photo-row))
+               (sync-window-title))
+             (when (eq how :chosen)
+               (set-status
+                (format nil "Sorted by ~A~:[~;, newest first~]"
+                        (ecase (gui-model-sort-key model)
+                          (:capture-time "capture time")
+                          (:name "name")
+                          (:rating "rating"))
+                        (gui-model-sort-reverse-p model))))
+             (when (eq pending-sort how)
+               (setf pending-sort nil)))
            (refresh-photo-focus (&key then)
              ;; Measuring focus develops the frame, which is half a second
              ;; each, so this runs on a thread of its own rather than on the
@@ -4926,6 +4978,10 @@ new cache entry is published."
                          (when graph-canvas (lightfast:redraw graph-canvas))
                          (redraw-thumbnails)
                          (schedule-initial-preview)
+                         ;; New arrivals take the filmstrip's order once
+                         ;; their capture times have been read.
+                         (setf pending-sort :automatic)
+                         (refresh-photo-groups)
                          (set-status (format nil "Added ~D photograph~:P" count)))
                        (set-status "All selected photographs are already in the project"))))))
            (remove-selected-photo ()
@@ -6466,6 +6522,8 @@ new cache entry is published."
                     (refresh-photo-groups)
                     (redraw-thumbnails)))
                  (:photo-groups
+                  (when (third event)
+                    (apply-photo-order (third event) (fourth event)))
                   (setf photo-groups (second event))
                   (redraw-thumbnails))
                  (:render-stage
@@ -6753,6 +6811,24 @@ new cache entry is published."
                                  (lambda (&rest ignored)
                                    (declare (ignore ignored))
                                    (set-bursts-expanded nil)))
+        ;; The filmstrip's order. FLTK keeps the bullet and the tick itself
+        ;; when an item is picked; the bullet starts on the order in force.
+        (loop for (path key) in '(("&View/Sort Photos/By Capture Time" :capture-time)
+                                  ("&View/Sort Photos/By Name" :name)
+                                  ("&View/Sort Photos/By Rating" :rating))
+              do (let ((key key))
+                   (lightfast:add-menu-item
+                    menu path
+                    (lambda (&rest ignored)
+                      (declare (ignore ignored))
+                      (sort-photos key))
+                    :radio t
+                    :checked (eq key (gui-model-sort-key model)))))
+        (lightfast:add-menu-item menu "&View/Sort Photos/Reverse Order"
+                                 (lambda (&rest ignored)
+                                   (declare (ignore ignored))
+                                   (reverse-photo-order))
+                                 :toggle t)
         (lightfast:add-menu-item menu "&Process/Grab Still"
                                (lambda (&rest ignored)
                                  (declare (ignore ignored))
