@@ -1525,6 +1525,8 @@ new cache entry is published."
            export-dialog-metadata export-dialog-timestamp
            lens-profile-label fringing-source-choice lens-picker lens-picker-caption
            lens-picker-search lens-picker-list lens-picker-focal
+           ;; Orfeus's own file dialog, built the first time it is asked for.
+           photo-picker
            lens-picker-remember lens-picker-records
            gallery-canvas gallery-title preset-name-input
            preset-apply-button preset-save-button
@@ -1564,6 +1566,8 @@ new cache entry is published."
            preview-native-p preview-one-to-one-pending-p)
       (labels
           ((picker-preset ()
+             ;; The folder the project dialogs open in: where photographs were
+             ;; last picked from, since projects tend to live beside them.
              (namestring picker-directory))
            (remember-picked-path (path)
              (when path
@@ -5049,21 +5053,29 @@ new cache entry is published."
              (if (selected-job)
                  (schedule-initial-preview)
                  (set-status "Open a photograph or project to begin")))
-           (choose-photos (title)
-             (choose-photo-files
-              :title title
-              :filter (fltk-file-filter
-                       "RAW photographs" "*.{orf,ORF,dng,DNG}")
-              :preset-path (picker-preset)))
+           (choose-photos (title continuation &key (accept-label "Add"))
+             ;; Orfeus's own picker: the camera's previews in a grid, a stash
+             ;; built across as many folders as it takes, and the last folder
+             ;; remembered. It reports through CONTINUATION when the
+             ;; photographer accepts, and not at all otherwise.
+             (unless photo-picker
+               (setf photo-picker (make-photo-picker :owner window :queue queue)))
+             (photo-picker-open photo-picker
+                                :title title
+                                :directory picker-directory
+                                :accept-label accept-label
+                                :on-pick (lambda (paths)
+                                           (remember-picked-path (first paths))
+                                           (funcall continuation paths))))
            (open-photo ()
-             (let ((paths (choose-photos "Open RAW photographs")))
-               (when paths
-                 (remember-picked-path (first paths))
-                 (replace-project (gui-photos-project paths)))))
+             (choose-photos "Open RAW photographs"
+                            (lambda (paths)
+                              (replace-project (gui-photos-project paths)))
+                            :accept-label "Open"))
            (add-photos ()
-             (let ((paths (choose-photos "Add RAW photographs to project")))
-               (when paths
-                 (remember-picked-path (first paths))
+             (choose-photos
+              "Add RAW photographs to project"
+              (lambda (paths)
                  (multiple-value-bind (count first-index)
                      (gui-model-add-photos model paths)
                    (if (plusp count)
@@ -6636,6 +6648,12 @@ new cache entry is published."
                   (when (or (null (second event))
                             (= (second event) preview-generation))
                     (set-status (third event))))
+                 ;; (:call function): work a background thread finished and
+                 ;; wants applied on the interface thread, which is the only
+                 ;; one allowed to touch widgets. The file picker's previews
+                 ;; arrive this way.
+                 (:call
+                  (funcall (second event)))
                  (:preview
                   (when (gui-preview-event-current-p model event preview-generation)
                     (publish-preview (fifth event) (sixth event) (second event)

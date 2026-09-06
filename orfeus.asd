@@ -43,6 +43,7 @@
                              (:file "model")
                              (:file "queue")
                              (:file "preview")
+                             (:file "picker")
                              (:file "application")))))
 
 (asdf:defsystem #:orfeus/gui-tests
