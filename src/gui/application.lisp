@@ -1172,6 +1172,18 @@ rendered again on demand, so the cache still ends up rebuilt."
                     :max-height *thumbnail-preview-size*
                     :jpeg-quality 82))
 
+(defun camera-thumbnail-pathname (preview-directory content-key)
+  "Where the camera's own preview of a photograph is kept as a thumbnail.
+
+Keyed by the file's content like the developed thumbnail, and by the size it
+was bounded to; a different name so that both can sit in the cache and the
+developed one is not mistaken for the camera's."
+  (merge-pathnames
+   (make-pathname :name (format nil "camera-~A-~D" content-key
+                                *thumbnail-preview-size*)
+                  :type "jpg")
+   preview-directory))
+
 (defun preview-lock-directory (pathname)
   (pathname (format nil "~A.lock/" (namestring pathname))))
 
@@ -1426,6 +1438,9 @@ new cache entry is published."
            (lens-cache (make-hash-table :test #'eq))
            (capture-cache (make-hash-table :test #'eq))
            (thumbnail-files (make-hash-table :test #'eq))
+           ;; Photograph -> :camera or :developed, saying which kind of
+           ;; thumbnail THUMBNAIL-FILES holds for it.
+           (thumbnail-grades (make-hash-table :test #'eq))
            ;; Photograph -> (burst number, place in it, how many): filled in
            ;; from a background pass, because reading capture times is a
            ;; subprocess per photograph and the filmstrip has to keep drawing.
@@ -3261,6 +3276,7 @@ new cache entry is published."
                (clear-previews)
                (clear-preview-cache)
                (clrhash thumbnail-files)
+               (clrhash thumbnail-grades)
                (clrhash gallery-thumbs)
                (clrhash photo-groups)
                (refresh-gallery)
@@ -5017,6 +5033,7 @@ new cache entry is published."
                    thumbnail-scroll 0
                    thumbnail-anchor 0)
              (clrhash thumbnail-files)
+             (clrhash thumbnail-grades)
              (clrhash gallery-thumbs)
              (setf gallery-selected nil
                    gallery-scroll 0
@@ -5072,7 +5089,8 @@ new cache entry is published."
                  (dolist (job removed)
                    (remhash job lens-cache)
                    (remhash job capture-cache)
-                   (remhash job thumbnail-files))
+                   (remhash job thumbnail-files)
+                   (remhash job thumbnail-grades))
                  (clear-previews)
                  (sync-controls)
                  (sync-node-tools)
@@ -5304,7 +5322,35 @@ new cache entry is published."
                                               render-started))
                                  internal-time-units-per-second))))))
                 :front-p front-p :generation generation)))
+           (enqueue-camera-thumbnail (job generation)
+             ;; The camera's own JPEG, lifted out of the file in a few tens
+             ;; of milliseconds, stands in until the develop is done: a card
+             ;; of five hundred frames used to be a wall of grey squares for
+             ;; minutes. Ahead of every develop in the queue, and no error is
+             ;; reported — a file without a preview simply waits for its
+             ;; develop like before.
+             (enqueue-gui-task
+              background-queue :camera-thumbnail
+              (lambda ()
+                (ignore-errors
+                  (let* ((digest (photo-content-key-for job generation))
+                         (output (camera-thumbnail-pathname preview-directory
+                                                            digest)))
+                    (call-with-preview-cache-fill
+                     output
+                     (lambda (temporary)
+                       (orfeus:photo-embedded-preview
+                        (photo-job-input-path job) temporary
+                        :max-edge *thumbnail-preview-size* :quality 82)))
+                    (let ((display (materialize-preview-cache-hit
+                                    output preview-session-directory)))
+                      (when display
+                        (queue-event queue
+                                     (list :thumbnail generation job display
+                                           :camera)))))))
+              :front-p t :generation generation))
            (enqueue-thumbnail (job generation)
+             (enqueue-camera-thumbnail job generation)
              (enqueue-gui-task
               background-queue :thumbnail
               (lambda ()
@@ -5339,7 +5385,7 @@ new cache entry is published."
                                      (when display
                                        (queue-event queue
                                                     (list :thumbnail generation job
-                                                          display))))
+                                                          display :developed))))
                                    (return))
                                (error (condition)
                                  (when (= attempt 2) (error condition)))))
@@ -6622,14 +6668,24 @@ new cache entry is published."
                         (when scope-canvas (lightfast:redraw scope-canvas)))
                       (cffi:foreign-free (fifth event))))
                  (:thumbnail
-                  (when (and (member (third event) (project-photos project) :test #'eq)
-                             (null (gethash (third event) thumbnail-files)))
-                    (setf (gethash (third event) thumbnail-files) (fourth event))
-                    ;; A thumbnail is also the first time this photograph can be
-                    ;; compared with its neighbours, so the bursts are worth
-                    ;; asking about again.
-                    (refresh-photo-groups)
-                    (redraw-thumbnails)))
+                  (destructuring-bind (generation job display
+                                       &optional (grade :developed))
+                      (rest event)
+                    (declare (ignore generation))
+                    (when (and (member job (project-photos project) :test #'eq)
+                               ;; The camera's preview stands in only while
+                               ;; there is nothing; the develop replaces it.
+                               (or (null (gethash job thumbnail-files))
+                                   (and (eq grade :developed)
+                                        (not (eq :developed
+                                                 (gethash job thumbnail-grades))))))
+                      (setf (gethash job thumbnail-files) display
+                            (gethash job thumbnail-grades) grade)
+                      ;; A thumbnail is also the first time this photograph can
+                      ;; be compared with its neighbours, so the bursts are worth
+                      ;; asking about again.
+                      (refresh-photo-groups)
+                      (redraw-thumbnails))))
                  (:photo-groups
                   (when (third event)
                     (apply-photo-order (third event) (fourth event)))
