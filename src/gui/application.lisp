@@ -310,6 +310,13 @@ the same reason.")
 (defparameter *left-sidebar-initial-width* 260
   "Preferred initial width of the photo and stills sidebar.")
 
+(defparameter *right-sidebar-min-width* 320
+  "Minimum width of the Node panel and graph sidebar.
+
+Wide enough for a caption, a slider and a spinner side by side with room to
+spare; the controls that used to hang out of a narrower column now follow its
+width, but a spinner cannot shrink below its digits.")
+
 (defparameter *thumbnail-selection-gutter* 28
   "Width reserved for the visible multi-selection checkbox in each photo row.")
 
@@ -6100,7 +6107,7 @@ new cache entry is published."
                                                   :x 204 :y top
                                                   :width 100 :height 90
                                                   :label "")
-                              204 top 100 90 :page)))
+                              204 top '(:rest 100) 90 :page)))
                  (lightfast:set-box swatch lightfast:+box-flat-box+)
                  (lightfast:set-tooltip swatch tooltip)
                  (base-button (+ top 96) "Sample Base From Photo" :dropper
@@ -6359,14 +6366,41 @@ new cache entry is published."
                    (let* ((basis-width (if (eq basis :page)
                                            (- right 12)
                                            right))
+                          ;; Widths that follow the page rather than the
+                          ;; designer: a control that stopped at a fixed pixel
+                          ;; hung out of a narrowed sidebar. Numbers stay as
+                          ;; they are; the keywords and lists are measured
+                          ;; from the page's 12-pixel margins.
                           (item-width
-                            (case width-mode
-                              (:scope-control (max 100 (- right 98)))
-                              (:control (max 100 (- basis-width 118)))
-                              (:frame (max 120 (- basis-width 8)))
-                              (:fill (max 100 (- basis-width 24)))
-                              (otherwise width-mode)))
-                          (item-x x)
+                            (cond
+                              ((eq width-mode :scope-control)
+                               (max 100 (- right 98)))
+                              ((eq width-mode :control)
+                               (max 100 (- basis-width 118)))
+                              ((eq width-mode :frame) (max 120 (- basis-width 8)))
+                              ((eq width-mode :fill) (max 100 (- basis-width 24)))
+                              ;; (:rest LIMIT): from X to the right margin, at
+                              ;; most LIMIT wide.
+                              ((and (consp width-mode) (eq (first width-mode) :rest))
+                               (max 24 (min (second width-mode)
+                                            (- basis-width 12 x))))
+                              ;; (:before WIDTH): from X up to a right-anchored
+                              ;; neighbour WIDTH wide, a gap between.
+                              ((and (consp width-mode) (eq (first width-mode) :before))
+                               (max 60 (- basis-width 12 (second width-mode) 8 x)))
+                              ;; (:share N): one of N equal columns with gaps.
+                              ((and (consp width-mode) (eq (first width-mode) :share))
+                               (max 40 (floor (- basis-width 24
+                                                 (* 8 (1- (second width-mode))))
+                                              (second width-mode))))
+                              (t width-mode)))
+                          (item-x (cond
+                                    ;; Against the right margin.
+                                    ((eq x :right) (- basis-width 12 item-width))
+                                    ;; (:column I) of a (:share N) row.
+                                    ((and (consp x) (eq (first x) :column))
+                                     (+ 12 (* (second x) (+ item-width 8))))
+                                    (t x)))
                           (item-y (case y
                                     (:action-row (- main-height 34))
                                     (:chart-row (+ 84 scope-height))
@@ -6418,12 +6452,13 @@ new cache entry is published."
                                     (if layout-initialized-p
                                         (lightfast:widget-width left-column)
                                         *left-sidebar-initial-width*))))
-                    (right (min (max 280 (- width left 300))
+                    (right (min (max *right-sidebar-min-width*
+                                     (- width left 300))
                                 480
-                                (max 280
+                                (max *right-sidebar-min-width*
                                      (if layout-initialized-p
                                          (lightfast:widget-width right-column)
-                                         (floor width 3)))))
+                                         (floor (* width 3) 8)))))
                     (center (- width left right)))
                (when toolbar-bottom-rule
                  (lightfast:resize-widget toolbar-bottom-rule :x 0 :y 38
@@ -7401,7 +7436,7 @@ new cache entry is published."
                            model :chromatic-aberration-correction-p
                            (string/= "0" (lightfast:value widget)))
                           (schedule-edited-preview)))
-                       12 108 170 26 :page)))
+                       12 108 '(:before 110) 26 :page)))
              (lightfast:set-tooltip
               tca "Draw red and blue back onto green where the lens spread them")
              (push (list :chromatic-aberration-correction-p tca)
@@ -7424,7 +7459,7 @@ new cache entry is published."
                          (gui-model-set-setting
                           model :chromatic-aberration-source source)
                          (schedule-edited-preview)))))
-                  190 108 110 26 :page))
+                  :right 108 110 26 :page))
            (lightfast:set-tooltip
             fringing-source-choice
             "Measured: read from this photograph. Lens profile: trust the database entry")
@@ -7452,7 +7487,7 @@ new cache entry is published."
                           (declare (ignore ignored))
                           (open-lens-picker)))
              :search)
-            12 204 140 26 :page)
+            '(:column 0) 204 '(:share 2) 26 :page)
            (register-inspector
             (lightfast:set-stock-icon
              (lightfast:make-button
@@ -7462,7 +7497,7 @@ new cache entry is published."
                           (declare (ignore ignored))
                           (clear-lens-profile)))
              :photo)
-            160 204 140 26 :page)))
+            '(:column 1) 204 '(:share 2) 26 :page)))
         (build-group
          :film
          (lambda ()
@@ -7648,11 +7683,10 @@ new cache entry is published."
         (build-group
          :crop
          (lambda ()
-           (register-inspector
-            (lightfast:make-label :parent node-page :x 12 :y 44
-                                :width 88 :height 26 :label "Angle")
-            12 44 88 26 :page)
-           (let ((angle-callback
+           (let ((angle-label
+                   (lightfast:make-label :parent node-page :x 12 :y 44
+                                         :width 88 :height 26 :label "Angle"))
+                 (angle-callback
                    (lambda (widget event value)
                      (declare (ignore event value))
                      (let ((node (crop-editing-node)))
@@ -7669,23 +7703,23 @@ new cache entry is published."
              ;; A slider as well as a number: levelling a horizon is a thing
              ;; you nudge until it looks right, not a figure anybody knows in
              ;; advance.
-             (let ((slider (register-inspector
-                            (lightfast:make-slider
-                             :parent node-page :x 110 :y 44
-                             :width 84 :height 26 :callback angle-callback)
-                            110 44 84 26 :page)))
+             (let ((slider (lightfast:make-slider
+                            :parent node-page :x 110 :y 44
+                            :width 84 :height 26 :callback angle-callback)))
                (lightfast:set-range slider -45 45)
                (lightfast:set-step slider 0.1)
-               (push (list :crop-angle slider) crop-angle-controls))
-             (setf crop-angle-input
-                   (register-inspector
-                    (lightfast:make-spinner
-                     :parent node-page :x 202 :y 44 :width 78 :height 26
-                     :callback angle-callback)
-                    202 44 78 26 :page))
-             (lightfast:set-range crop-angle-input -45 45)
-             (lightfast:set-step crop-angle-input 0.1)
-             (push (list :crop-angle crop-angle-input) crop-angle-controls))
+               (push (list :crop-angle slider) crop-angle-controls)
+               (setf crop-angle-input
+                     (lightfast:make-spinner
+                      :parent node-page :x 202 :y 44 :width 78 :height 26
+                      :callback angle-callback))
+               (lightfast:set-range crop-angle-input -45 45)
+               (lightfast:set-step crop-angle-input 0.1)
+               (push (list :crop-angle crop-angle-input) crop-angle-controls)
+               (register-inspector-row
+                (number-field-layout angle-label slider crop-angle-input)
+                (list angle-label slider crop-angle-input)
+                node-page 12 44 26 :page)))
            (let ((aspect-field
                    (lightfast:make-labeled-choice
                     :parent node-page :x 12 :y 76 :width 292 :height 26
@@ -7888,7 +7922,8 @@ new cache entry is published."
                                  :min-width 180 :max-width 420)
         (lightfast:tile-size-range main-tile center-pane :min-width 300)
         (lightfast:tile-size-range main-tile right-column
-                                 :min-width 280 :max-width 480)
+                                 :min-width *right-sidebar-min-width*
+                                 :max-width 480)
         (lightfast:tile-size-range left-column filmstrip-pane :min-height 140)
         (lightfast:tile-size-range left-column gallery-pane :min-height 140)
         (lightfast:tile-size-range right-column inspector
