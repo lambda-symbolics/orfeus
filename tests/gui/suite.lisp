@@ -286,6 +286,57 @@
       (check (eq (first photos) (orfeus/gui:gui-model-selected-job model))
              "Restoring the anchor did not keep the previewed photograph"))))
 
+(defun test-cursor-walks-past-a-marked-selection ()
+  "Arrow keys move the preview; Space builds a selection the arrows respect.
+
+Culling is arrows and Space: walk the filmstrip, press Space on each keeper.
+A plain selection follows the cursor as a list's would, but once a photograph
+has been marked the selection stays put while the cursor walks on, and taking
+the last mark out hands the selection back to the cursor."
+  (let* ((photos (loop for index below 4
+                       collect (orfeus:make-photo-job
+                                :input-path (make-pathname
+                                             :name (format nil "c~D" index)
+                                             :type "orf"))))
+         (project (orfeus:make-project :output-directory #P"exports/"
+                                       :photos photos))
+         (model (orfeus/gui:make-gui-model :project project)))
+    (orfeus/gui::gui-model-move-cursor model 1)
+    (check (equal '(1) (orfeus/gui::gui-model-selected-indices model))
+           "A plain selection did not follow the cursor")
+    (check (eq :marked (orfeus/gui::gui-model-toggle-mark model))
+           "Space did not mark the photograph on view")
+    (orfeus/gui::gui-model-move-cursor model 3)
+    (check (equal '(1) (orfeus/gui::gui-model-selected-indices model))
+           "Moving the cursor disturbed the marked selection")
+    (check (= 3 (orfeus/gui::gui-model-selected-index model))
+           "The cursor did not move past the marked photograph")
+    (check (eq :marked (orfeus/gui::gui-model-toggle-mark model))
+           "Space did not add a second photograph")
+    (check (equal '(1 3) (orfeus/gui::gui-model-selected-indices model))
+           "The second mark was not added to the first")
+    (check (eq :unmarked (orfeus/gui::gui-model-toggle-mark model))
+           "Space did not take the photograph out again")
+    (check (equal '(1) (orfeus/gui::gui-model-selected-indices model))
+           "Unmarking removed the wrong photograph")
+    (check (= 3 (orfeus/gui::gui-model-selected-index model))
+           "Unmarking moved the cursor")
+    (orfeus/gui::gui-model-move-cursor model 1)
+    (check (eq :unmarked (orfeus/gui::gui-model-toggle-mark model))
+           "The last mark did not come out")
+    (check (and (equal '(1) (orfeus/gui::gui-model-selected-indices model))
+                (not (orfeus/gui::gui-model-marked-p model)))
+           "An empty selection did not fall back to the cursor")
+    (orfeus/gui::gui-model-move-cursor model 2)
+    (check (equal '(2) (orfeus/gui::gui-model-selected-indices model))
+           "The selection did not follow the cursor again")
+    ;; A folded burst is one row for several photographs: the cursor's row
+    ;; marks and unmarks all of them together.
+    (check (eq :marked (orfeus/gui::gui-model-toggle-mark model '(2 3)))
+           "Marking a folded row did not mark it")
+    (check (equal '(2 3) (orfeus/gui::gui-model-selected-indices model))
+           "Marking a folded row did not select every frame of it")))
+
 (defun test-export-destination-anchor ()
   "Exports go beside the photographs until a project says otherwise.
 
@@ -1692,6 +1743,7 @@ would silently ignore whatever the Destination field said."
   (test-lightfast-root-layout-and-export-validation)
   (test-model-settings)
   (test-lens-profile-setting-reaches-the-optics-node)
+  (test-cursor-walks-past-a-marked-selection)
   (test-modified-flag)
   (test-undo-history)
   (test-graph-node-placement)

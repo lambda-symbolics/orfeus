@@ -323,6 +323,11 @@ the same reason.")
 (defconstant +key-page-down+ #xff56 "FLTK key code for Page Down.")
 (defconstant +key-home+ #xff50 "FLTK key code for Home.")
 (defconstant +key-end+ #xff57 "FLTK key code for End.")
+(defconstant +key-left+ #xff51 "FLTK key code for the left arrow.")
+(defconstant +key-up+ #xff52 "FLTK key code for the up arrow.")
+(defconstant +key-right+ #xff53 "FLTK key code for the right arrow.")
+(defconstant +key-down+ #xff54 "FLTK key code for the down arrow.")
+(defconstant +key-space+ 32 "FLTK key code for the space bar.")
 (defconstant +key-delete+ #xffff "FLTK key code for Delete.")
 
 (defparameter *fringing-source-choices*
@@ -2906,12 +2911,30 @@ new cache entry is published."
                    (multiple-value-bind (drawn anchor)
                        (thumbnail-selection-after-click
                         chosen row thumbnail-anchor state)
+                     (setf (gui-model-marked-p model)
+                           (logtest (logior +thumbnail-shift-mask+
+                                            +thumbnail-control-mask+)
+                                    state))
                      (apply-thumbnail-selection
                       (sort (loop for place in drawn
                                   append (copy-list (car (nth place rows))))
                             #'<)
                       (first (car entry))
                       anchor))))))
+           (apply-thumbnail-cursor (focus-index anchor)
+             ;; Put the preview on FOCUS-INDEX and leave the selection as the
+             ;; photographer built it: everything APPLY-THUMBNAIL-SELECTION
+             ;; does for the view, and nothing it does to the set.
+             (setf thumbnail-anchor anchor)
+             (gui-model-move-cursor model focus-index)
+             (setf (gui-model-selected-node model) nil
+                   pick-color-node nil)
+             (set-preview-cursor :default)
+             (clear-previews)
+             (sync-controls)
+             (sync-node-tools)
+             (when graph-canvas (lightfast:redraw graph-canvas))
+             (schedule-initial-preview))
            (apply-thumbnail-selection (selection focus-index anchor)
              (setf thumbnail-anchor anchor)
              (gui-model-set-selected-indices model selection)
@@ -2947,9 +2970,12 @@ new cache entry is published."
                (or (position-if (lambda (entry) (member index (car entry)))
                                 (thumbnail-display-rows))
                    0)))
-           (select-photo-row (row)
+           (move-to-photo-row (row)
              ;; Keyboard navigation lands on a drawn row and brings it into
-             ;; view, the way a list does when its selection is moved.
+             ;; view, the way a list does when its cursor is moved. A plain
+             ;; selection follows the cursor; one the photographer marked out
+             ;; with Space, control or shift stays put while the cursor walks
+             ;; past it, so that keepers can be gathered with the arrow keys.
              (let* ((rows (thumbnail-display-rows))
                     (count (length rows)))
                (when (plusp count)
@@ -2959,8 +2985,10 @@ new cache entry is published."
                         (visible (if thumbnail-canvas
                                      (lightfast:widget-height thumbnail-canvas)
                                      0)))
-                   (apply-thumbnail-selection (copy-list (car entry))
-                                              (first (car entry)) row)
+                   (if (gui-model-marked-p model)
+                       (apply-thumbnail-cursor (first (car entry)) row)
+                       (apply-thumbnail-selection (copy-list (car entry))
+                                                  (first (car entry)) row))
                    (cond ((< (* row height) thumbnail-scroll)
                           (setf thumbnail-scroll (* row height)))
                          ((and (plusp visible)
@@ -2976,7 +3004,24 @@ new cache entry is published."
                                          (nth (first (car entry))
                                               (project-photos project))))))))))
            (step-photo (delta)
-             (select-photo-row (+ (current-photo-row) delta)))
+             (move-to-photo-row (+ (current-photo-row) delta)))
+           (toggle-photo-mark ()
+             ;; Space: the photograph on view joins the selection or leaves
+             ;; it again, and the arrow keys then walk on without disturbing
+             ;; the set. Culling is arrows and Space, nothing else.
+             (let* ((rows (thumbnail-display-rows))
+                    (row (current-photo-row))
+                    (entry (nth row rows)))
+               (when entry
+                 (let ((result (gui-model-toggle-mark model
+                                                     (copy-list (car entry)))))
+                   (setf thumbnail-anchor row)
+                   (sync-preset-action-label)
+                   (redraw-thumbnails)
+                   (set-status
+                    (format nil "~:[Taken out of~;Added to~] the selection · ~D selected"
+                            (eq result :marked)
+                            (length (gui-model-selected-indices model))))))))
            (project-title ()
              (let ((path (gui-model-project-path model)))
                (if path (file-namestring path) "Untitled")))
@@ -3007,6 +3052,7 @@ new cache entry is published."
                                   collect index))
                    (current (gui-model-selected-index model)))
                (gui-model-set-selected-indices model indices)
+               (setf (gui-model-marked-p model) (and indices t))
                (when indices
                  (setf (gui-model-selected-index model)
                        (min current (1- (length indices)))
@@ -4820,6 +4866,10 @@ new cache entry is published."
                                                      photos)))
                                     (when (and leader (burst-leader-p leader))
                                       (setf (gethash leader expanded-bursts) t)))))
+                     ;; A selection the interface built for the photographer
+                     ;; is theirs to walk past with the arrows, like one they
+                     ;; marked out by hand.
+                     (setf (gui-model-marked-p model) t)
                      (apply-thumbnail-selection indices (first indices)
                                                 (first indices))
                      (set-status
@@ -6600,30 +6650,48 @@ new cache entry is published."
                                  (declare (ignore ignored))
                                  (remove-selected-photo-with-confirmation))
                                :shortcut +key-delete+)
+        (lightfast:add-menu-item menu "&Edit/Select Photo"
+                               (lambda (&rest ignored)
+                                 (declare (ignore ignored))
+                                 (toggle-photo-mark))
+                               :shortcut +key-space+)
         (lightfast:add-menu-item menu "&Edit/Select All Photos"
                                (lambda (&rest ignored)
                                  (declare (ignore ignored))
                                  (select-all-thumbnails))
                                :shortcut (logior +menu-ctrl+ (char-code #\a)))
+        ;; The arrows walk the filmstrip, as they do any list; the menu names
+        ;; one key per command and the others answer unseen. Page Down and
+        ;; Page Up still work for anyone whose hands learnt them here.
         (lightfast:add-menu-item menu "&Edit/Next Photo"
                                (lambda (&rest ignored)
                                  (declare (ignore ignored))
                                  (step-photo 1))
-                               :shortcut +key-page-down+)
+                               :shortcut +key-right+)
         (lightfast:add-menu-item menu "&Edit/Previous Photo"
                                (lambda (&rest ignored)
                                  (declare (ignore ignored))
                                  (step-photo -1))
-                               :shortcut +key-page-up+)
+                               :shortcut +key-left+)
+        (loop for (path key delta) in `(("&Edit/Next Photo (Down)" ,+key-down+ 1)
+                                        ("&Edit/Next Photo (Page Down)" ,+key-page-down+ 1)
+                                        ("&Edit/Previous Photo (Up)" ,+key-up+ -1)
+                                        ("&Edit/Previous Photo (Page Up)" ,+key-page-up+ -1))
+              do (let ((delta delta))
+                   (lightfast:add-menu-item menu path
+                                            (lambda (&rest ignored)
+                                              (declare (ignore ignored))
+                                              (step-photo delta))
+                                            :shortcut key :hidden t)))
         (lightfast:add-menu-item menu "&Edit/First Photo"
                                (lambda (&rest ignored)
                                  (declare (ignore ignored))
-                                 (select-photo-row 0))
+                                 (move-to-photo-row 0))
                                :shortcut +key-home+)
         (lightfast:add-menu-item menu "&Edit/Last Photo"
                                (lambda (&rest ignored)
                                  (declare (ignore ignored))
-                                 (select-photo-row most-positive-fixnum))
+                                 (move-to-photo-row most-positive-fixnum))
                                :shortcut +key-end+)
         (lightfast:add-menu-item menu "&Edit/Select Blurry Photos"
                                  (lambda (&rest ignored)
@@ -6802,6 +6870,16 @@ new cache entry is published."
                                   (lightfast:draw-color-rgb :red 0 :green 0
                                                             :blue (if all-chosen 128 72))
                                   (lightfast:draw-filled-rect x row-y width row-height))
+                                ;; The cursor: where the arrows are, whatever
+                                ;; the selection is doing. On a selected row it
+                                ;; frames the blue; on an unselected one it is
+                                ;; the only mark of where the preview stands.
+                                (when (member (gui-model-selected-index model) indices)
+                                  (lightfast:draw-color-rgb :red 240 :green 190 :blue 90)
+                                  (lightfast:draw-rect (+ x 2) (+ row-y 2)
+                                                       (- width 4) (- row-height 4))
+                                  (lightfast:draw-rect (+ x 3) (+ row-y 3)
+                                                       (- width 6) (- row-height 6)))
                                 (let ((path (gethash job thumbnail-files)))
                                   (if path
                                       (draw-thumbnail-file widget path

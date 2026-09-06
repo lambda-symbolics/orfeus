@@ -8,6 +8,9 @@ renumbering, so the selection stays valid across graph edits."
   project
   (selected-index 0 :type fixnum)
   (selected-indices '() :type list)
+  ;; True when the selection was made on purpose — Space, control or shift,
+  ;; Select All — and so is to be left alone while the cursor walks past it.
+  (marked-p nil)
   (edit-target :photo :type (member :photo :defaults))
   (selected-node nil)
   project-path
@@ -205,6 +208,7 @@ the project is the user's business."
         (gui-model-selected-index model) 0
         (gui-model-selected-indices model)
         (if (project-photos project) '(0) '())
+        (gui-model-marked-p model) nil
         (gui-model-edit-target model) :photo
         (gui-model-modified-p model) nil)
   (gui-model-clear-history model)
@@ -256,6 +260,7 @@ the project is the user's business."
                             new-inputs))
             (gui-model-selected-index model) first-index
             (gui-model-selected-indices model) (list first-index)
+            (gui-model-marked-p model) nil
             (gui-model-edit-target model) :photo))
     (values (length new-inputs) first-index)))
 
@@ -277,8 +282,55 @@ the project is the user's business."
         (setf (project-photos project) remaining
               (gui-model-selected-index model) next-index
               (gui-model-selected-indices model)
-              (if remaining (list next-index) '()))))
+              (if remaining (list next-index) '())
+              (gui-model-marked-p model) nil)))
     removed))
+
+(defun gui-model-move-cursor (model index &optional (row-indices (list index)))
+  "Put the preview on photograph INDEX without disturbing a selection made on
+purpose.
+
+A plain selection follows the cursor, as a list's does: moving to the next
+photograph selects it and nothing else. One the photographer built — with
+Space, control, shift or Select All — stays where it is while the cursor walks
+past it, which is what lets a set of keepers be gathered with the arrow keys.
+ROW-INDICES are the photographs the cursor's row stands for, several when a
+burst is folded."
+  (let ((count (length (project-photos (gui-model-project model)))))
+    (when (< -1 index count)
+      (unless (gui-model-marked-p model)
+        (gui-model-set-selected-indices model row-indices))
+      (setf (gui-model-selected-index model) index)
+      index)))
+
+(defun gui-model-toggle-mark (model &optional (row-indices
+                                              (list (gui-model-selected-index
+                                                     model))))
+  "Add the cursor's photographs to the selection, or take them out again.
+
+Returns :MARKED or :UNMARKED. The first mark turns whatever was selected into a
+selection made on purpose, so the arrow keys leave it alone from then on; taking
+the last photograph out returns the selection to following the cursor."
+  (let* ((current (gui-model-selected-index model))
+         (selected (gui-model-selected-indices model))
+         (result
+           (cond ((not (gui-model-marked-p model))
+                  (gui-model-set-selected-indices model (union selected row-indices))
+                  (setf (gui-model-marked-p model) t)
+                  :marked)
+                 ((subsetp row-indices selected)
+                  (let ((remaining (set-difference selected row-indices)))
+                    (if remaining
+                        (gui-model-set-selected-indices model remaining)
+                        (progn
+                          (gui-model-set-selected-indices model row-indices)
+                          (setf (gui-model-marked-p model) nil))))
+                  :unmarked)
+                 (t
+                  (gui-model-set-selected-indices model (union selected row-indices))
+                  :marked))))
+    (setf (gui-model-selected-index model) current)
+    result))
 
 (defun gui-model-selected-job (model)
   "Return MODEL's selected photo job, or NIL for an empty project."
