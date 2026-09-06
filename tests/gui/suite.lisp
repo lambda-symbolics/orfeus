@@ -337,6 +337,65 @@ the last mark out hands the selection back to the cursor."
     (check (equal '(2 3) (orfeus/gui::gui-model-selected-indices model))
            "Marking a folded row did not select every frame of it")))
 
+(defun test-a-turned-crop-stays-inside-the-frame ()
+  "A crop that is turned shrinks about its centre until the turned frame covers
+every corner; a level one is left exactly as it was."
+  (multiple-value-bind (left top width height)
+      (orfeus/gui:crop-rect-within-turned-frame 0.04 0.04 0.92 0.92 0.0)
+    (check (and (= left 0.04) (= top 0.04) (= width 0.92) (= height 0.92))
+           "A level frame moved the rectangle"))
+  ;; A slight roll — the kind a hand leaves — fits inside the default inset.
+  (multiple-value-bind (left top width height)
+      (orfeus/gui:crop-rect-within-turned-frame 0.04 0.04 0.92 0.92 -1.7)
+    (check (and (= left 0.04) (= top 0.04) (= width 0.92) (= height 0.92))
+           "A 1.7 degree turn shrank a rectangle the frame already covers"))
+  ;; Ten degrees on a 4:3 frame: the upright rectangle the turned frame
+  ;; covers is about 82 % of it, so the 92 % start has to give.
+  (let ((angle 10.0)
+        (aspect 4/3))
+    (multiple-value-bind (left top width height)
+        (orfeus/gui:crop-rect-within-turned-frame 0.04 0.04 0.92 0.92 angle
+                                                  :aspect aspect)
+      (check (and (< 0.80 width 0.84) (< 0.80 height 0.84))
+             "Ten degrees left a rectangle the frame does not cover: ~,3F x ~,3F"
+             width height)
+      (check (and (< (abs (- (+ left (/ width 2)) 0.5)) 1e-5)
+                  (< (abs (- (+ top (/ height 2)) 0.5)) 1e-5))
+             "The rectangle did not shrink about its centre")
+      (let ((radians (* (/ pi 180) angle)))
+        (dolist (corner (list (cons left top)
+                              (cons (+ left width) top)
+                              (cons left (+ top height))
+                              (cons (+ left width) (+ top height))))
+          (let* ((x (* aspect (- (car corner) 0.5)))
+                 (y (- (cdr corner) 0.5))
+                 (along (+ (* x (cos radians)) (* y (sin radians))))
+                 (across (+ (* x (- (sin radians))) (* y (cos radians)))))
+            (check (and (<= (abs along) (+ (/ aspect 2) 1e-4))
+                        (<= (abs across) (+ 0.5 1e-4)))
+                   "A corner of the shrunken rectangle lies outside the turned frame"))))))
+  ;; A rectangle pushed into a corner shrinks towards its own centre, not the
+  ;; frame's, so what the photographer framed stays framed.
+  (multiple-value-bind (left top width height)
+      (orfeus/gui:crop-rect-within-turned-frame 0.5 0.5 0.5 0.5 8.0)
+    (check (and (< width 0.5) (< height 0.5) (> left 0.5) (> top 0.5)
+                (< (abs (- (+ left (/ width 2)) 0.75)) 1e-5)
+                (< (abs (- (+ top (/ height 2)) 0.75)) 1e-5))
+           "An off-centre rectangle did not shrink about its own centre"))
+  ;; The parameters a fresh crop starts with carry the angle and the fit.
+  (let ((params (orfeus/gui:default-crop-params :angle -1.7)))
+    (check (= -1.7 (getf params :angle)) "The starting angle was not kept")
+    (check (= 0.04 (getf params :left))
+           "A slight turn shrank the default inset, which already covers it"))
+  (let ((params (orfeus/gui:default-crop-params :angle 10.0)))
+    (check (< (getf params :width) 0.85)
+           "A ten-degree start kept a rectangle the frame does not cover"))
+  ;; Without a photograph there is nothing to level from.
+  (let ((model (orfeus/gui:make-gui-model
+                :project (orfeus:make-project :output-directory #P"exports/"))))
+    (check (= 0.0 (orfeus/gui:crop-start-angle model))
+           "An empty project offered a starting angle")))
+
 (defun test-photographs-sort-and-keep-their-places ()
   "The filmstrip sorts by capture time, name or rating, defaulting to the order
 the card was shot in, and a sort leaves the cursor and the marks on the
@@ -1809,6 +1868,7 @@ would silently ignore whatever the Destination field said."
   (test-lens-profile-setting-reaches-the-optics-node)
   (test-cursor-walks-past-a-marked-selection)
   (test-photographs-sort-and-keep-their-places)
+  (test-a-turned-crop-stays-inside-the-frame)
   (test-modified-flag)
   (test-undo-history)
   (test-graph-node-placement)

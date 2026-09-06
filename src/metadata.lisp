@@ -61,7 +61,8 @@ five — nobody rates anything zero — so it reads as unrated."
     "-Rating" "-XMP:Rating"
     "-DateTimeOriginal" "-CreateDate"
     "-Model" "-ISO" "-FNumber" "-ExposureTime"
-    "-Make" "-FocalLength#")
+    "-Make" "-FocalLength#"
+    "-RollAngle")
   "Everything read out of a photograph, in one ExifTool run.
 
 Asked for together because the subprocess is the cost, not the tags: the lens,
@@ -82,7 +83,25 @@ output as a dash, which is what keeps the answers positional.")
   ;; looked up for a lens *on a body*, and read at a focal length.
   (camera-make nil)
   (camera-model nil)
-  (focal-length nil))
+  (focal-length nil)
+  ;; The camera's level gauge at the moment of exposure, in degrees of
+  ;; clockwise roll as ExifTool reports Olympus's RollAngle, or NIL when the
+  ;; body wrote none. Turning the picture clockwise by this much levels it.
+  (roll-angle nil))
+
+(defun parsed-roll-angle (value)
+  "Return VALUE, ExifTool's roll angle in degrees, or NIL.
+
+ExifTool prints the Olympus tag as degrees of clockwise camera rotation, to a
+tenth of a degree, and as n/a when the level gauge was off. Zero is an answer
+here, unlike a focal length: a level camera is worth knowing about."
+  (let ((number (and (usable-metadata-value-p value)
+                     (ignore-errors
+                       (let ((*read-default-float-format* 'single-float)
+                             (*read-eval* nil))
+                         (read-from-string value))))))
+    (when (and (realp number) (<= (abs number) 180))
+      (float number 1.0))))
 
 (defun parsed-focal-length (value)
   "Return VALUE, ExifTool's numeric focal length in millimetres, or NIL."
@@ -130,7 +149,8 @@ otherwise the slowest step of an interactive preview.")
                                                    (field 10) (field 11))
              :camera-make (field 12)
              :camera-model (field 8)
-             :focal-length (parsed-focal-length (nth 13 lines)))))
+             :focal-length (parsed-focal-length (nth 13 lines))
+             :roll-angle (parsed-roll-angle (nth 14 lines)))))
         (%make-photo-metadata))))
 
 (defun photo-metadata (pathname)
@@ -175,6 +195,14 @@ rawler names the lens in an ORF but not in the DNG converted from it."
 (defun photo-focal-length (pathname)
   "Return the focal length PATHNAME was taken at in millimetres, or NIL."
   (photo-metadata-focal-length (photo-metadata pathname)))
+
+(defun photo-roll-angle (pathname)
+  "Return the roll the camera recorded for PATHNAME, in degrees, or NIL.
+
+Positive is a camera turned clockwise, which is a scene turned the other
+way; a crop node with this angle puts it back. Checked against the verticals
+of OM-1 frames in every orientation the body writes."
+  (photo-metadata-roll-angle (photo-metadata pathname)))
 
 (defun photo-rating (pathname)
   "Return the star rating the photographer gave PATHNAME, 1 to 5, or NIL."

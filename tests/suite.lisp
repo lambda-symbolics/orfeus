@@ -1291,6 +1291,18 @@ and then quietly relocated them would be lying about where a click puts things."
                   (orfeus:photo-display-name #P"/store/P9054674.ORF"
                                              :interned-p t)))))
 
+(defun roll-angle-reads-as-the-camera-level-p ()
+  "ExifTool's RollAngle comes through as degrees, zero included; n/a as nothing."
+  (and (= -1.7 (orfeus::parsed-roll-angle "-1.7"))
+       (= 0.0 (orfeus::parsed-roll-angle "0"))
+       (= 6.3 (orfeus::parsed-roll-angle "6.3"))
+       (null (orfeus::parsed-roll-angle "n/a"))
+       (null (orfeus::parsed-roll-angle "-"))
+       (null (orfeus::parsed-roll-angle nil))
+       (null (orfeus::parsed-roll-angle "1e9"))
+       ;; Asked for where the reader looks for it.
+       (string= "-RollAngle" (nth 14 orfeus::*photo-metadata-tags*))))
+
 (defun missing-lens-profile-warning-can-be-switched-off-p ()
   "The once-per-photograph warning obeys the switch the interface throws."
   (let ((pathname (format nil "/nowhere/~D.ORF" (get-universal-time))))
@@ -2043,6 +2055,8 @@ neither way."
              (interned-display-names-drop-the-digest-p))
       (check "a missing lens profile is reported once, and not at all when told not to"
              (missing-lens-profile-warning-can-be-switched-off-p))
+      (check "the camera's roll angle reads as degrees of level"
+             (roll-angle-reads-as-the-camera-level-p))
       (check "a lens listing names the calibration crop apart from the body's"
              (lens-listing-keeps-the-calibration-crop-apart-p))
       (check "a hand-set lens profile replaces the nickname alias"

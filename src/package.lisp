@@ -74,6 +74,7 @@
    #:photo-metadata-known-p
    #:photo-as-shot-kelvin
    #:photo-rating
+   #:photo-roll-angle
    #:photo-capture-seconds
    #:photo-signature
    #:group-captures
@@ -165,6 +166,7 @@
    #:photo-job-graph
    #:processing-preset-graph
    #:analyze-negative-frame
+   #:analyze-level
    #:sample-photo-linear-color
    #:processing-preset
    #:processing-preset-disabled-stages

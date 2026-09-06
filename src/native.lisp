@@ -202,6 +202,13 @@ returns at once, so a caller can spend it during startup instead."
   (error-buffer :pointer)
   (error-capacity :size))
 
+(defcfun ("orfeus_analyze_level_v1" %analyze-level-v1) :int32
+  (input-path :string)
+  (cache-mode :uint32)
+  (results :pointer)
+  (error-buffer :pointer)
+  (error-capacity :size))
+
 (defcfun ("orfeus_sample_linear_v1" %sample-linear-v1) :int32
   (input-path :string)
   (cache-mode :uint32)
@@ -245,6 +252,40 @@ the straightening angle in degrees for a crop node."
                 (loop for index from 4 below 7
                       collect (mem-aref results :float index))
                 (mem-aref results :float 7))))))
+
+(defun analyze-level (input-pathname &key cache-p)
+  "Read the tilt of INPUT-PATHNAME's picture from its own straight edges.
+
+Returns two values: the crop angle in degrees that levels the picture (positive
+turns it clockwise, as the crop node does), and a confidence — how many times
+the winning angle's strongest line outweighs the run of angles'. Under about
+two there was no straight edge to read and the angle is noise; zero says the
+tilt lies beyond the ten degrees searched. Callers decide what to tell the
+photographer."
+  (native-library-load)
+  (with-foreign-pointer (results (* 2 4))
+    (with-foreign-pointer (error-buffer *native-error-buffer-size*)
+      (let ((status
+              #+sbcl
+              (sb-int:with-float-traps-masked
+                  (:invalid :divide-by-zero :overflow :underflow :inexact)
+                (%analyze-level-v1
+                 (namestring input-pathname)
+                 (if cache-p 1 0)
+                 results error-buffer *native-error-buffer-size*))
+              #-sbcl
+              (%analyze-level-v1
+               (namestring input-pathname)
+               (if cache-p 1 0)
+               results error-buffer *native-error-buffer-size*)))
+        (unless (zerop status)
+          (error 'raw-render-error
+                 :input-pathname input-pathname
+                 :output-pathname input-pathname
+                 :status status
+                 :message (native-error-message error-buffer)))
+        (values (mem-aref results :float 0)
+                (mem-aref results :float 1))))))
 
 (defun sample-photo-linear-color (input-pathname x y
                                   &key (radius 0.01) cache-p)

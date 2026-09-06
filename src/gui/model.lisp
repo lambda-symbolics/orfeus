@@ -803,13 +803,96 @@ handle's outermost pixel or outside the picture. An inset costs a little of the
 frame and makes the rectangle usable immediately, and typing 100 into the size
 fields gets the whole frame back.")
 
-(defun default-crop-params ()
-  "The parameters a crop node starts with."
+(defparameter *auto-level-limit* 10.0
+  "The largest camera roll a fresh crop levels on its own, in degrees.
+
+A hand that meant to hold the camera straight is off by a degree or three; a
+frame rolled further than this was composed that way, or is a shot of the
+ground, and levelling it unasked would be a surprise.")
+
+(defun crop-rect-within-turned-frame (left top width height angle
+                                      &key (aspect 4/3))
+  "Shrink the crop rectangle about its centre until the turned frame covers it.
+
+LEFT TOP WIDTH HEIGHT are fractions of the frame, ANGLE the crop's clockwise
+turn in degrees and ASPECT the frame's width over its height, which is what
+turns the fractions into a shape. The picture is turned about the frame's
+centre and the upright rectangle cut from it, so a corner of the rectangle
+that the turned frame no longer reaches would print black. Returns the four
+fractions, unchanged when the frame covers them all."
+  (let* ((radians (* (/ pi 180) angle))
+         (cosine (cos radians))
+         (sine (sin radians))
+         (frame-width (float aspect 1d0))
+         (frame-height 1d0)
+         (centre-x (* frame-width (- (+ left (/ width 2)) 0.5d0)))
+         (centre-y (* frame-height (- (+ top (/ height 2)) 0.5d0)))
+         (half-width (* frame-width (/ width 2)))
+         (half-height (* frame-height (/ height 2)))
+         (scale 1d0))
+    ;; Each corner is centre + scale * half-diagonal, and it sits inside the
+    ;; turned frame when both its projections onto the frame's turned axes
+    ;; are within the half extents: a linear bound on the scale per corner
+    ;; and axis, of which the tightest wins.
+    (dolist (corner (list (list half-width half-height)
+                          (list half-width (- half-height))
+                          (list (- half-width) half-height)
+                          (list (- half-width) (- half-height))))
+      (destructuring-bind (offset-x offset-y) corner
+        (loop for (axis-x axis-y limit)
+                in (list (list cosine sine (/ frame-width 2))
+                         (list (- sine) cosine (/ frame-height 2)))
+              do (let ((centre (+ (* centre-x axis-x) (* centre-y axis-y)))
+                       (reach (+ (* offset-x axis-x) (* offset-y axis-y))))
+                   (cond ((> reach 1d-9)
+                          (setf scale (min scale (/ (- limit centre) reach))))
+                         ((< reach -1d-9)
+                          (setf scale (min scale (/ (- (- limit) centre)
+                                                    reach)))))))))
+    (cond ((>= scale 1d0)
+           (values left top width height))
+          ;; A centre the turned frame does not even reach cannot be shrunk
+          ;; towards; start over from the middle of the frame instead.
+          ((< scale 0.05d0)
+           (crop-rect-within-turned-frame (- 0.5 (/ width 2)) (- 0.5 (/ height 2))
+                                          width height angle :aspect aspect))
+          (t
+           (let ((new-width (* width scale))
+                 (new-height (* height scale)))
+             (values (float (- (+ left (/ width 2)) (/ new-width 2)) 1.0)
+                     (float (- (+ top (/ height 2)) (/ new-height 2)) 1.0)
+                     (float new-width 1.0)
+                     (float new-height 1.0)))))))
+
+(defun default-crop-params (&key (angle 0.0) (aspect 4/3))
+  "The parameters a crop node starts with: the inset rectangle, turned by ANGLE.
+
+The rectangle shrinks as far as the turn needs so that no corner of it prints
+black; ASPECT is the frame's width over its height, which for every body
+Orfeus develops is four by three."
   (let ((inset *default-crop-inset*))
-    (list :left (float inset 1.0) :top (float inset 1.0)
-          :width (float (- 1.0 (* 2 inset)) 1.0)
-          :height (float (- 1.0 (* 2 inset)) 1.0)
-          :angle 0.0)))
+    (multiple-value-bind (left top width height)
+        (crop-rect-within-turned-frame inset inset
+                                       (- 1.0 (* 2 inset)) (- 1.0 (* 2 inset))
+                                       angle :aspect aspect)
+      (list :left (float left 1.0) :top (float top 1.0)
+            :width (float width 1.0) :height (float height 1.0)
+            :angle (float angle 1.0)))))
+
+(defun crop-start-angle (model)
+  "The angle a fresh crop on MODEL's selected photograph starts at, in degrees.
+
+The camera's level gauge when the maker notes carry it: the roll it recorded
+at exposure is the clockwise turn that levels the picture. Zero when nothing
+was recorded, when the camera was level to within its own resolution, or
+when the roll is past *AUTO-LEVEL-LIMIT*."
+  (let* ((job (gui-model-selected-job model))
+         (roll (and job
+                    (ignore-errors
+                      (orfeus:photo-roll-angle (photo-job-input-path job))))))
+    (if (and roll (<= 0.05 (abs roll) *auto-level-limit*))
+        (float roll 1.0)
+        0.0)))
 
 (defun gui-model-add-node (model kind &key after params)
   "Insert a KIND node into the selected photo's graph and select it.
@@ -832,7 +915,9 @@ placement breaks the film-domain rules."
              (node (orfeus:graph-insert-node
                     graph after-id kind
                     :params (or params
-                                (and (eq kind :crop) (default-crop-params))))))
+                                (and (eq kind :crop)
+                                     (default-crop-params
+                                      :angle (crop-start-angle model)))))))
         (reflow-graph-node-positions graph node)
         (setf (gui-model-selected-node model) node)
         node))))
@@ -910,11 +995,17 @@ had to move."
                          (let ((*inside-model-edit* t))
                            (orfeus:graph-move-node-after graph id legal)
                            t))))
-        (values (let ((*inside-model-edit* t))
-                  (orfeus:graph-set-node-kind graph
-                                              (orfeus:graph-node-id node)
-                                              kind))
-                (and moved legal))))))
+        (let ((changed (let ((*inside-model-edit* t))
+                         (orfeus:graph-set-node-kind graph
+                                                     (orfeus:graph-node-id node)
+                                                     kind))))
+          ;; A crop chosen from the dropdown starts where one added from the
+          ;; menu does: on the inset rectangle, level with the camera's gauge.
+          (when (and changed (eq kind :crop)
+                     (null (orfeus:graph-node-params node)))
+            (setf (orfeus:graph-node-params node)
+                  (default-crop-params :angle (crop-start-angle model))))
+          (values changed (and moved legal)))))))
 
 (defun gui-model-set-primary-input (model node input-id)
   "Point NODE's primary input at INPUT-ID on the selected photo's graph."

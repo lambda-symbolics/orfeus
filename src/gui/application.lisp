@@ -397,6 +397,16 @@ abbreviation, which is sized for a box and reads as a typo in a menu."
 (defparameter *graph-row-pitch* 58
   "Vertical distance between auto-laid-out nodes on the graph canvas.")
 
+(defparameter *level-confidence-floor* 2.0
+  "How far the picture's own level reading has to stand out to be believed.
+
+The native estimate compares the strongest line at the winning angle with the
+run of angles'; texture alone scores about one everywhere, and a wall or a
+window frame scores two and more (2.0 to 3.2 on the frames this was tried
+on; trees, a bicycle and a blurred wall scored 1.7 and under). Under this the
+picture had no straight edge to offer, and the photographer is told so rather
+than turned by noise.")
+
 (defparameter *inspector-min-height* 378
   "Minimum inspector height that keeps the complete Curves panel accessible.")
 
@@ -3812,6 +3822,10 @@ new cache entry is published."
                       (cons "Move Later" (move-node-action node :later)))
                 (when (eq kind :crop)
                   (list (cons "-" nil)
+                        (cons "Level From Camera"
+                              (lambda () (level-crop-from-camera node)))
+                        (cons "Level From Photo"
+                              (lambda () (level-crop-from-photo node)))
                         (cons "Autocrop Negative"
                               (lambda () (autocrop-negative node)))
                         (cons "Reset Crop"
@@ -3890,15 +3904,21 @@ new cache entry is published."
                    (cons (format nil "Add ~A" (node-kind-full-name kind))
                          (lambda ()
                            (handler-case
-                               (progn
-                                 (gui-model-add-node
-                                  model kind
-                                  :after (and after-node
-                                              (orfeus:graph-node-id
-                                               after-node)))
+                               (let* ((node (gui-model-add-node
+                                             model kind
+                                             :after (and after-node
+                                                         (orfeus:graph-node-id
+                                                          after-node))))
+                                      (angle (getf (orfeus:graph-node-params node)
+                                                   :angle 0.0)))
                                  (after-graph-edit
-                                  (format nil "Added ~A node"
-                                          (node-kind-label kind))))
+                                  (if (and (eq kind :crop) (/= angle 0.0))
+                                      ;; A crop that started level says so:
+                                      ;; the picture just turned by itself.
+                                      (format nil "Added Crop node, levelled from the camera: ~,1F deg"
+                                              angle)
+                                      (format nil "Added ~A node"
+                                              (node-kind-label kind)))))
                              (error (condition)
                                (set-status (princ-to-string condition)))))))
                  kinds)
@@ -4178,6 +4198,57 @@ new cache entry is published."
                        (after-graph-edit
                         (format nil "Film base ~,3F ~,3F ~,3F"
                                 (first base) (second base) (third base))))
+                   (error (condition)
+                     (set-status (princ-to-string condition)))))))
+           (level-crop (node angle source)
+             ;; Turn the crop by ANGLE and shrink its rectangle to whatever
+             ;; the turned frame still covers, so no corner prints black.
+             (let ((params (orfeus:graph-node-params node)))
+               (multiple-value-bind (left top width height)
+                   (crop-rect-within-turned-frame
+                    (getf params :left 0.0) (getf params :top 0.0)
+                    (getf params :width 1.0) (getf params :height 1.0)
+                    angle)
+                 (gui-model-set-node-params
+                  model node
+                  (list :left left :top top :width width :height height
+                        :angle angle))
+                 (sync-node-tools)
+                 (after-graph-edit
+                  (format nil "Levelled from the ~A: ~,1F deg" source angle)))))
+           (level-crop-from-camera (node)
+             ;; The maker note's RollAngle is the camera's clockwise roll at
+             ;; exposure, which turned the scene the other way; turning the
+             ;; picture clockwise by the same amount puts it back. Checked
+             ;; against drainpipes and window frames of OM-1 frames rolled
+             ;; -6.7 to +6.3 degrees in every orientation the body writes.
+             (let* ((job (selected-job))
+                    (roll (and job
+                               (ignore-errors
+                                 (orfeus:photo-roll-angle
+                                  (photo-job-input-path job))))))
+               (cond ((null roll)
+                      (set-status
+                       "The camera recorded no level for this photograph"))
+                     ((> (abs roll) 45)
+                      (set-status
+                       (format nil "The camera rolled ~,1F deg, more than a crop can level"
+                               roll)))
+                     (t (level-crop node (float roll 1.0) "camera")))))
+           (level-crop-from-photo (node)
+             ;; For a body that writes no level, or a photographer who trusts
+             ;; the walls over the gauge: the strongest straight edges near
+             ;; vertical or horizontal say where level is.
+             (let ((job (selected-job)))
+               (when job
+                 (handler-case
+                     (multiple-value-bind (angle confidence)
+                         (orfeus:analyze-level (photo-job-input-path job)
+                                               :cache-p t)
+                       (if (< confidence *level-confidence-floor*)
+                           (set-status
+                            "No straight edge to level by was found in the photograph")
+                           (level-crop node (float angle 1.0) "photograph")))
                    (error (condition)
                      (set-status (princ-to-string condition)))))))
            (set-preview-cursor (shape)
@@ -7776,20 +7847,50 @@ new cache entry is published."
                       spinner)))
              (setf crop-width-input (size-field :width "Width %" 108)
                    crop-height-input (size-field :height "Height %" 140)))
+           ;; Straightening without the slider. The camera's level gauge is
+           ;; written into the maker notes as the roll at exposure, so the
+           ;; exact correction is usually in the file already; the picture's
+           ;; own straight edges are the fallback for bodies that write none.
+           (lightfast:set-tooltip
+            (register-inspector
+             (lightfast:set-stock-icon
+              (lightfast:make-button
+               :parent node-page :x 12 :y 172 :width 140 :height 26
+               :label "Level From Camera"
+               :callback (lambda (&rest ignored)
+                           (declare (ignore ignored))
+                           (let ((node (crop-editing-node)))
+                             (when node (level-crop-from-camera node)))))
+              :camera)
+             '(:column 0) 172 '(:share 2) 26 :page)
+            "Turn the picture back by the roll the camera's level gauge recorded")
+           (lightfast:set-tooltip
+            (register-inspector
+             (lightfast:set-stock-icon
+              (lightfast:make-button
+               :parent node-page :x 160 :y 172 :width 140 :height 26
+               :label "Level From Photo"
+               :callback (lambda (&rest ignored)
+                           (declare (ignore ignored))
+                           (let ((node (crop-editing-node)))
+                             (when node (level-crop-from-photo node)))))
+              :photo)
+             '(:column 1) 172 '(:share 2) 26 :page)
+            "Stand the picture's strongest straight edges upright")
            (register-inspector
             (lightfast:set-stock-icon
              (lightfast:make-button
-              :parent node-page :x 12 :y 172 :width 292 :height 26
+              :parent node-page :x 12 :y 204 :width 292 :height 26
               :label "Autocrop Negative"
               :callback (lambda (&rest ignored)
                           (declare (ignore ignored))
                           (let ((node (crop-editing-node)))
                             (when node (autocrop-negative node)))))
              :crop)
-            12 172 :fill 26 :page)
+            12 204 :fill 26 :page)
            (register-inspector
             (lightfast:make-button
-             :parent node-page :x 12 :y 204 :width 292 :height 26
+             :parent node-page :x 12 :y 236 :width 292 :height 26
              :label "Reset Crop"
              :callback (lambda (&rest ignored)
                          (declare (ignore ignored))
@@ -7803,11 +7904,6 @@ new cache entry is published."
                               model node (default-crop-params))
                              (setf crop-aspect :original)
                              (after-graph-edit "Crop reset")))))
-            12 204 :fill 26 :page)
-           (register-inspector
-            (lightfast:make-label
-             :parent node-page :x 12 :y 236 :width 292 :height 26
-             :label "Drag the rectangle on the preview")
             12 236 :fill 26 :page)))
         (build-group
          :curves

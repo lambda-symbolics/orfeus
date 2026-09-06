@@ -1037,6 +1037,43 @@ pub unsafe extern "C" fn orfeus_analyze_negative_frame_v1(
     }
 }
 
+/// Read the tilt of a picture from its own straight edges.
+///
+/// Writes two floats: the crop angle, in degrees of the display convention
+/// (positive turns the picture clockwise), that stands the strongest edges
+/// upright, and a confidence — how many times the winning angle's strongest
+/// line outweighs the run of angles'. Under about two there was no straight
+/// edge worth trusting; zero says the tilt lies beyond the ten degrees
+/// searched. Cache semantics match `orfeus_raw_render_v2`.
+///
+/// # Safety
+///
+/// `input_path` must be a readable NUL-terminated path, `results` must be
+/// writable for two floats, and the error buffer, when non-null, writable for
+/// its stated capacity.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn orfeus_analyze_level_v1(
+    input_path: *const c_char,
+    cache_mode: u32,
+    results: *mut f32,
+    error_buffer: *mut c_char,
+    error_capacity: usize,
+) -> i32 {
+    // SAFETY: Pointer validation and dereferences remain inside the panic boundary.
+    unsafe {
+        ffi_result(error_buffer, error_capacity, || {
+            if results.is_null() {
+                return Err(Error::InvalidArgument("results pointer is null"));
+            }
+            let input = path_from_c(input_path)?;
+            let estimate = analyze::analyze_level_file(input, cache_mode)?;
+            let values = [estimate.angle, estimate.confidence];
+            ptr::copy_nonoverlapping(values.as_ptr(), results, values.len());
+            Ok(())
+        })
+    }
+}
+
 /// Average the scene-linear color around an oriented normalized point.
 ///
 /// Writes three floats. The radius is normalized against the shorter image
