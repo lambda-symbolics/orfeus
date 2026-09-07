@@ -5421,25 +5421,29 @@ the grace period, NOW being in seconds."
                                       (unless (string= digest (photo-content-key input))
                                         (error "RAW source changed during preview render")))
                                     :validation-function dependencies-current-p)
-                                   (let ((display
-                                           (materialize-preview-cache-hit
-                                            output preview-session-directory
-                                            :validation-function
-                                            dependencies-current-p)))
-                                     (unless (string= digest (photo-content-key input))
-                                       (when display (ignore-errors (delete-file display)))
-                                       (error "RAW source changed while loading cache hit"))
-                                     (cond ((null display))
-                                           ((and publish-p
-                                                 (= generation preview-generation))
-                                            (queue-event queue
-                                                         (list :preview generation index
-                                                               job role display viewport
-                                                               bound geometry)))
-                                           ;; Superseded while it rendered, or
-                                           ;; never meant for the screen: nobody
-                                           ;; will look at this copy.
-                                           (t (ignore-errors (delete-file display)))))
+                                   ;; Only a render somebody waits for gets a
+                                   ;; display copy. The background pass is here
+                                   ;; to fill the cache, and a copy of every hit
+                                   ;; it walked past filled the session directory
+                                   ;; instead — a tmpfs, so the machine's memory.
+                                   (when publish-p
+                                     (let ((display
+                                             (materialize-preview-cache-hit
+                                              output preview-session-directory
+                                              :validation-function
+                                              dependencies-current-p)))
+                                       (unless (string= digest (photo-content-key input))
+                                         (when display (ignore-errors (delete-file display)))
+                                         (error "RAW source changed while loading cache hit"))
+                                       (cond ((null display))
+                                             ((= generation preview-generation)
+                                              (queue-event queue
+                                                           (list :preview generation index
+                                                                 job role display viewport
+                                                                 bound geometry)))
+                                             ;; Superseded while it rendered:
+                                             ;; nobody will look at this copy.
+                                             (t (ignore-errors (delete-file display))))))
                                    (return))
                                (error (condition)
                                  (when (= attempt 2) (error condition)))))
@@ -5478,8 +5482,9 @@ the grace period, NOW being in seconds."
                                      (list :thumbnail generation job display
                                            :camera)))))))
               :front-p t :generation generation))
-           (enqueue-thumbnail (job generation)
-             (enqueue-camera-thumbnail job generation)
+           (enqueue-thumbnail (job generation &key (camera-p t))
+             (when camera-p
+               (enqueue-camera-thumbnail job generation))
              (enqueue-gui-task
               background-queue :thumbnail
               (lambda ()
@@ -5533,8 +5538,15 @@ the grace period, NOW being in seconds."
                                  (neutral-preview-settings) generation t
                                  :front-p t :cache-p t))
                (when selected-before-p
+                 ;; Only what the filmstrip still lacks. Every photo switch
+                 ;; comes through here, and asking again for two hundred
+                 ;; finished thumbnails each time made two hundred copies.
                  (dolist (index indices)
-                   (enqueue-thumbnail (nth index photos) generation)))
+                   (let ((job (nth index photos)))
+                     (case (gethash job thumbnail-grades)
+                       ((:developed :graded))
+                       (:camera (enqueue-thumbnail job generation :camera-p nil))
+                       (t (enqueue-thumbnail job generation))))))
                (dolist (index indices)
                  (unless (= index selected-index)
                    (let ((job (nth index photos)))
