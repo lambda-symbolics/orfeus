@@ -1387,6 +1387,35 @@ the grace period, NOW being in seconds."
     (setf (display-ledger-doomed ledger) (nreverse kept))
     (nreverse due)))
 
+(defun stale-session-directory-p (directory alive-p)
+  "True when DIRECTORY is a display or preview session directory of an Orfeus
+process that ALIVE-P, called with its process id, says is gone."
+  (let* ((name (car (last (pathname-directory directory))))
+         (prefix (and (stringp name)
+                      (find-if (lambda (prefix) (uiop:string-prefix-p prefix name))
+                               '("orfeus-display-" "orfeus-preview-session-")))))
+    (when prefix
+      (let* ((rest (subseq name (length prefix)))
+             (dash (position #\- rest))
+             (pid (and dash (ignore-errors (parse-integer rest :end dash)))))
+        (and pid (not (funcall alive-p pid)))))))
+
+(defun sweep-stale-session-directories (temporary-directory
+                                        &key (alive-p #'process-alive-p))
+  "Delete the session directories of Orfeus processes that no longer run.
+
+A crash or a kill skips the cleanup at exit, and on a tmpfs what it leaves
+behind is memory. Best effort; returns how many directories went."
+  (let ((removed 0))
+    (dolist (directory (ignore-errors (uiop:subdirectories temporary-directory))
+                       removed)
+      (when (and (ignore-errors (stale-session-directory-p directory alive-p))
+                 (ignore-errors
+                   (uiop:delete-directory-tree directory :validate t
+                                                         :if-does-not-exist :ignore)
+                   t))
+        (incf removed)))))
+
 (defun materialize-preview-cache-hit (pathname session-directory
                                       &key validation-function)
   "Copy and validate a cache hit under its per-key lock to a secure path."
@@ -8250,7 +8279,12 @@ the grace period, NOW being in seconds."
         (enqueue-gui-task background-queue :evict
                           (lambda ()
                             (ignore-errors
-                              (evict-stale-previews preview-directory))))
+                              (evict-stale-previews preview-directory))
+                            ;; And whatever a crashed run left in the temporary
+                            ;; directory, which on a tmpfs is memory.
+                            (ignore-errors
+                              (sweep-stale-session-directories
+                               (uiop:temporary-directory)))))
         (when (selected-job)
           (schedule-initial-preview))
         (unwind-protect

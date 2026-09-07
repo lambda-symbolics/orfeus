@@ -430,6 +430,47 @@ period so a scope worker still reading it is not cut off."
     (check (null (orfeus/gui::display-ledger-release ledger nil 0))
            "Releasing nothing did something")))
 
+(defun test-stale-session-directories-are-swept ()
+  "A session directory whose Orfeus process is gone is deleted at startup; a
+living run's directory and anything that is not ours are left alone."
+  (flet ((alive (pid) (= pid 42)))
+    (check (orfeus/gui::stale-session-directory-p
+            #P"/tmp/orfeus-display-41-99/" #'alive)
+           "A dead process's display directory is not stale")
+    (check (not (orfeus/gui::stale-session-directory-p
+                 #P"/tmp/orfeus-display-42-99/" #'alive))
+           "A living process's display directory is stale")
+    (check (orfeus/gui::stale-session-directory-p
+            #P"/tmp/orfeus-preview-session-7-1/" #'alive)
+           "A dead process's preview session directory is not stale")
+    (check (not (orfeus/gui::stale-session-directory-p
+                 #P"/tmp/nix-shell.abc/" #'alive))
+           "Somebody else's directory is stale")
+    (check (not (orfeus/gui::stale-session-directory-p
+                 #P"/tmp/orfeus-display-x-1/" #'alive))
+           "A malformed name is stale")
+    (let* ((root (merge-pathnames
+                  (format nil "orfeus-sweep-test-~D/" (get-universal-time))
+                  (uiop:temporary-directory)))
+           (dead (merge-pathnames "orfeus-display-41-5/" root))
+           (living (merge-pathnames "orfeus-display-42-5/" root))
+           (foreign (merge-pathnames "somebody-else/" root)))
+      (dolist (directory (list dead living foreign))
+        (ensure-directories-exist directory)
+        (with-open-file (stream (merge-pathnames "display-1.jpg" directory)
+                                :direction :output :if-exists :supersede)
+          (write-line "x" stream)))
+      (unwind-protect
+           (progn
+             (check (= 1 (orfeus/gui::sweep-stale-session-directories
+                          root :alive-p #'alive))
+                    "The sweep did not remove exactly the dead run's directory")
+             (check (not (probe-file dead))
+                    "The dead run's directory survived the sweep")
+             (check (and (probe-file living) (probe-file foreign))
+                    "The sweep took a directory that was not its to take"))
+        (uiop:delete-directory-tree root :validate t :if-does-not-exist :ignore)))))
+
 (defun test-the-picker-decides-without-a-window ()
   "The file picker's listing, selection, stash and geometry are functions
 over plain data: a folder lists as a card reads, clicks and keys change the
@@ -2062,6 +2103,7 @@ would silently ignore whatever the Destination field said."
   (test-a-turned-crop-stays-inside-the-frame)
   (test-the-picker-decides-without-a-window)
   (test-display-copies-are-let-go-when-nothing-shows-them)
+  (test-stale-session-directories-are-swept)
   (test-modified-flag)
   (test-undo-history)
   (test-graph-node-placement)
