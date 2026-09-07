@@ -396,6 +396,40 @@ every corner; a level one is left exactly as it was."
     (check (= 0.0 (orfeus/gui:crop-start-angle model))
            "An empty project offered a starting angle")))
 
+(defun test-display-copies-are-let-go-when-nothing-shows-them ()
+  "A display copy of a preview is kept while a canvas or a filmstrip thumbnail
+shows it, doomed when the last of them lets go, and deleted only after a grace
+period so a scope worker still reading it is not cut off."
+  (let ((ledger (orfeus/gui::make-display-ledger))
+        (path #P"/tmp/orfeus-display-1-2/display-1-3.jpg"))
+    (orfeus/gui::display-ledger-retain ledger path)
+    (orfeus/gui::display-ledger-retain ledger path)
+    (check (not (orfeus/gui::display-ledger-release ledger path 100))
+           "The first holder letting go doomed a copy another still shows")
+    (check (orfeus/gui::display-ledger-held-p ledger path)
+           "A copy with a holder left is not held")
+    (check (orfeus/gui::display-ledger-release ledger path 100)
+           "The last holder letting go did not doom the copy")
+    (check (not (orfeus/gui::display-ledger-held-p ledger path))
+           "A doomed copy is still held")
+    (check (null (orfeus/gui::display-ledger-due ledger 101))
+           "A doomed copy did not wait out its grace period")
+    (check (equal (list (namestring path))
+                  (orfeus/gui::display-ledger-due ledger 103))
+           "A doomed copy was not due once its grace period ran out")
+    (check (null (orfeus/gui::display-ledger-due ledger 200))
+           "A copy came due twice")
+    ;; Wanted again before it went: it stays.
+    (orfeus/gui::display-ledger-retain ledger path)
+    (orfeus/gui::display-ledger-release ledger path 100)
+    (orfeus/gui::display-ledger-retain ledger path)
+    (check (null (orfeus/gui::display-ledger-due ledger 200))
+           "Retaining a doomed copy did not rescue it")
+    (check (orfeus/gui::display-ledger-held-p ledger path)
+           "A rescued copy is not held")
+    (check (null (orfeus/gui::display-ledger-release ledger nil 0))
+           "Releasing nothing did something")))
+
 (defun test-the-picker-decides-without-a-window ()
   "The file picker's listing, selection, stash and geometry are functions
 over plain data: a folder lists as a card reads, clicks and keys change the
@@ -2027,6 +2061,7 @@ would silently ignore whatever the Destination field said."
   (test-photographs-sort-and-keep-their-places)
   (test-a-turned-crop-stays-inside-the-frame)
   (test-the-picker-decides-without-a-window)
+  (test-display-copies-are-let-go-when-nothing-shows-them)
   (test-modified-flag)
   (test-undo-history)
   (test-graph-node-placement)

@@ -1321,6 +1321,72 @@ new cache entry is published."
                    (ignore-errors (delete-file temporary))
                    (release-preview-lock lock)))))))))
 
+;;; Display copies live only as long as something on screen shows them.
+;;;
+;;; MATERIALIZE-PREVIEW-CACHE-HIT copies every cache hit into the session
+;;; directory, and on a laptop that directory is a tmpfs: it is memory. Left
+;;; to itself the directory grew by one copy per hit until the machine ran
+;;; out — thousands of files and gigabytes within minutes, because the
+;;; background pass re-walks every photograph on each switch. So every holder
+;;; of a display copy (the two canvases, a filmstrip thumbnail) is counted,
+;;; and the file goes when the last holder lets go. Deletion waits a moment,
+;;; because the scope worker may still be reading the copy just replaced.
+
+(defstruct (display-ledger (:constructor make-display-ledger ()))
+  ;; Namestring -> how many things on screen show the copy.
+  (counts (make-hash-table :test #'equal))
+  ;; (namestring . seconds at which it may go), oldest first.
+  (doomed '()))
+
+(defparameter *display-file-grace-seconds* 2
+  "How long a display copy nothing shows any more is kept before deletion.")
+
+(defun display-ledger-retain (ledger pathname)
+  "Count one more holder of display copy PATHNAME; return PATHNAME."
+  (when pathname
+    (let ((key (namestring pathname)))
+      (incf (gethash key (display-ledger-counts ledger) 0))
+      ;; A copy on its way out that is wanted again stays.
+      (setf (display-ledger-doomed ledger)
+            (delete key (display-ledger-doomed ledger)
+                    :key #'car :test #'string=))))
+  pathname)
+
+(defun display-ledger-release (ledger pathname now)
+  "Drop one holder of PATHNAME.
+
+True when it was the last one: the file is then due for deletion at NOW plus
+the grace period, NOW being in seconds."
+  (when pathname
+    (let* ((key (namestring pathname))
+           (counts (display-ledger-counts ledger))
+           (count (gethash key counts 0)))
+      (cond ((> count 1)
+             (setf (gethash key counts) (1- count))
+             nil)
+            (t
+             (remhash key counts)
+             (setf (display-ledger-doomed ledger)
+                   (nconc (display-ledger-doomed ledger)
+                          (list (cons key (+ now *display-file-grace-seconds*)))))
+             t)))))
+
+(defun display-ledger-held-p (ledger pathname)
+  "True while something still shows PATHNAME."
+  (and pathname
+       (plusp (gethash (namestring pathname) (display-ledger-counts ledger) 0))))
+
+(defun display-ledger-due (ledger now)
+  "Return, and forget, the doomed copies whose grace period has run out at NOW."
+  (let ((due '())
+        (kept '()))
+    (dolist (entry (display-ledger-doomed ledger))
+      (if (<= (cdr entry) now)
+          (push (car entry) due)
+          (push entry kept)))
+    (setf (display-ledger-doomed ledger) (nreverse kept))
+    (nreverse due)))
+
 (defun materialize-preview-cache-hit (pathname session-directory
                                       &key validation-function)
   "Copy and validate a cache hit under its per-key lock to a secure path."
@@ -1438,9 +1504,11 @@ new cache entry is published."
            (lens-cache (make-hash-table :test #'eq))
            (capture-cache (make-hash-table :test #'eq))
            (thumbnail-files (make-hash-table :test #'eq))
-           ;; Photograph -> :camera or :developed, saying which kind of
-           ;; thumbnail THUMBNAIL-FILES holds for it.
+           ;; Photograph -> :camera, :developed or :graded, saying which kind
+           ;; of thumbnail THUMBNAIL-FILES holds for it.
            (thumbnail-grades (make-hash-table :test #'eq))
+           ;; Which display copies are on screen, and which may be deleted.
+           (display-ledger (make-display-ledger))
            ;; Photograph -> (burst number, place in it, how many): filled in
            ;; from a background pass, because reading capture times is a
            ;; subprocess per photograph and the filmstrip has to keep drawing.
@@ -3278,9 +3346,8 @@ new cache entry is published."
              ;; by the photograph and the grade, neither of which moved.
              (let ((removed (discard-cached-previews preview-directory)))
                (clear-previews)
+               (forget-all-thumbnails)
                (clear-preview-cache)
-               (clrhash thumbnail-files)
-               (clrhash thumbnail-grades)
                (clrhash gallery-thumbs)
                (clrhash photo-groups)
                (refresh-gallery)
@@ -3288,6 +3355,49 @@ new cache entry is published."
                (redraw-thumbnails)
                (set-status
                 (format nil "Discarded ~D cached preview~:P; rebuilding" removed))))
+           (now-seconds ()
+             (/ (get-internal-real-time)
+                (float internal-time-units-per-second 1d0)))
+           (retain-display (path)
+             ;; One more thing on screen shows PATH.
+             (display-ledger-retain display-ledger path))
+           (release-display (path)
+             ;; One thing fewer shows PATH. Still shown elsewhere — the after
+             ;; preview doubles as its filmstrip thumbnail — the decoded
+             ;; full-size image is dropped and only the small copy kept;
+             ;; shown nowhere, the file itself goes after a grace period.
+             (when path
+               (if (display-ledger-release display-ledger path (now-seconds))
+                   (forget-preview-file path)
+                   (trim-preview-file path))))
+           (discard-display (path)
+             ;; A copy nothing ever showed: a stale event's, or one the
+             ;; filmstrip did not want. There is no reader to wait for.
+             (when path (ignore-errors (delete-file path))))
+           (delete-due-displays ()
+             (dolist (path (display-ledger-due display-ledger (now-seconds)))
+               (ignore-errors (delete-file path))))
+           (set-thumbnail (job path grade)
+             ;; Retain before release: the same copy handed over again must
+             ;; never touch zero on the way.
+             (let ((old (gethash job thumbnail-files)))
+               (retain-display path)
+               (unless (equal old path)
+                 (release-display old))
+               (setf (gethash job thumbnail-files) path
+                     (gethash job thumbnail-grades) grade)))
+           (forget-thumbnails (jobs)
+             (dolist (job jobs)
+               (release-display (gethash job thumbnail-files))
+               (remhash job thumbnail-files)
+               (remhash job thumbnail-grades)))
+           (forget-all-thumbnails ()
+             (maphash (lambda (job path)
+                        (declare (ignore job))
+                        (release-display path))
+                      thumbnail-files)
+             (clrhash thumbnail-files)
+             (clrhash thumbnail-grades))
            (clear-previews ()
              (setf preview-zoom 1d0
                    preview-center-x .5d0
@@ -3298,7 +3408,7 @@ new cache entry is published."
                    preview-native-p nil
                    preview-one-to-one-pending-p nil)
              (dolist (path (list before-preview-file after-preview-file))
-               (when path (forget-preview-file path)))
+               (release-display path))
              (setf before-preview-file nil
                    after-preview-file nil
                    before-preview-region nil
@@ -3326,9 +3436,9 @@ new cache entry is published."
              (let ((old-path (ecase role
                                (:before before-preview-file)
                                (:after after-preview-file))))
-               (when (and old-path (not (equal old-path path)))
-                 (forget-preview-file old-path))
-               (forget-preview-file path)
+               (retain-display path)
+               (unless (equal old-path path)
+                 (release-display old-path))
                (ecase role
                  (:before (setf before-preview-region region)
                           (setf before-preview-file path)
@@ -3337,8 +3447,12 @@ new cache entry is published."
                                after-preview-geometry geometry
                                after-preview-file path
                                after-preview-generation generation
-                               after-live-p nil
-                               (gethash (selected-job) thumbnail-files) path)
+                               after-live-p nil)
+                         ;; The graded frame is the best thumbnail there is
+                         ;; for it — the whole frame, that is; a zoomed-in
+                         ;; window is not a thumbnail of anything.
+                         (when (null region)
+                           (set-thumbnail (selected-job) path :graded))
                          (when preview-one-to-one-pending-p
                            (setf preview-one-to-one-pending-p nil)
                            (fit-preview-to-source-pixels))
@@ -5036,8 +5150,7 @@ new cache entry is published."
              (setf project new-project
                    thumbnail-scroll 0
                    thumbnail-anchor 0)
-             (clrhash thumbnail-files)
-             (clrhash thumbnail-grades)
+             (forget-all-thumbnails)
              (clrhash gallery-thumbs)
              (setf gallery-selected nil
                    gallery-scroll 0
@@ -5100,9 +5213,8 @@ new cache entry is published."
                  (incf preview-generation)
                  (dolist (job removed)
                    (remhash job lens-cache)
-                   (remhash job capture-cache)
-                   (remhash job thumbnail-files)
-                   (remhash job thumbnail-grades))
+                   (remhash job capture-cache))
+                 (forget-thumbnails removed)
                  (clear-previews)
                  (sync-controls)
                  (sync-node-tools)
@@ -5317,12 +5429,17 @@ new cache entry is published."
                                      (unless (string= digest (photo-content-key input))
                                        (when display (ignore-errors (delete-file display)))
                                        (error "RAW source changed while loading cache hit"))
-                                     (when (and display publish-p
-                                                (= generation preview-generation))
-                                       (queue-event queue
-                                                    (list :preview generation index job
-                                                          role display viewport
-                                                          bound geometry))))
+                                     (cond ((null display))
+                                           ((and publish-p
+                                                 (= generation preview-generation))
+                                            (queue-event queue
+                                                         (list :preview generation index
+                                                               job role display viewport
+                                                               bound geometry)))
+                                           ;; Superseded while it rendered, or
+                                           ;; never meant for the screen: nobody
+                                           ;; will look at this copy.
+                                           (t (ignore-errors (delete-file display)))))
                                    (return))
                                (error (condition)
                                  (when (= attempt 2) (error condition)))))
@@ -6642,6 +6759,7 @@ new cache entry is published."
                (setf layout-initialized-p t)))
                (setf applying-layout-p nil)))
            (poll ()
+             (delete-due-displays)
              (dolist (event (drain-events queue))
                (case (first event)
                  (:status
@@ -6655,15 +6773,18 @@ new cache entry is published."
                  (:call
                   (funcall (second event)))
                  (:preview
-                  (when (gui-preview-event-current-p model event preview-generation)
-                    (publish-preview (fifth event) (sixth event) (second event)
-                                     (published-region (sixth event)
-                                                       (seventh event)
-                                                       (eighth event))
-                                     (ninth event))
-                    (setf render-stage nil
-                          render-stage-fraction 0.0)
-                    (set-status (render-summary-text))))
+                  (if (gui-preview-event-current-p model event preview-generation)
+                      (progn
+                        (publish-preview (fifth event) (sixth event) (second event)
+                                         (published-region (sixth event)
+                                                           (seventh event)
+                                                           (eighth event))
+                                         (ninth event))
+                        (setf render-stage nil
+                              render-stage-fraction 0.0)
+                        (set-status (render-summary-text)))
+                      ;; Arrived for a photograph or a grade no longer shown.
+                      (discard-display (sixth event))))
                  (:live-preview
                   (when (and (= (second event) preview-generation)
                              (eq (third event) (selected-job)))
@@ -6690,20 +6811,22 @@ new cache entry is published."
                                        &optional (grade :developed))
                       (rest event)
                     (declare (ignore generation))
-                    (when (and (member job (project-photos project) :test #'eq)
-                               ;; The camera's preview stands in only while
-                               ;; there is nothing; the develop replaces it.
-                               (or (null (gethash job thumbnail-files))
-                                   (and (eq grade :developed)
-                                        (not (eq :developed
-                                                 (gethash job thumbnail-grades))))))
-                      (setf (gethash job thumbnail-files) display
-                            (gethash job thumbnail-grades) grade)
-                      ;; A thumbnail is also the first time this photograph can
-                      ;; be compared with its neighbours, so the bursts are worth
-                      ;; asking about again.
-                      (refresh-photo-groups)
-                      (redraw-thumbnails))))
+                    (if (and (member job (project-photos project) :test #'eq)
+                             ;; The camera's preview stands in only while
+                             ;; there is nothing; the develop replaces it;
+                             ;; nothing replaces the graded frame.
+                             (or (null (gethash job thumbnail-files))
+                                 (and (eq grade :developed)
+                                      (eq :camera (gethash job thumbnail-grades)))))
+                        (progn
+                          (set-thumbnail job display grade)
+                          ;; A thumbnail is also the first time this photograph
+                          ;; can be compared with its neighbours, so the bursts
+                          ;; are worth asking about again.
+                          (refresh-photo-groups)
+                          (redraw-thumbnails))
+                        ;; Not wanted: the copy was made for nothing.
+                        (discard-display display))))
                  (:photo-groups
                   (when (third event)
                     (apply-photo-order (third event) (fourth event)))
