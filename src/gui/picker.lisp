@@ -1196,12 +1196,25 @@ and put the dialog away."
           (t
            (picker-save-settings picker)
            (lightfast:hide (photo-picker-window picker))
+           (picker-forget-decoded-thumbnails picker)
            (picker-clear-stash picker)
            (when (photo-picker-on-pick picker)
              (funcall (photo-picker-on-pick picker) paths))))))
 
 (defun picker-cancel (picker)
-  (lightfast:hide (photo-picker-window picker)))
+  (lightfast:hide (photo-picker-window picker))
+  (picker-forget-decoded-thumbnails picker))
+
+(defun picker-forget-decoded-thumbnails (picker)
+  "Let the native cache drop the picker's decoded thumbnails.
+
+The files stay in the cache directory, so the next visit is as quick; only the
+decoded pixels of a whole folder of previews stop occupying memory."
+  (maphash (lambda (key thumb)
+             (declare (ignore key))
+             (when (pathnamep thumb)
+               (forget-preview-file thumb)))
+           (photo-picker-thumbnails picker)))
 
 (defun picker-refilter (picker)
   "The filter or sort changed: list the same folder again, keeping the
