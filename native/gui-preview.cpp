@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cmath>
 #include <climits>
+#include <cstddef>
 #include <csetjmp>
 #include <cstdio>
 #include <cstdlib>
@@ -24,32 +25,77 @@ Fl_Widget *find_widget(long long id);
 
 namespace {
 struct PreviewImage {
+    // The decoded file. Only the few most recently used entries keep theirs:
+    // a filmstrip of two hundred frames, each once shown on the canvas, must
+    // not hold two hundred full-size decodes. Loaded again from the path when
+    // wanted; the file's size is remembered so questions about it need no
+    // decode at all.
     std::unique_ptr<Fl_JPEG_Image> source;
+    int width = 0;
+    int height = 0;
     std::unique_ptr<Fl_Image> scaled;
     int scaled_width = 0;
     int scaled_height = 0;
+    // The filmstrip's copy, kept when the source goes: it is what the
+    // filmstrip draws, and it is tiny.
     std::unique_ptr<Fl_Image> thumbnail;
     int thumbnail_width = 0;
     int thumbnail_height = 0;
+    unsigned long long last_use = 0;
 };
 
 std::unordered_map<std::string, PreviewImage> images;
 // Native callbacks can load, draw, inspect, or evict the same FLTK image.
 // Serialize both the ownership map and access to its image objects.
 std::mutex images_mutex;
+unsigned long long use_counter = 0;
+// Decoded sources kept at once: the two canvases, their predecessors while a
+// swap is under way, and a couple of thumbnails being scaled for the first
+// time. Each is the size of a frame; two hundred of them were the leak.
+constexpr std::size_t SOURCE_LIMIT = 6;
 
-PreviewImage *find_image(const char *path) {
-    if (!path || !*path) return nullptr;
-    auto found = images.find(path);
-    if (found == images.end()) {
-        PreviewImage image;
-        image.source = std::make_unique<Fl_JPEG_Image>(path);
-        if (image.source->fail() || image.source->w() <= 0 || image.source->h() <= 0) {
-            return nullptr;
+// Drop the least recently used decoded sources beyond the limit, except
+// KEEP's. Their thumbnails stay.
+void trim_sources(const std::string &keep) {
+    for (;;) {
+        std::size_t loaded = 0;
+        PreviewImage *oldest = nullptr;
+        for (auto &entry : images) {
+            if (!entry.second.source) continue;
+            ++loaded;
+            if (entry.first == keep) continue;
+            if (!oldest || entry.second.last_use < oldest->last_use) {
+                oldest = &entry.second;
+            }
         }
-        found = images.emplace(path, std::move(image)).first;
+        if (loaded <= SOURCE_LIMIT || !oldest) return;
+        oldest->source.reset();
+        oldest->scaled.reset();
+        oldest->scaled_width = oldest->scaled_height = 0;
     }
-    return &found->second;
+}
+
+// The entry for PATH, decoding the file when it is not known yet or when
+// NEED_SOURCE asks for pixels the entry no longer holds. Null when the file
+// is not a readable JPEG.
+PreviewImage *find_image(const char *path, bool need_source) {
+    if (!path || !*path) return nullptr;
+    const std::string key(path);
+    auto found = images.find(key);
+    if (found != images.end() && (!need_source || found->second.source)) {
+        found->second.last_use = ++use_counter;
+        return &found->second;
+    }
+    auto source = std::make_unique<Fl_JPEG_Image>(path);
+    if (source->fail() || source->w() <= 0 || source->h() <= 0) return nullptr;
+    if (found == images.end()) found = images.emplace(key, PreviewImage()).first;
+    PreviewImage &image = found->second;
+    image.width = source->w();
+    image.height = source->h();
+    image.source = std::move(source);
+    image.last_use = ++use_counter;
+    trim_sources(key);
+    return &image;
 }
 
 int scaled_dimension(int source, double scale) {
@@ -74,7 +120,7 @@ extern "C" int orfeus_gui_preview_draw(long long widget_id,
                                         double center_y) {
     std::lock_guard<std::mutex> lock(images_mutex);
     Fl_Widget *widget = clfl_bridge::find_widget(widget_id);
-    PreviewImage *image = find_image(path);
+    PreviewImage *image = find_image(path, true);
     if (!widget || !image || widget->w() <= 0 || widget->h() <= 0 ||
         !std::isfinite(zoom) || !std::isfinite(center_x) || !std::isfinite(center_y)) {
         return 0;
@@ -178,17 +224,19 @@ extern "C" int orfeus_gui_preview_draw_rect(long long widget_id,
                                                int height) {
     std::lock_guard<std::mutex> lock(images_mutex);
     Fl_Widget *widget = clfl_bridge::find_widget(widget_id);
-    PreviewImage *image = find_image(path);
+    PreviewImage *image = find_image(path, false);
     if (!widget || !image || width <= 0 || height <= 0) return 0;
 
-    Fl_JPEG_Image &source = *image->source;
-    const double scale = std::min(static_cast<double>(width) / source.w(),
-                                  static_cast<double>(height) / source.h());
-    const int scaled_width = scaled_dimension(source.w(), scale);
-    const int scaled_height = scaled_dimension(source.h(), scale);
+    const double scale = std::min(static_cast<double>(width) / image->width,
+                                  static_cast<double>(height) / image->height);
+    const int scaled_width = scaled_dimension(image->width, scale);
+    const int scaled_height = scaled_dimension(image->height, scale);
     if (!image->thumbnail || image->thumbnail_width != scaled_width ||
         image->thumbnail_height != scaled_height) {
-        image->thumbnail.reset(source.copy(scaled_width, scaled_height));
+        // The one moment the filmstrip needs the frame itself.
+        image = find_image(path, true);
+        if (!image) return 0;
+        image->thumbnail.reset(image->source->copy(scaled_width, scaled_height));
         if (!image->thumbnail) return 0;
         image->thumbnail_width = scaled_width;
         image->thumbnail_height = scaled_height;
@@ -367,16 +415,28 @@ extern "C" int orfeus_gui_preview_draw_rgb_rect(long long widget_id,
 
 extern "C" int orfeus_gui_preview_size(const char *path, int *width, int *height) {
     std::lock_guard<std::mutex> lock(images_mutex);
-    PreviewImage *image = find_image(path);
+    PreviewImage *image = find_image(path, false);
     if (!image || !width || !height) return 0;
-    *width = image->source->w();
-    *height = image->source->h();
+    *width = image->width;
+    *height = image->height;
     return 1;
 }
 
 extern "C" void orfeus_gui_preview_forget(const char *path) {
     std::lock_guard<std::mutex> lock(images_mutex);
     if (path && *path) images.erase(path);
+}
+
+// Drop PATH's decoded frame but keep its thumbnail: the photograph has left
+// the canvas and lives on only in the filmstrip.
+extern "C" void orfeus_gui_preview_trim(const char *path) {
+    std::lock_guard<std::mutex> lock(images_mutex);
+    if (!path || !*path) return;
+    auto found = images.find(path);
+    if (found == images.end()) return;
+    found->second.source.reset();
+    found->second.scaled.reset();
+    found->second.scaled_width = found->second.scaled_height = 0;
 }
 
 extern "C" void orfeus_gui_preview_clear(void) {

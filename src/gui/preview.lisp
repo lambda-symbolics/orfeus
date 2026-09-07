@@ -19,6 +19,11 @@
       (unless (probe-file path)
         (error 'gui-preview-library-unavailable :path path))
       (cffi:load-foreign-library path)
+      ;; A library built before an entry point was added would fail at the
+      ;; first call, deep in a draw callback; say so at startup instead.
+      (unless (cffi:foreign-symbol-pointer "orfeus_gui_preview_trim")
+        (error "Orfeus GUI preview library at ~A is out of date. Run `make gui-native`."
+               path))
       (setf *gui-preview-library-loaded-p* t))))
 
 (cffi:defcfun ("orfeus_gui_preview_draw" %gui-preview-draw) :int
@@ -41,6 +46,8 @@
   (widget-id :long-long) (rgb :pointer) (width :int) (height :int)
   (generation :int) (zoom :double) (center-x :double) (center-y :double))
 (cffi:defcfun ("orfeus_gui_preview_forget" %gui-preview-forget) :void
+  (path :string))
+(cffi:defcfun ("orfeus_gui_preview_trim" %gui-preview-trim) :void
   (path :string))
 (cffi:defcfun ("orfeus_gui_preview_clear" %gui-preview-clear) :void)
 (defmacro with-preview-float-traps (&body body)
@@ -73,6 +80,15 @@ already applies to the render library."
   (when *gui-preview-library-loaded-p*
     (with-preview-float-traps
       (%gui-preview-forget (namestring pathname)))))
+
+(defun trim-preview-file (pathname)
+  "Drop PATHNAME's decoded full-size image from the native preview cache.
+
+The small copy the filmstrip draws stays, so a photograph that has left the
+canvas costs a thumbnail's worth of memory, not a frame's."
+  (when *gui-preview-library-loaded-p*
+    (with-preview-float-traps
+      (%gui-preview-trim (namestring pathname)))))
 
 (defun clear-preview-cache ()
   "Release all decoded images held by the native preview adapter."
