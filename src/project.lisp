@@ -20,7 +20,7 @@ TIMESTAMP-FILENAMES-P prefixes automatic output names with the capture time,
 as in 20260802-183512-PB020123.jpg, keeping the original name intact. FORMAT
 chooses the encoder for automatic output names; an explicit per-photo output
 path still decides its own format from its extension."
-  (format :jpeg :type (member :jpeg :tiff))
+  (format :jpeg :type (member :jpeg :tiff :avif))
   (jpeg-quality 92 :type (integer 1 100))
   (max-width nil :type (or null (integer 1)))
   (max-height nil :type (or null (integer 1)))
@@ -31,7 +31,8 @@ path still decides its own format from its extension."
   "Return the filename extension FORMAT's encoder writes."
   (ecase format
     (:jpeg "jpg")
-    (:tiff "tif")))
+    (:tiff "tif")
+    (:avif "avif")))
 
 (defstruct photo-job
   "One input photograph and its optional per-photo setting overrides.
@@ -250,8 +251,8 @@ frontend keep undo snapshots."
         (max-height (getf sexp :max-height))
         (timestamp-filenames-p (getf sexp :timestamp-filenames-p))
         (preserve-metadata-p (getf sexp :preserve-metadata-p t)))
-    (unless (member format '(:jpeg :tiff))
-      (project-invalid sexp ":format must be :JPEG or :TIFF"))
+    (unless (member format '(:jpeg :tiff :avif))
+      (project-invalid sexp ":format must be :JPEG, :TIFF or :AVIF"))
     (unless (and (integerp quality) (<= 1 quality 100))
       (project-invalid sexp ":jpeg-quality must be an integer from 1 to 100"))
     (dolist (entry (list (cons :max-width max-width)

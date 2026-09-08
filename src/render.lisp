@@ -5,12 +5,13 @@
     (cond
       ((member type '("jpg" "jpeg") :test #'string=) :jpeg)
       ((member type '("tif" "tiff") :test #'string=) :tiff)
+      ((string= type "avif") :avif)
       (t
        (error 'raw-render-error
               :input-pathname pathname
               :output-pathname pathname
               :status 1
-              :message "output extension must be JPEG, JPG, TIFF, or TIF")))))
+              :message "output extension must be JPEG, JPG, TIFF, TIF, or AVIF")))))
 
 (defun render-temporary-pathname (output-pathname)
   (let ((directory (uiop:pathname-directory-pathname output-pathname))

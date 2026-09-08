@@ -171,7 +171,7 @@ returns at once, so a caller can spend it during startup instead."
 (defun native-error-message (buffer)
   (foreign-string-to-lisp buffer :encoding :utf-8))
 
-(defparameter *required-render-capabilities* #b10111
+(defparameter *required-render-capabilities* #b110111
   "Render features required by the Common Lisp core.")
 
 (defun native-render-require-compatible ()
@@ -602,7 +602,8 @@ by definition."
                  (setting 'version 1)
                  (setting 'output-format (ecase output-format
                                            (:jpeg 1)
-                                           (:tiff 2)))
+                                           (:tiff 2)
+                                           (:avif 3)))
                  (setting 'max-width max-width)
                  (setting 'max-height max-height)
                  (setting 'jpeg-quality jpeg-quality)

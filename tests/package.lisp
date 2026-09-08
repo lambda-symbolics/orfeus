@@ -5,6 +5,8 @@
                 #:orfeus-version
                 #:orfeus-build-commit
                 #:orfeus-build-description
+                #:export-format-extension
+                #:export-settings-format
                 #:export-settings-jpeg-quality
                 #:export-settings-max-height
                 #:export-settings-max-width

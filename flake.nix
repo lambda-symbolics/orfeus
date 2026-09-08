@@ -26,6 +26,7 @@
           lcms2
           lensfun
           libjpeg_turbo
+          nasm
           libtiff
           pkg-config
           rustc

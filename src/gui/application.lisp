@@ -451,7 +451,7 @@ than turned by noise.")
     value))
 
 (defparameter *export-format-captions*
-  '(("JPEG" . :jpeg) ("16-bit TIFF" . :tiff))
+  '(("JPEG" . :jpeg) ("16-bit TIFF" . :tiff) ("AVIF" . :avif))
   "Export encoders offered in the dialog, in menu order.")
 
 (defun export-format-from-caption (caption)
@@ -479,7 +479,7 @@ than turned by noise.")
           (height (parse-export-integer-value
                    height-text "Maximum height" 0 0 100000))
           (quality (parse-export-integer-value
-                    quality-text "JPEG quality" 92 1 100))
+                    quality-text "Quality" 92 1 100))
           (settings (project-export-settings project)))
       (setf (project-output-directory project) destination-path
             (export-settings-format settings) format
@@ -3550,7 +3550,7 @@ behind is memory. Best effort; returns how many directories went."
                      (:jpeg-quality
                       (setf (export-settings-jpeg-quality settings)
                             (parse-export-integer-value
-                             (lightfast:value widget) "JPEG quality" 92 1 100)))
+                             (lightfast:value widget) "Quality" 92 1 100)))
                      (:max-width
                       (let ((value (parse-export-integer-value
                                     (lightfast:value widget)
@@ -6029,7 +6029,7 @@ behind is memory. Best effort; returns how many directories went."
                                :items (mapcar #'car
                                               *export-format-captions*))))
                  (setf export-dialog-quality
-                       (field (text "JPEG quality") (number-input))
+                       (field (text "Quality") (number-input))
                        export-dialog-width
                        (field (text "Maximum width") (number-input))
                        export-dialog-height
@@ -7644,7 +7644,7 @@ behind is memory. Best effort; returns how many directories went."
                                 (declare (ignore event value))
                                 (export-setting-changed key widget)))
                    y :page))))
-          (setf export-quality (export-integer-field :jpeg-quality "JPEG quality" 26)
+          (setf export-quality (export-integer-field :jpeg-quality "Quality" 26)
                 export-max-width (export-integer-field :max-width "Maximum width" 58)
                 export-max-height (export-integer-field :max-height "Maximum height" 90)
                 export-metadata

@@ -176,6 +176,18 @@ the failure list, and both ON-ERROR modes without needing real RAW files."
          (= 1600 (export-settings-max-height settings))
          (null (export-settings-preserve-metadata-p settings)))))
 
+(defun avif-export-format-round-trips-p ()
+  (let* ((project (make-project
+                   :output-directory #P"exports/"
+                   :export-settings (make-export-settings :format :avif)))
+         (decoded (sexp->project (project->sexp project))))
+    (and (eq :avif (export-settings-format (project-export-settings decoded)))
+         (string= "avif" (export-format-extension :avif))
+         (eq :avif (orfeus::render-output-format #P"/tmp/frame.avif"))
+         (handler-case
+             (progn (orfeus::sexp->export-settings '(:format :webp)) nil)
+           (invalid-project-data () t)))))
+
 (defun processing-presets-round-trip-p ()
   (let* ((project
            (make-project
@@ -2095,6 +2107,7 @@ neither way."
              (project-render-batches-in-order-p))
       (check "project files round trip" (project-file-round-trip-p))
       (check "export settings round trip" (export-settings-round-trip-p))
+      (check "AVIF export format round trips" (avif-export-format-round-trips-p))
       (check "processing presets round trip" (processing-presets-round-trip-p))
       (check "neural noise reduction round trips and validates"
              (neural-noise-reduction-round-trip-p))

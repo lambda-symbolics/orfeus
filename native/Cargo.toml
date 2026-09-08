@@ -11,7 +11,9 @@ crate-type = ["cdylib"]
 [dependencies]
 ash = { version = "=0.38.0", default-features = false, features = ["loaded", "std"] }
 flate2 = { version = "=1.1.2", default-features = false, features = ["rust_backend"] }
-image = { version = "=0.25.10", default-features = false, features = ["jpeg", "tiff"] }
+# The AVIF encoder is ravif on rav1e; "rayon" lets it use every core and
+# "nasm" builds rav1e's assembly kernels, which need nasm in the shell.
+image = { version = "=0.25.10", default-features = false, features = ["jpeg", "tiff", "avif", "rayon", "nasm"] }
 jpeg-encoder = { version = "=0.7.1", features = ["simd"] }
 lensfun = "=0.7.0"
 md-5 = "=0.10.6"
