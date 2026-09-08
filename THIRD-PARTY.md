@@ -43,3 +43,13 @@ unless otherwise specified. Its notice is preserved in
 `licenses/Film-Luts-MIT.txt`. The repository also states that its maintainer
 does not claim ownership of the LUTs and that they may remain subject to their
 respective owners' rights and trademarks.
+
+## JSZ CEDAR looks
+
+The eight `data/luts/JSZ-CEDAR *.cube` files were baked from the JSZ CEDAR
+Lightroom presets (`crs:Version` 10.5, Process Version 2012) by
+`scripts/lightroom-preset-lut.lisp`, which approximates Camera Raw's colour
+controls; the presets' sharpening, grain, vignette, clarity and dehaze are not
+in the LUTs and are listed in each file's header. The presets were supplied by
+the project's author for this conversion. Their SHA-256 digests are pinned in
+`tests/suite.lisp`.
