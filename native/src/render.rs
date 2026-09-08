@@ -3977,6 +3977,79 @@ pub(crate) fn apply_contrast(image: &mut RgbImage, contrast: f32, pivot: f32) {
     });
 }
 
+/// Compresses the frame's tonal range the way the camera's HDR modes do.
+///
+/// Measured against the OM-1's own HDR1 and HDR2 JPEGs, read through the
+/// inverse of the same camera's normal rendering: HDR1 lifts the deep shadows
+/// by two thirds of a stop and holds the highlights back by nearly a stop,
+/// pivoting at displayed middle grey; HDR2 lifts them by three and a half
+/// stops and pivots higher. Both are, to a tenth of a stop, a straight slope in the logarithm of
+/// luminance about the pivot — a contrast of `1 - strength` — with the lift
+/// eased into a ceiling of `max_lift` stops, so the noise floor is not hauled
+/// up without limit. The gain is read from luminance and applied to all three
+/// channels, which keeps colour where the camera keeps it; a per-channel
+/// slope would have drained it.
+///
+/// `lift_ev` is a plain exposure applied first, for frames deliberately held
+/// back at capture. The pivot is stated as displayed brightness, the way it
+/// was measured and the way a photographer reads a histogram, and turned into
+/// scene luminance through the default display tone curve.
+pub(crate) fn apply_hdr(
+    image: &mut RgbImage,
+    lift_ev: f32,
+    strength: f32,
+    pivot_displayed: f32,
+    max_lift: f32,
+) {
+    if strength <= 0.0 {
+        apply_exposure(image, lift_ev);
+        return;
+    }
+    let lift = 2.0_f32.powf(lift_ev);
+    let pivot = scene_luminance_for_displayed(pivot_displayed.clamp(0.02, 0.98)).max(1.0e-6);
+    let inverse_pivot = 1.0 / pivot;
+    let cap = max_lift.max(0.05);
+    image.data.par_chunks_mut(3 * 8192).for_each(|chunk| {
+        for pixel in chunk.as_chunks_mut::<3>().0 {
+            let luminance =
+                lift * (0.212_672_9 * pixel[0] + 0.715_152_2 * pixel[1] + 0.072_175 * pixel[2]);
+            let gain = if luminance > 0.0 && luminance.is_finite() {
+                let raw = -strength * (luminance * inverse_pivot).log2();
+                let ev = if raw > 0.0 { soft_cap(raw, cap) } else { raw };
+                lift * ev.exp2()
+            } else {
+                lift
+            };
+            for value in pixel.iter_mut() {
+                *value *= gain;
+            }
+        }
+    });
+}
+
+/// RAW stops of lift eased into a ceiling of CAP stops: linear well below the
+/// ceiling, never above it, and no corner where the two meet.
+fn soft_cap(raw: f32, cap: f32) -> f32 {
+    let ratio = raw / cap;
+    raw / (1.0 + ratio * ratio * ratio * ratio).sqrt().sqrt()
+}
+
+/// The scene luminance the default display tone shows at DISPLAYED, an
+/// sRGB-encoded brightness. The curve is monotonic, so a bisection finds it.
+pub(crate) fn scene_luminance_for_displayed(displayed: f32) -> f32 {
+    let target = srgb_decode(displayed.clamp(0.0, 1.0));
+    let (mut low, mut high) = (0.0_f32, 64.0_f32);
+    for _ in 0..60 {
+        let middle = 0.5 * (low + high);
+        if super::tone::default_display_tone(middle) < target {
+            low = middle;
+        } else {
+            high = middle;
+        }
+    }
+    0.5 * (low + high)
+}
+
 /// Bins of the log-spaced histograms the negative inversion measures with, and
 /// the signal they span in octaves: from far below any sensor's noise floor to
 /// a little above full scale.
@@ -6628,6 +6701,64 @@ mod tests {
             apply_flip(&mut untouched, false, false);
             assert_eq!(untouched.data, original.data);
         }
+    }
+
+    #[test]
+    fn hdr_lifts_shadows_holds_highlights_and_keeps_the_pivot() {
+        // A compression of the log signal about displayed middle grey at
+        // half strength, the lift capped at a stop: a little past the
+        // camera's HDR1, in round numbers.
+        let pivot_displayed = 0.49_f32;
+        let pivot = scene_luminance_for_displayed(pivot_displayed);
+        assert!((pivot - 0.08).abs() < 0.03, "middle grey landed at {pivot}");
+        let mut image = flat_image(4, 4, [pivot; 3]);
+        apply_hdr(&mut image, 0.0, 0.5, pivot_displayed, 1.0);
+        for value in &image.data {
+            assert!((*value - pivot).abs() < 1.0e-4, "the pivot moved to {value}");
+        }
+        // Two stops under the pivot comes up by one, half the distance, and
+        // two stops over goes down by one.
+        let mut image = RgbImage {
+            width: 2,
+            height: 1,
+            data: [pivot / 4.0; 3].into_iter().chain([pivot * 4.0; 3]).collect(),
+        };
+        apply_hdr(&mut image, 0.0, 0.5, pivot_displayed, 4.0);
+        let shadow_gain = image.data[0] / (pivot / 4.0);
+        let highlight_gain = image.data[3] / (pivot * 4.0);
+        assert!((shadow_gain - 2.0).abs() < 0.02, "shadow gain {shadow_gain}");
+        assert!((highlight_gain - 0.5).abs() < 0.005, "highlight gain {highlight_gain}");
+        // The cap: ten stops under the pivot is not hauled up five stops but
+        // eased into the ceiling, and a colour keeps its ratios on the way.
+        let deep = pivot / 1024.0;
+        let mut image = RgbImage {
+            width: 1,
+            height: 1,
+            data: vec![deep, deep * 0.5, deep * 0.25],
+        };
+        apply_hdr(&mut image, 0.0, 0.5, pivot_displayed, 1.0);
+        let gain = image.data[0] / deep;
+        assert!(gain > 1.9 && gain <= 2.0, "capped gain {gain}");
+        assert!(
+            (image.data[1] / image.data[0] - 0.5).abs() < 1.0e-5
+                && (image.data[2] / image.data[0] - 0.25).abs() < 1.0e-5,
+            "colour ratios moved: {:?}",
+            image.data
+        );
+        // Strength zero is a plain exposure, and nothing at all at zero lift.
+        let mut image = flat_image(2, 2, [0.2, 0.1, 0.05]);
+        apply_hdr(&mut image, 1.0, 0.0, pivot_displayed, 1.0);
+        for (after, before) in image.data.iter().zip([0.4_f32, 0.2, 0.1].iter().cycle()) {
+            assert!((after - before).abs() < 1.0e-6, "lift alone gave {after} for {before}");
+        }
+        let mut image = flat_image(2, 2, [0.2, 0.1, 0.05]);
+        apply_hdr(&mut image, 0.0, 0.0, pivot_displayed, 1.0);
+        for (after, before) in image.data.iter().zip([0.2_f32, 0.1, 0.05].iter().cycle()) {
+            assert!((after - before).abs() < 1.0e-6, "the identity changed {before} to {after}");
+        }
+        // The soft cap is linear far below the ceiling and never above it.
+        assert!((soft_cap(0.1, 1.0) - 0.1).abs() < 1.0e-3);
+        assert!(soft_cap(10.0, 1.0) < 1.0 && soft_cap(10.0, 1.0) > 0.99);
     }
 
     #[test]

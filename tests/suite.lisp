@@ -1608,6 +1608,61 @@ filled in."
            ;; Like any inversion, it works on the scene, not on a film look.
            (rejected-p '(:gamma 2.2) :film)))))
 
+(defun hdr-node-validates-and-encodes-p ()
+  "An HDR node carries a lift, a strength, a pivot and a shadow cap, refuses
+what the camera's modes cannot mean, reaches the executor as kind 16 with four
+parameters, and the two camera presets are what was measured off the OM-1."
+  (flet ((rejected-p (params &optional (input-kind :crop))
+           (handler-case
+               (progn
+                 (graph-validate
+                  (make-processing-graph
+                   :nodes (list (make-graph-node
+                                 :id 1 :kind input-kind
+                                 :params (if (eq input-kind :film)
+                                             '(:grain-amount 0.2)
+                                             '(:left 0.1 :top 0.1
+                                               :width 0.8 :height 0.8))
+                                 :inputs '(0))
+                                (make-graph-node
+                                 :id 2 :kind :hdr
+                                 :params params :inputs '(1)))
+                   :output 2))
+                 nil)
+             (invalid-project-data () t))))
+    (let* ((graph (graph-validate
+                   (make-processing-graph
+                    :nodes (list (make-graph-node
+                                  :id 1 :kind :hdr
+                                  :params (orfeus:hdr-preset-params :hdr2)
+                                  :inputs '(0)))
+                    :output 1)))
+           (decoded (sexp->graph (graph->sexp graph)))
+           (bytes (orfeus::graph->program-bytes decoded)))
+      (and (equal (orfeus:hdr-preset-params :hdr2)
+                  (graph-node-params (graph-find-node decoded 1)))
+           ;; Wire code 16, four parameters.
+           (= 16 (elt bytes 12))
+           (= 4 (elt bytes 24))
+           (member :hdr (graph-node-kinds))
+           ;; The camera's modes as measured: HDR1 eases the log slope to 0.6
+           ;; about middle grey, HDR2 to 0.2 about a brighter pivot.
+           (= 0.4 (getf (orfeus:hdr-preset-params :hdr1) :strength))
+           (= 0.8 (getf (orfeus:hdr-preset-params :hdr2) :strength))
+           (< (getf (orfeus:hdr-preset-params :hdr1) :pivot)
+              (getf (orfeus:hdr-preset-params :hdr2) :pivot))
+           (null (orfeus:hdr-preset-params :hdr3))
+           (not (rejected-p (orfeus:hdr-preset-params :hdr1)))
+           ;; Every parameter has a default.
+           (not (rejected-p '()))
+           (rejected-p '(:strength 1.5))
+           (rejected-p '(:pivot 0.0))
+           (rejected-p '(:shadows -1.0))
+           (rejected-p '(:lift 9.0))
+           (rejected-p '(:gamma 2.0))
+           ;; It reasons about scene luminance, so not after a film look.
+           (rejected-p (orfeus:hdr-preset-params :hdr1) :film)))))
+
 (defun graph-program-bytes-p ()
   (let* ((graph (make-processing-graph
                  :nodes (list (make-graph-node :id 1 :kind :exposure
@@ -2032,6 +2087,8 @@ neither way."
              (negative-workflow-graph-p))
       (check "a negative node validates its print and encodes with defaults"
              (negative-node-validates-and-encodes-p))
+      (check "HDR node validates, encodes as kind 16, and carries the camera's modes"
+             (hdr-node-validates-and-encodes-p))
       (check "timestamped output names format and round trip"
              (timestamped-output-names-p))
       (check "old projects receive export defaults" (old-project-export-defaults-p))

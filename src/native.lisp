@@ -364,7 +364,8 @@ photographer."
   '((:white-balance . 1) (:exposure . 2) (:noise-reduction . 3)
     (:tone . 4) (:optics . 5) (:film . 6) (:blend . 7)
     (:color-subtract . 8) (:crop . 9) (:curves . 10) (:rotate . 11)
-    (:contrast . 12) (:sharpen . 13) (:flip . 14) (:negative . 15))
+    (:contrast . 12) (:sharpen . 13) (:flip . 14) (:negative . 15)
+    (:hdr . 16))
   "Wire codes of graph node kinds in the native program format.")
 
 (defconstant +graph-program-magic+ #x4746524F
@@ -455,6 +456,15 @@ reaches it and there is nothing to keep alive across threads.")
                        (getf params :blue 0.0)
                        (getf params :gamma *negative-default-gamma*)
                        (getf params :balance *negative-default-balance*))
+                 nil)))
+      (:hdr
+       ;; Absent parameters take the camera's HDR1, the milder mode.
+       (let ((params (graph-node-params node))
+             (preset (hdr-preset-params :hdr1)))
+         (values (list (float (getf params :lift (getf preset :lift)) 1.0)
+                       (float (getf params :strength (getf preset :strength)) 1.0)
+                       (float (getf params :pivot (getf preset :pivot)) 1.0)
+                       (float (getf params :shadows (getf preset :shadows)) 1.0))
                  nil)))
       (:crop
        (let ((params (graph-node-params node)))

@@ -146,6 +146,9 @@
    #:*curve-channel-keys*
    #:*quarter-turn-labels*
    #:*negative-keys*
+   #:*hdr-keys*
+   #:*hdr-presets*
+   #:hdr-preset-params
    #:*negative-default-gamma*
    #:*negative-default-balance*
    #:*rotate-keys*

@@ -126,7 +126,7 @@ them as a copyable node chain.")
   "Rotation amounts a rotate node offers, as quarter turns clockwise.")
 
 (defparameter *graph-only-node-kinds*
-  '(:blend :color-subtract :negative :contrast :crop :rotate :flip :curves)
+  '(:blend :color-subtract :negative :contrast :hdr :crop :rotate :flip :curves)
   "Node kinds that exist only in graphs, beyond the flat pipeline stages.
 
 :COLOR-SUBTRACT computes picked-color minus pixel per channel in scene-linear
@@ -145,13 +145,40 @@ contrast control applies. :SHARPEN is an unsharp mask on brightness alone, with
 the frame's own noise floor kept out of what it amplifies. :FLIP mirrors the
 frame across either axis, which is the part of orientation a rotation cannot
 reach — a negative laid on the light table emulsion side up comes out mirrored,
-and no amount of turning fixes a mirror.")
+and no amount of turning fixes a mirror. :HDR compresses the tonal range the
+way the camera's HDR modes do: a slope in the logarithm of luminance about a
+displayed pivot, the shadow lift eased into a cap, colour kept.")
 
 (defparameter *flip-keys* '(:horizontal :vertical)
   "Parameters of a flip node: which axes to mirror across.")
 
 (defparameter *contrast-keys* '(:contrast :pivot)
   "Parameters of a contrast node: the slope, and the tone it turns about.")
+
+(defparameter *hdr-keys* '(:lift :strength :pivot :shadows)
+  "Parameters of an HDR node: a plain exposure lift in stops for a frame held
+back at capture; the strength of the compression, where 0 leaves the tones
+alone and 1 would flatten them entirely; the displayed brightness that stays
+put; and the most the shadows may be lifted, in stops.")
+
+(defparameter *hdr-presets*
+  '((:hdr1 . (:lift 0.0 :strength 0.4 :pivot 0.47 :shadows 0.7))
+    (:hdr2 . (:lift 0.0 :strength 0.8 :pivot 0.63 :shadows 3.4)))
+  "The camera's two HDR modes as an HDR node, measured off an OM-1.
+
+Fitted against the camera's own HDR JPEGs, read through the inverse of its
+normal rendering — measured from normal frames of the same day — against
+Orfeus's neutral development of the RAW it kept. HDR1 came out as a slope of
+0.6 in the log about displayed middle grey with two thirds of a stop of shadow
+lift, within a tenth of a stop across the range; HDR2 as a slope of 0.2 about
+a brighter pivot with three and a half stops of lift. The RAW itself is
+recorded half a stop under the setting in both modes, and the JPEG's midtones
+sit where that RAW's do, so neither preset lifts the exposure: the camera keeps
+the frame dark and opens the shadows.")
+
+(defun hdr-preset-params (mode)
+  "The HDR node parameters for MODE, :HDR1 or :HDR2; NIL for anything else."
+  (copy-list (rest (assoc mode *hdr-presets*))))
 
 (defparameter *color-subtract-keys* '(:red :green :blue))
 

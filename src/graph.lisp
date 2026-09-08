@@ -64,6 +64,23 @@
       (graph-invalid params "contrast pivot must be within 0.05..0.95")))
   params)
 
+(defun hdr-params-validate (params)
+  (unless (and (listp params) (plist-known-keys-p params *hdr-keys*))
+    (graph-invalid params "expected :lift :strength :pivot :shadows parameters"))
+  (let ((lift (getf params :lift 0.0))
+        (strength (getf params :strength 0.4))
+        (pivot (getf params :pivot 0.47))
+        (shadows (getf params :shadows 0.7)))
+    (unless (and (realp lift) (<= -4 lift 4))
+      (graph-invalid params "HDR lift must be within -4..4 stops"))
+    (unless (and (realp strength) (<= 0 strength 49/50))
+      (graph-invalid params "HDR strength must be within 0..0.98"))
+    (unless (and (realp pivot) (<= 1/50 pivot 49/50))
+      (graph-invalid params "HDR pivot must be within 0.02..0.98"))
+    (unless (and (realp shadows) (<= 1/20 shadows 8))
+      (graph-invalid params "HDR shadow lift must be within 0.05..8 stops")))
+  params)
+
 (defparameter *legacy-sharpen-keys*
   '((:amount . :sharpen-amount) (:radius . :sharpen-radius)
     (:threshold . :sharpen-threshold))
@@ -222,6 +239,7 @@ whose frame has already moved, whichever of the two moved it."
     ((eq kind :flip) (flip-params-validate params))
     ((eq kind :curves) (curves-params-validate params))
     ((eq kind :contrast) (contrast-params-validate params))
+    ((eq kind :hdr) (hdr-params-validate params))
     ((graph-filter-kind-p kind)
      (graph-node-params-validate
       (make-graph-node :kind kind :params params)))
@@ -293,12 +311,14 @@ while blends stay scene-linear."
              (when (member input display)
                (graph-invalid node
                               "blend node ~S cannot consume film output" id))))
-          ((member kind '(:color-subtract :negative))
+          ((member kind '(:color-subtract :negative :hdr))
            (unless (= 1 (length inputs))
              (graph-invalid node "filter node ~S needs exactly one input" id))
-           (if (eq kind :negative)
-               (negative-params-validate (graph-node-params node))
-               (color-subtract-params-validate (graph-node-params node)))
+           (ecase kind
+             (:negative (negative-params-validate (graph-node-params node)))
+             (:hdr (hdr-params-validate (graph-node-params node)))
+             (:color-subtract
+              (color-subtract-params-validate (graph-node-params node))))
            (when (member (first inputs) display)
              (graph-invalid node "node ~S cannot process film output" id)))
           ((eq kind :crop)

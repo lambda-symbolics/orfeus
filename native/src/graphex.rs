@@ -40,6 +40,7 @@ pub const NODE_CONTRAST: u32 = 12;
 pub const NODE_SHARPEN: u32 = 13;
 pub const NODE_FLIP: u32 = 14;
 pub const NODE_NEGATIVE: u32 = 15;
+pub const NODE_HDR: u32 = 16;
 
 /// Frame-level settings shared by every node of one graph render.
 #[repr(C)]
@@ -251,6 +252,7 @@ fn param_arity(kind: u32) -> Result<ParamArity, Error> {
         NODE_SHARPEN => ParamArity::Exact(3),       // amount, radius, noise floor
         NODE_FLIP => ParamArity::Exact(2),          // mirror across x?, across y?
         NODE_NEGATIVE => ParamArity::Exact(5),      // film base, paper gamma, balance
+        NODE_HDR => ParamArity::Exact(4),           // lift ev, strength, displayed pivot, shadow cap ev
         _ => return Err(Error::InvalidArgument("unknown graph node kind")),
     })
 }
@@ -478,6 +480,10 @@ fn validate_param(kind: u32, index: usize, value: f32) -> Result<(), Error> {
         (NODE_NEGATIVE, 0..=2) => (0.0..=4.0).contains(&value),
         (NODE_NEGATIVE, 3) => (1.0..=4.0).contains(&value),
         (NODE_NEGATIVE, 4) => (0.0..=1.0).contains(&value),
+        (NODE_HDR, 0) => (-4.0..=4.0).contains(&value),
+        (NODE_HDR, 1) => (0.0..=0.98).contains(&value),
+        (NODE_HDR, 2) => (0.02..=0.98).contains(&value),
+        (NODE_HDR, 3) => (0.05..=8.0).contains(&value),
         // The four leading parameters are point counts, not signal levels.
         (NODE_CURVES, index) if index < CURVE_CHANNELS => {
             (MIN_CURVE_POINTS as f32..=MAX_CURVE_POINTS as f32).contains(&value)
@@ -1014,6 +1020,7 @@ fn node_stage_name(kind: u32) -> &'static str {
         NODE_ROTATE => "turning\0",
         NODE_FLIP => "mirroring\0",
         NODE_NEGATIVE => "inverting\0",
+        NODE_HDR => "compressing range\0",
         NODE_CONTRAST => "contrast\0",
         NODE_SHARPEN => "sharpening\0",
         _ => "developing\0",
@@ -1419,6 +1426,7 @@ fn execute_graph_into(
                     | NODE_FILM
                     | NODE_COLOR_SUBTRACT
                     | NODE_NEGATIVE
+                    | NODE_HDR
                     | NODE_CROP
                     | NODE_ROTATE
                     | NODE_FLIP
@@ -1480,6 +1488,15 @@ fn execute_graph_into(
                     [op.params[0], op.params[1], op.params[2]],
                     op.params[3],
                     op.params[4],
+                );
+            }
+            NODE_HDR => {
+                render::apply_hdr(
+                    &mut image,
+                    op.params[0],
+                    op.params[1],
+                    op.params[2],
+                    op.params[3],
                 );
             }
             NODE_SHARPEN => {
@@ -2606,12 +2623,14 @@ mod tests {
             NODE_NOISE_REDUCTION,
             NODE_COLOR_SUBTRACT,
             NODE_NEGATIVE,
+            NODE_HDR,
         ] {
             let params: &[f32] = match kind {
                 NODE_WHITE_BALANCE => &[0.0, 0.0],
                 NODE_EXPOSURE => &[0.5],
                 NODE_NOISE_REDUCTION => &[0.5, 0.0],
                 NODE_NEGATIVE => &[0.5, 0.3, 0.2, 2.2, 1.0],
+                NODE_HDR => &[0.0, 0.5, 0.49, 1.0],
                 _ => &[1.0, 1.0, 1.0],
             };
             assert!(
