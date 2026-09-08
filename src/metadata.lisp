@@ -62,7 +62,7 @@ five — nobody rates anything zero — so it reads as unrated."
     "-DateTimeOriginal" "-CreateDate"
     "-Model" "-ISO" "-FNumber" "-ExposureTime"
     "-Make" "-FocalLength#"
-    "-RollAngle")
+    "-RollAngle" "-StackedImage")
   "Everything read out of a photograph, in one ExifTool run.
 
 Asked for together because the subprocess is the cost, not the tags: the lens,
@@ -87,7 +87,32 @@ output as a dash, which is what keeps the answers positional.")
   ;; The camera's level gauge at the moment of exposure, in degrees of
   ;; clockwise roll as ExifTool reports Olympus's RollAngle, or NIL when the
   ;; body wrote none. Turning the picture clockwise by this much levels it.
-  (roll-angle nil))
+  (roll-angle nil)
+  ;; :HDR1 or :HDR2 when the frame was shot in one of the camera's HDR modes,
+  ;; which the OM-1 marks only in the JPEG it writes beside the RAW.
+  (hdr-mode nil))
+
+(defun parsed-hdr-mode (value)
+  "Return :HDR1 or :HDR2 for ExifTool's StackedImage VALUE, or NIL."
+  (when (usable-metadata-value-p value)
+    (cond ((string-equal value "HDR1") :hdr1)
+          ((string-equal value "HDR2") :hdr2))))
+
+(defun photo-sibling-jpeg (pathname)
+  "The camera's JPEG beside PATHNAME, same folder and name, or NIL.
+
+A body shooting RAW+JPEG writes the pair side by side, and some of what it
+knows about a frame it writes only into the JPEG: the OM-1's HDR modes leave
+the RAW unmarked and stamp the JPEG. Asked for nothing when PATHNAME is itself
+a JPEG."
+  (let ((pathname (pathname pathname)))
+    (unless (member (pathname-type pathname) '("jpg" "jpeg")
+                    :test #'string-equal)
+      (dolist (type '("JPG" "jpg" "JPEG" "jpeg"))
+        (let ((candidate (probe-file (make-pathname :type type
+                                                    :defaults pathname))))
+          (when candidate
+            (return candidate)))))))
 
 (defun parsed-roll-angle (value)
   "Return VALUE, ExifTool's roll angle in degrees, or NIL.
@@ -119,39 +144,52 @@ here, unlike a focal length: a level camera is worth knowing about."
 otherwise the slowest step of an interactive preview.")
 
 (defun read-photo-metadata (pathname)
-  "Run ExifTool once over PATHNAME and return everything it said."
-  (multiple-value-bind (output error-output status)
-      (uiop:run-program
-       (append (list "exiftool" "-f" "-s3") *photo-metadata-tags*
-               (list (namestring (pathname pathname))))
-       :output :string :error-output :string :ignore-error-status t)
-    (declare (ignore error-output))
-    (if (zerop status)
-        (let* ((lines (mapcar (lambda (line)
-                                (string-trim '(#\Space #\Tab #\Return) line))
-                              (uiop:split-string output :separator
-                                                 '(#\Newline))))
-               (dates (remove-if-not #'usable-metadata-value-p
-                                     (list (nth 6 lines) (nth 7 lines)))))
-          (flet ((field (index)
-                   (let ((value (nth index lines)))
-                     (and (usable-metadata-value-p value) value))))
-            (%make-photo-metadata
-             :lens-description (find-if #'usable-lens-description-p
-                                        (subseq lines 0 (min 3 (length lines))))
-             :lens-name (find-if #'usable-lens-description-p
-                                 (subseq lines 2 (min 4 (length lines))))
-             :rating (or (parsed-rating (nth 4 lines))
-                         (parsed-rating (nth 5 lines)))
-             :timestamp (some #'timestamp-token dates)
-             :seconds (some #'capture-universal-time dates)
-             :capture-summary (capture-description (field 8) (field 9)
-                                                   (field 10) (field 11))
-             :camera-make (field 12)
-             :camera-model (field 8)
-             :focal-length (parsed-focal-length (nth 13 lines))
-             :roll-angle (parsed-roll-angle (nth 14 lines)))))
-        (%make-photo-metadata))))
+  "Run ExifTool once over PATHNAME, and over the camera's JPEG beside it when
+there is one, and return everything they said.
+
+Both files go into the one run: the process is the cost, not the file. Quiet,
+so that two files do not get the banner ExifTool otherwise puts between them,
+and every tag forced, so the answers stay positional: the RAW's block first,
+the JPEG's after it."
+  (let ((sibling (photo-sibling-jpeg pathname))
+        (count (length *photo-metadata-tags*)))
+    (multiple-value-bind (output error-output status)
+        (uiop:run-program
+         (append (list "exiftool" "-q" "-f" "-s3") *photo-metadata-tags*
+                 (list (namestring (pathname pathname)))
+                 (when sibling (list (namestring sibling))))
+         :output :string :error-output :string :ignore-error-status t)
+      (declare (ignore error-output))
+      (if (zerop status)
+          (let* ((lines (mapcar (lambda (line)
+                                  (string-trim '(#\Space #\Tab #\Return) line))
+                                (uiop:split-string output :separator
+                                                   '(#\Newline))))
+                 (dates (remove-if-not #'usable-metadata-value-p
+                                       (list (nth 6 lines) (nth 7 lines)))))
+            (flet ((field (index)
+                     (let ((value (nth index lines)))
+                       (and (usable-metadata-value-p value) value))))
+              (%make-photo-metadata
+               :lens-description (find-if #'usable-lens-description-p
+                                          (subseq lines 0 (min 3 (length lines))))
+               :lens-name (find-if #'usable-lens-description-p
+                                   (subseq lines 2 (min 4 (length lines))))
+               :rating (or (parsed-rating (nth 4 lines))
+                           (parsed-rating (nth 5 lines)))
+               :timestamp (some #'timestamp-token dates)
+               :seconds (some #'capture-universal-time dates)
+               :capture-summary (capture-description (field 8) (field 9)
+                                                     (field 10) (field 11))
+               :camera-make (field 12)
+               :camera-model (field 8)
+               :focal-length (parsed-focal-length (nth 13 lines))
+               :roll-angle (parsed-roll-angle (nth 14 lines))
+               ;; The JPEG's word first: it is where the camera puts the mark.
+               :hdr-mode (or (and sibling
+                                  (parsed-hdr-mode (nth (+ count 15) lines)))
+                             (parsed-hdr-mode (nth 15 lines))))))
+          (%make-photo-metadata)))))
 
 (defun photo-metadata (pathname)
   "Return PATHNAME's memoized metadata."
@@ -203,6 +241,15 @@ Positive is a camera turned clockwise, which is a scene turned the other
 way; a crop node with this angle puts it back. Checked against the verticals
 of OM-1 frames in every orientation the body writes."
   (photo-metadata-roll-angle (photo-metadata pathname)))
+
+(defun photo-hdr-mode (pathname)
+  "Return :HDR1 or :HDR2 when PATHNAME was shot in one of the camera's HDR
+modes, or NIL.
+
+The OM-1 records the RAW of such a frame half a stop under the setting and
+merges the bracket only into its JPEG, so the RAW looks dark until its shadows
+are opened the way the camera opened them; see *HDR-PRESETS*."
+  (photo-metadata-hdr-mode (photo-metadata pathname)))
 
 (defun photo-rating (pathname)
   "Return the star rating the photographer gave PATHNAME, 1 to 5, or NIL."

@@ -1663,6 +1663,34 @@ parameters, and the two camera presets are what was measured off the OM-1."
            ;; It reasons about scene luminance, so not after a film look.
            (rejected-p (orfeus:hdr-preset-params :hdr1) :film)))))
 
+(defun hdr-mode-reads-from-the-camera-jpeg-p ()
+  "The OM-1 marks HDR frames only in the JPEG it writes beside the RAW: the
+reader finds that file, asks it too, and reads the mark as a mode."
+  (let* ((root (merge-pathnames
+                (format nil "orfeus-hdr-sibling-~D/" (get-universal-time))
+                (uiop:temporary-directory)))
+         (raw (merge-pathnames "P1.ORF" root))
+         (jpeg (merge-pathnames "P1.JPG" root))
+         (lonely (merge-pathnames "P2.ORF" root)))
+    (ensure-directories-exist root)
+    (unwind-protect
+         (progn
+           (dolist (file (list raw jpeg lonely))
+             (with-open-file (stream file :direction :output
+                                          :if-exists :supersede)
+               (write-line "x" stream)))
+           (and (eq :hdr1 (orfeus::parsed-hdr-mode "HDR1"))
+                (eq :hdr2 (orfeus::parsed-hdr-mode "HDR2"))
+                (null (orfeus::parsed-hdr-mode "No"))
+                (null (orfeus::parsed-hdr-mode "-"))
+                (null (orfeus::parsed-hdr-mode nil))
+                ;; Asked for where the reader looks for it.
+                (string= "-StackedImage" (nth 15 orfeus::*photo-metadata-tags*))
+                (equal (truename jpeg) (orfeus::photo-sibling-jpeg raw))
+                (null (orfeus::photo-sibling-jpeg lonely))
+                (null (orfeus::photo-sibling-jpeg jpeg))))
+      (uiop:delete-directory-tree root :validate t :if-does-not-exist :ignore))))
+
 (defun graph-program-bytes-p ()
   (let* ((graph (make-processing-graph
                  :nodes (list (make-graph-node :id 1 :kind :exposure
@@ -2114,6 +2142,8 @@ neither way."
              (missing-lens-profile-warning-can-be-switched-off-p))
       (check "the camera's roll angle reads as degrees of level"
              (roll-angle-reads-as-the-camera-level-p))
+      (check "HDR mode is read from the camera's JPEG beside the RAW"
+             (hdr-mode-reads-from-the-camera-jpeg-p))
       (check "a lens listing names the calibration crop apart from the body's"
              (lens-listing-keeps-the-calibration-crop-apart-p))
       (check "a hand-set lens profile replaces the nickname alias"

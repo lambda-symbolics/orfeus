@@ -76,6 +76,7 @@
    #:photo-as-shot-kelvin
    #:photo-rating
    #:photo-roll-angle
+   #:photo-hdr-mode
    #:photo-capture-seconds
    #:photo-signature
    #:group-captures
