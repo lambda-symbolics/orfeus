@@ -132,6 +132,19 @@ impl Reporter {
 /// export is an export even when it asks for a small image.
 pub const FRAME_FLAG_DRAFT: u32 = 1;
 
+/// Develop with the RCD demosaic rather than PPG. The choice is the optics
+/// node's, read on the Lisp side, because the source itself has no node.
+pub const FRAME_FLAG_RCD: u32 = 2;
+
+/// The demosaic a frame's flags ask for.
+fn demosaic_for(flags: u32) -> render::Demosaic {
+    if flags & FRAME_FLAG_RCD != 0 {
+        render::Demosaic::Rcd
+    } else {
+        render::Demosaic::Ppg
+    }
+}
+
 impl RenderFrameV1 {
     fn validate(&self) -> Result<(), Error> {
         if self.struct_size < size_of::<Self>() as u32 {
@@ -1897,7 +1910,13 @@ pub fn prewarm_decode(
     }
     let profiling = std::env::var_os("ORFEUS_PROFILE").is_some();
     let draft = develops_draft(flags, max_width, max_height);
-    render::decoded_for_render_with_identity(input, cache_mode, draft, profiling)?;
+    render::decoded_for_render_with_identity(
+        input,
+        cache_mode,
+        draft,
+        demosaic_for(flags),
+        profiling,
+    )?;
     Ok(())
 }
 
@@ -1959,7 +1978,13 @@ fn render_graph_frame(
     };
     reporter.report("reading\0", 0.0);
     let (decoded, source_identity): (Arc<DecodedRaw>, Option<render::DecodeCacheKey>) =
-        render::decoded_for_render_with_identity(input, cache_mode, draft, profiling)?;
+        render::decoded_for_render_with_identity(
+            input,
+            cache_mode,
+            draft,
+            demosaic_for(frame.flags),
+            profiling,
+        )?;
     profile_stage!("decoded-source");
     reporter.report("scaling\0", 0.2);
     let (native_max_width, native_max_height) =

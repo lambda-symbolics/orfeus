@@ -48,6 +48,26 @@ pub const FLAG_LENS_TCA: u32 = 2;
 pub const CACHE_NONE: u32 = 0;
 pub const CACHE_USE: u32 = 1;
 
+/// Which algorithm interpolates the colour filter array.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Demosaic {
+    /// Ratio Corrected Demosaicing, the default: reads fine texture without
+    /// the maze PPG draws near the sensor's limit. See `rcd.rs`.
+    #[default]
+    Rcd,
+    /// Pattern Pixel Grouping: the quicker of the two.
+    Ppg,
+}
+
+impl Demosaic {
+    fn name(self) -> &'static str {
+        match self {
+            Demosaic::Rcd => "rcd",
+            Demosaic::Ppg => "ppg",
+        }
+    }
+}
+
 pub(crate) fn validate_cache_mode(cache_mode: u32) -> Result<(), Error> {
     if matches!(cache_mode, CACHE_NONE | CACHE_USE) {
         Ok(())
@@ -5569,6 +5589,39 @@ pub(crate) fn draft_identity(key: DecodeCacheKey) -> DecodeCacheKey {
     hasher.finalize().into()
 }
 
+/// The cache identity of a full develop by METHOD. PPG keeps the content key
+/// itself, as it always has; RCD derives its own, so the two never collide.
+pub(crate) fn method_identity(key: DecodeCacheKey, method: Demosaic) -> DecodeCacheKey {
+    match method {
+        Demosaic::Ppg => key,
+        Demosaic::Rcd => {
+            let mut hasher = Sha256::new();
+            hasher.update(key);
+            hasher.update(b"orfeus-rcd-v1");
+            hasher.finalize().into()
+        }
+    }
+}
+
+/// A full develop of INPUT already in the cache, by whichever method: colour
+/// sampling and analysis want the developed frame, not a particular
+/// interpolation of it, and must not decode again beside a render.
+fn cached_full_develop(input: &Path) -> Result<Option<Arc<DecodedRaw>>, Error> {
+    let key = decode_cache_key(input)?;
+    let (cache_lock, _) = decode_cache();
+    let cache = cache_lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    Ok([Demosaic::Rcd, Demosaic::Ppg].into_iter().find_map(|method| {
+        let wanted = method_identity(key, method);
+        cache
+            .entries
+            .iter()
+            .find(|(held, _)| *held == wanted)
+            .map(|(_, decoded)| decoded.clone())
+    }))
+}
+
 /// Whether this frame is Olympus's eight-shot high-resolution composite.
 fn olympus_high_resolution(make: &str, model: &str, width: usize, height: usize) -> bool {
     make.to_ascii_uppercase().contains("OLYMPUS")
@@ -5786,7 +5839,7 @@ fn develop_binned(raw: &RawImage, factor: usize) -> Option<Intermediate> {
 /// default crop. `demosaic` runs the same algorithm over cache-sized tiles and
 /// emits only the crop, which at 80 MP is the difference between about seven
 /// gigabytes of memory traffic and about one.
-fn develop_full(raw: &RawImage) -> Option<Intermediate> {
+fn develop_full(raw: &RawImage, method: Demosaic) -> Option<Intermediate> {
     let RawPhotometricInterpretation::Cfa(config) = &raw.photometric else {
         return None;
     };
@@ -5821,7 +5874,7 @@ fn develop_full(raw: &RawImage) -> Option<Intermediate> {
         height: crop.d.h,
     };
     let developed = match &raw.data {
-        RawImageData::Integer(data) => super::demosaic::demosaic_ppg(
+        RawImageData::Integer(data) => interpolate(
             &super::demosaic::BayerFrame {
                 data,
                 stride: raw.width,
@@ -5833,8 +5886,9 @@ fn develop_full(raw: &RawImage) -> Option<Intermediate> {
                 levels,
             },
             window,
+            method,
         ),
-        RawImageData::Float(data) => super::demosaic::demosaic_ppg(
+        RawImageData::Float(data) => interpolate(
             &super::demosaic::BayerFrame {
                 data,
                 stride: raw.width,
@@ -5846,9 +5900,22 @@ fn develop_full(raw: &RawImage) -> Option<Intermediate> {
                 levels,
             },
             window,
+            method,
         ),
     };
     Some(Intermediate::ThreeColor(developed))
+}
+
+/// Interpolates the part of FRAME that WINDOW names by METHOD.
+fn interpolate<T: Copy + Into<f32> + Sync>(
+    frame: &super::demosaic::BayerFrame<'_, T>,
+    window: super::demosaic::Window,
+    method: Demosaic,
+) -> Color2D<f32, 3> {
+    match method {
+        Demosaic::Rcd => super::rcd::demosaic_rcd(frame, window),
+        Demosaic::Ppg => super::demosaic::demosaic_ppg(frame, window),
+    }
 }
 
 /// Decodes a RAW file, unwrapping a DNG's embedded original if the container
@@ -5866,10 +5933,11 @@ fn develop_full(raw: &RawImage) -> Option<Intermediate> {
 pub(crate) fn decode_linear_srgb(
     input: &Path,
     draft: bool,
+    method: Demosaic,
     profiling: bool,
 ) -> Result<DecodedRaw, Error> {
     let source = RawSource::new(input)?;
-    let container_error = match decode_source(&source, draft, profiling) {
+    let container_error = match decode_source(&source, draft, method, profiling) {
         Ok(decoded) => return Ok(decoded),
         Err(error) => error,
     };
@@ -5883,7 +5951,7 @@ pub(crate) fn decode_linear_srgb(
         );
     }
     let source = RawSource::new_from_shared_vec(Arc::new(original)).with_path(input);
-    decode_source(&source, draft, profiling).map_err(|original_error| {
+    decode_source(&source, draft, method, profiling).map_err(|original_error| {
         // Both failed, so say so: naming only one of them sends the reader to
         // the wrong half of the file.
         Error::Render(format!(
@@ -5902,9 +5970,16 @@ fn cached_as_shot_kelvin(input: &Path) -> Option<f32> {
     let cache = cache_lock
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    // A preview decodes a draft and an export decodes the frame itself; either
-    // knows the temperature, so take whichever is present.
-    [draft_identity(key), key].iter().find_map(|wanted| {
+    // A preview decodes a draft and an export decodes the frame itself, by
+    // either method; any of them knows the temperature, so take whichever is
+    // present.
+    [
+        draft_identity(key),
+        method_identity(key, Demosaic::Rcd),
+        method_identity(key, Demosaic::Ppg),
+    ]
+    .iter()
+    .find_map(|wanted| {
         cache
             .entries
             .iter()
@@ -5938,6 +6013,7 @@ pub(crate) fn as_shot_kelvin(input: &Path) -> Result<Option<f32>, Error> {
 fn decode_source(
     source: &RawSource,
     draft: bool,
+    method: Demosaic,
     profiling: bool,
 ) -> Result<DecodedRaw, Error> {
     let mut stage_started = Instant::now();
@@ -5987,7 +6063,7 @@ fn decode_source(
             }
             binned
         }
-        None => match develop_full(&raw).filter(|_| {
+        None => match develop_full(&raw, method).filter(|_| {
             // Set ORFEUS_TILED_DEMOSAIC=0 to develop through rawler instead,
             // which is how the two are compared on real photographs.
             std::env::var_os("ORFEUS_TILED_DEMOSAIC").as_deref()
@@ -5995,7 +6071,7 @@ fn decode_source(
         }) {
             Some(developed) => {
                 if profiling {
-                    eprintln!("orfeus-profile develop-path=tiled-ppg");
+                    eprintln!("orfeus-profile develop-path=tiled-{}", method.name());
                 }
                 developed
             }
@@ -6045,6 +6121,7 @@ fn decoded_for_render_with_identity_using<F>(
     input: &Path,
     cache_mode: u32,
     draft: bool,
+    method: Demosaic,
     profiling: bool,
     decode: F,
 ) -> Result<(Arc<DecodedRaw>, Option<DecodeCacheKey>), Error>
@@ -6060,11 +6137,13 @@ where
     // marker into the key used for that check made every draft render fail:
     // `file_content_digest` never returns a drafted digest, so the guard below
     // always fired and the whole live-preview path errored out.
+    // A draft bins the sensor and owes nothing to the method; a full develop
+    // is one method's picture and is cached as that.
     let content_key = decode_cache_key(input)?;
     let key = if draft {
         draft_identity(content_key)
     } else {
-        content_key
+        method_identity(content_key, method)
     };
     let (cache_lock, cache_changed) = decode_cache();
     loop {
@@ -6135,19 +6214,33 @@ fn decoded_for_render_with<F>(
 where
     F: FnOnce() -> Result<DecodedRaw, Error>,
 {
-    decoded_for_render_with_identity_using(input, cache_mode, draft, profiling, decode)
-        .map(|(decoded, _)| decoded)
+    decoded_for_render_with_identity_using(
+        input,
+        cache_mode,
+        draft,
+        Demosaic::default(),
+        profiling,
+        decode,
+    )
+    .map(|(decoded, _)| decoded)
 }
 
 /// Decodes at full quality. Colour sampling and analysis use this, because a
 /// binned image reports different values than the render it is sampled for.
+/// A full develop already cached by either method serves; otherwise the
+/// default method decodes, which is what the next render will want too.
 pub(crate) fn decoded_for_render(
     input: &Path,
     cache_mode: u32,
     profiling: bool,
 ) -> Result<Arc<DecodedRaw>, Error> {
+    if cache_mode == CACHE_USE {
+        if let Some(decoded) = cached_full_develop(input)? {
+            return Ok(decoded);
+        }
+    }
     decoded_for_render_with(input, cache_mode, false, profiling, || {
-        decode_linear_srgb(input, false, profiling)
+        decode_linear_srgb(input, false, Demosaic::default(), profiling)
     })
 }
 
@@ -6155,10 +6248,11 @@ pub(crate) fn decoded_for_render_with_identity(
     input: &Path,
     cache_mode: u32,
     draft: bool,
+    method: Demosaic,
     profiling: bool,
 ) -> Result<(Arc<DecodedRaw>, Option<DecodeCacheKey>), Error> {
-    decoded_for_render_with_identity_using(input, cache_mode, draft, profiling, || {
-        decode_linear_srgb(input, draft, profiling)
+    decoded_for_render_with_identity_using(input, cache_mode, draft, method, profiling, || {
+        decode_linear_srgb(input, draft, method, profiling)
     })
 }
 
@@ -6190,7 +6284,8 @@ pub fn render(
         None
     };
     // The flat path always writes a file, so it never develops a draft.
-    let (decoded, _) = decoded_for_render_with_identity(input, cache_mode, false, profiling)?;
+    let (decoded, _) =
+        decoded_for_render_with_identity(input, cache_mode, false, Demosaic::default(), profiling)?;
     let mut stage_started = Instant::now();
     macro_rules! profile_stage {
         ($name:literal) => {
@@ -6945,15 +7040,36 @@ mod tests {
             }
         };
         let (_, draft_key) =
-            decoded_for_render_with_identity_using(&input, CACHE_USE, true, false, decode())
+            decoded_for_render_with_identity_using(
+                &input,
+                CACHE_USE,
+                true,
+                Demosaic::default(),
+                false,
+                decode(),
+            )
                 .expect("a draft decode must not be mistaken for a changed file");
         assert_eq!(decodes.load(Ordering::SeqCst), 1);
         // Asking again reuses the entry rather than decoding a second time.
-        decoded_for_render_with_identity_using(&input, CACHE_USE, true, false, decode()).unwrap();
+        decoded_for_render_with_identity_using(
+                &input,
+                CACHE_USE,
+                true,
+                Demosaic::default(),
+                false,
+                decode(),
+            ).unwrap();
         assert_eq!(decodes.load(Ordering::SeqCst), 1);
         // The full decode is a different image, so it needs its own entry.
         let (_, full_key) =
-            decoded_for_render_with_identity_using(&input, CACHE_USE, false, false, decode())
+            decoded_for_render_with_identity_using(
+                &input,
+                CACHE_USE,
+                false,
+                Demosaic::default(),
+                false,
+                decode(),
+            )
                 .expect("a full decode of the same file must succeed too");
         assert_eq!(decodes.load(Ordering::SeqCst), 2);
         assert_ne!(draft_key, full_key);

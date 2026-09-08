@@ -124,6 +124,8 @@ frontend keep undo snapshots."
      (and (realp value) (<= -1/2 value 1/2)))
     (:chromatic-aberration-source
      (member value '(:measured :profile)))
+    (:demosaic
+     (member value *demosaic-methods*))
     (:lens-profile
      (or (null value) (and (stringp value) (plusp (length value)))))
     (:lens-focal-length
@@ -173,6 +175,7 @@ frontend keep undo snapshots."
         :lens-distortion (processing-settings-lens-distortion settings)
         :lens-profile (processing-settings-lens-profile settings)
         :lens-focal-length (processing-settings-lens-focal-length settings)
+        :demosaic (processing-settings-demosaic settings)
         :lut-path (processing-settings-lut-path settings)
         :lut-strength (processing-settings-lut-strength settings)
         :grain-amount (processing-settings-grain-amount settings)
@@ -362,6 +365,8 @@ frontend keep undo snapshots."
                 (setf (processing-settings-lens-profile result) value))
                (:lens-focal-length
                 (setf (processing-settings-lens-focal-length result) value))
+               (:demosaic
+                (setf (processing-settings-demosaic result) value))
                (:chromatic-aberration-correction-p
                 (setf (processing-settings-chromatic-aberration-correction-p
                        result)

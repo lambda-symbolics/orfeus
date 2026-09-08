@@ -110,6 +110,14 @@ form by hand for each of them buried the call it guards."
 (defparameter +frame-flag-draft+ 1
   "RENDER-FRAME-V1 flag asking the bridge to develop at half resolution.")
 
+(defparameter +frame-flag-rcd+ 2
+  "RENDER-FRAME-V1 flag asking for the RCD demosaic; clear, the bridge uses PPG.")
+
+(defun frame-flags (draft-p demosaic)
+  "The RENDER-FRAME-V1 flag word for a DRAFT-P render developed by DEMOSAIC."
+  (logior (if draft-p +frame-flag-draft+ 0)
+          (if (eq demosaic :rcd) +frame-flag-rcd+ 0)))
+
 (defparameter *native-error-buffer-size* 1024
   "Bytes reserved for a diagnostic returned by the Rust bridge.")
 
@@ -575,7 +583,9 @@ reaches it and there is nothing to keep alive across threads.")
                                   lens-crop-factor (grain-seed 0)
                                   (max-width 0) (max-height 0)
                                   (jpeg-quality 92) output-format cache-p
-                                  draft-p viewport progress)
+                                  draft-p viewport progress
+                                  (demosaic (getf *stage-identity-plist*
+                                                  :demosaic)))
   "Render INPUT-PATHNAME through the node GRAPH via the version 3 bridge.
 
 DRAFT-P asks the bridge to develop at half resolution. Only a preview may.
@@ -613,7 +623,7 @@ by definition."
                           (float (or lens-crop-factor 0.0) 0.0))
                  (setting 'lens-profile-model lens-pointer)
                  (setting 'lens-name name-pointer)
-                 (setting 'flags (if draft-p +frame-flag-draft+ 0))
+                 (setting 'flags (frame-flags draft-p demosaic))
                  (setting 'progress
                           (if progress
                               (cffi:callback render-progress-trampoline)
@@ -670,7 +680,9 @@ by definition."
                                       focal-reducer lens-focal-length
                                       lens-crop-factor (grain-seed 0)
                                       (max-width 0) (max-height 0) cache-p
-                                      draft-p viewport progress)
+                                      draft-p viewport progress
+                                      (demosaic (getf *stage-identity-plist*
+                                                      :demosaic)))
   "Render INPUT-PATHNAME through GRAPH into the foreign RGB-BUFFER.
 
 The live-preview hot path: no JPEG encode and no file. Returns the oriented
@@ -700,7 +712,7 @@ image width and height as two values."
                           (float (or lens-crop-factor 0.0) 0.0))
                  (setting 'lens-profile-model lens-pointer)
                  (setting 'lens-name name-pointer)
-                 (setting 'flags (if draft-p +frame-flag-draft+ 0))
+                 (setting 'flags (frame-flags draft-p demosaic))
                  (setting 'progress
                           (if progress
                               (cffi:callback render-progress-trampoline)

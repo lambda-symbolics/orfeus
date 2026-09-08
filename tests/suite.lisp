@@ -188,6 +188,43 @@ the failure list, and both ON-ERROR modes without needing real RAW files."
              (progn (orfeus::sexp->export-settings '(:format :webp)) nil)
            (invalid-project-data () t)))))
 
+(defun demosaic-choice-round-trips-p ()
+  (let* ((settings (make-processing-settings
+                    :demosaic :ppg
+                    :lens-correction-p nil
+                    :chromatic-aberration-correction-p nil))
+         (graph (settings->graph settings))
+         (optics (find :optics (processing-graph-nodes graph)
+                       :key #'graph-node-kind))
+         (project (make-project :output-directory #P"exports/"
+                                :defaults settings))
+         (decoded (sexp->project (project->sexp project))))
+    (and (eq :rcd (processing-settings-demosaic (make-processing-settings)))
+         ;; A graph that does not say, or has no optics node, develops by the
+         ;; default method.
+         (eq :rcd (nth-value 2 (orfeus::graph-optics-overrides
+                                (default-processing-graph))))
+         (eq :rcd (nth-value 2 (orfeus::graph-optics-overrides
+                                (make-processing-graph))))
+         ;; Asking for the other method is reason enough for an optics node.
+         optics
+         (eq :ppg (getf (graph-node-params optics) :demosaic))
+         (eq :ppg (nth-value 2 (orfeus::graph-optics-overrides graph)))
+         (eq :ppg (processing-settings-demosaic (project-defaults decoded)))
+         (= 2 (orfeus::frame-flags nil :rcd))
+         (= 3 (orfeus::frame-flags t :rcd))
+         (= 0 (orfeus::frame-flags nil :ppg))
+         (not (orfeus::processing-value-valid-p :demosaic :amaze))
+         (handler-case
+             (progn
+               (sexp->project
+                (project->sexp
+                 (make-project :output-directory #P"exports/"
+                               :defaults (make-processing-settings
+                                          :demosaic :amaze))))
+               nil)
+           (invalid-project-data () t)))))
+
 (defun processing-presets-round-trip-p ()
   (let* ((project
            (make-project
@@ -2108,6 +2145,7 @@ neither way."
       (check "project files round trip" (project-file-round-trip-p))
       (check "export settings round trip" (export-settings-round-trip-p))
       (check "AVIF export format round trips" (avif-export-format-round-trips-p))
+      (check "demosaic choice round trips" (demosaic-choice-round-trips-p))
       (check "processing presets round trip" (processing-presets-round-trip-p))
       (check "neural noise reduction round trips and validates"
              (neural-noise-reduction-round-trip-p))

@@ -349,6 +349,14 @@ width, but a spinner cannot shrink below its digits.")
   '(("Measured" . :measured) ("Lens profile" . :profile))
   "How the optics panel names the sources of a colour fringing correction.")
 
+(defparameter *demosaic-choices*
+  '(("RCD" . :rcd) ("PPG" . :ppg))
+  "How the optics panel names the demosaicing methods, in menu order.")
+
+(defun demosaic-choice-label (method)
+  "Return the menu label for demosaicing by METHOD."
+  (or (car (rassoc method *demosaic-choices*)) "RCD"))
+
 (defparameter *node-kind-labels*
   '((:white-balance . "WB")
     (:exposure . "Expo")
@@ -1641,7 +1649,8 @@ behind is memory. Best effort; returns how many directories went."
            export-dialog-format export-dialog-quality
            export-dialog-width export-dialog-height
            export-dialog-metadata export-dialog-timestamp
-           lens-profile-label fringing-source-choice lens-picker lens-picker-caption
+           lens-profile-label fringing-source-choice demosaic-choice
+           lens-picker lens-picker-caption
            lens-picker-search lens-picker-list lens-picker-focal
            ;; Orfeus's own file dialog, built the first time it is asked for.
            photo-picker
@@ -5075,6 +5084,10 @@ behind is memory. Best effort; returns how many directories went."
                                        model :chromatic-aberration-source)
                                       *fringing-source-choices* :key #'rest))
                          "Measured")))
+             (when demosaic-choice
+               (setf (lightfast:value demosaic-choice)
+                     (demosaic-choice-label
+                      (gui-model-setting model :demosaic))))
              (sync-export-controls)
              (sync-preset-action-label)
              (sync-window-title))
@@ -7895,7 +7908,29 @@ behind is memory. Best effort; returns how many directories went."
                           (declare (ignore ignored))
                           (clear-lens-profile)))
              :photo)
-            '(:column 1) 204 '(:share 2) 26 :page)))
+            '(:column 1) 204 '(:share 2) 26 :page)
+           ;; Which algorithm turns the sensor's mosaic into colour. RCD reads
+           ;; fine texture without the maze PPG draws near the sensor's limit,
+           ;; for a small share of the render; PPG is the quicker of the two.
+           (let ((field
+                   (lightfast:make-labeled-choice
+                    :parent node-page :x 12 :y 236 :width 292 :height 26
+                    :label "Demosaic" :label-width 88
+                    :items (mapcar #'first *demosaic-choices*)
+                    :callback
+                    (lambda (widget event value)
+                      (declare (ignore event value))
+                      (let ((method (rest (assoc (lightfast:value widget)
+                                                 *demosaic-choices*
+                                                 :test #'string=))))
+                        (when method
+                          (gui-model-set-setting model :demosaic method)
+                          (schedule-edited-preview)))))))
+             (lightfast:set-tooltip
+              (lightfast:field-control field)
+              "RCD: finer texture, no maze near the sensor's limit. PPG: quicker")
+             (setf demosaic-choice (lightfast:field-control field))
+             (register-field field 236 :page))))
         (build-group
          :film
          (lambda ()

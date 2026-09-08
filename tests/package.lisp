@@ -16,6 +16,7 @@
                 #:lens-profile-aliases-read
                 #:lens-profile-alias-save
                 #:processing-settings-chromatic-aberration-source
+                #:processing-settings-demosaic
                 #:resolve-lens-profile-alias
                 #:make-export-settings
                 #:make-photo-job

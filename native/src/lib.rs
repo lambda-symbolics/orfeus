@@ -38,6 +38,7 @@ mod gpu;
 mod graphex;
 mod jpeg;
 mod nn;
+mod rcd;
 mod render;
 mod tone;
 
@@ -574,7 +575,8 @@ pub unsafe extern "C" fn orfeus_image_focus_v1(
                 return Err(Error::InvalidArgument("focus pointer is null"));
             }
             let path = path_from_c(path)?;
-            let decoded = render::decode_linear_srgb(path, true, false)?;
+            let decoded =
+                render::decode_linear_srgb(path, true, render::Demosaic::default(), false)?;
             let report = focus::measure_frame(decoded.width, decoded.height, &decoded.data);
             let out = std::slice::from_raw_parts_mut(focus, 3);
             out[0] = report.blur_radius;
@@ -1230,7 +1232,12 @@ mod tests {
         // fails — but its message has to show the embedded original was tried,
         // which is the only way to see the fallback happen without shipping a
         // photograph as a fixture.
-        let message = crate::render::decode_linear_srgb(&path, false, false)
+        let message = crate::render::decode_linear_srgb(
+            &path,
+            false,
+            crate::render::Demosaic::default(),
+            false,
+        )
             .err()
             .expect("a synthetic container cannot decode")
             .to_string();
@@ -1251,7 +1258,12 @@ mod tests {
             std::process::id()
         ));
         fs::write(&path, b"this is not a photograph").unwrap();
-        let message = crate::render::decode_linear_srgb(&path, false, false)
+        let message = crate::render::decode_linear_srgb(
+            &path,
+            false,
+            crate::render::Demosaic::default(),
+            false,
+        )
             .err()
             .expect("an unreadable file must fail")
             .to_string();

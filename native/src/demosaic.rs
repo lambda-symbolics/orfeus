@@ -17,9 +17,9 @@ use rawler::pixarray::Color2D;
 use rayon::prelude::*;
 
 /// Colour plane indices, matching rawler's `CFA_COLOR_*`.
-const RED: usize = 0;
-const GREEN: usize = 1;
-const BLUE: usize = 2;
+pub(crate) const RED: usize = 0;
+pub(crate) const GREEN: usize = 1;
+pub(crate) const BLUE: usize = 2;
 
 /// Output pixels across one tile, and rows in one parallel band.
 ///
@@ -73,6 +73,41 @@ impl<T: Copy + Into<f32>> BayerFrame<'_, T> {
     #[inline]
     fn color_at(&self, row: usize, column: usize) -> usize {
         self.colors[(row & 1) * 2 + (column & 1)]
+    }
+
+    /// The scaled sensor value at a developed coordinate that may lie past
+    /// the frame, mirrored back in about the edge photosite: column -1 reads
+    /// column 1 and column `width` reads `width - 2`, so the colour filter
+    /// keeps its phase and an edge pixel gets a real neighbourhood.
+    #[inline]
+    pub(crate) fn sample_reflected(&self, row: isize, column: isize) -> f32 {
+        self.sample(reflect(row, self.height), reflect(column, self.width))
+    }
+
+    /// The colour plane at a developed coordinate, which may lie past the
+    /// frame: parity decides, and a mirrored coordinate has the same parity.
+    #[inline]
+    pub(crate) fn color_at_signed(&self, row: isize, column: isize) -> usize {
+        self.colors[((row & 1) * 2 + (column & 1)) as usize]
+    }
+}
+
+/// INDEX folded into `0..size` by mirroring about the end photosites.
+#[inline]
+fn reflect(index: isize, size: usize) -> usize {
+    let size = size as isize;
+    if size < 2 {
+        return 0;
+    }
+    let mut index = index;
+    loop {
+        if index < 0 {
+            index = -index;
+        } else if index >= size {
+            index = 2 * (size - 1) - index;
+        } else {
+            return index as usize;
+        }
     }
 }
 

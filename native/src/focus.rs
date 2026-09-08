@@ -835,7 +835,12 @@ mod photographs {
         let files = std::env::var("ORFEUS_FOCUS_FILES").unwrap_or_default();
         for path in files.split(':').filter(|path| !path.is_empty()) {
             let started = std::time::Instant::now();
-            match crate::render::decode_linear_srgb(std::path::Path::new(path), true, false) {
+            match crate::render::decode_linear_srgb(
+                std::path::Path::new(path),
+                true,
+                crate::render::Demosaic::default(),
+                false,
+            ) {
                 Ok(decoded) => {
                     let report = measure_frame(decoded.width, decoded.height, &decoded.data);
                     println!(

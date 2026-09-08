@@ -205,6 +205,8 @@
    #:processing-settings-lens-distortion
    #:processing-settings-lens-profile
    #:processing-settings-lens-focal-length
+   #:processing-settings-demosaic
+   #:*demosaic-methods*
    #:processing-settings-exposure
    #:processing-settings-grain-amount
    #:processing-settings-grain-size

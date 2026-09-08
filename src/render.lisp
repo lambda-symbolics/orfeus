@@ -168,18 +168,20 @@ The output is published atomically and INPUT-PATHNAME is never modified."
      "metadata copy")))
 
 (defun graph-optics-overrides (graph)
-  "Return the profile and focal length GRAPH's optics node chose by hand.
+  "Return the profile, focal length and demosaic GRAPH's optics node chose.
 
-Two values, either NIL when the node leaves them to the photograph's metadata.
-Read from the first optics node that is not bypassed; a graph has one."
+Three values. The first two are NIL when the node leaves them to the
+photograph's metadata; the third is the demosaicing method, which falls back
+to the identity setting when the node does not say or the graph has no optics
+node. Read from the first optics node that is not bypassed; a graph has one."
   (let ((node (find-if (lambda (node)
                          (and (eq :optics (graph-node-kind node))
                               (not (graph-node-bypassed-p node))))
                        (processing-graph-nodes graph))))
-    (when node
-      (let ((params (graph-node-params node)))
-        (values (getf params :lens-profile)
-                (getf params :lens-focal-length))))))
+    (let ((params (and node (graph-node-params node))))
+      (values (getf params :lens-profile)
+              (getf params :lens-focal-length)
+              (getf params :demosaic (getf *stage-identity-plist* :demosaic))))))
 
 (defun photo-lens-resolution (pathname profile focal-length)
   "How PATHNAME's lens profile is to be looked up, given hand-set overrides.
@@ -326,7 +328,8 @@ be found and keeps what the photographer typed in."
                                   &key max-width max-height jpeg-quality
                                     grain-seed cache-p draft-p viewport progress
                                     (report-input-pathname input-pathname))
-  (multiple-value-bind (chosen-profile chosen-focal) (graph-optics-overrides graph)
+  (multiple-value-bind (chosen-profile chosen-focal demosaic)
+      (graph-optics-overrides graph)
    (multiple-value-bind (lens-profile focal-reducer lens-crop-factor focal-length)
       (photo-lens-resolution report-input-pathname chosen-profile chosen-focal)
     (flet ((invoke (effective-graph)
@@ -336,6 +339,7 @@ be found and keeps what the photographer typed in."
               :lens-focal-length focal-length
               :cache-p cache-p
               :draft-p draft-p
+              :demosaic demosaic
               :viewport viewport
               :progress progress
               :output-format (render-output-format output-pathname)
@@ -519,7 +523,8 @@ reported, because that render will fail again and say so properly."
 The interactive hot path: no JPEG encode, no file, no metadata copy.
 Returns the oriented image width and height as two values."
   (check-type graph processing-graph)
-  (multiple-value-bind (chosen-profile chosen-focal) (graph-optics-overrides graph)
+  (multiple-value-bind (chosen-profile chosen-focal demosaic)
+      (graph-optics-overrides graph)
    (multiple-value-bind (lens-profile focal-reducer lens-crop-factor focal-length)
       (with-decoded-while
           (input-pathname :max-width max-width :max-height max-height
@@ -535,6 +540,7 @@ Returns the oriented image width and height as two values."
                  :lens-focal-length focal-length
                  :cache-p cache-p
                  :draft-p t
+                 :demosaic demosaic
                  :lens-profile-model lens-profile
                  :focal-reducer focal-reducer
                  :lens-crop-factor lens-crop-factor
