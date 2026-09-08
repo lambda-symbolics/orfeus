@@ -41,6 +41,7 @@ pub const NODE_SHARPEN: u32 = 13;
 pub const NODE_FLIP: u32 = 14;
 pub const NODE_NEGATIVE: u32 = 15;
 pub const NODE_HDR: u32 = 16;
+pub const NODE_DUST: u32 = 17;
 
 /// Frame-level settings shared by every node of one graph render.
 #[repr(C)]
@@ -253,6 +254,7 @@ fn param_arity(kind: u32) -> Result<ParamArity, Error> {
         NODE_FLIP => ParamArity::Exact(2),          // mirror across x?, across y?
         NODE_NEGATIVE => ParamArity::Exact(5),      // film base, paper gamma, balance
         NODE_HDR => ParamArity::Exact(4),           // lift ev, strength, displayed pivot, shadow cap ev
+        NODE_DUST => ParamArity::Exact(3),          // speck size px, contrast ev, which specks
         _ => return Err(Error::InvalidArgument("unknown graph node kind")),
     })
 }
@@ -484,6 +486,9 @@ fn validate_param(kind: u32, index: usize, value: f32) -> Result<(), Error> {
         (NODE_HDR, 1) => (0.0..=0.98).contains(&value),
         (NODE_HDR, 2) => (0.02..=0.98).contains(&value),
         (NODE_HDR, 3) => (0.05..=8.0).contains(&value),
+        (NODE_DUST, 0) => (2.0..=64.0).contains(&value),
+        (NODE_DUST, 1) => (0.1..=3.0).contains(&value),
+        (NODE_DUST, 2) => value == 0.0 || value == 1.0 || value == 2.0,
         // The four leading parameters are point counts, not signal levels.
         (NODE_CURVES, index) if index < CURVE_CHANNELS => {
             (MIN_CURVE_POINTS as f32..=MAX_CURVE_POINTS as f32).contains(&value)
@@ -1021,6 +1026,7 @@ fn node_stage_name(kind: u32) -> &'static str {
         NODE_FLIP => "mirroring\0",
         NODE_NEGATIVE => "inverting\0",
         NODE_HDR => "compressing range\0",
+        NODE_DUST => "removing dust\0",
         NODE_CONTRAST => "contrast\0",
         NODE_SHARPEN => "sharpening\0",
         _ => "developing\0",
@@ -1084,6 +1090,8 @@ pub(crate) fn plan_viewport(ops: &[GraphOp]) -> Option<ViewportPlan> {
                 render::NOISE_REDUCTION_REACH.max(super::nn::NETWORK_REACH)
             }
             NODE_SHARPEN => render::SHARPEN_MAX_REACH,
+            // Stated for the photograph, so an upper bound for any reduction.
+            NODE_DUST => render::dust_reach(op.params[0]),
             _ => 0,
         };
     }
@@ -1427,6 +1435,7 @@ fn execute_graph_into(
                     | NODE_COLOR_SUBTRACT
                     | NODE_NEGATIVE
                     | NODE_HDR
+                    | NODE_DUST
                     | NODE_CROP
                     | NODE_ROTATE
                     | NODE_FLIP
@@ -1497,6 +1506,17 @@ fn execute_graph_into(
                     op.params[1],
                     op.params[2],
                     op.params[3],
+                );
+            }
+            NODE_DUST => {
+                // The speck size is stated for the photograph, like the
+                // sharpening radius, and shrinks with the render.
+                let ratio = render::scale_ratio(context.scaled_pixels, context.full_pixels);
+                render::apply_dust(
+                    &mut image,
+                    0.5 * op.params[0] * ratio,
+                    op.params[1],
+                    render::Specks::from_code(op.params[2]),
                 );
             }
             NODE_SHARPEN => {
@@ -2624,6 +2644,7 @@ mod tests {
             NODE_COLOR_SUBTRACT,
             NODE_NEGATIVE,
             NODE_HDR,
+            NODE_DUST,
         ] {
             let params: &[f32] = match kind {
                 NODE_WHITE_BALANCE => &[0.0, 0.0],
@@ -2631,6 +2652,7 @@ mod tests {
                 NODE_NOISE_REDUCTION => &[0.5, 0.0],
                 NODE_NEGATIVE => &[0.5, 0.3, 0.2, 2.2, 1.0],
                 NODE_HDR => &[0.0, 0.5, 0.49, 1.0],
+                NODE_DUST => &[12.0, 0.5, 0.0],
                 _ => &[1.0, 1.0, 1.0],
             };
             assert!(

@@ -4329,6 +4329,442 @@ pub(crate) fn apply_negative_measured(
     });
 }
 
+/// The largest half-size of a speck dust removal will fill, in pixels of the
+/// image it runs on. Anything wider is a thing in the picture.
+pub(crate) const DUST_MAX_RADIUS: usize = 32;
+
+/// The luminance below which a pixel is taken to read nothing at all: fifteen
+/// stops under white is black, and the ratio of two blacks is not a speck.
+const DUST_LUMINANCE_FLOOR: f32 = 3.0e-5;
+
+/// Which specks dust removal looks for. Dust blocks light: on a negative it is
+/// dark before the inversion and light after; on a positive it is dark.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Specks {
+    Dark,
+    Light,
+    Both,
+}
+
+impl Specks {
+    /// The graph's code for the choice: 0 dark, 1 light, 2 both.
+    pub(crate) fn from_code(code: f32) -> Specks {
+        if code == 1.0 {
+            Specks::Light
+        } else if code == 2.0 {
+            Specks::Both
+        } else {
+            Specks::Dark
+        }
+    }
+}
+
+fn dust_radius(half_size: f32) -> usize {
+    (half_size.round().max(1.0) as usize).min(DUST_MAX_RADIUS)
+}
+
+/// How far dust removal reads around each pixel it writes for specks of SIZE
+/// pixels at most: the closing's window twice over, the widening by one, then
+/// the fill's window on top. Stated for the photograph, which bounds every
+/// reduction of it.
+pub(crate) fn dust_reach(size: f32) -> usize {
+    3 * dust_radius(size * 0.5) + 3
+}
+
+/// The running maximum (TAKE_MAX) or minimum of SRC over a window of RADIUS
+/// either side, clamped at the ends, into DST. Van Herk's blocks: a prefix and
+/// a suffix extreme per block of one window's length, then one combination per
+/// output, so the cost does not grow with the radius.
+fn running_extreme(src: &[f32], dst: &mut [f32], radius: usize, take_max: bool) {
+    let n = src.len();
+    let window = 2 * radius + 1;
+    let (ext, identity): (fn(f32, f32) -> f32, f32) = if take_max {
+        (f32::max, f32::NEG_INFINITY)
+    } else {
+        (f32::min, f32::INFINITY)
+    };
+    // Padded by a radius on the left and to whole blocks on the right, with
+    // the identity, so a window hanging off either end reads only what is
+    // there. Output i is then the window over padded i..=i + 2 radius, which
+    // is a suffix of one block joined to a prefix of the next.
+    let padded_len = (n + 2 * radius).div_ceil(window) * window;
+    let mut padded = vec![identity; padded_len];
+    padded[radius..radius + n].copy_from_slice(src);
+    let mut prefix = vec![identity; padded_len];
+    let mut suffix = vec![identity; padded_len];
+    for block in (0..padded_len).step_by(window) {
+        prefix[block] = padded[block];
+        for i in block + 1..block + window {
+            prefix[i] = ext(prefix[i - 1], padded[i]);
+        }
+        suffix[block + window - 1] = padded[block + window - 1];
+        for i in (block..block + window - 1).rev() {
+            suffix[i] = ext(suffix[i + 1], padded[i]);
+        }
+    }
+    for (i, out) in dst.iter_mut().enumerate().take(n) {
+        *out = ext(suffix[i], prefix[i + 2 * radius]);
+    }
+}
+
+/// Runs PASS along every row of SRC into DST, rows in parallel.
+fn for_each_row<F>(src: &[f32], dst: &mut [f32], width: usize, pass: F)
+where
+    F: Fn(&[f32], &mut [f32]) + Sync,
+{
+    dst.par_chunks_mut(width)
+        .zip(src.par_chunks(width))
+        .for_each(|(out, row)| pass(row, out));
+}
+
+/// Runs PASS down every column of PLANE in place. Columns are gathered a
+/// stripe at a time into a transposed block, so the pass reads memory that is
+/// contiguous, and the stripes run in parallel: each writes its own columns
+/// and no other's, which is what makes the shared pointer sound.
+fn for_each_column<F>(plane: &mut [f32], width: usize, height: usize, pass: F)
+where
+    F: Fn(&[f32], &mut [f32]) + Sync,
+{
+    const STRIPE: usize = 32;
+    struct Plane(*mut f32);
+    unsafe impl Sync for Plane {}
+    unsafe impl Send for Plane {}
+    let shared = Plane(plane.as_mut_ptr());
+    let stripes: Vec<usize> = (0..width).step_by(STRIPE).collect();
+    stripes.into_par_iter().for_each(|x0| {
+        let shared = &shared;
+        let columns = (width - x0).min(STRIPE);
+        let mut block = vec![0.0_f32; columns * height];
+        let mut out = vec![0.0_f32; height];
+        for y in 0..height {
+            // SAFETY: the plane outlives this call, and every stripe touches a
+            // disjoint range of columns; a row segment of one stripe never
+            // overlaps another's.
+            let row = unsafe { std::slice::from_raw_parts(shared.0.add(y * width + x0), columns) };
+            for (j, value) in row.iter().enumerate() {
+                block[j * height + y] = *value;
+            }
+        }
+        for j in 0..columns {
+            let column = &mut block[j * height..(j + 1) * height];
+            pass(column, &mut out);
+            column.copy_from_slice(&out);
+        }
+        for y in 0..height {
+            // SAFETY: as above; this stripe alone writes these columns.
+            let row = unsafe { std::slice::from_raw_parts_mut(shared.0.add(y * width + x0), columns) };
+            for (j, value) in row.iter_mut().enumerate() {
+                *value = block[j * height + y];
+            }
+        }
+    });
+}
+
+/// PLANE dilated (TAKE_MAX) or eroded by a square of RADIUS, separably.
+fn extreme_filter(plane: &[f32], width: usize, height: usize, radius: usize, take_max: bool) -> Vec<f32> {
+    let mut out = vec![0.0_f32; plane.len()];
+    for_each_row(plane, &mut out, width, |row, dst| {
+        running_extreme(row, dst, radius, take_max)
+    });
+    for_each_column(&mut out, width, height, |column, dst| {
+        running_extreme(column, dst, radius, take_max)
+    });
+    out
+}
+
+/// A compact patch of candidate pixels and the box about it.
+struct Patch {
+    pixels: Vec<usize>,
+    min_x: usize,
+    max_x: usize,
+    min_y: usize,
+    max_y: usize,
+}
+
+/// Gathers the connected patches of CANDIDATE no wider or taller than LIMIT,
+/// flooding eight ways. A stroke — a wire, a branch, a letter — is longer than
+/// a speck could be and is not gathered.
+fn compact_patches(candidate: &[bool], width: usize, height: usize, limit: usize) -> Vec<Patch> {
+    let mut taken = vec![false; candidate.len()];
+    let mut patches = Vec::new();
+    let mut stack = Vec::new();
+    for start in 0..candidate.len() {
+        if !candidate[start] || taken[start] {
+            continue;
+        }
+        taken[start] = true;
+        stack.push(start);
+        let mut patch = Patch {
+            pixels: Vec::new(),
+            min_x: width,
+            max_x: 0,
+            min_y: height,
+            max_y: 0,
+        };
+        while let Some(index) = stack.pop() {
+            patch.pixels.push(index);
+            let (x, y) = (index % width, index / width);
+            patch.min_x = patch.min_x.min(x);
+            patch.max_x = patch.max_x.max(x);
+            patch.min_y = patch.min_y.min(y);
+            patch.max_y = patch.max_y.max(y);
+            for (dx, dy) in [(-1, -1), (0, -1), (1, -1), (-1, 0), (1, 0), (-1, 1), (0, 1), (1, 1)] {
+                let nx = x as isize + dx;
+                let ny = y as isize + dy;
+                if nx < 0 || ny < 0 || nx as usize >= width || ny as usize >= height {
+                    continue;
+                }
+                let next = ny as usize * width + nx as usize;
+                if candidate[next] && !taken[next] {
+                    taken[next] = true;
+                    stack.push(next);
+                }
+            }
+        }
+        if patch.max_x - patch.min_x < limit && patch.max_y - patch.min_y < limit {
+            patches.push(patch);
+        }
+    }
+    patches
+}
+
+/// What surrounds a patch: the sound pixels — none a candidate — within REACH
+/// of its box.
+struct Surroundings {
+    /// Their mean luminance and its spread.
+    mean: f32,
+    spread: f32,
+    /// Their mean colour.
+    colour: [f32; 3],
+}
+
+fn surroundings(
+    patch: &Patch,
+    luma: &[f32],
+    pixels: &[[f32; 3]],
+    candidate: &[bool],
+    width: usize,
+    height: usize,
+    reach: usize,
+) -> Option<Surroundings> {
+    let mut sum = 0.0_f64;
+    let mut sum_of_squares = 0.0_f64;
+    let mut colour = [0.0_f64; 3];
+    let mut count = 0_usize;
+    for y in patch.min_y.saturating_sub(reach)..(patch.max_y + reach + 1).min(height) {
+        for x in patch.min_x.saturating_sub(reach)..(patch.max_x + reach + 1).min(width) {
+            let index = y * width + x;
+            if !candidate[index] {
+                let value = luma[index] as f64;
+                sum += value;
+                sum_of_squares += value * value;
+                for c in 0..3 {
+                    colour[c] += pixels[index][c] as f64;
+                }
+                count += 1;
+            }
+        }
+    }
+    if count < 8 {
+        return None;
+    }
+    let scale = 1.0 / count as f64;
+    let mean = sum * scale;
+    let variance = (sum_of_squares * scale - mean * mean).max(0.0);
+    Some(Surroundings {
+        mean: mean as f32,
+        spread: variance.sqrt() as f32,
+        colour: colour.map(|value| (value * scale) as f32),
+    })
+}
+
+/// How far a colour's proportions lie from another's: the sum over the three
+/// channels of the difference in each channel's share.
+fn chromaticity_distance(a: [f32; 3], b: [f32; 3]) -> f32 {
+    let sum_a = (a[0] + a[1] + a[2]).max(1.0e-9);
+    let sum_b = (b[0] + b[1] + b[2]).max(1.0e-9);
+    (0..3).map(|c| (a[c] / sum_a - b[c] / sum_b).abs()).sum()
+}
+
+/// The most the picture about a speck may vary, as a share of its brightness.
+/// Dust shows on the even parts of a picture — sky, a wall — and on a busy one
+/// a patch as small and as dark is as likely a gap between leaves. Measured on
+/// a scanned negative: the sky's grain came to three or four hundredths, the
+/// foliage to a tenth and more.
+const DUST_EVENNESS: f32 = 0.08;
+
+/// How many spreads of its surroundings a speck must lie beyond. At three, a
+/// gap of sky in an even patch of leaves passed; at four the same scan kept
+/// its foliage and lost its specks.
+const DUST_SIGNIFICANCE: f32 = 4.0;
+
+/// How far a dark speck's colour may stray from its surroundings'. Dust in
+/// front of the picture darkens it without colouring it, so a speck with a
+/// colour of its own — the sky seen through leaves — is picture. Measured:
+/// dust came to two hundredths, gaps to six and more.
+const DUST_COLOUR_TOLERANCE: f32 = 0.03;
+
+/// The pixels of the specks among CANDIDATE: the compact patches on even
+/// surroundings that lie well beyond those surroundings' spread and, when
+/// dark, carry no colour of their own. Dust on a scan sits on an otherwise
+/// even patch of picture — sky, a wall — which is also where it shows; a gap
+/// of sky between leaves is as dark and as small, but its surroundings are
+/// busy, or it is the sky's colour and not the leaves', and it stays.
+fn speck_pixels(
+    candidate: &[bool],
+    luma: &[f32],
+    pixels: &[[f32; 3]],
+    width: usize,
+    height: usize,
+    window: usize,
+    reach: usize,
+    dark: bool,
+) -> Vec<usize> {
+    compact_patches(candidate, width, height, 2 * window)
+        .par_iter()
+        .filter(|patch| {
+            let Some(around) = surroundings(patch, luma, pixels, candidate, width, height, reach) else {
+                return false;
+            };
+            if around.spread > DUST_EVENNESS * around.mean {
+                return false;
+            }
+            let count = patch.pixels.len() as f32;
+            let level = patch.pixels.iter().map(|&index| luma[index]).sum::<f32>() / count;
+            let apart = if dark { around.mean - level } else { level - around.mean };
+            if apart <= DUST_SIGNIFICANCE * around.spread {
+                return false;
+            }
+            if dark {
+                let mut colour = [0.0_f32; 3];
+                for &index in &patch.pixels {
+                    for c in 0..3 {
+                        colour[c] += pixels[index][c] / count;
+                    }
+                }
+                if chromaticity_distance(colour, around.colour) > DUST_COLOUR_TOLERANCE {
+                    return false;
+                }
+            }
+            true
+        })
+        .flat_map_iter(|patch| patch.pixels.iter().copied())
+        .collect()
+}
+
+/// Fills the specks dust leaves on a scan: compact patches darker (or lighter)
+/// than the even picture about them by CONTRAST_EV stops and no wider than
+/// twice HALF_SIZE, each replaced by the mean of the sound pixels around it.
+///
+/// A candidate is what a morphological closing of the luminance changes — an
+/// opening, for light specks: a patch too small to hold the window is filled by
+/// it and a thing in the picture is not. Of the candidates, only compact ones
+/// on even surroundings, well clear of their grain and of the picture's own
+/// colour, are taken, see SPECK_PIXELS; a stroke longer than two windows stays
+/// whatever its contrast, since dust is not a line. The hole is widened by a
+/// pixel for the soft edge a speck has after demosaicing, and that rim is half
+/// filled, so the mend has no edge of its own. The fill takes the surroundings'
+/// colour channel by channel.
+pub(crate) fn apply_dust(image: &mut RgbImage, half_size: f32, contrast_ev: f32, specks: Specks) {
+    let (width, height) = (image.width, image.height);
+    let radius = dust_radius(half_size);
+    let window = 2 * radius + 1;
+    if contrast_ev <= 0.0 || width < 2 * window || height < 2 * window {
+        return;
+    }
+    let pixels = image.data.as_chunks::<3>().0;
+    let luma: Vec<f32> = pixels
+        .par_iter()
+        .map(|pixel| (0.212_672_9 * pixel[0] + 0.715_152_2 * pixel[1] + 0.072_175 * pixel[2]).max(0.0))
+        .collect();
+    let ratio = 2.0_f32.powf(contrast_ev);
+    // The fill's window: wide enough to hold the widened speck and a rim of
+    // sound pixels beyond it on every side.
+    let reach = radius + 2;
+    let mut found: Vec<usize> = Vec::new();
+    if specks != Specks::Light {
+        let dilated = extreme_filter(&luma, width, height, radius, true);
+        let closed = extreme_filter(&dilated, width, height, radius, false);
+        drop(dilated);
+        let candidate: Vec<bool> = luma
+            .par_iter()
+            .zip(&closed)
+            .map(|(y, background)| *background > (*y + DUST_LUMINANCE_FLOOR) * ratio)
+            .collect();
+        drop(closed);
+        found.extend(speck_pixels(&candidate, &luma, pixels, width, height, window, reach, true));
+    }
+    if specks != Specks::Dark {
+        let eroded = extreme_filter(&luma, width, height, radius, false);
+        let opened = extreme_filter(&eroded, width, height, radius, true);
+        drop(eroded);
+        let candidate: Vec<bool> = luma
+            .par_iter()
+            .zip(&opened)
+            .map(|(y, background)| *y > (*background + DUST_LUMINANCE_FLOOR) * ratio)
+            .collect();
+        drop(opened);
+        found.extend(speck_pixels(&candidate, &luma, pixels, width, height, window, reach, false));
+    }
+    drop(luma);
+    if found.is_empty() {
+        return;
+    }
+    let mut core = vec![false; width * height];
+    for &index in &found {
+        core[index] = true;
+    }
+    let mut hole = core.clone();
+    let mut hole_pixels = found;
+    for i in 0..hole_pixels.len() {
+        let index = hole_pixels[i];
+        let (x, y) = (index % width, index / width);
+        for ny in y.saturating_sub(1)..(y + 2).min(height) {
+            for nx in x.saturating_sub(1)..(x + 2).min(width) {
+                let next = ny * width + nx;
+                if !hole[next] {
+                    hole[next] = true;
+                    hole_pixels.push(next);
+                }
+            }
+        }
+    }
+    let fills: Vec<(usize, [f32; 3])> = hole_pixels
+        .par_iter()
+        .filter_map(|&index| {
+            let (x, y) = (index % width, index / width);
+            let mut sum = [0.0_f64; 3];
+            let mut count = 0_usize;
+            for ny in y.saturating_sub(reach)..(y + reach + 1).min(height) {
+                for nx in x.saturating_sub(reach)..(x + reach + 1).min(width) {
+                    let at = ny * width + nx;
+                    if !hole[at] {
+                        let pixel = &pixels[at];
+                        sum[0] += pixel[0] as f64;
+                        sum[1] += pixel[1] as f64;
+                        sum[2] += pixel[2] as f64;
+                        count += 1;
+                    }
+                }
+            }
+            (count > 0).then(|| {
+                let scale = 1.0 / count as f64;
+                let mut fill = [(sum[0] * scale) as f32, (sum[1] * scale) as f32, (sum[2] * scale) as f32];
+                if !core[index] {
+                    let own = &pixels[index];
+                    for c in 0..3 {
+                        fill[c] = 0.5 * (fill[c] + own[c]);
+                    }
+                }
+                (index, fill)
+            })
+        })
+        .collect();
+    for (index, value) in fills {
+        image.data[index * 3..index * 3 + 3].copy_from_slice(&value);
+    }
+}
+
 /// The linear ratio between the size a render works at and the whole frame's.
 ///
 /// One for an export. Anything that is measured in pixels — a blur radius, a
@@ -6761,6 +7197,130 @@ mod tests {
         assert!(soft_cap(10.0, 1.0) < 1.0 && soft_cap(10.0, 1.0) > 0.99);
     }
 
+
+    #[test]
+    fn dust_fills_compact_specks_and_leaves_the_picture() {
+        // A gentle ramp with: a three-pixel speck, a lone dark pixel, a patch
+        // too wide to be dust, a stroke too long to be dust, a bright speck.
+        let (width, height) = (96_usize, 64_usize);
+        let tint = [1.1_f32, 1.0, 0.8];
+        let mut image = RgbImage {
+            width,
+            height,
+            data: vec![0.0; width * height * 3],
+        };
+        for y in 0..height {
+            for x in 0..width {
+                let level = 0.3 + 0.4 * x as f32 / width as f32;
+                for c in 0..3 {
+                    image.data[(y * width + x) * 3 + c] = level * tint[c];
+                }
+            }
+        }
+        let ramp = image.data.clone();
+        let mut paint = |x0: usize, y0: usize, w: usize, h: usize, level: f32| {
+            for y in y0..y0 + h {
+                for x in x0..x0 + w {
+                    for c in 0..3 {
+                        image.data[(y * width + x) * 3 + c] = level * tint[c];
+                    }
+                }
+            }
+        };
+        paint(40, 20, 3, 3, 0.02);
+        paint(50, 10, 1, 1, 0.05);
+        paint(60, 30, 16, 16, 0.02);
+        paint(10, 50, 60, 1, 0.02);
+        paint(80, 12, 2, 2, 3.0);
+        // A busy corner: cells of two tones, each wider than the window, and
+        // a dark speck in a light cell. Half the surroundings are as dark as
+        // the speck, so it is not dust.
+        for cell_y in 0..3 {
+            for cell_x in 0..3 {
+                let level = if (cell_x + cell_y) % 2 == 0 { 0.9 } else { 0.3 };
+                paint(2 + cell_x * 8, 2 + cell_y * 8, 8, 8, level);
+            }
+        }
+        paint(13, 13, 2, 2, 0.3);
+        // A dark speck of its own colour: the sky through a gap, not dust.
+        for y in 44..46 {
+            for x in 40..42 {
+                image.data[(y * width + x) * 3..(y * width + x) * 3 + 3].copy_from_slice(&[0.03, 0.03, 0.12]);
+            }
+        }
+        let spoiled = image.data.clone();
+        let at = |data: &[f32], x: usize, y: usize| -> [f32; 3] {
+            let i = (y * width + x) * 3;
+            [data[i], data[i + 1], data[i + 2]]
+        };
+        apply_dust(&mut image, 3.0, 1.0, Specks::Dark);
+        // The specks read as the ramp around them, in every channel.
+        for (x, y) in [(40, 20), (41, 21), (42, 22), (50, 10)] {
+            for c in 0..3 {
+                let value = at(&image.data, x, y)[c];
+                let expected = at(&ramp, x, y)[c];
+                assert!(
+                    (value / expected - 1.0).abs() < 0.05,
+                    "({x}, {y}) channel {c}: {value} against the ramp's {expected}"
+                );
+            }
+        }
+        // The patch, the stroke, the bright speck, the busy corner and the
+        // coloured speck are what they were.
+        for (x, y) in [(60, 30), (67, 37), (75, 45), (10, 50), (40, 50), (69, 50), (80, 12), (81, 13), (13, 13), (14, 14), (40, 44), (41, 45)] {
+            assert_eq!(at(&image.data, x, y), at(&spoiled, x, y), "({x}, {y}) was touched");
+        }
+        // And nothing beyond a pixel of the two specks moved at all.
+        let changed = (0..width * height)
+            .filter(|i| image.data[i * 3..i * 3 + 3] != spoiled[i * 3..i * 3 + 3])
+            .count();
+        assert!((10..=34).contains(&changed), "{changed} pixels changed");
+        // Asked for light specks, the bright one goes and the dark ones stay.
+        let mut image = RgbImage {
+            width,
+            height,
+            data: spoiled.clone(),
+        };
+        apply_dust(&mut image, 3.0, 1.0, Specks::Light);
+        for c in 0..3 {
+            let value = at(&image.data, 80, 12)[c];
+            let expected = at(&ramp, 80, 12)[c];
+            assert!((value / expected - 1.0).abs() < 0.05, "bright speck channel {c}: {value}");
+        }
+        assert_eq!(at(&image.data, 41, 21), at(&spoiled, 41, 21), "a dark speck was taken as light");
+        // Both at once takes both.
+        let mut image = RgbImage {
+            width,
+            height,
+            data: spoiled,
+        };
+        apply_dust(&mut image, 3.0, 1.0, Specks::Both);
+        assert!((at(&image.data, 41, 21)[1] / at(&ramp, 41, 21)[1] - 1.0).abs() < 0.05);
+        assert!((at(&image.data, 80, 12)[1] / at(&ramp, 80, 12)[1] - 1.0).abs() < 0.05);
+    }
+
+    #[test]
+    fn running_extremes_match_the_plain_window() {
+        let values: Vec<f32> = (0..37).map(|i| ((i * 7919) % 101) as f32 / 101.0).collect();
+        for radius in [1_usize, 2, 5, 13] {
+            for take_max in [true, false] {
+                let mut fast = vec![0.0; values.len()];
+                running_extreme(&values, &mut fast, radius, take_max);
+                for (i, out) in fast.iter().enumerate() {
+                    let window = &values[i.saturating_sub(radius)..(i + radius + 1).min(values.len())];
+                    let plain = window
+                        .iter()
+                        .copied()
+                        .reduce(if take_max { f32::max } else { f32::min })
+                        .unwrap();
+                    assert_eq!(*out, plain, "radius {radius} max {take_max} at {i}");
+                }
+            }
+        }
+        assert_eq!(dust_reach(12.0), 3 * 6 + 3);
+        assert_eq!(dust_reach(1.0), 6);
+        assert_eq!(dust_reach(1000.0), 3 * DUST_MAX_RADIUS + 3);
+    }
     #[test]
     fn contrast_pivots_without_clipping_and_composes() {
         let pivot = 0.435_f32;

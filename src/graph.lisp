@@ -81,6 +81,21 @@
       (graph-invalid params "HDR shadow lift must be within 0.05..8 stops")))
   params)
 
+(defun dust-params-validate (params)
+  (unless (and (listp params) (plist-known-keys-p params *dust-keys*))
+    (graph-invalid params "expected :size :contrast :specks parameters"))
+  (let ((size (getf params :size 12))
+        (contrast (getf params :contrast 1/2))
+        (specks (getf params :specks :dark)))
+    (unless (and (realp size) (<= 2 size 64))
+      (graph-invalid params "dust speck size must be within 2..64 pixels"))
+    (unless (and (realp contrast) (<= 1/10 contrast 3))
+      (graph-invalid params "dust contrast must be within 0.1..3 stops"))
+    (unless (member specks *dust-speck-kinds*)
+      (graph-invalid params "dust specks must be one of ~{~S~^, ~}"
+                     *dust-speck-kinds*)))
+  params)
+
 (defparameter *legacy-sharpen-keys*
   '((:amount . :sharpen-amount) (:radius . :sharpen-radius)
     (:threshold . :sharpen-threshold))
@@ -240,6 +255,7 @@ whose frame has already moved, whichever of the two moved it."
     ((eq kind :curves) (curves-params-validate params))
     ((eq kind :contrast) (contrast-params-validate params))
     ((eq kind :hdr) (hdr-params-validate params))
+    ((eq kind :dust) (dust-params-validate params))
     ((graph-filter-kind-p kind)
      (graph-node-params-validate
       (make-graph-node :kind kind :params params)))
@@ -311,12 +327,13 @@ while blends stay scene-linear."
              (when (member input display)
                (graph-invalid node
                               "blend node ~S cannot consume film output" id))))
-          ((member kind '(:color-subtract :negative :hdr))
+          ((member kind '(:color-subtract :negative :hdr :dust))
            (unless (= 1 (length inputs))
              (graph-invalid node "filter node ~S needs exactly one input" id))
            (ecase kind
              (:negative (negative-params-validate (graph-node-params node)))
              (:hdr (hdr-params-validate (graph-node-params node)))
+             (:dust (dust-params-validate (graph-node-params node)))
              (:color-subtract
               (color-subtract-params-validate (graph-node-params node))))
            (when (member (first inputs) display)

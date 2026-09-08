@@ -150,6 +150,9 @@
    #:*hdr-keys*
    #:*hdr-presets*
    #:hdr-preset-params
+   #:*dust-keys*
+   #:*dust-speck-kinds*
+   #:dust-default-params
    #:*negative-default-gamma*
    #:*negative-default-balance*
    #:*rotate-keys*

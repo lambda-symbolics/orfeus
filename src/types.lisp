@@ -126,7 +126,7 @@ them as a copyable node chain.")
   "Rotation amounts a rotate node offers, as quarter turns clockwise.")
 
 (defparameter *graph-only-node-kinds*
-  '(:blend :color-subtract :negative :contrast :hdr :crop :rotate :flip :curves)
+  '(:blend :color-subtract :negative :contrast :hdr :dust :crop :rotate :flip :curves)
   "Node kinds that exist only in graphs, beyond the flat pipeline stages.
 
 :COLOR-SUBTRACT computes picked-color minus pixel per channel in scene-linear
@@ -147,7 +147,10 @@ frame across either axis, which is the part of orientation a rotation cannot
 reach — a negative laid on the light table emulsion side up comes out mirrored,
 and no amount of turning fixes a mirror. :HDR compresses the tonal range the
 way the camera's HDR modes do: a slope in the logarithm of luminance about a
-displayed pivot, the shadow lift eased into a cap, colour kept.")
+displayed pivot, the shadow lift eased into a cap, colour kept. :DUST fills the
+specks dust leaves on a scan — compact patches darker or lighter than their
+surroundings by a stated contrast, no wider than a stated size — from the sound
+pixels around them.")
 
 (defparameter *flip-keys* '(:horizontal :vertical)
   "Parameters of a flip node: which axes to mirror across.")
@@ -179,6 +182,24 @@ the frame dark and opens the shadows.")
 (defun hdr-preset-params (mode)
   "The HDR node parameters for MODE, :HDR1 or :HDR2; NIL for anything else."
   (copy-list (rest (assoc mode *hdr-presets*))))
+
+(defparameter *dust-keys* '(:size :contrast :specks)
+  "Parameters of a dust node: the widest speck it fills, in pixels of the
+photograph; how much darker or lighter than its surroundings a speck must be,
+in stops; and which specks it looks for, :DARK, :LIGHT or :BOTH. Dust blocks
+light, so on a negative it is dark before the inversion and light after, and on
+a positive it is dark.")
+
+(defparameter *dust-speck-kinds* '(:dark :light :both)
+  "What a dust node may be told to look for.")
+
+(defun dust-default-params (&key (specks :dark))
+  "A dust node's parameters as the panel first shows them: twelve pixels, a
+third of a stop, SPECKS. Twelve pixels is a speck on a 20 megapixel frame and
+a large one on a scan at that size. A third of a stop is what the specks on a
+scanned negative measured against the film about them — small and softened,
+they are fainter than they look — and six times the grain of its sky."
+  (list :size 12.0 :contrast 0.3 :specks specks))
 
 (defparameter *color-subtract-keys* '(:red :green :blue))
 

@@ -365,7 +365,7 @@ photographer."
     (:tone . 4) (:optics . 5) (:film . 6) (:blend . 7)
     (:color-subtract . 8) (:crop . 9) (:curves . 10) (:rotate . 11)
     (:contrast . 12) (:sharpen . 13) (:flip . 14) (:negative . 15)
-    (:hdr . 16))
+    (:hdr . 16) (:dust . 17))
   "Wire codes of graph node kinds in the native program format.")
 
 (defconstant +graph-program-magic+ #x4746524F
@@ -465,6 +465,17 @@ reaches it and there is nothing to keep alive across threads.")
                        (float (getf params :strength (getf preset :strength)) 1.0)
                        (float (getf params :pivot (getf preset :pivot)) 1.0)
                        (float (getf params :shadows (getf preset :shadows)) 1.0))
+                 nil)))
+      (:dust
+       ;; Which specks, as the executor's code: 0 dark, 1 light, 2 both.
+       (let ((params (graph-node-params node))
+             (defaults (dust-default-params)))
+         (values (list (float (getf params :size (getf defaults :size)) 1.0)
+                       (float (getf params :contrast (getf defaults :contrast)) 1.0)
+                       (ecase (getf params :specks (getf defaults :specks))
+                         (:dark 0.0)
+                         (:light 1.0)
+                         (:both 2.0)))
                  nil)))
       (:crop
        (let ((params (graph-node-params node)))
