@@ -579,7 +579,7 @@ Returns the new vector and how many were new."
   filter-choice sort-choice browse-label stash-label
   stash-button unstash-button stash-all-button clear-stash-button
   select-all-button cancel-button accept-button
-  back-button forward-button up-button home-button hint-label
+  back-button forward-button up-button home-button
   ;; The two panes.
   (browse (%make-picker-grid :kind :browse))
   (stash (%make-picker-grid :kind :stash))
@@ -785,8 +785,7 @@ amber, a band or a drag badge over the top."
         (lightfast:draw-color-rgb :red 170 :green 172 :blue 176)
         (let ((lines (if (eq (picker-grid-kind grid) :stash)
                          '("Nothing stashed yet."
-                           "Add frames from the folder on the left,"
-                           "from as many folders as you like.")
+                           "Add frames from the folder on the left.")
                          (list (ecase (photo-picker-filter picker)
                                  (:raw "No RAW photographs in this folder")
                                  (:pictures "No pictures in this folder")
@@ -1277,8 +1276,6 @@ the browse grid, the crossing buttons, the stash, two rows of controls."
         (place (photo-picker-filter-choice picker) gap y 170 row)
         (place (photo-picker-sort-choice picker) (+ gap 178) y 130 row)
         (place (photo-picker-select-all-button picker) (+ gap 316) y 100 row)
-        (place (photo-picker-hint-label picker) (+ gap 424) y
-               (max 100 (- stash-x gap gap 424)) row)
         (place (photo-picker-clear-stash-button picker) stash-x y 110 row))
       (let ((y (- height gap row)))
         (place (photo-picker-accept-button picker) (- width gap 200) y 200 row)
@@ -1362,7 +1359,7 @@ shown as often as asked."
             (photo-picker-forward-button picker)
             (button "" :forward (lambda () (picker-go-forward picker)) :tooltip "Forward")
             (photo-picker-up-button picker)
-            (button "" :folder-open (lambda () (picker-go-up picker)) :tooltip "Up one folder")
+            (button "" :folder-up (lambda () (picker-go-up picker)) :tooltip "Up one folder")
             (photo-picker-home-button picker)
             (button "" :home (lambda () (picker-show-directory picker (user-homedir-pathname)))
                     :tooltip "Home folder"))
@@ -1407,13 +1404,13 @@ shown as often as asked."
       (picker-build-grid picker (photo-picker-browse picker) window)
       (picker-build-grid picker (photo-picker-stash picker) window)
       (setf (photo-picker-stash-button picker)
-            (button "Add ►" nil (lambda () (picker-stash-selected picker)) :width 88
+            (button "Add" :chevron-right (lambda () (picker-stash-selected picker)) :width 88
                     :tooltip "Put the selected frames in the stash")
             (photo-picker-stash-all-button picker)
-            (button "Add All ►" nil (lambda () (picker-stash-all picker)) :width 88
+            (button "Add All" :chevron-right-all (lambda () (picker-stash-all picker)) :width 88
                     :tooltip "Put every frame of this folder in the stash")
             (photo-picker-unstash-button picker)
-            (button "◄ Remove" nil (lambda () (picker-unstash-selected picker)) :width 88
+            (button "Remove" :chevron-left (lambda () (picker-unstash-selected picker)) :width 88
                     :tooltip "Take the selected frames out of the stash"))
       (setf (photo-picker-filter-choice picker)
             (choice '("RAW photographs" "All pictures" "Everything")
@@ -1432,7 +1429,7 @@ shown as often as asked."
                       (picker-refilter picker))
                     :width 130 :tooltip "The order of the frames"))
       (setf (photo-picker-select-all-button picker)
-            (button "Select All" nil
+            (button "Select All" :select-all
                     (lambda ()
                       (let ((browse (photo-picker-browse picker)))
                         (picker-selection-all (picker-grid-selection browse)
@@ -1440,14 +1437,10 @@ shown as often as asked."
                       (picker-update-status picker)
                       (picker-redraw picker))
                     :width 100))
-      (setf (photo-picker-hint-label picker)
-            (lightfast:make-label
-             :parent window :x 0 :y 0 :width 300 :height 26
-             :label "Stash frames from as many folders as you like, then add them all at once"))
       (setf (photo-picker-clear-stash-button picker)
-            (button "Clear Stash" nil (lambda () (picker-clear-stash picker)) :width 110))
+            (button "Clear Stash" :delete (lambda () (picker-clear-stash picker)) :width 110))
       (setf (photo-picker-cancel-button picker)
-            (button "Cancel" nil (lambda () (picker-cancel picker)) :width 96))
+            (button "Cancel" :cancel (lambda () (picker-cancel picker)) :width 96))
       (setf (photo-picker-accept-button picker)
             (button "Add Photographs" :import (lambda () (picker-accept picker))
                     :width 200 :return-p t
