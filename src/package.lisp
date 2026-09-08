@@ -155,6 +155,8 @@
    #:dust-default-params
    #:*vignette-keys*
    #:vignette-default-params
+   #:*clarity-keys*
+   #:clarity-default-params
    #:*negative-default-gamma*
    #:*negative-default-balance*
    #:*rotate-keys*

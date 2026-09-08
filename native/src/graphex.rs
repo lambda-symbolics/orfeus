@@ -43,6 +43,7 @@ pub const NODE_NEGATIVE: u32 = 15;
 pub const NODE_HDR: u32 = 16;
 pub const NODE_DUST: u32 = 17;
 pub const NODE_VIGNETTE: u32 = 18;
+pub const NODE_CLARITY: u32 = 19;
 
 /// Frame-level settings shared by every node of one graph render.
 #[repr(C)]
@@ -270,6 +271,7 @@ fn param_arity(kind: u32) -> Result<ParamArity, Error> {
         NODE_HDR => ParamArity::Exact(4),           // lift ev, strength, displayed pivot, shadow cap ev
         NODE_DUST => ParamArity::Exact(3),          // speck size px, contrast ev, which specks
         NODE_VIGNETTE => ParamArity::Exact(4),      // amount, midpoint, feather, roundness
+        NODE_CLARITY => ParamArity::Exact(2),       // amount, radius px
         _ => return Err(Error::InvalidArgument("unknown graph node kind")),
     })
 }
@@ -508,6 +510,8 @@ fn validate_param(kind: u32, index: usize, value: f32) -> Result<(), Error> {
         (NODE_VIGNETTE, 1) => (0.0..=1.0).contains(&value),
         (NODE_VIGNETTE, 2) => (0.0..=1.0).contains(&value),
         (NODE_VIGNETTE, 3) => (-1.0..=1.0).contains(&value),
+        (NODE_CLARITY, 0) => (-1.0..=1.0).contains(&value),
+        (NODE_CLARITY, 1) => (10.0..=1000.0).contains(&value),
         // The four leading parameters are point counts, not signal levels.
         (NODE_CURVES, index) if index < CURVE_CHANNELS => {
             (MIN_CURVE_POINTS as f32..=MAX_CURVE_POINTS as f32).contains(&value)
@@ -1047,6 +1051,7 @@ fn node_stage_name(kind: u32) -> &'static str {
         NODE_HDR => "compressing range\0",
         NODE_DUST => "removing dust\0",
         NODE_VIGNETTE => "vignetting\0",
+        NODE_CLARITY => "adding clarity\0",
         NODE_CONTRAST => "contrast\0",
         NODE_SHARPEN => "sharpening\0",
         _ => "developing\0",
@@ -1112,6 +1117,7 @@ pub(crate) fn plan_viewport(ops: &[GraphOp]) -> Option<ViewportPlan> {
             NODE_SHARPEN => render::SHARPEN_MAX_REACH,
             // Stated for the photograph, so an upper bound for any reduction.
             NODE_DUST => render::dust_reach(op.params[0]),
+            NODE_CLARITY => render::clarity_reach(op.params[1]),
             _ => 0,
         };
     }
@@ -1465,6 +1471,7 @@ fn execute_graph_into(
                     | NODE_HDR
                     | NODE_DUST
                     | NODE_VIGNETTE
+                    | NODE_CLARITY
                     | NODE_CROP
                     | NODE_ROTATE
                     | NODE_FLIP
@@ -1547,6 +1554,12 @@ fn execute_graph_into(
                     op.params[1],
                     render::Specks::from_code(op.params[2]),
                 );
+            }
+            NODE_CLARITY => {
+                // The radius is stated for the photograph, like the sharpening
+                // radius, and shrinks with the render.
+                let ratio = render::scale_ratio(context.scaled_pixels, context.full_pixels);
+                render::apply_clarity(&mut image, op.params[0], op.params[1] * ratio);
             }
             NODE_VIGNETTE => {
                 // Placed within the whole frame, which is the image itself
@@ -2337,6 +2350,16 @@ mod tests {
         .unwrap();
         // A vignette reads where it sits in the frame, which a window has to
         // be told; the turned orientations are where that goes wrong first.
+        // Clarity reads a wide neighbourhood, which the window's halo covers.
+        let clarified = parse_graph(
+            &GraphBuilder::new()
+                .node(NODE_EXPOSURE, 0, -1, &[0.4], None)
+                .node(NODE_CLARITY, 1, -1, &[0.5, 12.0], None)
+                .node(NODE_TONE, 2, -1, &[0.2, 0.1, 0.0, -0.1, 0.0, 0.1, 0.0], None)
+                .node(NODE_FILM, 3, -1, &[0.0, 0.4, 2.0], None)
+                .build(),
+        )
+        .unwrap();
         let vignetted = parse_graph(
             &GraphBuilder::new()
                 .node(NODE_EXPOSURE, 0, -1, &[0.4], None)
@@ -2359,6 +2382,7 @@ mod tests {
                 // narrower range of brightness than the frame does.
                 ("denoised", &denoised, 0.005),
                 ("vignetted", &vignetted, 1.0e-6),
+                ("clarified", &clarified, 1.0e-5),
             ] {
                 let whole = execute_graph(ops, noisy_scene(320, 240), &graph_context).unwrap();
                 for rect in [
@@ -2713,6 +2737,7 @@ mod tests {
             NODE_HDR,
             NODE_DUST,
             NODE_VIGNETTE,
+            NODE_CLARITY,
         ] {
             let params: &[f32] = match kind {
                 NODE_WHITE_BALANCE => &[0.0, 0.0],
@@ -2722,6 +2747,7 @@ mod tests {
                 NODE_HDR => &[0.0, 0.5, 0.49, 1.0],
                 NODE_DUST => &[12.0, 0.5, 0.0],
                 NODE_VIGNETTE => &[-0.3, 0.5, 0.5, 0.0],
+                NODE_CLARITY => &[0.3, 150.0],
                 _ => &[1.0, 1.0, 1.0],
             };
             assert!(

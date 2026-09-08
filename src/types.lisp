@@ -135,8 +135,8 @@ them as a copyable node chain.")
   "Rotation amounts a rotate node offers, as quarter turns clockwise.")
 
 (defparameter *graph-only-node-kinds*
-  '(:blend :color-subtract :negative :contrast :hdr :dust :vignette :crop :rotate :flip
-    :curves)
+  '(:blend :color-subtract :negative :contrast :hdr :dust :vignette :clarity :crop :rotate
+    :flip :curves)
   "Node kinds that exist only in graphs, beyond the flat pipeline stages.
 
 :COLOR-SUBTRACT computes picked-color minus pixel per channel in scene-linear
@@ -162,7 +162,9 @@ specks dust leaves on a scan — compact patches darker or lighter than their
 surroundings by a stated contrast, no wider than a stated size — from the sound
 pixels around them. :VIGNETTE darkens or lightens the frame away from its
 centre in scene-linear light, as a lens does, so a highlight in a darkened
-corner stays a highlight.")
+corner stays a highlight. :CLARITY is Lightroom's clarity: the contrast
+between each pixel and its wide surroundings, raised or lowered in the
+midtones, colour kept.")
 
 (defparameter *flip-keys* '(:horizontal :vertical)
   "Parameters of a flip node: which axes to mirror across.")
@@ -223,6 +225,17 @@ the frame, +1 a circle, -1 a rounded rectangle.")
   "A vignette node's parameters as the panel first shows them: about a third
 of a stop off the corners, half way out, half feathered, following the frame."
   (list :amount -0.25 :midpoint 0.5 :feather 0.5 :roundness 0.0))
+
+(defparameter *clarity-keys* '(:amount :radius)
+  "Parameters of a clarity node: how much local contrast to add, -1 to 1, and
+how wide the surroundings it is measured against are, in pixels of the
+photograph.")
+
+(defun clarity-default-params ()
+  "A clarity node's parameters as the panel first shows them: a quarter of the
+range, measured over a hundred and fifty pixels of the photograph, which on a
+20 megapixel frame is the scale of a face rather than of its texture."
+  (list :amount 0.25 :radius 150.0))
 
 (defparameter *color-subtract-keys* '(:red :green :blue))
 

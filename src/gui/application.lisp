@@ -371,6 +371,7 @@ width, but a spinner cannot shrink below its digits.")
     (:hdr . "HDR")
     (:dust . "Dust")
     (:vignette . "Vignette")
+    (:clarity . "Clarity")
     (:sharpen . "Sharp")
     (:crop . "Crop")
     (:rotate . "Rotate")
@@ -394,6 +395,7 @@ width, but a spinner cannot shrink below its digits.")
     ("HDR" . :hdr)
     ("Dust" . :dust)
     ("Vignette" . :vignette)
+    ("Clarity" . :clarity)
     ("Sharpen" . :sharpen)
     ("Crop" . :crop)
     ("Rotate" . :rotate)
@@ -584,6 +586,8 @@ sliders and nothing else has to be recomputed."
            (:line 0 11 12 6))
     (:vignette (:rect 0 0 12 1) (:rect 0 11 12 1) (:rect 0 0 1 12) (:rect 11 0 1 12)
                (:rect 4 4 4 4))
+    (:clarity (:line 6 0 0 6) (:line 0 6 6 12) (:line 6 12 12 6) (:line 12 6 6 0)
+              (:rect 5 5 2 2))
     (:sharpen (:line 6 0 1 11) (:line 6 0 11 11) (:line 1 11 11 11))
     (:crop (:line 3 0 3 9) (:line 0 3 9 3) (:line 8 2 8 11) (:line 2 8 11 8))
     (:rotate (:line 1 10 1 2) (:line 1 2 9 2) (:line 6 0 9 2) (:line 6 4 9 2))
@@ -607,6 +611,7 @@ sliders and nothing else has to be recomputed."
     (:hdr . :hdr)
     (:dust . :dust)
     (:vignette . :vignette)
+    (:clarity . :clarity)
     (:sharpen . :sharpen)
     (:crop . :crop)
     (:rotate . :rotate)
@@ -715,6 +720,7 @@ channel carries anywhere from its two endpoints to a full film-stock shape."
     (:blend t)
     ((:color-subtract :negative :dust) t)
     (:vignette (/= 0.0 (getf (orfeus:graph-node-params node) :amount -0.25)))
+    (:clarity (/= 0.0 (getf (orfeus:graph-node-params node) :amount 0.25)))
     (:contrast (/= 1.0 (getf (orfeus:graph-node-params node) :contrast 1.0)))
     (:hdr (let ((params (orfeus:graph-node-params node)))
             (or (plusp (getf params :strength 0.4))
@@ -3657,7 +3663,7 @@ behind is memory. Best effort; returns how many directories went."
                  (when crop-aspect-input
                    (setf (lightfast:value crop-aspect-input)
                          (or (crop-aspect-label crop-aspect) "Free"))))
-               (when (and node (member kind '(:contrast :negative :hdr :dust :vignette)))
+               (when (and node (member kind '(:contrast :negative :hdr :dust :vignette :clarity)))
                  (let ((params (orfeus:graph-node-params node)))
                    (dolist (entry node-param-controls)
                      (destructuring-bind (key widget default) entry
@@ -8106,6 +8112,17 @@ behind is memory. Best effort; returns how many directories went."
             (make-node-number-field :roundness "Roundness" -1.0 1.0 0.05 0.0 140
                                     node-page)
             "0 follows the frame's shape, +1 is a circle, -1 a rounded rectangle")))
+        (build-group
+         :clarity
+         (lambda ()
+           (lightfast:set-tooltip
+            (make-node-number-field :amount "Amount" -1.0 1.0 0.05 0.25 44
+                                    node-page)
+            "Local contrast in the midtones; negative softens")
+           (lightfast:set-tooltip
+            (make-node-number-field :radius "Radius (px)" 10.0 1000.0 10.0 150.0 76
+                                    node-page)
+            "How wide the surroundings each pixel is compared with are, in pixels of the photograph")))
         (build-group
          :sharpen
          (lambda ()

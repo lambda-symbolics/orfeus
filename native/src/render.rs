@@ -5081,6 +5081,99 @@ pub(crate) fn srgb_encode(value: f32) -> f32 {
     table[index] + (table[next] - table[index]) * fraction
 }
 
+/// How far the clarity's blur reads around a pixel it writes: two box passes
+/// of RADIUS each, stated for the photograph, so an upper bound for a window.
+pub(crate) fn clarity_reach(radius: f32) -> usize {
+    2 * (radius.max(1.0).ceil() as usize) + 2
+}
+
+/// A box mean of RADIUS along one line, the ends averaging what is there.
+fn running_mean(src: &[f32], dst: &mut [f32], radius: usize) {
+    let n = src.len();
+    if n == 0 {
+        return;
+    }
+    // Prefix sums in double precision: a long row of small values must not
+    // lose them to the running total.
+    let mut prefix = vec![0.0_f64; n + 1];
+    for (i, value) in src.iter().enumerate() {
+        prefix[i + 1] = prefix[i] + f64::from(*value);
+    }
+    for (i, out) in dst.iter_mut().enumerate().take(n) {
+        let low = i.saturating_sub(radius);
+        let high = (i + radius + 1).min(n);
+        *out = ((prefix[high] - prefix[low]) / (high - low) as f64) as f32;
+    }
+}
+
+/// PLANE blurred by a box of RADIUS twice along each axis: a tent kernel,
+/// which has no edges of its own to leave in the picture, for the cost of four
+/// O(1) passes whatever the radius.
+fn tent_blur(plane: &[f32], width: usize, height: usize, radius: usize) -> Vec<f32> {
+    let mut out = vec![0.0_f32; plane.len()];
+    let mut scratch = vec![0.0_f32; plane.len()];
+    for_each_row(plane, &mut scratch, width, |row, dst| running_mean(row, dst, radius));
+    for_each_row(&scratch, &mut out, width, |row, dst| running_mean(row, dst, radius));
+    for _ in 0..2 {
+        for_each_column(&mut out, width, height, |column, dst| {
+            running_mean(column, dst, radius)
+        });
+    }
+    out
+}
+
+/// The most a clarity may add to or take from the local contrast, in stops:
+/// a hard edge seen through a wide blur reads as several stops of detail, and
+/// boosting that draws the halos the control is known for.
+const CLARITY_DETAIL_LIMIT: f32 = 1.5;
+
+/// Lightroom's Clarity: contrast between each pixel and its wide surroundings,
+/// in the midtones.
+///
+/// Luminance is taken in stops and compared with a tent blur of RADIUS
+/// pixels; the difference, softly limited, is scaled by AMOUNT and by how far
+/// the pixel's displayed brightness is from black and white, and the pixel's
+/// colour is multiplied by the result so its hue and saturation stay. Negative
+/// amounts soften instead. Two O(1) box passes per axis, so the radius costs
+/// nothing.
+pub(crate) fn apply_clarity(image: &mut RgbImage, amount: f32, radius: f32) {
+    if amount == 0.0 || image.width == 0 || image.height == 0 {
+        return;
+    }
+    let (width, height) = (image.width, image.height);
+    let radius = (radius.round() as usize).max(1);
+    const FLOOR: f32 = 1.0e-4;
+    let log_luma: Vec<f32> = image
+        .data
+        .par_chunks(3)
+        .map(|pixel| (0.2126 * pixel[0] + 0.7152 * pixel[1] + 0.0722 * pixel[2] + FLOOR).log2())
+        .collect();
+    let blurred = tent_blur(&log_luma, width, height, radius);
+    let strength = 0.8 * amount;
+    image
+        .data
+        .par_chunks_mut(3 * 8192)
+        .enumerate()
+        .for_each(|(chunk_index, chunk)| {
+            let first = chunk_index * 8192;
+            for (offset, pixel) in chunk.as_chunks_mut::<3>().0.iter_mut().enumerate() {
+                let index = first + offset;
+                let detail = log_luma[index] - blurred[index];
+                let limited = CLARITY_DETAIL_LIMIT * (detail / CLARITY_DETAIL_LIMIT).tanh();
+                // Midtones take the whole effect; black and white none of it.
+                let luminance = log_luma[index].exp2() - FLOOR;
+                let displayed = srgb_encode(super::tone::default_display_tone(luminance.max(0.0)))
+                    .clamp(0.0, 1.0);
+                let midtone = 1.0 - (2.0 * displayed - 1.0).powi(4);
+                let gain = (strength * limited * midtone).exp2();
+                for value in pixel.iter_mut() {
+                    *value *= gain;
+                }
+            }
+        });
+}
+
+
 /// Darkens or lightens the frame away from its centre, as a lens would.
 ///
 /// AMOUNT is the gain change at the frame's corner, -1 black to +1 doubled.
@@ -8933,7 +9026,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         paths.sort();
-        assert_eq!(paths.len(), 12, "unexpected bundled LUT count");
+        assert_eq!(paths.len(), 20, "unexpected bundled LUT count");
         for path in &paths {
             CubeLut::read(path)
                 .unwrap_or_else(|error| panic!("invalid bundled LUT {}: {error}", path.display()));
@@ -8973,6 +9066,52 @@ mod tests {
         let mut decoder = image::codecs::tiff::TiffDecoder::new(bytes).unwrap();
         assert_eq!(decoder.color_type(), ColorType::Rgb16);
         assert!(decoder.icc_profile().unwrap().is_some());
+    }
+
+    #[test]
+    fn clarity_steepens_a_soft_edge_and_leaves_flat_ground() {
+        let (width, height) = (160, 40);
+        // A soft step from 0.1 to 0.6 across the middle, flat well away from it.
+        let mut image = RgbImage {
+            width,
+            height,
+            data: vec![0.0; width * height * 3],
+        };
+        for row in 0..height {
+            for column in 0..width {
+                let t = ((column as f32 - 80.0) / 12.0).clamp(-1.0, 1.0) * 0.5 + 0.5;
+                let value = 0.1 + 0.5 * t;
+                for channel in 0..3 {
+                    image.data[(row * width + column) * 3 + channel] = value;
+                }
+            }
+        }
+        let before = image.clone();
+        apply_clarity(&mut image, 0.6, 8.0);
+        let at = |image: &RgbImage, x: usize| image.data[((height / 2) * width + x) * 3];
+        // Beyond the blur's reach the picture is untouched.
+        assert!((at(&image, 5) - at(&before, 5)).abs() < 1.0e-5, "flat ground moved");
+        assert!((at(&image, 154) - at(&before, 154)).abs() < 1.0e-5, "flat ground moved");
+        // Just inside the edge the bright side brightened and the dark side darkened.
+        assert!(at(&image, 90) > at(&before, 90) + 0.01, "bright side {}", at(&image, 90));
+        // The dark side sits low in the tones, where the midtone weight is
+        // small, so it moves less; it must still move the right way.
+        assert!(at(&image, 70) < at(&before, 70) - 0.003, "dark side {}", at(&image, 70));
+        // Colour is kept: every channel scaled alike.
+        let pixel = &image.data[((height / 2) * width + 90) * 3..][..3];
+        assert!((pixel[0] - pixel[1]).abs() < 1.0e-6 && (pixel[1] - pixel[2]).abs() < 1.0e-6);
+        // Negative clarity does the opposite, and nothing else.
+        let mut softened = before.clone();
+        apply_clarity(&mut softened, -0.6, 8.0);
+        assert!(at(&softened, 90) < at(&before, 90));
+        assert!((at(&softened, 5) - at(&before, 5)).abs() < 1.0e-5);
+        let mut flat = RgbImage {
+            width,
+            height,
+            data: vec![0.3; width * height * 3],
+        };
+        apply_clarity(&mut flat, 1.0, 8.0);
+        assert!(flat.data.iter().all(|value| (value - 0.3).abs() < 1.0e-5));
     }
 
     #[test]

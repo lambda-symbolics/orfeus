@@ -1705,6 +1705,49 @@ executor as kind 18 with four parameters."
            ;; Scene-linear light only: it multiplies, as a lens does.
            (rejected-p '(:amount -0.3) :film)))))
 
+(defun clarity-node-validates-and-encodes-p ()
+  "A clarity node carries an amount and a radius, refuses values off their
+ranges, fills its defaults in, and reaches the executor as kind 19."
+  (flet ((rejected-p (params &optional (input-kind :crop))
+           (handler-case
+               (progn
+                 (graph-validate
+                  (make-processing-graph
+                   :nodes (list (make-graph-node
+                                 :id 1 :kind input-kind
+                                 :params (if (eq input-kind :film)
+                                             '(:grain-amount 0.2)
+                                             '(:left 0.1 :top 0.1
+                                               :width 0.8 :height 0.8))
+                                 :inputs '(0))
+                                (make-graph-node
+                                 :id 2 :kind :clarity
+                                 :params params :inputs '(1)))
+                   :output 2))
+                 nil)
+             (invalid-project-data () t))))
+    (let* ((params '(:amount 0.5))
+           (graph (graph-validate
+                   (make-processing-graph
+                    :nodes (list (make-graph-node
+                                  :id 1 :kind :clarity
+                                  :params params :inputs '(0)))
+                    :output 1)))
+           (decoded (sexp->graph (graph->sexp graph)))
+           (bytes (orfeus::graph->program-bytes decoded)))
+      (and (equal params (graph-node-params (graph-find-node decoded 1)))
+           (= 19 (elt bytes 12))
+           (= 2 (elt bytes 24))
+           (member :clarity (graph-node-kinds))
+           (equal '(:amount 0.25 :radius 150.0) (clarity-default-params))
+           (not (rejected-p (clarity-default-params)))
+           (not (rejected-p '()))
+           (rejected-p '(:amount 2))
+           (rejected-p '(:radius 5))
+           (rejected-p '(:radius 5000))
+           (rejected-p '(:size 3))
+           (rejected-p '(:amount 0.3) :film)))))
+
 (defun dust-node-validates-and-encodes-p ()
   "A dust node carries a speck size, a contrast and which specks it looks for,
 refuses what cannot be dust, and reaches the executor as kind 17 with three
@@ -2276,6 +2319,8 @@ neither way."
              (negative-node-validates-and-encodes-p))
       (check "HDR node validates, encodes as kind 16, and carries the camera's modes"
              (hdr-node-validates-and-encodes-p))
+      (check "clarity node validates, encodes and defaults"
+             (clarity-node-validates-and-encodes-p))
       (check "vignette node validates, encodes and defaults"
              (vignette-node-validates-and-encodes-p))
       (check "dust node validates, encodes and defaults"

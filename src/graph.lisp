@@ -113,6 +113,17 @@
       (graph-invalid params "vignette roundness must be within -1..1")))
   params)
 
+(defun clarity-params-validate (params)
+  (unless (and (listp params) (plist-known-keys-p params *clarity-keys*))
+    (graph-invalid params "expected :amount :radius parameters"))
+  (let ((amount (getf params :amount 0))
+        (radius (getf params :radius 150)))
+    (unless (and (realp amount) (<= -1 amount 1))
+      (graph-invalid params "clarity amount must be within -1..1"))
+    (unless (and (realp radius) (<= 10 radius 1000))
+      (graph-invalid params "clarity radius must be within 10..1000 pixels")))
+  params)
+
 (defparameter *legacy-sharpen-keys*
   '((:amount . :sharpen-amount) (:radius . :sharpen-radius)
     (:threshold . :sharpen-threshold))
@@ -274,6 +285,7 @@ whose frame has already moved, whichever of the two moved it."
     ((eq kind :hdr) (hdr-params-validate params))
     ((eq kind :dust) (dust-params-validate params))
     ((eq kind :vignette) (vignette-params-validate params))
+    ((eq kind :clarity) (clarity-params-validate params))
     ((graph-filter-kind-p kind)
      (graph-node-params-validate
       (make-graph-node :kind kind :params params)))
@@ -345,7 +357,7 @@ while blends stay scene-linear."
              (when (member input display)
                (graph-invalid node
                               "blend node ~S cannot consume film output" id))))
-          ((member kind '(:color-subtract :negative :hdr :dust :vignette))
+          ((member kind '(:color-subtract :negative :hdr :dust :vignette :clarity))
            (unless (= 1 (length inputs))
              (graph-invalid node "filter node ~S needs exactly one input" id))
            (ecase kind
@@ -353,6 +365,7 @@ while blends stay scene-linear."
              (:hdr (hdr-params-validate (graph-node-params node)))
              (:dust (dust-params-validate (graph-node-params node)))
              (:vignette (vignette-params-validate (graph-node-params node)))
+             (:clarity (clarity-params-validate (graph-node-params node)))
              (:color-subtract
               (color-subtract-params-validate (graph-node-params node))))
            (when (member (first inputs) display)
