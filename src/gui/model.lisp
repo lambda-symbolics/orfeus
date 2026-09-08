@@ -933,20 +933,39 @@ when the roll is past *AUTO-LEVEL-LIMIT*."
         (float roll 1.0)
         0.0)))
 
+(defun graph-chain-node-of-kind (graph kind from-id)
+  "The nearest KIND node at FROM-ID or upstream of it along primary inputs."
+  (loop for id = from-id then (first (orfeus:graph-node-inputs node))
+        for node = (and id
+                        (not (eql id orfeus:*graph-source-id*))
+                        (orfeus:graph-find-node graph id))
+        while node
+        when (eq kind (orfeus:graph-node-kind node)) return node))
+
 (defun gui-model-add-node (model kind &key after params)
   "Insert a KIND node into the selected photo's graph and select it.
 
-Without AFTER, film nodes append at the output and every other kind lands at
-the end of the scene-linear chain. Signals INVALID-PROJECT-DATA when the
-placement breaks the film-domain rules."
+Without AFTER, film nodes append at the output, a dust node goes in front of the
+negative when there is one, and every other kind lands at the end of the
+scene-linear chain. Signals INVALID-PROJECT-DATA when the placement breaks the
+film-domain rules."
   (gui-model-checkpoint model)
   (let ((graph (let ((*inside-model-edit* t))
                  (gui-model-ensure-graph model))))
     (when graph
-      (let* ((requested (or after
-                            (if (eq kind :film)
-                                (orfeus:processing-graph-output graph)
-                                (orfeus:graph-tail-linear-node-id graph))))
+      (let* ((output (orfeus:processing-graph-output graph))
+             (negative (and (eq kind :dust)
+                            (graph-chain-node-of-kind graph :negative output)))
+             (requested (or after
+                            (cond ((eq kind :film) output)
+                                  ;; Dust belongs in front of the inversion:
+                                  ;; the specks are what they are there, dark,
+                                  ;; and the negative's own reading of its
+                                  ;; base and its white is not led astray by
+                                  ;; them.
+                                  (negative
+                                   (first (orfeus:graph-node-inputs negative)))
+                                  (t (orfeus:graph-tail-linear-node-id graph)))))
              ;; Clamped to where the kind is legal: right-clicking the film node
              ;; and asking for a grade correction used to fail validation and
              ;; look like the menu entry did nothing.
@@ -954,9 +973,16 @@ placement breaks the film-domain rules."
              (node (orfeus:graph-insert-node
                     graph after-id kind
                     :params (or params
-                                (and (eq kind :crop)
-                                     (default-crop-params
-                                      :angle (crop-start-angle model)))))))
+                                (case kind
+                                  (:crop (default-crop-params
+                                          :angle (crop-start-angle model)))
+                                  ;; Light specks once a negative has been
+                                  ;; inverted, dark before it and anywhere else.
+                                  (:dust (orfeus:dust-default-params
+                                          :specks (if (graph-chain-node-of-kind
+                                                       graph :negative after-id)
+                                                      :light
+                                                      :dark))))))))
         (reflow-graph-node-positions graph node)
         (setf (gui-model-selected-node model) node)
         node))))

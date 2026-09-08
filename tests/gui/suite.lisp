@@ -138,6 +138,42 @@ than the preview had photographs, under the wrong thumbnails."
       (check (null (getf (orfeus:photo-job-overrides (first jobs)) :exposure))
              "Undo left the edit on the photograph"))))
 
+(defun test-dust-goes-in-front-of-the-negative ()
+  "A dust node asked for on a negative goes in front of the inversion looking
+for dark specks — dust blocks light — while one placed after the inversion looks
+for light ones, and on any other photograph it joins the end of the chain."
+  (let* ((job (orfeus:make-photo-job :input-path #P"neg.orf"))
+         (project (orfeus:make-project :output-directory #P"exports/"
+                                       :photos (list job)))
+         (model (orfeus/gui:make-gui-model :project project))
+         (negative (orfeus/gui:gui-model-add-node model :negative))
+         (dust (orfeus/gui:gui-model-add-node model :dust)))
+    (check (eql (orfeus:graph-node-id dust)
+                (first (orfeus:graph-node-inputs negative)))
+           "Dust did not go in front of the negative")
+    (check (eq :dark (getf (orfeus:graph-node-params dust) :specks))
+           "Dust before the inversion looks for ~S specks"
+           (getf (orfeus:graph-node-params dust) :specks))
+    (let ((after (orfeus/gui:gui-model-add-node
+                  model :dust :after (orfeus:graph-node-id negative))))
+      (check (eql (orfeus:graph-node-id negative)
+                  (first (orfeus:graph-node-inputs after)))
+             "Dust asked for after the negative did not land there")
+      (check (eq :light (getf (orfeus:graph-node-params after) :specks))
+             "Dust after the inversion looks for ~S specks"
+             (getf (orfeus:graph-node-params after) :specks))))
+  (let* ((plain (orfeus:make-photo-job :input-path #P"plain.orf"))
+         (model (orfeus/gui:make-gui-model
+                 :project (orfeus:make-project :output-directory #P"exports/"
+                                               :photos (list plain))))
+         (dust (orfeus/gui:gui-model-add-node model :dust)))
+    (check (eq :dark (getf (orfeus:graph-node-params dust) :specks))
+           "Dust on a plain photograph looks for ~S specks"
+           (getf (orfeus:graph-node-params dust) :specks))
+    (check (eql (orfeus:graph-node-id dust)
+                (orfeus:graph-tail-linear-node-id (orfeus:photo-job-graph plain)))
+           "Dust on a plain photograph did not join the end of the chain")))
+
 (defun test-undo-history ()
   (let* ((job (orfeus:make-photo-job :input-path #P"one.orf"
                                      :overrides '(:exposure 1.0)))
@@ -2186,6 +2222,7 @@ would silently ignore whatever the Destination field said."
   (test-modified-flag)
   (test-undo-history)
   (test-undo-after-a-removal-keeps-the-project-and-its-survivors)
+  (test-dust-goes-in-front-of-the-negative)
   (test-graph-node-placement)
   (test-thumbnail-context-menu)
   (test-node-adds-land-where-they-are-legal)

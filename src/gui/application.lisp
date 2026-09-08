@@ -212,6 +212,14 @@ corner, which is as wrong as it can get."
     ("Both" t t))
   "Mirror states offered by a flip node, as label then the two axes.")
 
+(defparameter *dust-speck-choices*
+  '(("Dark" . :dark) ("Light" . :light) ("Both" . :both))
+  "What a dust node may look for, as the panel names it.")
+
+(defun dust-speck-label (specks)
+  "Return the menu label for a dust node looking for SPECKS."
+  (or (car (rassoc specks *dust-speck-choices*)) "Dark"))
+
 (defun flip-choice-label (horizontal vertical)
   "Return the menu label for a mirror across HORIZONTAL and VERTICAL."
   (or (first (find-if (lambda (entry)
@@ -353,6 +361,7 @@ width, but a spinner cannot shrink below its digits.")
     (:negative . "Negative")
     (:contrast . "Contr")
     (:hdr . "HDR")
+    (:dust . "Dust")
     (:sharpen . "Sharp")
     (:crop . "Crop")
     (:rotate . "Rotate")
@@ -374,6 +383,7 @@ width, but a spinner cannot shrink below its digits.")
     ("Negative" . :negative)
     ("Contrast" . :contrast)
     ("HDR" . :hdr)
+    ("Dust" . :dust)
     ("Sharpen" . :sharpen)
     ("Crop" . :crop)
     ("Rotate" . :rotate)
@@ -560,6 +570,8 @@ sliders and nothing else has to be recomputed."
                (:rect 10 1 1 10) (:rect 4 4 4 4))
     (:contrast (:rect 1 1 10 10) (:rect 6 2 4 8))
     (:hdr (:line 0 10 3 5) (:line 3 5 7 4) (:line 7 4 11 0) (:rect 0 11 12 1))
+    (:dust (:rect 1 1 2 2) (:rect 7 2 3 3) (:rect 3 6 2 2) (:rect 9 8 2 2)
+           (:line 0 11 12 6))
     (:sharpen (:line 6 0 1 11) (:line 6 0 11 11) (:line 1 11 11 11))
     (:crop (:line 3 0 3 9) (:line 0 3 9 3) (:line 8 2 8 11) (:line 2 8 11 8))
     (:rotate (:line 1 10 1 2) (:line 1 2 9 2) (:line 6 0 9 2) (:line 6 4 9 2))
@@ -581,6 +593,7 @@ sliders and nothing else has to be recomputed."
     (:negative . :negative)
     (:contrast . :contrast)
     (:hdr . :hdr)
+    (:dust . :dust)
     (:sharpen . :sharpen)
     (:crop . :crop)
     (:rotate . :rotate)
@@ -687,7 +700,7 @@ channel carries anywhere from its two endpoints to a full film-stock shape."
   "True when NODE visibly changes the image, for the panel's indicator."
   (case (orfeus:graph-node-kind node)
     (:blend t)
-    ((:color-subtract :negative) t)
+    ((:color-subtract :negative :dust) t)
     (:contrast (/= 1.0 (getf (orfeus:graph-node-params node) :contrast 1.0)))
     (:hdr (let ((params (orfeus:graph-node-params node)))
             (or (plusp (getf params :strength 0.4))
@@ -1598,6 +1611,7 @@ behind is memory. Best effort; returns how many directories went."
            kind-choice
            (node-panel-groups '())
            blend-opacity-input crop-angle-input rotate-turn-input flip-axis-input
+           dust-specks-input
            (crop-angle-controls '())
            base-red-input base-green-input base-blue-input base-swatch
            negative-red-input negative-green-input negative-blue-input
@@ -3628,12 +3642,16 @@ behind is memory. Best effort; returns how many directories went."
                  (when crop-aspect-input
                    (setf (lightfast:value crop-aspect-input)
                          (or (crop-aspect-label crop-aspect) "Free"))))
-               (when (and node (member kind '(:contrast :negative :hdr)))
+               (when (and node (member kind '(:contrast :negative :hdr :dust)))
                  (let ((params (orfeus:graph-node-params node)))
                    (dolist (entry node-param-controls)
                      (destructuring-bind (key widget default) entry
                        (setf (lightfast:value widget)
                              (format nil "~,3F" (getf params key default)))))))
+               (when (and node (eq kind :dust) dust-specks-input)
+                 (setf (lightfast:value dust-specks-input)
+                       (dust-speck-label
+                        (getf (orfeus:graph-node-params node) :specks :dark))))
                (when (and node (eq kind :flip) flip-axis-input)
                  (let ((params (orfeus:graph-node-params node)))
                    (setf (lightfast:value flip-axis-input)
@@ -8014,6 +8032,51 @@ behind is memory. Best effort; returns how many directories went."
                                             :hdr2)))
              '(:column 1) 204 '(:share 2) 26 :page)
             "The OM-1's HDR2: the log slope eased to 0.2 about a brighter pivot, three and a half stops of lift")))
+        (build-group
+         :dust
+         (lambda ()
+           (register-inspector
+            (lightfast:make-label :parent node-page :x 12 :y 44
+                                  :width 292 :height 26
+                                  :label "Specks filled from the picture around them")
+            12 44 :fill 26 :page)
+           (make-node-number-field :size "Size (px)" 2.0 64.0 1.0 12.0 76
+                                   node-page)
+           (make-node-number-field :contrast "Contrast (EV)" 0.1 3.0 0.05 0.3 108
+                                   node-page)
+           ;; Dust blocks light: dark on a negative before the inversion and
+           ;; on any positive, light once a negative has been inverted. The
+           ;; node is put in front of a negative by default, so the default
+           ;; here is dark; the choice is for the other placement.
+           (let ((field
+                   (lightfast:make-labeled-choice
+                    :parent node-page :x 12 :y 140 :width 292 :height 26
+                    :label "Specks" :label-width 88
+                    :items (mapcar #'first *dust-speck-choices*)
+                    :callback
+                    (lambda (widget event value)
+                      (declare (ignore event value))
+                      (let ((node (gui-model-selected-graph-node model))
+                            (specks (rest (assoc (lightfast:value widget)
+                                                 *dust-speck-choices*
+                                                 :test #'string=))))
+                        (when (and node specks)
+                          (handler-case
+                              (progn
+                                (gui-model-set-node-params
+                                 model node (list :specks specks))
+                                (after-graph-edit
+                                 (format nil "Specks: ~A"
+                                         (lightfast:value widget))))
+                            (error (condition)
+                              (set-status (princ-to-string condition))))))))))
+             (setf dust-specks-input (lightfast:field-control field))
+             (register-field field 140 :page))
+           (register-inspector
+            (lightfast:make-label
+             :parent node-page :x 12 :y 172 :width 292 :height 26
+             :label "Strokes longer than two sizes are left alone")
+            12 172 :fill 26 :page)))
         (build-group
          :sharpen
          (lambda ()
