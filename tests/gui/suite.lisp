@@ -471,6 +471,38 @@ living run's directory and anything that is not ours are left alone."
                     "The sweep took a directory that was not its to take"))
         (uiop:delete-directory-tree root :validate t :if-does-not-exist :ignore)))))
 
+(defun test-hdr-frames-are-seeded-once ()
+  "A photograph the camera shot in an HDR mode gets the matching HDR node while
+it is untouched, and only then: a graded one, or one with no mode, is left
+alone, and nothing is seeded twice."
+  (let* ((fresh (orfeus:make-photo-job :input-path #P"hdr.orf"))
+         (graded (orfeus:make-photo-job :input-path #P"graded.orf"
+                                        :overrides '(:exposure 1.0)))
+         (project (orfeus:make-project :output-directory #P"exports/"
+                                       :photos (list fresh graded)))
+         (model (orfeus/gui:make-gui-model :project project))
+         (node (orfeus/gui::gui-model-seed-hdr-node model fresh :hdr2)))
+    (check node "An untouched HDR2 frame was not seeded")
+    (check (eq :hdr (orfeus:graph-node-kind node))
+           "The seeded node is a ~S, not an HDR node" (orfeus:graph-node-kind node))
+    (check (equal (orfeus:hdr-preset-params :hdr2) (orfeus:graph-node-params node))
+           "The seeded node does not carry the HDR2 preset: ~S"
+           (orfeus:graph-node-params node))
+    (check (member node (orfeus:processing-graph-nodes (orfeus:photo-job-graph fresh)))
+           "The node is not in the photograph's graph")
+    ;; Placed by the canvas, like any node inserted into a chain.
+    (check (null (orfeus:graph-node-position node))
+           "The seeded node was pinned to a place instead of left to the canvas")
+    (check (null (orfeus/gui::gui-model-seed-hdr-node model fresh :hdr2))
+           "A frame was seeded twice")
+    (check (null (orfeus/gui::gui-model-seed-hdr-node model graded :hdr1))
+           "A graded frame was seeded")
+    (check (null (orfeus:photo-job-graph graded))
+           "Seeding touched a graded frame's grade")
+    (check (null (orfeus/gui::gui-model-seed-hdr-node
+                  model (orfeus:make-photo-job :input-path #P"plain.orf") nil))
+           "A frame with no HDR mode was seeded")))
+
 (defun test-the-picker-decides-without-a-window ()
   "The file picker's listing, selection, stash and geometry are functions
 over plain data: a folder lists as a card reads, clicks and keys change the
@@ -2104,6 +2136,7 @@ would silently ignore whatever the Destination field said."
   (test-the-picker-decides-without-a-window)
   (test-display-copies-are-let-go-when-nothing-shows-them)
   (test-stale-session-directories-are-swept)
+  (test-hdr-frames-are-seeded-once)
   (test-modified-flag)
   (test-undo-history)
   (test-graph-node-placement)

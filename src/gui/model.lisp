@@ -922,6 +922,29 @@ placement breaks the film-domain rules."
         (setf (gui-model-selected-node model) node)
         node))))
 
+(defun gui-model-seed-hdr-node (model job mode)
+  "Give JOB, shot in the camera's HDR MODE, the node its JPEG got, once.
+
+Only a photograph nobody has touched — no graph, no overrides — is seeded:
+after that the grade is the photographer's, and a node they deleted must stay
+deleted. The graph is built the way the first edit would build it, with the
+node at the end of the scene-linear chain, where a fresh grade correction
+lands. Returns the node, or NIL when nothing was done."
+  (let ((params (orfeus:hdr-preset-params mode)))
+    (when (and params
+               (null (photo-job-graph job))
+               (null (photo-job-overrides job)))
+      (let* ((graph (orfeus:settings->graph
+                     (orfeus:photo-render-settings (gui-model-project model) job)
+                     (orfeus:photo-job-disabled-stages job)))
+             (node (orfeus:graph-insert-node
+                    graph (orfeus:graph-tail-linear-node-id graph)
+                    :hdr :params params)))
+        (setf (photo-job-graph job) graph
+              (orfeus:photo-job-disabled-stages job) '())
+        (reflow-graph-node-positions graph node)
+        node))))
+
 (defun gui-model-delete-node (model node)
   "Delete NODE from the selected photo's graph."
   (gui-model-checkpoint model)

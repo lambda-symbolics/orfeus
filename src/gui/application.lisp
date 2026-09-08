@@ -5097,13 +5097,46 @@ behind is memory. Best effort; returns how many directories went."
                                    :seconds (lambda (job) (second (assoc job entries))))))
                          (entries (if order
                                       (mapcar (lambda (job) (assoc job entries)) order)
-                                      entries)))
+                                      entries))
+                         ;; The same metadata says which frames the camera
+                         ;; shot in an HDR mode and kept dark.
+                         (hdr-frames
+                           (loop for job in jobs
+                                 for mode = (ignore-errors
+                                              (orfeus:photo-hdr-mode
+                                               (photo-job-input-path job)))
+                                 when mode collect (cons job mode))))
                     (queue-event queue
                                  (list :photo-groups
                                        (orfeus:group-index-of
                                         (orfeus:group-captures entries))
                                        order
-                                       sorting)))))))
+                                       sorting
+                                       hdr-frames)))))))
+           (seed-hdr-nodes (frames)
+             ;; FRAMES: (job . mode) for every photograph the camera shot in
+             ;; an HDR mode. Each untouched one gets, once, the node its JPEG
+             ;; got; a photograph already graded — the node deleted, say — is
+             ;; left as the photographer left it.
+             (let ((seeded 0)
+                   (selected-p nil))
+               (loop for (job . mode) in frames
+                     when (and (member job (project-photos project) :test #'eq)
+                               (gui-model-seed-hdr-node model job mode))
+                       do (incf seeded)
+                          (when (eq job (selected-job))
+                            (setf selected-p t)))
+               (when (plusp seeded)
+                 (setf (gui-model-modified-p model) t)
+                 (sync-window-title)
+                 (when selected-p
+                   (sync-controls)
+                   (sync-node-tools)
+                   (when graph-canvas (lightfast:redraw graph-canvas))
+                   (schedule-edited-preview))
+                 (set-status
+                  (format nil "Opened the shadows of ~D HDR frame~:P the camera kept dark"
+                          seeded)))))
            (sort-photos (key)
              (setf (gui-model-sort-key model) key
                    pending-sort :chosen)
@@ -6896,6 +6929,8 @@ behind is memory. Best effort; returns how many directories went."
                   (when (third event)
                     (apply-photo-order (third event) (fourth event)))
                   (setf photo-groups (second event))
+                  (when (fifth event)
+                    (seed-hdr-nodes (fifth event)))
                   (redraw-thumbnails))
                  (:render-stage
                   ;; Only the render the interface is waiting for; a stale one
