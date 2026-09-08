@@ -1657,6 +1657,54 @@ filled in."
            ;; Like any inversion, it works on the scene, not on a film look.
            (rejected-p '(:gamma 2.2) :film)))))
 
+(defun vignette-node-validates-and-encodes-p ()
+  "A vignette node carries an amount, a midpoint, a feather and a roundness,
+refuses values off their ranges, fills its defaults in, and reaches the
+executor as kind 18 with four parameters."
+  (flet ((rejected-p (params &optional (input-kind :crop))
+           (handler-case
+               (progn
+                 (graph-validate
+                  (make-processing-graph
+                   :nodes (list (make-graph-node
+                                 :id 1 :kind input-kind
+                                 :params (if (eq input-kind :film)
+                                             '(:grain-amount 0.2)
+                                             '(:left 0.1 :top 0.1
+                                               :width 0.8 :height 0.8))
+                                 :inputs '(0))
+                                (make-graph-node
+                                 :id 2 :kind :vignette
+                                 :params params :inputs '(1)))
+                   :output 2))
+                 nil)
+             (invalid-project-data () t))))
+    (let* ((params '(:amount -0.4 :roundness 0.5))
+           (graph (graph-validate
+                   (make-processing-graph
+                    :nodes (list (make-graph-node
+                                  :id 1 :kind :vignette
+                                  :params params :inputs '(0)))
+                    :output 1)))
+           (decoded (sexp->graph (graph->sexp graph)))
+           (bytes (orfeus::graph->program-bytes decoded)))
+      (and (equal params (graph-node-params (graph-find-node decoded 1)))
+           ;; Wire code 18, four parameters, defaults filled in.
+           (= 18 (elt bytes 12))
+           (= 4 (elt bytes 24))
+           (member :vignette (graph-node-kinds))
+           (equal '(:amount -0.25 :midpoint 0.5 :feather 0.5 :roundness 0.0)
+                  (vignette-default-params))
+           (not (rejected-p (vignette-default-params)))
+           (not (rejected-p '()))
+           (rejected-p '(:amount 1.5))
+           (rejected-p '(:midpoint 2))
+           (rejected-p '(:feather -0.1))
+           (rejected-p '(:roundness 3))
+           (rejected-p '(:size 3))
+           ;; Scene-linear light only: it multiplies, as a lens does.
+           (rejected-p '(:amount -0.3) :film)))))
+
 (defun dust-node-validates-and-encodes-p ()
   "A dust node carries a speck size, a contrast and which specks it looks for,
 refuses what cannot be dust, and reaches the executor as kind 17 with three
@@ -2220,6 +2268,8 @@ neither way."
              (negative-node-validates-and-encodes-p))
       (check "HDR node validates, encodes as kind 16, and carries the camera's modes"
              (hdr-node-validates-and-encodes-p))
+      (check "vignette node validates, encodes and defaults"
+             (vignette-node-validates-and-encodes-p))
       (check "dust node validates, encodes and defaults"
              (dust-node-validates-and-encodes-p))
       (check "timestamped output names format and round trip"

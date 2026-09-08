@@ -989,6 +989,7 @@ film-domain rules."
                                 (case kind
                                   (:crop (default-crop-params
                                           :angle (crop-start-angle model)))
+                                  (:vignette (orfeus:vignette-default-params))
                                   ;; Light specks once a negative has been
                                   ;; inverted, dark before it and anywhere else.
                                   (:dust (orfeus:dust-default-params

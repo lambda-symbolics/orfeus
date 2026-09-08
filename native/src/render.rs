@@ -5081,6 +5081,88 @@ pub(crate) fn srgb_encode(value: f32) -> f32 {
     table[index] + (table[next] - table[index]) * fraction
 }
 
+/// Darkens or lightens the frame away from its centre, as a lens would.
+///
+/// AMOUNT is the gain change at the frame's corner, -1 black to +1 doubled.
+/// MIDPOINT (0..1) is how far out toward the corner the change is half done,
+/// FEATHER (0..1) how gradually it comes on, and ROUNDNESS the shape of the
+/// contours: 0 an ellipse touching the frame's edges, +1 a circle of the longer
+/// half-side, -1 a rounded rectangle. Multiplied into scene-linear light, so a
+/// highlight in a darkened corner stays a highlight, which is what Lightroom
+/// calls highlight priority.
+///
+/// ORIGIN and FRAME place IMAGE inside the whole frame, in the same pixels:
+/// a window of a zoomed view gets exactly the gain the whole frame has there,
+/// so a preview matches its export and nothing moves as the view is panned.
+pub(crate) fn apply_vignette(
+    image: &mut RgbImage,
+    amount: f32,
+    midpoint: f32,
+    feather: f32,
+    roundness: f32,
+    origin: (usize, usize),
+    frame: (usize, usize),
+) {
+    if amount == 0.0 || image.width == 0 || image.height == 0 {
+        return;
+    }
+    let (half_width, half_height) = (frame.0.max(1) as f32 / 2.0, frame.1.max(1) as f32 / 2.0);
+    let longest = half_width.max(half_height);
+    let roundness = roundness.clamp(-1.0, 1.0);
+    // The axis radii: the ellipse through the edge midpoints at 0, pulled out
+    // to a circle of the longer half-side at +1. Below zero the ellipse keeps
+    // its axes and the exponent rises instead, squaring it toward the frame.
+    let (axis_x, axis_y) = if roundness > 0.0 {
+        (
+            half_width + (longest - half_width) * roundness,
+            half_height + (longest - half_height) * roundness,
+        )
+    } else {
+        (half_width, half_height)
+    };
+    let exponent = if roundness < 0.0 { 2.0 - 4.0 * roundness } else { 2.0 };
+    // The frame's corner on that contour, so that 1 always means the corner.
+    let corner = contour_radius(half_width / axis_x, half_height / axis_y, exponent);
+    let start = midpoint * (1.0 - feather);
+    let end = midpoint + (1.0 - midpoint) * feather;
+    let width = image.width;
+    image
+        .data
+        .par_chunks_mut(width * 3)
+        .enumerate()
+        .for_each(|(row, line)| {
+            let y = ((origin.1 + row) as f32 + 0.5 - half_height) / axis_y;
+            for (column, pixel) in line.as_chunks_mut::<3>().0.iter_mut().enumerate() {
+                let x = ((origin.0 + column) as f32 + 0.5 - half_width) / axis_x;
+                let radius = contour_radius(x.abs(), y.abs(), exponent) / corner;
+                let gain = (1.0 + amount * smooth_step(start, end, radius)).max(0.0);
+                for value in pixel.iter_mut() {
+                    *value *= gain;
+                }
+            }
+        });
+}
+
+/// The p-norm of (X, Y): the circle for 2, squarer as the exponent grows.
+#[inline]
+fn contour_radius(x: f32, y: f32, exponent: f32) -> f32 {
+    if exponent == 2.0 {
+        (x * x + y * y).sqrt()
+    } else {
+        (x.powf(exponent) + y.powf(exponent)).powf(1.0 / exponent)
+    }
+}
+
+/// Hermite ease from 0 at EDGE0 to 1 at EDGE1; a step when they coincide.
+#[inline]
+fn smooth_step(edge0: f32, edge1: f32, x: f32) -> f32 {
+    if edge1 <= edge0 {
+        return if x < edge0 { 0.0 } else { 1.0 };
+    }
+    let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
 pub(crate) fn apply_lut(image: &mut RgbImage, lut: &CubeLut, strength: f32) {
     image.data.par_chunks_mut(3 * 8192).for_each(|chunk| {
         for pixel in chunk.as_chunks_mut::<3>().0 {
@@ -8891,6 +8973,60 @@ mod tests {
         let mut decoder = image::codecs::tiff::TiffDecoder::new(bytes).unwrap();
         assert_eq!(decoder.color_type(), ColorType::Rgb16);
         assert!(decoder.icc_profile().unwrap().is_some());
+    }
+
+    #[test]
+    fn a_vignette_darkens_the_corners_and_spares_the_centre() {
+        let (width, height) = (96, 64);
+        let mut image = RgbImage {
+            width,
+            height,
+            data: vec![0.5; width * height * 3],
+        };
+        apply_vignette(&mut image, -0.6, 0.5, 0.5, 0.0, (0, 0), (width, height));
+        let centre = image.data[((height / 2) * width + width / 2) * 3];
+        let corner = image.data[0];
+        let far_corner = image.data[((height - 1) * width + width - 1) * 3];
+        assert!((centre - 0.5).abs() < 1.0e-6, "the centre moved to {centre}");
+        // The corner is past the feather's end, so it takes the whole amount.
+        assert!((corner - 0.2).abs() < 1.0e-5, "the corner is {corner}");
+        assert!((corner - far_corner).abs() < 1.0e-6, "the corners disagree");
+        // Half way out along the long axis the change is half done.
+        let midway = image.data[((height / 2) * width + width / 2 + width / 4) * 3];
+        assert!(midway > 0.3 && midway < 0.5, "midway is {midway}");
+    }
+
+    #[test]
+    fn a_vignetted_window_matches_the_whole_frame() {
+        // The window only knows where it sits; every pixel must come out as
+        // the whole frame's would, or a zoomed view would not match its export.
+        let (width, height) = (120, 80);
+        let scene = RgbImage {
+            width,
+            height,
+            data: (0..width * height * 3)
+                .map(|index| 0.2 + 0.6 * ((index % 97) as f32 / 97.0))
+                .collect(),
+        };
+        for roundness in [-0.7_f32, 0.0, 0.6] {
+            let mut whole = scene.clone();
+            apply_vignette(&mut whole, -0.5, 0.4, 0.7, roundness, (0, 0), (width, height));
+            let (left, top, w, h) = (37, 11, 50, 40);
+            let mut window = crop_rect(&scene, left, top, w, h);
+            apply_vignette(&mut window, -0.5, 0.4, 0.7, roundness, (left, top), (width, height));
+            for row in 0..h {
+                for column in 0..w {
+                    for channel in 0..3 {
+                        let taken = window.data[(row * w + column) * 3 + channel];
+                        let expected = whole.data[((row + top) * width + column + left) * 3 + channel];
+                        assert!(
+                            (taken - expected).abs() < 1.0e-6,
+                            "roundness {roundness} row {row} column {column}: {taken} against {expected}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

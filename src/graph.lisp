@@ -96,6 +96,23 @@
                      *dust-speck-kinds*)))
   params)
 
+(defun vignette-params-validate (params)
+  (unless (and (listp params) (plist-known-keys-p params *vignette-keys*))
+    (graph-invalid params "expected :amount :midpoint :feather :roundness parameters"))
+  (let ((amount (getf params :amount 0))
+        (midpoint (getf params :midpoint 1/2))
+        (feather (getf params :feather 1/2))
+        (roundness (getf params :roundness 0)))
+    (unless (and (realp amount) (<= -1 amount 1))
+      (graph-invalid params "vignette amount must be within -1..1"))
+    (unless (and (realp midpoint) (<= 0 midpoint 1))
+      (graph-invalid params "vignette midpoint must be within 0..1"))
+    (unless (and (realp feather) (<= 0 feather 1))
+      (graph-invalid params "vignette feather must be within 0..1"))
+    (unless (and (realp roundness) (<= -1 roundness 1))
+      (graph-invalid params "vignette roundness must be within -1..1")))
+  params)
+
 (defparameter *legacy-sharpen-keys*
   '((:amount . :sharpen-amount) (:radius . :sharpen-radius)
     (:threshold . :sharpen-threshold))
@@ -256,6 +273,7 @@ whose frame has already moved, whichever of the two moved it."
     ((eq kind :contrast) (contrast-params-validate params))
     ((eq kind :hdr) (hdr-params-validate params))
     ((eq kind :dust) (dust-params-validate params))
+    ((eq kind :vignette) (vignette-params-validate params))
     ((graph-filter-kind-p kind)
      (graph-node-params-validate
       (make-graph-node :kind kind :params params)))
@@ -327,13 +345,14 @@ while blends stay scene-linear."
              (when (member input display)
                (graph-invalid node
                               "blend node ~S cannot consume film output" id))))
-          ((member kind '(:color-subtract :negative :hdr :dust))
+          ((member kind '(:color-subtract :negative :hdr :dust :vignette))
            (unless (= 1 (length inputs))
              (graph-invalid node "filter node ~S needs exactly one input" id))
            (ecase kind
              (:negative (negative-params-validate (graph-node-params node)))
              (:hdr (hdr-params-validate (graph-node-params node)))
              (:dust (dust-params-validate (graph-node-params node)))
+             (:vignette (vignette-params-validate (graph-node-params node)))
              (:color-subtract
               (color-subtract-params-validate (graph-node-params node))))
            (when (member (first inputs) display)

@@ -135,7 +135,8 @@ them as a copyable node chain.")
   "Rotation amounts a rotate node offers, as quarter turns clockwise.")
 
 (defparameter *graph-only-node-kinds*
-  '(:blend :color-subtract :negative :contrast :hdr :dust :crop :rotate :flip :curves)
+  '(:blend :color-subtract :negative :contrast :hdr :dust :vignette :crop :rotate :flip
+    :curves)
   "Node kinds that exist only in graphs, beyond the flat pipeline stages.
 
 :COLOR-SUBTRACT computes picked-color minus pixel per channel in scene-linear
@@ -159,7 +160,9 @@ way the camera's HDR modes do: a slope in the logarithm of luminance about a
 displayed pivot, the shadow lift eased into a cap, colour kept. :DUST fills the
 specks dust leaves on a scan — compact patches darker or lighter than their
 surroundings by a stated contrast, no wider than a stated size — from the sound
-pixels around them.")
+pixels around them. :VIGNETTE darkens or lightens the frame away from its
+centre in scene-linear light, as a lens does, so a highlight in a darkened
+corner stays a highlight.")
 
 (defparameter *flip-keys* '(:horizontal :vertical)
   "Parameters of a flip node: which axes to mirror across.")
@@ -209,6 +212,17 @@ a large one on a scan at that size. A third of a stop is what the specks on a
 scanned negative measured against the film about them — small and softened,
 they are fainter than they look — and six times the grain of its sky."
   (list :size 12.0 :contrast 0.3 :specks specks))
+
+(defparameter *vignette-keys* '(:amount :midpoint :feather :roundness)
+  "Parameters of a vignette node: the gain change at the frame's corner, -1
+black to +1 doubled; how far out toward the corner the change is half done; how
+gradually it comes on; and the shape of its contours, 0 an ellipse following
+the frame, +1 a circle, -1 a rounded rectangle.")
+
+(defun vignette-default-params ()
+  "A vignette node's parameters as the panel first shows them: about a third
+of a stop off the corners, half way out, half feathered, following the frame."
+  (list :amount -0.25 :midpoint 0.5 :feather 0.5 :roundness 0.0))
 
 (defparameter *color-subtract-keys* '(:red :green :blue))
 

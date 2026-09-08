@@ -17,6 +17,7 @@
                 #:lens-profile-alias-save
                 #:processing-settings-chromatic-aberration-source
                 #:processing-settings-demosaic
+                #:vignette-default-params
                 #:resolve-lens-profile-alias
                 #:make-export-settings
                 #:make-photo-job

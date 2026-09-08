@@ -42,6 +42,7 @@ pub const NODE_FLIP: u32 = 14;
 pub const NODE_NEGATIVE: u32 = 15;
 pub const NODE_HDR: u32 = 16;
 pub const NODE_DUST: u32 = 17;
+pub const NODE_VIGNETTE: u32 = 18;
 
 /// Frame-level settings shared by every node of one graph render.
 #[repr(C)]
@@ -268,6 +269,7 @@ fn param_arity(kind: u32) -> Result<ParamArity, Error> {
         NODE_NEGATIVE => ParamArity::Exact(5),      // film base, paper gamma, balance
         NODE_HDR => ParamArity::Exact(4),           // lift ev, strength, displayed pivot, shadow cap ev
         NODE_DUST => ParamArity::Exact(3),          // speck size px, contrast ev, which specks
+        NODE_VIGNETTE => ParamArity::Exact(4),      // amount, midpoint, feather, roundness
         _ => return Err(Error::InvalidArgument("unknown graph node kind")),
     })
 }
@@ -502,6 +504,10 @@ fn validate_param(kind: u32, index: usize, value: f32) -> Result<(), Error> {
         (NODE_DUST, 0) => (2.0..=64.0).contains(&value),
         (NODE_DUST, 1) => (0.1..=3.0).contains(&value),
         (NODE_DUST, 2) => value == 0.0 || value == 1.0 || value == 2.0,
+        (NODE_VIGNETTE, 0) => (-1.0..=1.0).contains(&value),
+        (NODE_VIGNETTE, 1) => (0.0..=1.0).contains(&value),
+        (NODE_VIGNETTE, 2) => (0.0..=1.0).contains(&value),
+        (NODE_VIGNETTE, 3) => (-1.0..=1.0).contains(&value),
         // The four leading parameters are point counts, not signal levels.
         (NODE_CURVES, index) if index < CURVE_CHANNELS => {
             (MIN_CURVE_POINTS as f32..=MAX_CURVE_POINTS as f32).contains(&value)
@@ -1040,6 +1046,7 @@ fn node_stage_name(kind: u32) -> &'static str {
         NODE_NEGATIVE => "inverting\0",
         NODE_HDR => "compressing range\0",
         NODE_DUST => "removing dust\0",
+        NODE_VIGNETTE => "vignetting\0",
         NODE_CONTRAST => "contrast\0",
         NODE_SHARPEN => "sharpening\0",
         _ => "developing\0",
@@ -1228,6 +1235,9 @@ fn execute_graph_into(
     // Where the window may narrow, if it may at all.
     let plan = viewport.and_then(|rect| plan_viewport(ops).map(|plan| (rect, plan)));
     let mut window_origin = (0_usize, 0_usize);
+    // The oriented size of the whole frame at the moment the render narrowed,
+    // for the one stage that cares where the frame's centre and corners are.
+    let mut window_frame: Option<(usize, usize)> = None;
     // The requested region inside the window that was developed, so the halo
     // can come off before the result is handed back.
     let mut window_inner: Option<(usize, usize, usize, usize)> = None;
@@ -1386,6 +1396,11 @@ fn execute_graph_into(
             && stage == STAGE_ENTRY
             && let Some(whole) = registers[op.input_a].take()
         {
+            window_frame = Some(if oriented[op.input_a] || context.orientation < 5 {
+                (whole.width, whole.height)
+            } else {
+                (whole.height, whole.width)
+            });
             let (window, origin, inner) = crop_to_viewport(
                 whole,
                 *rect,
@@ -1449,6 +1464,7 @@ fn execute_graph_into(
                     | NODE_NEGATIVE
                     | NODE_HDR
                     | NODE_DUST
+                    | NODE_VIGNETTE
                     | NODE_CROP
                     | NODE_ROTATE
                     | NODE_FLIP
@@ -1530,6 +1546,20 @@ fn execute_graph_into(
                     0.5 * op.params[0] * ratio,
                     op.params[1],
                     render::Specks::from_code(op.params[2]),
+                );
+            }
+            NODE_VIGNETTE => {
+                // Placed within the whole frame, which is the image itself
+                // until the render narrows to a window.
+                let frame = window_frame.unwrap_or((image.width, image.height));
+                render::apply_vignette(
+                    &mut image,
+                    op.params[0],
+                    op.params[1],
+                    op.params[2],
+                    op.params[3],
+                    window_origin,
+                    frame,
                 );
             }
             NODE_SHARPEN => {
@@ -2305,6 +2335,17 @@ mod tests {
                 .build(),
         )
         .unwrap();
+        // A vignette reads where it sits in the frame, which a window has to
+        // be told; the turned orientations are where that goes wrong first.
+        let vignetted = parse_graph(
+            &GraphBuilder::new()
+                .node(NODE_EXPOSURE, 0, -1, &[0.4], None)
+                .node(NODE_VIGNETTE, 1, -1, &[-0.6, 0.4, 0.6, 0.2], None)
+                .node(NODE_TONE, 2, -1, &[0.2, 0.1, 0.0, -0.1, 0.0, 0.1, 0.0], None)
+                .node(NODE_FILM, 3, -1, &[0.0, 0.4, 2.0], None)
+                .build(),
+        )
+        .unwrap();
         // The plain case and two quarter turns, which is what an Olympus frame
         // actually does and where a rectangle is easiest to map to the wrong
         // corner.
@@ -2317,6 +2358,7 @@ mod tests {
                 // one eight-bit level, and only where a corner window sees a
                 // narrower range of brightness than the frame does.
                 ("denoised", &denoised, 0.005),
+                ("vignetted", &vignetted, 1.0e-6),
             ] {
                 let whole = execute_graph(ops, noisy_scene(320, 240), &graph_context).unwrap();
                 for rect in [
@@ -2670,6 +2712,7 @@ mod tests {
             NODE_NEGATIVE,
             NODE_HDR,
             NODE_DUST,
+            NODE_VIGNETTE,
         ] {
             let params: &[f32] = match kind {
                 NODE_WHITE_BALANCE => &[0.0, 0.0],
@@ -2678,6 +2721,7 @@ mod tests {
                 NODE_NEGATIVE => &[0.5, 0.3, 0.2, 2.2, 1.0],
                 NODE_HDR => &[0.0, 0.5, 0.49, 1.0],
                 NODE_DUST => &[12.0, 0.5, 0.0],
+                NODE_VIGNETTE => &[-0.3, 0.5, 0.5, 0.0],
                 _ => &[1.0, 1.0, 1.0],
             };
             assert!(

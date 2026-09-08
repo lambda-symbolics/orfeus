@@ -373,7 +373,7 @@ photographer."
     (:tone . 4) (:optics . 5) (:film . 6) (:blend . 7)
     (:color-subtract . 8) (:crop . 9) (:curves . 10) (:rotate . 11)
     (:contrast . 12) (:sharpen . 13) (:flip . 14) (:negative . 15)
-    (:hdr . 16) (:dust . 17))
+    (:hdr . 16) (:dust . 17) (:vignette . 18))
   "Wire codes of graph node kinds in the native program format.")
 
 (defconstant +graph-program-magic+ #x4746524F
@@ -484,6 +484,13 @@ reaches it and there is nothing to keep alive across threads.")
                          (:dark 0.0)
                          (:light 1.0)
                          (:both 2.0)))
+                 nil)))
+      (:vignette
+       (let ((params (graph-node-params node))
+             (defaults (vignette-default-params)))
+         (values (mapcar (lambda (key)
+                           (float (getf params key (getf defaults key)) 1.0))
+                         *vignette-keys*)
                  nil)))
       (:crop
        (let ((params (graph-node-params node)))

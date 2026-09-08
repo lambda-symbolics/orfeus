@@ -370,6 +370,7 @@ width, but a spinner cannot shrink below its digits.")
     (:contrast . "Contr")
     (:hdr . "HDR")
     (:dust . "Dust")
+    (:vignette . "Vignette")
     (:sharpen . "Sharp")
     (:crop . "Crop")
     (:rotate . "Rotate")
@@ -392,6 +393,7 @@ width, but a spinner cannot shrink below its digits.")
     ("Contrast" . :contrast)
     ("HDR" . :hdr)
     ("Dust" . :dust)
+    ("Vignette" . :vignette)
     ("Sharpen" . :sharpen)
     ("Crop" . :crop)
     ("Rotate" . :rotate)
@@ -580,6 +582,8 @@ sliders and nothing else has to be recomputed."
     (:hdr (:line 0 10 3 5) (:line 3 5 7 4) (:line 7 4 11 0) (:rect 0 11 12 1))
     (:dust (:rect 1 1 2 2) (:rect 7 2 3 3) (:rect 3 6 2 2) (:rect 9 8 2 2)
            (:line 0 11 12 6))
+    (:vignette (:rect 0 0 12 1) (:rect 0 11 12 1) (:rect 0 0 1 12) (:rect 11 0 1 12)
+               (:rect 4 4 4 4))
     (:sharpen (:line 6 0 1 11) (:line 6 0 11 11) (:line 1 11 11 11))
     (:crop (:line 3 0 3 9) (:line 0 3 9 3) (:line 8 2 8 11) (:line 2 8 11 8))
     (:rotate (:line 1 10 1 2) (:line 1 2 9 2) (:line 6 0 9 2) (:line 6 4 9 2))
@@ -602,6 +606,7 @@ sliders and nothing else has to be recomputed."
     (:contrast . :contrast)
     (:hdr . :hdr)
     (:dust . :dust)
+    (:vignette . :vignette)
     (:sharpen . :sharpen)
     (:crop . :crop)
     (:rotate . :rotate)
@@ -709,6 +714,7 @@ channel carries anywhere from its two endpoints to a full film-stock shape."
   (case (orfeus:graph-node-kind node)
     (:blend t)
     ((:color-subtract :negative :dust) t)
+    (:vignette (/= 0.0 (getf (orfeus:graph-node-params node) :amount -0.25)))
     (:contrast (/= 1.0 (getf (orfeus:graph-node-params node) :contrast 1.0)))
     (:hdr (let ((params (orfeus:graph-node-params node)))
             (or (plusp (getf params :strength 0.4))
@@ -3651,7 +3657,7 @@ behind is memory. Best effort; returns how many directories went."
                  (when crop-aspect-input
                    (setf (lightfast:value crop-aspect-input)
                          (or (crop-aspect-label crop-aspect) "Free"))))
-               (when (and node (member kind '(:contrast :negative :hdr :dust)))
+               (when (and node (member kind '(:contrast :negative :hdr :dust :vignette)))
                  (let ((params (orfeus:graph-node-params node)))
                    (dolist (entry node-param-controls)
                      (destructuring-bind (key widget default) entry
@@ -8081,6 +8087,25 @@ behind is memory. Best effort; returns how many directories went."
                               (set-status (princ-to-string condition))))))))))
              (setf dust-specks-input (lightfast:field-control field))
              (register-field field 108 :page))))
+        (build-group
+         :vignette
+         (lambda ()
+           (lightfast:set-tooltip
+            (make-node-number-field :amount "Amount" -1.0 1.0 0.05 -0.25 44
+                                    node-page)
+            "The gain at the frame's corners: -1 black, +1 twice as bright")
+           (lightfast:set-tooltip
+            (make-node-number-field :midpoint "Midpoint" 0.0 1.0 0.05 0.5 76
+                                    node-page)
+            "How far out from the centre the change is half done")
+           (lightfast:set-tooltip
+            (make-node-number-field :feather "Feather" 0.0 1.0 0.05 0.5 108
+                                    node-page)
+            "How gradually the corners come on")
+           (lightfast:set-tooltip
+            (make-node-number-field :roundness "Roundness" -1.0 1.0 0.05 0.0 140
+                                    node-page)
+            "0 follows the frame's shape, +1 is a circle, -1 a rounded rectangle")))
         (build-group
          :sharpen
          (lambda ()
