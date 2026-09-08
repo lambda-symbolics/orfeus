@@ -111,11 +111,50 @@ Returns true when a new entry was pushed."
 (defun gui-model-can-redo-p (model)
   (and (gui-model-redo-stack model) t))
 
+(defun adopt-photo-jobs (restored live)
+  "Return RESTORED's photo jobs, each photograph that LIVE also holds standing
+on its live job object with the restored state written into it.
+
+The interface keys thumbnails, burst places and caches by the job object, so a
+restore that handed out fresh objects lost every photograph's thumbnail and left
+each burst place on an object no longer in the project. A photograph only the
+snapshot holds — one removed since — comes back as the fresh copy, which is what
+it is: nothing is known about it any more."
+  (let ((by-path (make-hash-table :test #'equal)))
+    (dolist (job live)
+      (push job (gethash (photo-job-input-path job) by-path)))
+    (mapcar (lambda (copy)
+              (let ((job (pop (gethash (photo-job-input-path copy) by-path))))
+                (cond (job
+                       (setf (photo-job-output-path job)
+                             (photo-job-output-path copy)
+                             (photo-job-overrides job) (photo-job-overrides copy)
+                             (photo-job-disabled-stages job)
+                             (photo-job-disabled-stages copy)
+                             (photo-job-graph job) (photo-job-graph copy))
+                       job)
+                      (t copy))))
+            restored)))
+
 (defun gui-model-restore (model snapshot)
-  "Make SNAPSHOT current, leaving SNAPSHOT itself reusable."
-  (setf (gui-model-project model)
-        (orfeus:copy-project-deep (gui-snapshot-project snapshot))
-        (gui-model-selected-index model) (gui-snapshot-selected-index snapshot)
+  "Make SNAPSHOT current, leaving SNAPSHOT itself reusable.
+
+The project object stays the one it is and takes the snapshot's contents. The
+interface holds the project in a binding of its own, so a restore that put a
+fresh project on the model left the filmstrip drawing the photographs of the
+project it had while the model edited another: undoing the removal of several
+photographs brought them back for the preview and not for the filmstrip, whose
+rows then showed the wrong thumbnails against the wrong frame. Photo jobs are
+kept by the same rule, see ADOPT-PHOTO-JOBS."
+  (let ((project (gui-model-project model))
+        (restored (orfeus:copy-project-deep (gui-snapshot-project snapshot))))
+    (setf (project-output-directory project) (project-output-directory restored)
+          (project-defaults project) (project-defaults restored)
+          (project-export-settings project) (project-export-settings restored)
+          (project-presets project) (project-presets restored)
+          (project-photos project)
+          (adopt-photo-jobs (project-photos restored) (project-photos project))))
+  (setf (gui-model-selected-index model) (gui-snapshot-selected-index snapshot)
         (gui-model-selected-indices model)
         (copy-list (gui-snapshot-selected-indices snapshot))
         (gui-model-edit-target model) (gui-snapshot-edit-target snapshot))

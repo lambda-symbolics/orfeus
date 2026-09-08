@@ -92,6 +92,52 @@
     (check (not (orfeus/gui:gui-model-modified-p model))
            "Opening a project kept the modified mark")))
 
+(defun test-undo-after-a-removal-keeps-the-project-and-its-survivors ()
+  "Undoing the removal of several photographs brings them back on the very
+project object the interface holds, and the ones that stayed keep their job
+objects: the filmstrip reads the project from a binding of its own, and
+thumbnails, burst places and caches are keyed by the jobs. A restore that put a
+fresh project on the model left the filmstrip on the old one, with fewer rows
+than the preview had photographs, under the wrong thumbnails."
+  (let* ((jobs (loop for name in '("a.orf" "b.orf" "c.orf" "d.orf")
+                     collect (orfeus:make-photo-job :input-path (pathname name))))
+         (project (orfeus:make-project :output-directory #P"exports/"
+                                       :photos (copy-list jobs)))
+         (model (orfeus/gui:make-gui-model :project project))
+         (names (lambda ()
+                  (mapcar (lambda (job)
+                            (file-namestring (orfeus:photo-job-input-path job)))
+                          (orfeus:project-photos project)))))
+    (orfeus/gui:gui-model-set-selected-indices model '(1 2))
+    (check (= 2 (length (orfeus/gui:gui-model-remove-selected model)))
+           "Two photographs were not removed")
+    (check (equal '("a.orf" "d.orf") (funcall names))
+           "The removal left ~S" (funcall names))
+    (check (orfeus/gui:gui-model-undo model) "Undo refused the removal")
+    (check (eq project (orfeus/gui:gui-model-project model))
+           "Undo put a different project object on the model")
+    (check (equal '("a.orf" "b.orf" "c.orf" "d.orf") (funcall names))
+           "Undo did not bring the photographs back in place: ~S" (funcall names))
+    (let ((photos (orfeus:project-photos project)))
+      (check (and (eq (first photos) (first jobs))
+                  (eq (fourth photos) (fourth jobs)))
+             "The photographs that stayed came back as new objects"))
+    (check (orfeus/gui:gui-model-redo model) "Redo refused the removal")
+    (check (equal (list (first jobs) (fourth jobs))
+                  (orfeus:project-photos project))
+           "Redo did not remove the same two, on the same objects")
+    ;; An edit undone keeps the photograph's object too, with the edit gone.
+    (let ((orfeus/gui::*undo-coalesce-seconds* 0))
+      (orfeus/gui:gui-model-set-selected-indices model '(0))
+      (orfeus/gui:gui-model-set-setting model :exposure 1.5)
+      (check (= 1.5 (getf (orfeus:photo-job-overrides (first jobs)) :exposure))
+             "The edit did not land on the photograph")
+      (check (orfeus/gui:gui-model-undo model) "Undo refused the edit")
+      (check (eq (first jobs) (first (orfeus:project-photos project)))
+             "Undoing an edit replaced the photograph's object")
+      (check (null (getf (orfeus:photo-job-overrides (first jobs)) :exposure))
+             "Undo left the edit on the photograph"))))
+
 (defun test-undo-history ()
   (let* ((job (orfeus:make-photo-job :input-path #P"one.orf"
                                      :overrides '(:exposure 1.0)))
@@ -2139,6 +2185,7 @@ would silently ignore whatever the Destination field said."
   (test-hdr-frames-are-seeded-once)
   (test-modified-flag)
   (test-undo-history)
+  (test-undo-after-a-removal-keeps-the-project-and-its-survivors)
   (test-graph-node-placement)
   (test-thumbnail-context-menu)
   (test-node-adds-land-where-they-are-legal)

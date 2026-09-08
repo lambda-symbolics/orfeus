@@ -2955,9 +2955,21 @@ behind is memory. Best effort; returns how many directories went."
                      do (cond
                           ((plusp skip) (decf skip))
                           ((burst-collapsed-p job)
-                           (let* ((size (third (photo-group-of job)))
-                                  (end (min (+ index size) (length photos))))
-                             (setf skip (- end index 1))
+                           ;; The burst's own frames, by their places in it,
+                           ;; not the count it had when it was found: between
+                           ;; the pass that found it and the next, frames may
+                           ;; have been removed from under the leader.
+                           (let* ((group (first (photo-group-of job)))
+                                  (members
+                                    (loop for next in (rest (nthcdr index photos))
+                                          for position from 1
+                                          for place = (photo-group-of next)
+                                          while (and place
+                                                     (eql (first place) group)
+                                                     (eql (second place) position))
+                                          count t))
+                                  (end (+ index 1 members)))
+                             (setf skip members)
                              (push (cons (loop for place from index below end
                                                collect place)
                                          job)
@@ -3225,24 +3237,30 @@ behind is memory. Best effort; returns how many directories went."
            (step-history (direction)
              ;; Undo and redo restore the whole project, so every view that
              ;; reads it has to be told, not just the one the edit came from.
-             (if (funcall (ecase direction
-                            (:undo #'gui-model-undo)
-                            (:redo #'gui-model-redo))
-                          model)
-                 (progn
-                   (sync-controls)
-                   (sync-node-tools)
-                   (sync-export-controls)
-                   (when graph-canvas (lightfast:redraw graph-canvas))
-                   (refresh-gallery)
-                   (redraw-thumbnails)
-                   (schedule-edited-preview)
+             ;; Photographs that leave with the step — an addition undone, a
+             ;; removal redone — take what was kept for them along, and the
+             ;; bursts are asked about again for any that came back.
+             (let ((before (copy-list (project-photos project))))
+               (if (funcall (ecase direction
+                              (:undo #'gui-model-undo)
+                              (:redo #'gui-model-redo))
+                            model)
+                   (progn
+                     (retire-jobs (set-difference before (project-photos project)))
+                     (refresh-photo-groups)
+                     (sync-controls)
+                     (sync-node-tools)
+                     (sync-export-controls)
+                     (when graph-canvas (lightfast:redraw graph-canvas))
+                     (refresh-gallery)
+                     (redraw-thumbnails)
+                     (schedule-edited-preview)
+                     (set-status (ecase direction
+                                   (:undo "Undid one edit")
+                                   (:redo "Redid one edit"))))
                    (set-status (ecase direction
-                                 (:undo "Undid one edit")
-                                 (:redo "Redid one edit"))))
-                 (set-status (ecase direction
-                               (:undo "Nothing left to undo")
-                               (:redo "Nothing left to redo")))))
+                                 (:undo "Nothing left to undo")
+                                 (:redo "Nothing left to redo"))))))
            (reset-selected-photo-edits ()
              (let ((count (length (gui-model-acting-jobs model))))
                (if (plusp count)
@@ -5293,14 +5311,23 @@ behind is memory. Best effort; returns how many directories went."
                          (refresh-photo-groups)
                          (set-status (format nil "Added ~D photograph~:P" count)))
                        (set-status "All selected photographs are already in the project"))))))
+           (retire-jobs (jobs)
+             ;; Photographs that have left the project: everything the
+             ;; interface kept for them goes with them. A burst they were in
+             ;; is asked about again, or the rows still folded by the old
+             ;; count would swallow whatever now follows the leader.
+             (dolist (job jobs)
+               (remhash job lens-cache)
+               (remhash job capture-cache)
+               (remhash job photo-focus-reports)
+               (remhash job collapsed-bursts))
+             (forget-thumbnails jobs))
            (remove-selected-photo ()
              (let ((removed (gui-model-remove-selected model)))
                (when removed
                  (incf preview-generation)
-                 (dolist (job removed)
-                   (remhash job lens-cache)
-                   (remhash job capture-cache))
-                 (forget-thumbnails removed)
+                 (retire-jobs removed)
+                 (refresh-photo-groups)
                  (clear-previews)
                  (sync-controls)
                  (sync-node-tools)
