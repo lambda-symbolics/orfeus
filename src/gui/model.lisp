@@ -190,15 +190,12 @@ kept by the same rule, see ADOPT-PHOTO-JOBS."
                                      "orfeus" #P"data/luts/")))
         #'string-lessp :key #'file-namestring))
 
-(defun gui-default-lut-path ()
-  "Return the bundled Agfa Precisa 100 LUT pathname, when installed."
-  (find "agfa_precisa_100" (gui-bundled-lut-paths)
-        :test #'string-equal :key #'pathname-name))
-
 (defun gui-default-processing-settings ()
-  (make-processing-settings
-   :lut-path (let ((path (gui-default-lut-path)))
-               (and path (namestring path)))))
+  "Return the settings a new project starts from.
+
+No film LUT: a fresh photograph renders as the camera saw it, and a look is
+something the user adds. The bundled LUTs stay a choice on the Film node."
+  (make-processing-settings))
 
 (defun gui-empty-project ()
   "Return an empty in-memory project suitable for a newly opened GUI."

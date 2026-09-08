@@ -1567,10 +1567,9 @@ would silently ignore whatever the Destination field said."
            "Direct photo output directory is not beside the first input")
     (check (equal inputs (mapcar #'orfeus:photo-job-input-path jobs))
            "Multi-photo project changed input order")
-    (check (search "agfa_precisa_100.cube"
-                   (orfeus:processing-settings-lut-path
-                    (orfeus:project-defaults project)))
-           "Direct photo project did not select the bundled Agfa LUT")))
+    (check (null (orfeus:processing-settings-lut-path
+                  (orfeus:project-defaults project)))
+           "Direct photo project started with a film LUT")))
 
 (defun test-project-photo-mutations ()
   (let* ((first (orfeus:make-photo-job :input-path #P"/photos/one.orf"))
