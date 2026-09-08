@@ -4133,22 +4133,7 @@ behind is memory. Best effort; returns how many directories went."
                                               (node-kind-label kind)))))
                              (error (condition)
                                (set-status (princ-to-string condition)))))))
-                 kinds)
-                ;; Say why the list is short rather than leaving the missing
-                ;; entries to be puzzled over. The label carries no action, and
-                ;; SHOW-NODE-MENU ignores entries that have none.
-                (when (< (length kinds) (length (orfeus:graph-node-kinds)))
-                  (list (cons "-" nil)
-                        (cons (omitted-kinds-reason after-node) nil))))))
-           (omitted-kinds-reason (after-node)
-             ;; Two rules narrow the list, and they read very differently: below
-             ;; a film node almost nothing scene-linear is legal, while below a
-             ;; crop it is only optics and blends that drop out.
-             (let* ((graph (gui-model-display-graph model))
-                    (id (and after-node (orfeus:graph-node-id after-node))))
-               (if (and graph id (orfeus:graph-display-domain-p graph id))
-                   "grades go above the film transform"
-                   "optics and blends go above a crop")))
+                 kinds))))
            (show-node-menu (actions)
              ;; Every entry is guarded here rather than one at a time. A graph
              ;; edit that the validator refuses signals, and an unhandled signal
@@ -7982,30 +7967,20 @@ behind is memory. Best effort; returns how many directories went."
         (build-group
          :contrast
          (lambda ()
-           (register-inspector
-            (lightfast:make-label :parent node-page :x 12 :y 44
-                                  :width 292 :height 26
-                                  :label "Slope about a fixed tone")
-            12 44 :fill 26 :page)
-           (make-node-number-field :contrast "Contrast" 0.2 4.0 0.05 1.0 76
+           (make-node-number-field :contrast "Contrast" 0.2 4.0 0.05 1.0 44
                                    node-page)
-           (make-node-number-field :pivot "Pivot" 0.05 0.95 0.005 0.435 108
+           (make-node-number-field :pivot "Pivot" 0.05 0.95 0.005 0.435 76
                                    node-page)))
         (build-group
          :hdr
          (lambda ()
-           (register-inspector
-            (lightfast:make-label :parent node-page :x 12 :y 44
-                                  :width 292 :height 26
-                                  :label "Shadows opened, highlights held, colour kept")
-            12 44 :fill 26 :page)
-           (make-node-number-field :strength "Strength" 0.0 0.98 0.02 0.4 76
+           (make-node-number-field :strength "Strength" 0.0 0.98 0.02 0.4 44
                                    node-page)
-           (make-node-number-field :pivot "Pivot" 0.02 0.98 0.01 0.47 108
+           (make-node-number-field :pivot "Pivot" 0.02 0.98 0.01 0.47 76
                                    node-page)
-           (make-node-number-field :shadows "Shadows (EV)" 0.05 8.0 0.1 0.7 140
+           (make-node-number-field :shadows "Shadows (EV)" 0.05 8.0 0.1 0.7 108
                                    node-page)
-           (make-node-number-field :lift "Lift (EV)" -4.0 4.0 0.1 0.0 172
+           (make-node-number-field :lift "Lift (EV)" -4.0 4.0 0.1 0.0 140
                                    node-page)
            ;; The camera's two modes, as measured off its own JPEGs: a frame
            ;; shot in one of them arrives with the matching preset already on,
@@ -8013,44 +7988,43 @@ behind is memory. Best effort; returns how many directories went."
            (lightfast:set-tooltip
             (register-inspector
              (lightfast:make-button
-              :parent node-page :x 12 :y 204 :width 140 :height 26
+              :parent node-page :x 12 :y 172 :width 140 :height 26
               :label "Camera HDR1"
               :callback (lambda (&rest ignored)
                           (declare (ignore ignored))
                           (apply-hdr-preset (gui-model-selected-graph-node model)
                                             :hdr1)))
-             '(:column 0) 204 '(:share 2) 26 :page)
+             '(:column 0) 172 '(:share 2) 26 :page)
             "The OM-1's HDR1: the log slope eased to 0.6 about middle grey, two thirds of a stop of shadow lift")
            (lightfast:set-tooltip
             (register-inspector
              (lightfast:make-button
-              :parent node-page :x 160 :y 204 :width 140 :height 26
+              :parent node-page :x 160 :y 172 :width 140 :height 26
               :label "Camera HDR2"
               :callback (lambda (&rest ignored)
                           (declare (ignore ignored))
                           (apply-hdr-preset (gui-model-selected-graph-node model)
                                             :hdr2)))
-             '(:column 1) 204 '(:share 2) 26 :page)
+             '(:column 1) 172 '(:share 2) 26 :page)
             "The OM-1's HDR2: the log slope eased to 0.2 about a brighter pivot, three and a half stops of lift")))
         (build-group
          :dust
          (lambda ()
-           (register-inspector
-            (lightfast:make-label :parent node-page :x 12 :y 44
-                                  :width 292 :height 26
-                                  :label "Specks filled from the picture around them")
-            12 44 :fill 26 :page)
-           (make-node-number-field :size "Size (px)" 2.0 64.0 1.0 12.0 76
-                                   node-page)
-           (make-node-number-field :contrast "Contrast (EV)" 0.1 3.0 0.05 0.3 108
-                                   node-page)
+           (lightfast:set-tooltip
+            (make-node-number-field :size "Size (px)" 2.0 64.0 1.0 12.0 44
+                                    node-page)
+            "The widest speck filled, in pixels of the photograph; longer strokes are left alone")
+           (lightfast:set-tooltip
+            (make-node-number-field :contrast "Contrast (EV)" 0.1 3.0 0.05 0.3 76
+                                    node-page)
+            "How far a speck must stand out from the picture around it")
            ;; Dust blocks light: dark on a negative before the inversion and
            ;; on any positive, light once a negative has been inverted. The
            ;; node is put in front of a negative by default, so the default
            ;; here is dark; the choice is for the other placement.
            (let ((field
                    (lightfast:make-labeled-choice
-                    :parent node-page :x 12 :y 140 :width 292 :height 26
+                    :parent node-page :x 12 :y 108 :width 292 :height 26
                     :label "Specks" :label-width 88
                     :items (mapcar #'first *dust-speck-choices*)
                     :callback
@@ -8071,25 +8045,15 @@ behind is memory. Best effort; returns how many directories went."
                             (error (condition)
                               (set-status (princ-to-string condition))))))))))
              (setf dust-specks-input (lightfast:field-control field))
-             (register-field field 140 :page))
-           (register-inspector
-            (lightfast:make-label
-             :parent node-page :x 12 :y 172 :width 292 :height 26
-             :label "Strokes longer than two sizes are left alone")
-            12 172 :fill 26 :page)))
+             (register-field field 108 :page))))
         (build-group
          :sharpen
          (lambda ()
-           (register-inspector
-            (lightfast:make-label :parent node-page :x 12 :y 44
-                                  :width 292 :height 26
-                                  :label "Unsharp mask on brightness, halos held in")
-            12 44 :fill 26 :page)
-           (make-number-field :sharpen-amount "Amount" 0.0 3.0 0.05 76
+           (make-number-field :sharpen-amount "Amount" 0.0 3.0 0.05 44
                               node-page)
-           (make-number-field :sharpen-radius "Radius (px)" 0.3 5.0 0.1 108
+           (make-number-field :sharpen-radius "Radius (px)" 0.3 5.0 0.1 76
                               node-page)
-           (make-number-field :sharpen-threshold "Noise floor" 0.0 8.0 0.25 140
+           (make-number-field :sharpen-threshold "Noise floor" 0.0 8.0 0.25 108
                               node-page)))
         (build-group
          :color-subtract
@@ -8137,12 +8101,7 @@ behind is memory. Best effort; returns how many directories went."
                             (error (condition)
                               (set-status (princ-to-string condition))))))))))
              (setf rotate-turn-input (lightfast:field-control field))
-             (register-field field 44 :page))
-           (register-inspector
-            (lightfast:make-label
-             :parent node-page :x 12 :y 76 :width 292 :height 26
-             :label "Whole turns keep every photosite")
-            12 76 :fill 26 :page)))
+             (register-field field 44 :page))))
         (build-group
          :flip
          (lambda ()
@@ -8173,12 +8132,7 @@ behind is memory. Best effort; returns how many directories went."
                             (error (condition)
                               (set-status (princ-to-string condition))))))))))
              (setf flip-axis-input (lightfast:field-control field))
-             (register-field field 44 :page))
-           (register-inspector
-            (lightfast:make-label
-             :parent node-page :x 12 :y 76 :width 292 :height 26
-             :label "A mirror keeps every photosite")
-            12 76 :fill 26 :page)))
+             (register-field field 44 :page))))
         (build-group
          :crop
          (lambda ()
