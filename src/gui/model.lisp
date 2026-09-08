@@ -190,6 +190,20 @@ kept by the same rule, see ADOPT-PHOTO-JOBS."
                                      "orfeus" #P"data/luts/")))
         #'string-lessp :key #'file-namestring))
 
+(defun gui-user-lut-directory ()
+  "Where a user's own CUBE LUTs live: the luts folder of Orfeus's XDG data
+directory, beside the still gallery."
+  (uiop:xdg-data-home "orfeus/luts/"))
+
+(defun gui-user-lut-paths ()
+  "Return the user's own CUBE LUT pathnames in stable display order."
+  (sort (directory (merge-pathnames #P"*.cube" (gui-user-lut-directory)))
+        #'string-lessp :key #'file-namestring))
+
+(defun gui-lut-menu-paths ()
+  "Every LUT the Film panel offers: the bundled looks, then the user's own."
+  (append (gui-bundled-lut-paths) (gui-user-lut-paths)))
+
 (defun gui-default-processing-settings ()
   "Return the settings a new project starts from.
 

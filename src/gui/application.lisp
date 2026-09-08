@@ -7939,7 +7939,7 @@ behind is memory. Best effort; returns how many directories went."
                                 :width 88 :height 26 :label "3D LUT")
             12 44 88 26 :page)
            (let ((items '("None")))
-             (dolist (path (gui-bundled-lut-paths))
+             (dolist (path (gui-lut-menu-paths))
                (let ((name (file-namestring path)))
                  (setf (gethash name lut-paths) (namestring path)
                        items (append items (list name)))))
