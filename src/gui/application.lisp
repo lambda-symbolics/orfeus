@@ -352,6 +352,7 @@ width, but a spinner cannot shrink below its digits.")
     (:color-subtract . "Subtr")
     (:negative . "Negative")
     (:contrast . "Contr")
+    (:hdr . "HDR")
     (:sharpen . "Sharp")
     (:crop . "Crop")
     (:rotate . "Rotate")
@@ -372,6 +373,7 @@ width, but a spinner cannot shrink below its digits.")
     ("Color Subtract" . :color-subtract)
     ("Negative" . :negative)
     ("Contrast" . :contrast)
+    ("HDR" . :hdr)
     ("Sharpen" . :sharpen)
     ("Crop" . :crop)
     ("Rotate" . :rotate)
@@ -557,6 +559,7 @@ sliders and nothing else has to be recomputed."
     (:negative (:rect 1 1 10 1) (:rect 1 10 10 1) (:rect 1 1 1 10)
                (:rect 10 1 1 10) (:rect 4 4 4 4))
     (:contrast (:rect 1 1 10 10) (:rect 6 2 4 8))
+    (:hdr (:line 0 10 3 5) (:line 3 5 7 4) (:line 7 4 11 0) (:rect 0 11 12 1))
     (:sharpen (:line 6 0 1 11) (:line 6 0 11 11) (:line 1 11 11 11))
     (:crop (:line 3 0 3 9) (:line 0 3 9 3) (:line 8 2 8 11) (:line 2 8 11 8))
     (:rotate (:line 1 10 1 2) (:line 1 2 9 2) (:line 6 0 9 2) (:line 6 4 9 2))
@@ -577,6 +580,7 @@ sliders and nothing else has to be recomputed."
     (:color-subtract . :color-subtract)
     (:negative . :negative)
     (:contrast . :contrast)
+    (:hdr . :hdr)
     (:sharpen . :sharpen)
     (:crop . :crop)
     (:rotate . :rotate)
@@ -685,6 +689,9 @@ channel carries anywhere from its two endpoints to a full film-stock shape."
     (:blend t)
     ((:color-subtract :negative) t)
     (:contrast (/= 1.0 (getf (orfeus:graph-node-params node) :contrast 1.0)))
+    (:hdr (let ((params (orfeus:graph-node-params node)))
+            (or (plusp (getf params :strength 0.4))
+                (/= 0.0 (getf params :lift 0.0)))))
     (:flip (let ((params (orfeus:graph-node-params node)))
              (or (getf params :horizontal) (getf params :vertical))))
     (:sharpen (plusp (getf (orfeus:graph-node-params node) :sharpen-amount 0.0)))
@@ -3603,7 +3610,7 @@ behind is memory. Best effort; returns how many directories went."
                  (when crop-aspect-input
                    (setf (lightfast:value crop-aspect-input)
                          (or (crop-aspect-label crop-aspect) "Free"))))
-               (when (and node (member kind '(:contrast :negative)))
+               (when (and node (member kind '(:contrast :negative :hdr)))
                  (let ((params (orfeus:graph-node-params node)))
                    (dolist (entry node-param-controls)
                      (destructuring-bind (key widget default) entry
@@ -3997,6 +4004,12 @@ behind is memory. Best effort; returns how many directories went."
                                  model node (default-crop-params))
                                 (setf crop-aspect :original)
                                 (after-graph-edit "Crop reset")))))
+                (when (eq kind :hdr)
+                  (list (cons "-" nil)
+                        (cons "Camera HDR1"
+                              (lambda () (apply-hdr-preset node :hdr1)))
+                        (cons "Camera HDR2"
+                              (lambda () (apply-hdr-preset node :hdr2)))))
                 (when (member kind '(:color-subtract :negative))
                   (list (cons "-" nil)
                         (cons "Sample Base From Photo"
@@ -4379,6 +4392,17 @@ behind is memory. Best effort; returns how many directories went."
                  (sync-node-tools)
                  (after-graph-edit
                   (format nil "Levelled from the ~A: ~,1F deg" source angle)))))
+           (apply-hdr-preset (node mode)
+             ;; The camera's own HDR1 or HDR2, as measured off its JPEGs.
+             (when (and node (eq :hdr (orfeus:graph-node-kind node)))
+               (handler-case
+                   (progn
+                     (gui-model-set-node-params
+                      model node (orfeus:hdr-preset-params mode))
+                     (after-graph-edit
+                      (format nil "Set to the camera's ~A" (symbol-name mode))))
+                 (error (condition)
+                   (set-status (princ-to-string condition))))))
            (level-crop-from-camera (node)
              ;; The maker note's RollAngle is the camera's clockwise roll at
              ;; exposure, which turned the scene the other way; turning the
@@ -7887,6 +7911,47 @@ behind is memory. Best effort; returns how many directories went."
                                    node-page)
            (make-node-number-field :pivot "Pivot" 0.05 0.95 0.005 0.435 108
                                    node-page)))
+        (build-group
+         :hdr
+         (lambda ()
+           (register-inspector
+            (lightfast:make-label :parent node-page :x 12 :y 44
+                                  :width 292 :height 26
+                                  :label "Shadows opened, highlights held, colour kept")
+            12 44 :fill 26 :page)
+           (make-node-number-field :strength "Strength" 0.0 0.98 0.02 0.4 76
+                                   node-page)
+           (make-node-number-field :pivot "Pivot" 0.02 0.98 0.01 0.47 108
+                                   node-page)
+           (make-node-number-field :shadows "Shadows (EV)" 0.05 8.0 0.1 0.7 140
+                                   node-page)
+           (make-node-number-field :lift "Lift (EV)" -4.0 4.0 0.1 0.0 172
+                                   node-page)
+           ;; The camera's two modes, as measured off its own JPEGs: a frame
+           ;; shot in one of them arrives with the matching preset already on,
+           ;; and any other frame can borrow the look from here.
+           (lightfast:set-tooltip
+            (register-inspector
+             (lightfast:make-button
+              :parent node-page :x 12 :y 204 :width 140 :height 26
+              :label "Camera HDR1"
+              :callback (lambda (&rest ignored)
+                          (declare (ignore ignored))
+                          (apply-hdr-preset (gui-model-selected-graph-node model)
+                                            :hdr1)))
+             '(:column 0) 204 '(:share 2) 26 :page)
+            "The OM-1's HDR1: the log slope eased to 0.6 about middle grey, two thirds of a stop of shadow lift")
+           (lightfast:set-tooltip
+            (register-inspector
+             (lightfast:make-button
+              :parent node-page :x 160 :y 204 :width 140 :height 26
+              :label "Camera HDR2"
+              :callback (lambda (&rest ignored)
+                          (declare (ignore ignored))
+                          (apply-hdr-preset (gui-model-selected-graph-node model)
+                                            :hdr2)))
+             '(:column 1) 204 '(:share 2) 26 :page)
+            "The OM-1's HDR2: the log slope eased to 0.2 about a brighter pivot, three and a half stops of lift")))
         (build-group
          :sharpen
          (lambda ()
