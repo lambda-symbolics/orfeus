@@ -19,6 +19,7 @@
                 #:processing-settings-demosaic
                 #:vignette-default-params
                 #:clarity-default-params
+                #:dehaze-default-params
                 #:resolve-lens-profile-alias
                 #:make-export-settings
                 #:make-photo-job

@@ -374,7 +374,7 @@ photographer."
     (:color-subtract . 8) (:crop . 9) (:curves . 10) (:rotate . 11)
     (:contrast . 12) (:sharpen . 13) (:flip . 14) (:negative . 15)
     (:hdr . 16) (:dust . 17) (:vignette . 18)
-    (:clarity . 19))
+    (:clarity . 19) (:dehaze . 20))
   "Wire codes of graph node kinds in the native program format.")
 
 (defconstant +graph-program-magic+ #x4746524F
@@ -500,6 +500,11 @@ reaches it and there is nothing to keep alive across threads.")
                            (float (getf params key (getf defaults key)) 1.0))
                          *clarity-keys*)
                  nil)))
+      (:dehaze
+       (values (list (float (getf (graph-node-params node) :amount
+                                  (getf (dehaze-default-params) :amount))
+                            1.0))
+               nil))
       (:crop
        (let ((params (graph-node-params node)))
          (values (list (getf params :left 0.0)

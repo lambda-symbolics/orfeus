@@ -372,6 +372,7 @@ width, but a spinner cannot shrink below its digits.")
     (:dust . "Dust")
     (:vignette . "Vignette")
     (:clarity . "Clarity")
+    (:dehaze . "Dehaze")
     (:sharpen . "Sharp")
     (:crop . "Crop")
     (:rotate . "Rotate")
@@ -396,6 +397,7 @@ width, but a spinner cannot shrink below its digits.")
     ("Dust" . :dust)
     ("Vignette" . :vignette)
     ("Clarity" . :clarity)
+    ("Dehaze" . :dehaze)
     ("Sharpen" . :sharpen)
     ("Crop" . :crop)
     ("Rotate" . :rotate)
@@ -588,6 +590,8 @@ sliders and nothing else has to be recomputed."
                (:rect 4 4 4 4))
     (:clarity (:line 6 0 0 6) (:line 0 6 6 12) (:line 6 12 12 6) (:line 12 6 6 0)
               (:rect 5 5 2 2))
+    (:dehaze (:line 0 7 4 2) (:line 4 2 8 7) (:line 7 6 9 4) (:line 9 4 12 7)
+             (:rect 0 9 12 1) (:rect 0 11 12 1))
     (:sharpen (:line 6 0 1 11) (:line 6 0 11 11) (:line 1 11 11 11))
     (:crop (:line 3 0 3 9) (:line 0 3 9 3) (:line 8 2 8 11) (:line 2 8 11 8))
     (:rotate (:line 1 10 1 2) (:line 1 2 9 2) (:line 6 0 9 2) (:line 6 4 9 2))
@@ -612,6 +616,7 @@ sliders and nothing else has to be recomputed."
     (:dust . :dust)
     (:vignette . :vignette)
     (:clarity . :clarity)
+    (:dehaze . :dehaze)
     (:sharpen . :sharpen)
     (:crop . :crop)
     (:rotate . :rotate)
@@ -721,6 +726,7 @@ channel carries anywhere from its two endpoints to a full film-stock shape."
     ((:color-subtract :negative :dust) t)
     (:vignette (/= 0.0 (getf (orfeus:graph-node-params node) :amount -0.25)))
     (:clarity (/= 0.0 (getf (orfeus:graph-node-params node) :amount 0.25)))
+    (:dehaze (/= 0.0 (getf (orfeus:graph-node-params node) :amount 0.3)))
     (:contrast (/= 1.0 (getf (orfeus:graph-node-params node) :contrast 1.0)))
     (:hdr (let ((params (orfeus:graph-node-params node)))
             (or (plusp (getf params :strength 0.4))
@@ -3663,7 +3669,8 @@ behind is memory. Best effort; returns how many directories went."
                  (when crop-aspect-input
                    (setf (lightfast:value crop-aspect-input)
                          (or (crop-aspect-label crop-aspect) "Free"))))
-               (when (and node (member kind '(:contrast :negative :hdr :dust :vignette :clarity)))
+               (when (and node (member kind '(:contrast :negative :hdr :dust :vignette :clarity
+                                              :dehaze)))
                  (let ((params (orfeus:graph-node-params node)))
                    (dolist (entry node-param-controls)
                      (destructuring-bind (key widget default) entry
@@ -8123,6 +8130,13 @@ behind is memory. Best effort; returns how many directories went."
             (make-node-number-field :radius "Radius (px)" 10.0 1000.0 10.0 150.0 76
                                     node-page)
             "How wide the surroundings each pixel is compared with are, in pixels of the photograph")))
+        (build-group
+         :dehaze
+         (lambda ()
+           (lightfast:set-tooltip
+            (make-node-number-field :amount "Amount" -1.0 1.0 0.05 0.3 44
+                                    node-page)
+            "How much of the haze to take out; negative lays it on")))
         (build-group
          :sharpen
          (lambda ()

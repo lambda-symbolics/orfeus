@@ -135,8 +135,8 @@ them as a copyable node chain.")
   "Rotation amounts a rotate node offers, as quarter turns clockwise.")
 
 (defparameter *graph-only-node-kinds*
-  '(:blend :color-subtract :negative :contrast :hdr :dust :vignette :clarity :crop :rotate
-    :flip :curves)
+  '(:blend :color-subtract :negative :contrast :hdr :dust :vignette :clarity :dehaze :crop
+    :rotate :flip :curves)
   "Node kinds that exist only in graphs, beyond the flat pipeline stages.
 
 :COLOR-SUBTRACT computes picked-color minus pixel per channel in scene-linear
@@ -164,7 +164,9 @@ pixels around them. :VIGNETTE darkens or lightens the frame away from its
 centre in scene-linear light, as a lens does, so a highlight in a darkened
 corner stays a highlight. :CLARITY is Lightroom's clarity: the contrast
 between each pixel and its wide surroundings, raised or lowered in the
-midtones, colour kept.")
+midtones, colour kept. :DEHAZE takes the veiling light of haze out by the
+dark channel prior, measured from the whole frame; negative amounts lay it
+on.")
 
 (defparameter *flip-keys* '(:horizontal :vertical)
   "Parameters of a flip node: which axes to mirror across.")
@@ -236,6 +238,14 @@ photograph.")
 range, measured over a hundred and fifty pixels of the photograph, which on a
 20 megapixel frame is the scale of a face rather than of its texture."
   (list :amount 0.25 :radius 150.0))
+
+(defparameter *dehaze-keys* '(:amount)
+  "Parameter of a dehaze node: how much of the haze to take out, -1 to 1,
+negative laying veiling light over the frame instead.")
+
+(defun dehaze-default-params ()
+  "A dehaze node's parameters as the panel first shows them."
+  (list :amount 0.3))
 
 (defparameter *color-subtract-keys* '(:red :green :blue))
 

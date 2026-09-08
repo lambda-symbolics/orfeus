@@ -991,6 +991,7 @@ film-domain rules."
                                           :angle (crop-start-angle model)))
                                   (:vignette (orfeus:vignette-default-params))
                                   (:clarity (orfeus:clarity-default-params))
+                                  (:dehaze (orfeus:dehaze-default-params))
                                   ;; Light specks once a negative has been
                                   ;; inverted, dark before it and anywhere else.
                                   (:dust (orfeus:dust-default-params

@@ -5174,6 +5174,127 @@ pub(crate) fn apply_clarity(image: &mut RgbImage, amount: f32, radius: f32) {
 }
 
 
+/// Width the frame is reduced to for estimating haze: coarse enough that the
+/// estimate costs nothing, fine enough that the transmission follows the scene.
+const DEHAZE_SMALL_WIDTH: usize = 256;
+
+/// The least transmission a pixel may be given, which caps how far a deep
+/// haze may be pulled: dividing by less would magnify noise into the picture.
+const DEHAZE_TRANSMISSION_FLOOR: f32 = 0.1;
+
+/// Area-averages IMAGE by FACTOR into a small RGB plane.
+fn box_downscale(image: &RgbImage, factor: usize) -> (Vec<[f32; 3]>, usize, usize) {
+    let (small_width, small_height) = (image.width / factor, image.height / factor);
+    let mut small = vec![[0.0_f32; 3]; small_width * small_height];
+    small
+        .par_chunks_mut(small_width)
+        .enumerate()
+        .for_each(|(small_row, out)| {
+            for (small_column, pixel) in out.iter_mut().enumerate() {
+                let mut sum = [0.0_f32; 3];
+                for row in small_row * factor..(small_row + 1) * factor {
+                    let line = &image.data[row * image.width * 3..];
+                    for column in small_column * factor..(small_column + 1) * factor {
+                        for channel in 0..3 {
+                            sum[channel] += line[column * 3 + channel];
+                        }
+                    }
+                }
+                let count = (factor * factor) as f32;
+                *pixel = [sum[0] / count, sum[1] / count, sum[2] / count];
+            }
+        });
+    (small, small_width, small_height)
+}
+
+/// Bilinear sample of a small plane at a fractional position, clamped.
+#[inline]
+fn sample_plane(plane: &[f32], width: usize, height: usize, x: f32, y: f32) -> f32 {
+    let x = x.clamp(0.0, (width - 1) as f32);
+    let y = y.clamp(0.0, (height - 1) as f32);
+    let (x0, y0) = (x.floor() as usize, y.floor() as usize);
+    let (x1, y1) = ((x0 + 1).min(width - 1), (y0 + 1).min(height - 1));
+    let (fx, fy) = (x - x0 as f32, y - y0 as f32);
+    let top = plane[y0 * width + x0] * (1.0 - fx) + plane[y0 * width + x1] * fx;
+    let bottom = plane[y1 * width + x0] * (1.0 - fx) + plane[y1 * width + x1] * fx;
+    top * (1.0 - fy) + bottom * fy
+}
+
+/// Lightroom's Dehaze, by the dark channel prior.
+///
+/// Haze adds the same veiling light everywhere, so the darkest channel of a
+/// neighbourhood says how much of it there is. The frame is reduced to a few
+/// hundred pixels across; the least channel is eroded and smoothed into a
+/// dark channel; the atmospheric light is the mean colour of the small pixels
+/// whose dark channel is brightest; and the transmission is one minus AMOUNT
+/// times the dark channel relative to that light, no lower than a floor.
+/// Every pixel then has the light subtracted, is divided by the transmission
+/// read from the small map, and has the light added back. A negative AMOUNT
+/// lays veiling light over the frame instead. Measured from the whole frame,
+/// so it runs whole like the negative does: a window of sky must not decide
+/// the haze of the frame.
+pub(crate) fn apply_dehaze(image: &mut RgbImage, amount: f32) {
+    if amount == 0.0 || image.width < 8 || image.height < 8 {
+        return;
+    }
+    let factor = (image.width / DEHAZE_SMALL_WIDTH).max(1);
+    let (small, small_width, small_height) = box_downscale(image, factor);
+    let dark: Vec<f32> = small
+        .iter()
+        .map(|pixel| pixel[0].min(pixel[1]).min(pixel[2]).max(0.0))
+        .collect();
+    let radius = (small_width / 24).max(1);
+    let eroded = extreme_filter(&dark, small_width, small_height, radius, false);
+    let smooth = tent_blur(&eroded, small_width, small_height, radius);
+    // The atmospheric light: what the haziest thousandth of the frame looks like.
+    let mut order: Vec<usize> = (0..eroded.len()).collect();
+    order.sort_unstable_by(|a, b| eroded[*b].total_cmp(&eroded[*a]));
+    let count = (order.len() / 1000).max(1);
+    let mut air = [0.0_f32; 3];
+    for index in &order[..count] {
+        for channel in 0..3 {
+            air[channel] += small[*index][channel];
+        }
+    }
+    for value in air.iter_mut() {
+        *value = (*value / count as f32).max(1.0e-4);
+    }
+    let air_dark = air[0].min(air[1]).min(air[2]);
+    let width = image.width;
+    let scale = 1.0 / factor as f32;
+    if amount > 0.0 {
+        let strength = 0.9 * amount;
+        let transmission: Vec<f32> = smooth
+            .iter()
+            .map(|dark| (1.0 - strength * (dark / air_dark).min(1.0)).max(DEHAZE_TRANSMISSION_FLOOR))
+            .collect();
+        image
+            .data
+            .par_chunks_mut(width * 3)
+            .enumerate()
+            .for_each(|(row, line)| {
+                let y = (row as f32 + 0.5) * scale - 0.5;
+                for (column, pixel) in line.as_chunks_mut::<3>().0.iter_mut().enumerate() {
+                    let x = (column as f32 + 0.5) * scale - 0.5;
+                    let t = sample_plane(&transmission, small_width, small_height, x, y);
+                    for (value, light) in pixel.iter_mut().zip(air) {
+                        *value = ((*value - light) / t + light).max(0.0);
+                    }
+                }
+            });
+    } else {
+        // Veiling light laid over the frame, up to two fifths of it.
+        let veil = 0.4 * -amount;
+        image.data.par_chunks_mut(3 * 8192).for_each(|chunk| {
+            for pixel in chunk.as_chunks_mut::<3>().0 {
+                for (value, light) in pixel.iter_mut().zip(air) {
+                    *value += (light - *value) * veil;
+                }
+            }
+        });
+    }
+}
+
 /// Darkens or lightens the frame away from its centre, as a lens would.
 ///
 /// AMOUNT is the gain change at the frame's corner, -1 black to +1 doubled.
@@ -9112,6 +9233,68 @@ mod tests {
         };
         apply_clarity(&mut flat, 1.0, 8.0);
         assert!(flat.data.iter().all(|value| (value - 0.3).abs() < 1.0e-5));
+    }
+
+    #[test]
+    fn dehaze_restores_contrast_to_a_veiled_scene() {
+        let (width, height) = (128, 96);
+        // A checkerboard under a band of sky, seen through a uniform haze of
+        // known colour and transmission.
+        let air = [0.85_f32, 0.87, 0.95];
+        let clear: Vec<f32> = (0..width * height * 3)
+            .map(|index| {
+                let (pixel, channel) = (index / 3, index % 3);
+                let (x, y) = (pixel % width, pixel / width);
+                if y < 20 {
+                    air[channel]
+                } else {
+                    let value = if (x / 16 + y / 16) % 2 == 0 { 0.08 } else { 0.7 };
+                    value * [1.0, 0.9, 0.8][channel]
+                }
+            })
+            .collect();
+        let transmission = 0.45;
+        let hazy: Vec<f32> = clear
+            .iter()
+            .enumerate()
+            .map(|(index, value)| value * transmission + air[index % 3] * (1.0 - transmission))
+            .collect();
+        let spread = |data: &[f32]| {
+            let ground = &data[20 * width * 3..];
+            let (mut low, mut high) = (f32::MAX, f32::MIN);
+            for value in ground.iter().step_by(3) {
+                low = low.min(*value);
+                high = high.max(*value);
+            }
+            high - low
+        };
+        let mut image = RgbImage {
+            width,
+            height,
+            data: hazy.clone(),
+        };
+        apply_dehaze(&mut image, 1.0);
+        assert!(
+            spread(&image.data) > spread(&hazy) * 1.5,
+            "spread {} against hazy {}",
+            spread(&image.data),
+            spread(&hazy)
+        );
+        assert!(image.data.iter().all(|value| *value >= 0.0));
+        let mut same = RgbImage {
+            width,
+            height,
+            data: hazy.clone(),
+        };
+        apply_dehaze(&mut same, 0.0);
+        assert_eq!(same.data, hazy);
+        let mut veiled = RgbImage {
+            width,
+            height,
+            data: hazy.clone(),
+        };
+        apply_dehaze(&mut veiled, -1.0);
+        assert!(spread(&veiled.data) < spread(&hazy));
     }
 
     #[test]

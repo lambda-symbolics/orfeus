@@ -44,6 +44,7 @@ pub const NODE_HDR: u32 = 16;
 pub const NODE_DUST: u32 = 17;
 pub const NODE_VIGNETTE: u32 = 18;
 pub const NODE_CLARITY: u32 = 19;
+pub const NODE_DEHAZE: u32 = 20;
 
 /// Frame-level settings shared by every node of one graph render.
 #[repr(C)]
@@ -272,6 +273,7 @@ fn param_arity(kind: u32) -> Result<ParamArity, Error> {
         NODE_DUST => ParamArity::Exact(3),          // speck size px, contrast ev, which specks
         NODE_VIGNETTE => ParamArity::Exact(4),      // amount, midpoint, feather, roundness
         NODE_CLARITY => ParamArity::Exact(2),       // amount, radius px
+        NODE_DEHAZE => ParamArity::Exact(1),        // amount
         _ => return Err(Error::InvalidArgument("unknown graph node kind")),
     })
 }
@@ -512,6 +514,7 @@ fn validate_param(kind: u32, index: usize, value: f32) -> Result<(), Error> {
         (NODE_VIGNETTE, 3) => (-1.0..=1.0).contains(&value),
         (NODE_CLARITY, 0) => (-1.0..=1.0).contains(&value),
         (NODE_CLARITY, 1) => (10.0..=1000.0).contains(&value),
+        (NODE_DEHAZE, 0) => (-1.0..=1.0).contains(&value),
         // The four leading parameters are point counts, not signal levels.
         (NODE_CURVES, index) if index < CURVE_CHANNELS => {
             (MIN_CURVE_POINTS as f32..=MAX_CURVE_POINTS as f32).contains(&value)
@@ -1052,6 +1055,7 @@ fn node_stage_name(kind: u32) -> &'static str {
         NODE_DUST => "removing dust\0",
         NODE_VIGNETTE => "vignetting\0",
         NODE_CLARITY => "adding clarity\0",
+        NODE_DEHAZE => "removing haze\0",
         NODE_CONTRAST => "contrast\0",
         NODE_SHARPEN => "sharpening\0",
         _ => "developing\0",
@@ -1096,8 +1100,15 @@ pub(crate) fn plan_viewport(ops: &[GraphOp]) -> Option<ViewportPlan> {
                 op.kind,
                 // A negative measures its film base and its white from the
                 // whole frame, so it runs whole like the geometry does: a
-                // window of sky must not decide the black of the frame.
-                NODE_OPTICS | NODE_CROP | NODE_ROTATE | NODE_FLIP | NODE_BLEND | NODE_NEGATIVE
+                // window of sky must not decide the black of the frame. The
+                // dehaze measures the haze the same way.
+                NODE_OPTICS
+                    | NODE_CROP
+                    | NODE_ROTATE
+                    | NODE_FLIP
+                    | NODE_BLEND
+                    | NODE_NEGATIVE
+                    | NODE_DEHAZE
             )
         })
         .map_or(0, |index| index + 1);
@@ -1472,6 +1483,7 @@ fn execute_graph_into(
                     | NODE_DUST
                     | NODE_VIGNETTE
                     | NODE_CLARITY
+                    | NODE_DEHAZE
                     | NODE_CROP
                     | NODE_ROTATE
                     | NODE_FLIP
@@ -1554,6 +1566,9 @@ fn execute_graph_into(
                     op.params[1],
                     render::Specks::from_code(op.params[2]),
                 );
+            }
+            NODE_DEHAZE => {
+                render::apply_dehaze(&mut image, op.params[0]);
             }
             NODE_CLARITY => {
                 // The radius is stated for the photograph, like the sharpening
@@ -2738,6 +2753,7 @@ mod tests {
             NODE_DUST,
             NODE_VIGNETTE,
             NODE_CLARITY,
+            NODE_DEHAZE,
         ] {
             let params: &[f32] = match kind {
                 NODE_WHITE_BALANCE => &[0.0, 0.0],
@@ -2748,6 +2764,7 @@ mod tests {
                 NODE_DUST => &[12.0, 0.5, 0.0],
                 NODE_VIGNETTE => &[-0.3, 0.5, 0.5, 0.0],
                 NODE_CLARITY => &[0.3, 150.0],
+                NODE_DEHAZE => &[0.3],
                 _ => &[1.0, 1.0, 1.0],
             };
             assert!(
