@@ -3305,14 +3305,23 @@ behind is memory. Best effort; returns how many directories went."
            (project-title ()
              (let ((path (gui-model-project-path model)))
                (if path (file-namestring path) "Untitled")))
+           (project-display-title ()
+             ;; The project's name without its extension, for the panel header
+             ;; where the file type says nothing.
+             (let ((path (gui-model-project-path model)))
+               (if path
+                   (or (pathname-name path) (file-namestring path))
+                   "Untitled")))
            (sync-window-title ()
              ;; The document's name and whether it has unsaved edits, where
-             ;; every desktop application of the era put them.
+             ;; every desktop application of the era put them — and in the
+             ;; header over the photographs, which is where the eye rests.
              (when window
                (setf (lightfast:label window)
                      (format nil "~A~:[~;*~] - Orfeus"
                              (project-title)
-                             (gui-model-modified-p model)))))
+                             (gui-model-modified-p model))))
+             (sync-preset-action-label))
            (confirm-discard (verb)
              ;; True when it is fine to go ahead: nothing is unsaved, or the
              ;; user chose to save it or to let it go.
@@ -5154,7 +5163,10 @@ behind is memory. Best effort; returns how many directories went."
                        (format nil "Apply to ~D photo~:P" count)))
                (when photo-selection-label
                  (setf (lightfast:label photo-selection-label)
-                       (format nil "Photos · ~D open · ~D selected" open count)))))
+                       (format nil "~A~:[~;*~] · ~D open · ~D selected"
+                               (project-display-title)
+                               (gui-model-modified-p model)
+                               open count)))))
            (save-current-preset ()
              (handler-case
                  (let ((preset (gui-model-save-preset
