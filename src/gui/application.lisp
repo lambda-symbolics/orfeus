@@ -332,6 +332,10 @@ width, but a spinner cannot shrink below its digits.")
   "FLTK FL_SHIFT modifier for menu shortcuts.")
 (defconstant +menu-ctrl+ #x00040000
   "FLTK FL_CTRL modifier for menu shortcuts.")
+(defconstant +menu-item-inactive+ #x01
+  "FLTK FL_MENU_INACTIVE: the item shows greyed and cannot be chosen.")
+(defconstant +menu-item-invisible+ #x10
+  "FLTK FL_MENU_INVISIBLE: the item is not shown at all.")
 (defconstant +key-f5+ #xffc2
   "FLTK key code for the F5 function key.")
 (defconstant +key-page-up+ #xff55 "FLTK key code for Page Up.")
@@ -1575,14 +1579,25 @@ behind is memory. Best effort; returns how many directories went."
                            (random most-positive-fixnum))
                    (uiop:temporary-directory)))
                  (error "Cannot create secure preview display directory.")))
+           (session (session-read-settings))
            (picker-directory
-             (let ((photo (first (project-photos project))))
+             ;; Where the project dialogs open: beside what was given on the
+             ;; command line, else beside the photographs, else where the last
+             ;; session left them, else here.
+             (let ((photo (first (project-photos project)))
+                   (remembered (getf session :project-directory)))
                (cond (initial-path
                       (uiop:pathname-directory-pathname initial-path))
                      (photo
                       (uiop:pathname-directory-pathname
                        (photo-job-input-path photo)))
+                     ((and remembered (probe-file remembered))
+                      (uiop:ensure-directory-pathname remembered))
                      (t (uiop:getcwd)))))
+           ;; The labels the Recent Projects slots show at the moment, which
+           ;; is how FLTK finds an item to rename.
+           (recent-slot-labels (make-array *recent-project-limit*
+                                           :initial-element nil))
            (lens-cache (make-hash-table :test #'eq))
            (capture-cache (make-hash-table :test #'eq))
            (thumbnail-files (make-hash-table :test #'eq))
@@ -1726,8 +1741,62 @@ behind is memory. Best effort; returns how many directories went."
            (remember-picked-path (path)
              (when path
                (setf picker-directory
-                     (uiop:pathname-directory-pathname (pathname path))))
+                     (uiop:pathname-directory-pathname (pathname path)))
+               (setf (getf session :project-directory)
+                     (namestring picker-directory))
+               (session-write-settings session))
              path)
+           (remember-project (path)
+             ;; A project opened, saved or created goes to the top of the
+             ;; Recent Projects list, on disk and in the menu.
+             (setf (getf session :recent-projects)
+                   (session-remember-project (getf session :recent-projects)
+                                             path))
+             (session-write-settings session)
+             (sync-recent-projects-menu))
+           (recent-slot-path (index)
+             (format nil "&File/Recent Projects/~A"
+                     (aref recent-slot-labels index)))
+           (sync-recent-projects-menu ()
+             ;; The slots are fixed items renamed to the list: the first ones
+             ;; the projects, the rest hidden, and one greyed line when there
+             ;; is nothing to list.
+             (when menu
+               (let ((projects (session-existing-projects
+                                (getf session :recent-projects))))
+                 (setf (getf session :recent-projects) projects)
+                 (dotimes (index *recent-project-limit*)
+                   (let* ((project (nth index projects))
+                          (empty (and (zerop index) (null projects)))
+                          (label (cond (project
+                                        (recent-project-label (1+ index) project))
+                                       (empty "No recent projects")
+                                       (t (format nil "Slot ~D" (1+ index)))))
+                          (mode (cond (project 0)
+                                      (empty +menu-item-inactive+)
+                                      (t +menu-item-invisible+))))
+                     (unless (equal label (aref recent-slot-labels index))
+                       (lightfast:menu-set-item-label
+                        menu (recent-slot-path index) label)
+                       (setf (aref recent-slot-labels index) label))
+                     (lightfast:menu-set-item-mode
+                      menu (recent-slot-path index) mode))))))
+           (open-recent-project (index)
+             (let ((path (nth index (getf session :recent-projects))))
+               (cond ((null path))
+                     ((not (probe-file path))
+                      (set-status (format nil "~A is no longer there" path))
+                      (sync-recent-projects-menu))
+                     ((confirm-discard "opening another project")
+                      (handler-case
+                          (let ((read (project-read path)))
+                            (remember-picked-path path)
+                            (replace-project read (pathname path))
+                            (remember-project path))
+                        (error (condition)
+                          (set-status (format nil "Could not open ~A: ~A"
+                                              (file-namestring path)
+                                              condition))))))))
            (selected-lens-description ()
              (let ((job (selected-job)))
                (if job
@@ -5438,7 +5507,8 @@ behind is memory. Best effort; returns how many directories went."
                             :preset-file (picker-preset))))
                  (when path
                    (remember-picked-path path)
-                   (replace-project (project-read path) (pathname path))))))
+                   (replace-project (project-read path) (pathname path))
+                   (remember-project path)))))
            (new-project ()
              ;; An empty project to import into, named up front so its export
              ;; destination is settled before any photograph arrives.
@@ -5464,6 +5534,7 @@ behind is memory. Best effort; returns how many directories went."
                           (project-write project (pathname path))
                           (setf (gui-model-project-path model) (pathname path))
                           (sync-export-controls)
+                          (remember-project path)
                           (set-status
                            (format nil "New project at ~A; exports go to ~A"
                                    (file-namestring path)
@@ -5498,6 +5569,7 @@ behind is memory. Best effort; returns how many directories went."
                          (gui-model-modified-p model) nil)
                    (sync-export-controls)
                    (sync-window-title)
+                   (remember-project path)
                    (set-status
                     (if moved
                         (format nil "Project saved; exports go to ~A"
@@ -7169,6 +7241,16 @@ behind is memory. Best effort; returns how many directories went."
                                                             (open-project))
                                :shortcut (logior +menu-ctrl+ +menu-shift+
                                                  (char-code #\o)))
+        ;; Recent Projects: a fixed set of items, renamed to the list as it
+        ;; changes, since FLTK adds items but does not take them away.
+        (dotimes (index *recent-project-limit*)
+          (let ((index index))
+            (setf (aref recent-slot-labels index) (format nil "Slot ~D" (1+ index)))
+            (lightfast:add-menu-item menu (recent-slot-path index)
+                                   (lambda (&rest ignored)
+                                     (declare (ignore ignored))
+                                     (open-recent-project index)))))
+        (sync-recent-projects-menu)
         (lightfast:add-menu-item menu "&File/Save Project" (lambda (&rest ignored)
                                                             (declare (ignore ignored))
                                                             (save-project))
@@ -8576,6 +8658,8 @@ behind is memory. Best effort; returns how many directories went."
                             (ignore-errors
                               (sweep-stale-session-directories
                                (uiop:temporary-directory)))))
+        (when (and initial-path (eq (gui-open-kind initial-path) :project))
+          (remember-project initial-path))
         (when (selected-job)
           (schedule-initial-preview))
         (unwind-protect

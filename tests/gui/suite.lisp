@@ -2234,6 +2234,53 @@ would silently ignore whatever the Destination field said."
                '(:still-error 3 "stale") 4))
          "Stale still error was accepted"))
 
+(defun test-session-settings-and-recent-projects ()
+  ;; What a session leaves for the next: validated on the way in, capped.
+  (let ((pathname (format nil "/tmp/orfeus-session-~D-~D.sexp"
+                          (get-universal-time) (random 100000))))
+    (check (orfeus/gui::session-write-settings
+            (list :project-directory "/photos/2026/" :junk 1
+                  :recent-projects (loop for index below 12
+                                         collect (format nil "/p~D/project.sexp" index)))
+            pathname)
+           "Session settings did not write")
+    (let ((read (orfeus/gui::session-read-settings pathname)))
+      (check (equal "/photos/2026/" (getf read :project-directory))
+             "The project folder did not come back")
+      (check (= orfeus/gui::*recent-project-limit* (length (getf read :recent-projects)))
+             "Recent projects were not capped")
+      (check (null (getf read :junk)) "An unknown setting came back"))
+    (delete-file pathname))
+  (check (null (orfeus/gui::session-read-settings "/nonexistent/orfeus-session.sexp"))
+         "A missing file did not read as nothing")
+  ;; A project opened again moves to the front; the list never outgrows the menu.
+  (check (equal '("/b/project.sexp" "/a/project.sexp" "/c/project.sexp")
+                (orfeus/gui::session-remember-project
+                 '("/a/project.sexp" "/b/project.sexp" "/c/project.sexp")
+                 #P"/b/project.sexp"))
+         "A reopened project did not move to the front")
+  (check (= orfeus/gui::*recent-project-limit*
+            (length (orfeus/gui::session-remember-project
+                     (loop for index below 20 collect (format nil "/p~D.sexp" index))
+                     "/new.sexp")))
+         "Remembering did not cap the list")
+  ;; Projects whose files are gone drop out; present ones stay.
+  (let ((present (format nil "/tmp/orfeus-session-present-~D.sexp" (random 100000))))
+    (with-open-file (stream present :direction :output :if-exists :supersede)
+      (write-line "()" stream))
+    (check (equal (list present)
+                  (orfeus/gui::session-existing-projects
+                   (list "/nowhere/gone.sexp" present)))
+           "A missing project was kept or a present one dropped")
+    (delete-file present))
+  ;; The menu line: folder and file, numbered, FLTK's mnemonic marker doubled.
+  (check (string= "&3 fotecky/project.sexp"
+                  (orfeus/gui::recent-project-label 3 "/root/project/fotecky/project.sexp"))
+         "The label did not name the folder and file")
+  (check (string= "&1 a&&b/x.sexp"
+                  (orfeus/gui::recent-project-label 1 "/home/a&b/x.sexp"))
+         "The mnemonic marker in a name was not doubled"))
+
 (defun run-tests ()
   (test-lightfast-root-layout-and-export-validation)
   (test-model-settings)
@@ -2242,6 +2289,7 @@ would silently ignore whatever the Destination field said."
   (test-photographs-sort-and-keep-their-places)
   (test-a-turned-crop-stays-inside-the-frame)
   (test-the-picker-decides-without-a-window)
+  (test-session-settings-and-recent-projects)
   (test-display-copies-are-let-go-when-nothing-shows-them)
   (test-stale-session-directories-are-swept)
   (test-hdr-frames-are-seeded-once)
