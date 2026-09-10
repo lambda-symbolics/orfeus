@@ -2,9 +2,10 @@
 ;;;; 3D CUBE LUT for Orfeus's Film node.
 ;;;;
 ;;;;   sbcl --script scripts/lightroom-preset-lut.lisp OUT-DIRECTORY PRESET.xmp...
+;;;;   sbcl --script scripts/lightroom-preset-lut.lisp OUT-DIRECTORY "Name=PRESET.xmp"...
 ;;;;
-;;;; Self-contained SBCL; no dependencies. One .cube per preset, named after the
-;;;; preset's crs:Name, 33 steps a side.
+;;;; Self-contained SBCL; no dependencies. One .cube per preset, 33 steps a
+;;;; side, named after the preset's crs:Name unless the argument gives a name.
 ;;;;
 ;;;; What is baked: the colour work of the preset -- camera calibration
 ;;;; (primary hue and saturation), a custom white balance taken relative to
@@ -15,11 +16,28 @@
 ;;;; dehaze. Orfeus has nodes for those; the values a preset asked for are
 ;;;; written into the .cube's header as comments.
 ;;;;
-;;;; Adobe's pipeline is not public. Each control here is a documented
-;;;; approximation of what the slider does to an already developed picture, in
-;;;; the order Camera Raw applies them, with ranges chosen so that a slider at
-;;;; its limit does about what Lightroom's does. The LUT is applied by the Film
-;;;; node to display-referred sRGB, so that is the domain everything works in.
+;;;; Camera Raw does its work in ProPhoto RGB: linear for white balance,
+;;;; calibration and exposure, and with the sRGB transfer curve -- the space
+;;;; Adobe calls Melissa RGB -- for the tone curve and the point curves. The
+;;;; same curve on sRGB primaries turns colours differently, because a
+;;;; saturated colour's three channels sit far apart in sRGB and close together
+;;;; in ProPhoto, so those stages happen in ProPhoto here. The LUT is applied by
+;;;; the Film node to display-referred sRGB: a colour comes in as sRGB, goes to
+;;;; ProPhoto through XYZ with a Bradford adaptation from D65 to D50, is
+;;;; exposed and curved, and comes back the same way, clipped to the sRGB
+;;;; gamut. White balance is a Bradford scaling in XYZ on the way in, and the
+;;;; calibration panel a matrix built from the sRGB primaries turned in Oklab,
+;;;; where a hue turn keeps the colour's chroma; an earlier turn in a plane of
+;;;; channel differences made a slightly cyan sky a saturated turquoise. The colour panels -- HSL, vibrance and
+;;;; saturation, split toning -- then work on the display colour in sRGB HSV.
+;;;; They were tried in ProPhoto's HSV and it is the wrong coordinate system for
+;;;; them: its saturation is 0.8 for display red and 0.28 for display aqua, so
+;;;; turning a green toward aqua at constant saturation blew it far past the
+;;;; sRGB gamut, and a saturation slider meant nothing consistent. Saturation
+;;;; in sRGB HSV is relative to the gamut the picture is shown in, which is
+;;;; what the sliders promise. Adobe's own arithmetic for each control is not
+;;;; public; each one here is a documented approximation with ranges chosen so
+;;;; a slider at its limit does about what Lightroom's does.
 
 (require :asdf)
 
@@ -116,8 +134,116 @@ that sets 4600 K makes a daylight photograph cooler by that much.")
         (/ v 12.92d0)
         (expt (/ (+ v 0.055d0) 1.055d0) 2.4d0))))
 
-(defun luminance (r g b)
+;;; Three-by-three matrices as lists of rows.
+
+(defun mat* (a b)
+  "A times B: B is a 3x3 matrix or a 3-vector."
+  (if (numberp (first b))
+      (mapcar (lambda (row) (reduce #'+ (mapcar #'* row b))) a)
+      (mapcar (lambda (row)
+                (loop for j below 3
+                      collect (loop for k below 3
+                                    sum (* (nth k row) (nth j (nth k b))))))
+              a)))
+
+(defun mat-inverse (m)
+  (destructuring-bind ((a b c) (d e f) (g h i)) m
+    (let* ((det (+ (* a (- (* e i) (* f h)))
+                   (- (* b (- (* d i) (* f g))))
+                   (* c (- (* d h) (* e g)))))
+           (s (/ 1d0 det)))
+      (list (list (* s (- (* e i) (* f h))) (* s (- (* c h) (* b i))) (* s (- (* b f) (* c e))))
+            (list (* s (- (* f g) (* d i))) (* s (- (* a i) (* c g))) (* s (- (* c d) (* a f))))
+            (list (* s (- (* d h) (* e g))) (* s (- (* b g) (* a h))) (* s (- (* a e) (* b d))))))))
+
+(defun diagonal (v)
+  (list (list (first v) 0d0 0d0)
+        (list 0d0 (second v) 0d0)
+        (list 0d0 0d0 (third v))))
+
+(defparameter *identity* (diagonal '(1d0 1d0 1d0)))
+
+;;; ------------------------------------------------------------ colour spaces
+
+(defun xy->xyz (x y)
+  "XYZ of the chromaticity (x y) at unit luminance."
+  (list (/ x y) 1d0 (/ (- 1d0 x y) y)))
+
+(defun rgb->xyz-matrix (red green blue white)
+  "The matrix taking linear RGB with primaries RED GREEN BLUE and WHITE, each an
+(x y) chromaticity, to XYZ."
+  (let* ((columns (list (xy->xyz (first red) (second red))
+                        (xy->xyz (first green) (second green))
+                        (xy->xyz (first blue) (second blue))))
+         (primaries (loop for i below 3 collect (mapcar (lambda (c) (nth i c)) columns)))
+         (scale (mat* (mat-inverse primaries) (xy->xyz (first white) (second white)))))
+    (mat* primaries (diagonal scale))))
+
+(defparameter *bradford*
+  '((0.8951d0 0.2664d0 -0.1614d0)
+    (-0.7502d0 1.7135d0 0.0367d0)
+    (0.0389d0 -0.0685d0 1.0296d0))
+  "XYZ to the sharpened cone responses of the Bradford transform.")
+
+(defun cone-scaling (gains)
+  "The XYZ matrix that scales the Bradford cone responses by GAINS."
+  (mat* (mat-inverse *bradford*) (mat* (diagonal gains) *bradford*)))
+
+(defun adaptation (source destination)
+  "Bradford chromatic adaptation from the white SOURCE to DESTINATION, both XYZ."
+  (cone-scaling (mapcar #'/ (mat* *bradford* destination) (mat* *bradford* source))))
+
+(defparameter *d65* '(0.3127d0 0.3290d0))
+(defparameter *d50* '(0.3457d0 0.3585d0))
+
+(defparameter *srgb->xyz*
+  (rgb->xyz-matrix '(0.64d0 0.33d0) '(0.30d0 0.60d0) '(0.15d0 0.06d0) *d65*))
+
+(defparameter *prophoto->xyz*
+  (rgb->xyz-matrix '(0.7347d0 0.2653d0) '(0.1596d0 0.8404d0) '(0.0366d0 0.0001d0) *d50*)
+  "ProPhoto RGB (ROMM), Camera Raw's working primaries, white D50.")
+
+(defparameter *d65->d50*
+  (adaptation (xy->xyz (first *d65*) (second *d65*))
+              (xy->xyz (first *d50*) (second *d50*))))
+
+(defparameter *srgb->working*
+  (mat* (mat-inverse *prophoto->xyz*) (mat* *d65->d50* *srgb->xyz*))
+  "Linear sRGB to linear ProPhoto RGB, the display white landing on D50.")
+
+(defparameter *working->srgb* (mat-inverse *srgb->working*))
+
+(defparameter *xyz->srgb* (mat-inverse *srgb->xyz*))
+
+(defun display-luminance (r g b)
+  "Luma of an sRGB colour, encoded or not."
   (+ (* 0.2126d0 r) (* 0.7152d0 g) (* 0.0722d0 b)))
+
+;;; Oklab, for turning a primary's hue without changing how colourful it is.
+
+(defparameter *oklab-m1*
+  '((0.4122214708d0 0.5363325363d0 0.0514459929d0)
+    (0.2119034982d0 0.6806995451d0 0.1073969566d0)
+    (0.0883024619d0 0.2817188376d0 0.6299787005d0))
+  "Linear sRGB to Oklab's cone responses.")
+
+(defparameter *oklab-m2*
+  '((0.2104542553d0 0.7936177850d0 -0.0040720468d0)
+    (1.9779984951d0 -2.4285922050d0 0.4505937099d0)
+    (0.0259040371d0 0.7827717662d0 -0.8086757660d0))
+  "Cube-rooted cone responses to Oklab L a b.")
+
+(defparameter *oklab-m1-inverse* (mat-inverse *oklab-m1*))
+(defparameter *oklab-m2-inverse* (mat-inverse *oklab-m2*))
+
+(defun signed-cbrt (v)
+  (if (minusp v) (- (expt (- v) (/ 1d0 3d0))) (expt v (/ 1d0 3d0))))
+
+(defun srgb->oklab (rgb)
+  (mat* *oklab-m2* (mapcar #'signed-cbrt (mat* *oklab-m1* rgb))))
+
+(defun oklab->srgb (lab)
+  (mat* *oklab-m1-inverse* (mapcar (lambda (v) (* v v v)) (mat* *oklab-m2-inverse* lab))))
 
 ;;; Monotone cubic interpolation (Fritsch-Carlson) through a point curve, so
 ;;; the curve never overshoots the points it was drawn through.
@@ -183,66 +309,49 @@ that sets 4600 K makes a daylight photograph cooler by that much.")
                       (* 3.75112997d0 x) -0.37001483d0)))))
     (values x y)))
 
-(defun kelvin-rgb (kelvin)
-  "Linear sRGB of a white at KELVIN, green scaled to one."
-  (multiple-value-bind (x y) (planckian-xy kelvin)
-    (let* ((bx (/ x y)) (by 1d0) (bz (/ (- 1d0 x y) y))
-           (r (+ (* 3.2406d0 bx) (* -1.5372d0 by) (* -0.4986d0 bz)))
-           (g (+ (* -0.9689d0 bx) (* 1.8758d0 by) (* 0.0415d0 bz)))
-           (b (+ (* 0.0557d0 bx) (* -0.2040d0 by) (* 1.0570d0 bz))))
-      (values (/ r g) 1d0 (/ b g)))))
-
-(defun white-balance-gains (kelvin tint)
-  "Channel gains that render a daylight photograph as a preset set to KELVIN
-and TINT would: the ratio of the daylight white to the chosen white, tint
-pulling green down for magenta and up for green."
-  (multiple-value-bind (dr dg db) (kelvin-rgb *daylight-kelvin*)
-    (multiple-value-bind (tr tg tb) (kelvin-rgb kelvin)
-      (list (/ dr tr) (* (/ dg tg) (- 1d0 (* 0.35d0 (/ tint 150d0)))) (/ db tb)))))
+(defun white-balance-matrix (kelvin tint)
+  "The XYZ matrix that renders a daylight photograph as a preset set to KELVIN
+and TINT would: a von Kries scaling in Bradford cone space by the ratio of the
+daylight white to the chosen white, tint taking the middle cone down for
+magenta and up for green."
+  (multiple-value-bind (dx dy) (planckian-xy *daylight-kelvin*)
+    (multiple-value-bind (tx ty) (planckian-xy kelvin)
+      (let ((gains (mapcar #'/ (mat* *bradford* (xy->xyz dx dy))
+                           (mat* *bradford* (xy->xyz tx ty)))))
+        (setf (second gains) (* (second gains) (- 1d0 (* 0.35d0 (/ tint 150d0)))))
+        (cone-scaling gains)))))
 
 ;;; -------------------------------------------------------------- calibration
 
-(defun rotate-hue-linear (r g b degrees)
-  "Rotate the hue of a linear RGB colour by DEGREES about the grey axis,
-keeping its luminance: the colour's two chroma differences turn as a vector."
-  (let* ((theta (* degrees (/ pi 180d0)))
-         (c (cos theta)) (s (sin theta))
-         (y (luminance r g b))
-         (i-axis (- r y)) (q-axis (- b y))
-         (ci (- (* i-axis c) (* q-axis s)))
-         (cq (+ (* i-axis s) (* q-axis c)))
-         (nr (+ y ci)) (nb (+ y cq))
-         (ng (/ (- y (* 0.2126d0 nr) (* 0.0722d0 nb)) 0.7152d0)))
-    (values nr ng nb)))
+(defun turn-primary (rgb degrees factor)
+  "The linear sRGB primary RGB with its Oklab hue turned by DEGREES and its
+chroma scaled by FACTOR, lightness kept. Positive goes the way round the wheel
+the calibration sliders' ramps do: red toward orange, green toward cyan, blue
+toward purple."
+  (destructuring-bind (l a b) (srgb->oklab rgb)
+    (let* ((theta (* degrees (/ pi 180d0)))
+           (c (cos theta)) (s (sin theta)))
+      (oklab->srgb (list l
+                         (* factor (- (* a c) (* b s)))
+                         (* factor (+ (* a s) (* b c))))))))
 
 (defun calibration-matrix (text)
-  "The 3x3 matrix Camera Raw's calibration sliders amount to: each primary's
-hue turned by up to thirty degrees and its saturation scaled by up to a
-factor of two, rows normalised so white stays white."
-  (flet ((primary (name r g b)
-           (let* ((hue (number-attribute text (format nil "~AHue" name)))
-                  (sat (number-attribute text (format nil "~ASaturation" name)))
-                  (factor (expt 2d0 (/ sat 100d0))))
-             (multiple-value-bind (nr ng nb) (rotate-hue-linear r g b (* 30d0 (/ hue 100d0)))
-               (let ((y (luminance nr ng nb)))
-                 (list (+ y (* factor (- nr y)))
-                       (+ y (* factor (- ng y)))
-                       (+ y (* factor (- nb y)))))))))
-    (let* ((red (primary "Red" 1d0 0d0 0d0))
-           (green (primary "Green" 0d0 1d0 0d0))
-           (blue (primary "Blue" 0d0 0d0 1d0))
-           ;; Columns are the new primaries; normalise each row so that
-           ;; (1 1 1) maps to (1 1 1).
-           (rows (loop for i below 3
-                       collect (let* ((row (list (nth i red) (nth i green) (nth i blue)))
-                                      (sum (reduce #'+ row)))
-                                 (mapcar (lambda (v) (/ v sum)) row)))))
-      rows)))
-
-(defun apply-matrix (rows r g b)
-  (flet ((row (k) (let ((w (nth k rows)))
-                    (+ (* (first w) r) (* (second w) g) (* (third w) b)))))
-    (values (row 0) (row 1) (row 2))))
+  "The 3x3 matrix Camera Raw's calibration sliders amount to, on linear sRGB:
+each primary's hue turned by up to thirty degrees and its chroma scaled by up
+to a factor of two, rows normalised so white stays white."
+  (flet ((primary (name rgb)
+           (turn-primary rgb
+                         (* 30d0 (/ (number-attribute text (format nil "~AHue" name)) 100d0))
+                         (expt 2d0 (/ (number-attribute text (format nil "~ASaturation" name)) 100d0)))))
+    (let ((red (primary "Red" '(1d0 0d0 0d0)))
+          (green (primary "Green" '(0d0 1d0 0d0)))
+          (blue (primary "Blue" '(0d0 0d0 1d0))))
+      ;; Columns are the new primaries; normalise each row so that
+      ;; (1 1 1) maps to (1 1 1).
+      (loop for i below 3
+            collect (let* ((row (list (nth i red) (nth i green) (nth i blue)))
+                           (sum (reduce #'+ row)))
+                      (mapcar (lambda (v) (/ v sum)) row))))))
 
 ;;; ---------------------------------------------------------- basic tone panel
 
@@ -294,6 +403,10 @@ each moving its region by up to 0.15, the ends held."
     (+ v (* shift edge))))
 
 ;;; ------------------------------------------------------------------- HSL
+;;;
+;;; On the display colour, in sRGB HSV: the bands are named after display
+;;; colours, and saturation there is relative to the gamut the picture is
+;;; shown in.
 
 (defparameter *hsl-centres* '(0d0 30d0 60d0 120d0 180d0 240d0 280d0 320d0)
   "Where Lightroom's eight colour bands sit on the hue circle: red, orange,
@@ -373,13 +486,13 @@ luminance moved by up to a stop, each by the bands the colour belongs to."
 (defun split-tone (r g b shadow-hue shadow-sat highlight-hue highlight-sat balance)
   (if (and (zerop shadow-sat) (zerop highlight-sat))
       (values r g b)
-      (let* ((l (luminance r g b))
+      (let* ((l (display-luminance r g b))
              (pivot (+ 0.5d0 (* 0.25d0 (/ balance 100d0))))
              (shadow-weight (- 1d0 (smoothstep 0d0 (+ pivot 0.1d0) l)))
              (highlight-weight (smoothstep (- pivot 0.1d0) 1d0 l)))
         (flet ((tint (hue sat weight)
                  (multiple-value-bind (tr tg tb) (hsv->rgb hue 1d0 1d0)
-                   (let ((grey (luminance tr tg tb))
+                   (let ((grey (display-luminance tr tg tb))
                          (k (* 0.3d0 (/ sat 100d0) weight)))
                      (list (* k (- tr grey)) (* k (- tg grey)) (* k (- tb grey)))))))
           (let ((sh (tint shadow-hue shadow-sat shadow-weight))
@@ -391,13 +504,14 @@ luminance moved by up to a stop, each by the bands the colour belongs to."
 ;;; ---------------------------------------------------------------- pipeline
 
 (defstruct preset
-  name gains matrix exposure contrast highlights shadows whites blacks
+  name source-name input-matrix exposure contrast highlights shadows whites blacks
   parametric point-curve red-curve green-curve blue-curve
   hues sats lums saturation vibrance split notes)
 
-(defun read-preset (path)
+(defun read-preset (path &key name)
   (let* ((text (slurp path))
          (custom-wb (equal (attribute text "WhiteBalance") "Custom"))
+         (source-name (read-preset-name text))
          (band (lambda (prefix)
                  (mapcar (lambda (name)
                            (number-attribute text (format nil "~A~A" prefix name)))
@@ -409,11 +523,18 @@ luminance moved by up to a stop, each by the bands the colour belongs to."
                         (monotone-curve points)
                         nil)))))
     (make-preset
-     :name (read-preset-name text)
-     :gains (when custom-wb
-              (white-balance-gains (number-attribute text "Temperature" *daylight-kelvin*)
-                                   (number-attribute text "Tint")))
-     :matrix (calibration-matrix text)
+     :name (or name source-name)
+     :source-name source-name
+     ;; Display sRGB -> white balance (in XYZ) -> calibration -> ProPhoto.
+     :input-matrix (mat* *srgb->working*
+                         (mat* (calibration-matrix text)
+                               (mat* *xyz->srgb*
+                                     (mat* (if custom-wb
+                                               (white-balance-matrix
+                                                (number-attribute text "Temperature" *daylight-kelvin*)
+                                                (number-attribute text "Tint"))
+                                               *identity*)
+                                           *srgb->xyz*))))
      :exposure (number-attribute text "Exposure2012")
      :contrast (number-attribute text "Contrast2012")
      :highlights (number-attribute text "Highlights2012")
@@ -469,16 +590,11 @@ luminance moved by up to a stop, each by the bands the colour belongs to."
 
 (defun develop (preset r g b)
   "PRESET applied to one display-referred sRGB colour; returns three values."
-  (let ((lr (srgb-decode r)) (lg (srgb-decode g)) (lb (srgb-decode b)))
-    ;; White balance, relative to daylight.
-    (when (preset-gains preset)
-      (destructuring-bind (kr kg kb) (preset-gains preset)
-        (setf lr (* lr kr) lg (* lg kg) lb (* lb kb))))
-    ;; Calibration.
-    (multiple-value-setq (lr lg lb) (apply-matrix (preset-matrix preset) lr lg lb))
-    ;; Exposure.
-    (let ((gain (expt 2d0 (preset-exposure preset))))
-      (setf lr (max 0d0 (* lr gain)) lg (max 0d0 (* lg gain)) lb (max 0d0 (* lb gain))))
+  (let* ((gain (expt 2d0 (preset-exposure preset)))
+         ;; Into linear ProPhoto, white balanced and calibrated, then exposed.
+         (working (mapcar (lambda (v) (max 0d0 (* v gain)))
+                          (mat* (preset-input-matrix preset)
+                                (list (srgb-decode r) (srgb-decode g) (srgb-decode b))))))
     ;; The Basic panel and the curves, per channel, on the encoded signal.
     (flet ((tone (linear)
              (let ((v (srgb-encode linear)))
@@ -493,10 +609,18 @@ luminance moved by up to a stop, each by the bands the colour belongs to."
                (when (preset-point-curve preset)
                  (setf v (funcall (preset-point-curve preset) v)))
                v)))
-      (let ((er (tone lr)) (eg (tone lg)) (eb (tone lb)))
+      (let ((er (tone (first working))) (eg (tone (second working))) (eb (tone (third working))))
         (when (preset-red-curve preset) (setf er (funcall (preset-red-curve preset) er)))
         (when (preset-green-curve preset) (setf eg (funcall (preset-green-curve preset) eg)))
         (when (preset-blue-curve preset) (setf eb (funcall (preset-blue-curve preset) eb)))
+        ;; Back to display sRGB, clipped to its gamut channel by channel.
+        (let ((out (mat* *working->srgb*
+                         (list (srgb-decode (clamp er 0d0 1d0))
+                               (srgb-decode (clamp eg 0d0 1d0))
+                               (srgb-decode (clamp eb 0d0 1d0))))))
+          (setf er (srgb-encode (clamp (first out) 0d0 1d0))
+                eg (srgb-encode (clamp (second out) 0d0 1d0))
+                eb (srgb-encode (clamp (third out) 0d0 1d0))))
         ;; Colour: HSL bands, then vibrance and saturation, then split toning.
         (multiple-value-setq (er eg eb)
           (hsl-adjust er eg eb (preset-hues preset) (preset-sats preset) (preset-lums preset)))
@@ -513,7 +637,7 @@ luminance moved by up to a stop, each by the bands the colour belongs to."
   (with-open-file (stream path :direction :output :if-exists :supersede
                                :external-format :utf-8)
     (format stream "# Baked from the Lightroom preset ~S by scripts/lightroom-preset-lut.lisp~%"
-            (preset-name preset))
+            (preset-source-name preset))
     (format stream "# Colour only; not in this LUT (add the node instead):~%")
     (dolist (note (preset-notes preset))
       (format stream "#   ~A~%" note))
@@ -527,25 +651,36 @@ luminance moved by up to a stop, each by the bands the colour belongs to."
                 (develop preset (/ ri steps) (/ gi steps) (/ bi steps))
               (format stream "~,6F ~,6F ~,6F~%" r g b))))))))
 
-(defun convert (xmp-path out-directory)
-  (let* ((preset (read-preset xmp-path))
+(defun convert (xmp-path out-directory &key name)
+  "Bake XMP-PATH into OUT-DIRECTORY, as NAME or the preset's own name."
+  (let* ((preset (read-preset xmp-path :name name))
          (out (merge-pathnames (make-pathname :name (preset-name preset) :type "cube")
                                (uiop:ensure-directory-pathname out-directory))))
     (write-cube preset out)
     (format t "~A -> ~A~@[  (not baked: ~{~A~^; ~})~]~%" xmp-path out (preset-notes preset))
     out))
 
+(defun parse-argument (argument)
+  "An argument is PRESET.xmp, or NAME=PRESET.xmp to name the LUT differently."
+  (let ((separator (position #\= argument)))
+    (if (and separator (not (probe-file argument)))
+        (values (subseq argument (1+ separator)) (subseq argument 0 separator))
+        (values argument nil))))
+
 (defun main (arguments)
   (when (< (length arguments) 2)
-    (format *error-output* "usage: lightroom-preset-lut.lisp OUT-DIRECTORY PRESET.xmp...~%")
+    (format *error-output* "usage: lightroom-preset-lut.lisp OUT-DIRECTORY [NAME=]PRESET.xmp...~%")
     (uiop:quit 2))
   (let ((out (first arguments)))
     (ensure-directories-exist (uiop:ensure-directory-pathname out))
-    (dolist (xmp (rest arguments))
-      (convert xmp out)))
+    (dolist (argument (rest arguments))
+      (multiple-value-bind (xmp name) (parse-argument argument)
+        (convert xmp out :name name))))
   (uiop:quit 0))
 
 (when (and (boundp 'sb-ext:*posix-argv*)
            (not (find-package "SWANK"))
-           (not (find-package "SLYNK")))
+           (not (find-package "SLYNK"))
+           ;; Loaded as a library (push this feature first), not run.
+           (not (member :lightroom-preset-lut-library *features*)))
   (main (rest sb-ext:*posix-argv*)))
