@@ -42,6 +42,10 @@ void main() {
         }
     }
     saturation = clamp(saturation, 0.0, 1.0);
+    // Highlights ease toward neutral from display 0.6 to a fifth of their
+    // chroma at white, as tone.rs's highlight_chroma does.
+    float ease = clamp((tone_value - 0.6) / 0.4, 0.0, 1.0);
+    saturation *= 1.0 - 0.8 * ease * ease * (3.0 - 2.0 * ease);
     vec3 output_rgb = vec3(
         transfer(tone_value + saturation * (toned.x - tone_value)),
         transfer(tone_value + saturation * (toned.y - tone_value)),

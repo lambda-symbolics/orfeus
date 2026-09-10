@@ -194,6 +194,11 @@ pub(crate) fn as_shot_kelvin(
 /// every channel's white level to 1.0, so a clipped channel arrives at unity.
 pub(crate) const CLIP_ONSET: f32 = 0.97;
 
+/// Where a clipped pixel starts to count as a blown neutral rather than a
+/// coloured light: its dimmest balanced channel at this fraction of its
+/// brightest. Below it the colour is kept whole, at the peak it is all let go.
+const NEUTRAL_ONSET: f32 = 0.5;
+
 /// Raises clipped channels to the brightest balanced channel of their pixel.
 ///
 /// A saturated photosite recorded no ratio: the sensor stopped before the true
@@ -205,15 +210,35 @@ pub(crate) const CLIP_ONSET: f32 = 0.97;
 ///
 /// The brightest balanced channel is itself a lower bound on the true neutral
 /// level, so lifting each clipped channel to it reconstructs a blown highlight
-/// as bright grey. A highlight where only one channel clipped already peaks in
-/// that channel, so its hue survives untouched.
+/// as bright grey.
+///
+/// What the unclipped channels say decides what the pixel was. A coloured
+/// light that clipped in its own colour — a red lamp, a sodium street light —
+/// has its other channels far below the peak, and keeps its hue. A cloud that
+/// clipped only in green under a warm white balance has red *above* the
+/// clipped green and blue not far below: lifting green to red alone would
+/// paint it yellow, when the sensor recorded no colour there at all. So the
+/// nearer a pixel's dimmest channel stands to its brightest, the more the whole
+/// pixel is taken for a blown neutral and drawn to the peak — from nothing at
+/// half the peak to entirely at the peak.
 fn reconstruct_clipped<const N: usize>(camera: &[f32; N], balanced: &mut [f32; N]) {
     let peak = balanced.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let mut clipped_most = 0.0_f32;
     for (value, raw) in balanced.iter_mut().zip(camera) {
         let clipped = ((raw - CLIP_ONSET) / (1.0 - CLIP_ONSET)).clamp(0.0, 1.0);
+        clipped_most = clipped_most.max(clipped);
         if clipped > 0.0 {
             *value += clipped * (peak - *value).max(0.0);
         }
+    }
+    if clipped_most <= 0.0 || peak <= 0.0 {
+        return;
+    }
+    let dimmest = balanced.iter().copied().fold(f32::INFINITY, f32::min);
+    let nearness = ((dimmest / peak - NEUTRAL_ONSET) / (1.0 - NEUTRAL_ONSET)).clamp(0.0, 1.0);
+    let weight = clipped_most * nearness * nearness * (3.0 - 2.0 * nearness);
+    for value in balanced.iter_mut() {
+        *value += weight * (peak - *value);
     }
 }
 
@@ -391,33 +416,42 @@ mod tests {
     }
 
     #[test]
-    fn reconstruction_lifts_only_clipped_channels() {
-        let reconstruct = |camera: [f32; 3]| {
-            let gains = [2.2, 1.0, 1.5];
+    fn reconstruction_neutralises_blown_pixels_and_keeps_coloured_lights() {
+        let reconstruct = |camera: [f32; 3], gains: [f32; 3]| {
             let mut balanced: [f32; 3] =
                 std::array::from_fn(|channel| camera[channel] * gains[channel]);
             reconstruct_clipped(&camera, &mut balanced);
             balanced
         };
+        let daylight = [2.2, 1.0, 1.5];
         // Every channel saturated: all three land on the brightest balanced
         // channel, which is a lower bound on the true neutral level.
-        let blown = reconstruct([1.0, 1.0, 1.0]);
+        let blown = reconstruct([1.0, 1.0, 1.0], daylight);
         close(blown[0], 2.2);
         close(blown[1], 2.2);
         close(blown[2], 2.2);
-        // A saturated red light clips only in red, and red is already the
-        // brightest balanced channel, so its hue survives untouched.
-        let red = reconstruct([1.0, 0.3, 0.25]);
+        // A saturated red light clips only in red, and its other channels sit
+        // far below it: a coloured light, so its hue survives untouched.
+        let red = reconstruct([1.0, 0.3, 0.25], daylight);
         close(red[0], 2.2);
         close(red[1], 0.3);
         close(red[2], 0.375);
-        // Green alone clipped: it rises to the peak, red and blue stay put.
-        let green = reconstruct([0.5, 1.0, 0.7]);
+        // Green alone clipped on a near-neutral: green rises to the peak and
+        // blue, already close, follows it up to grey.
+        let green = reconstruct([0.5, 1.0, 0.7], daylight);
         close(green[0], 1.1);
         close(green[1], 1.1);
-        close(green[2], 1.05);
+        assert!(green[2] > 1.09 && green[2] <= 1.1, "blue stayed at {}", green[2]);
+        // The cloud that found this: an OM-1 frame balanced warm (red 2.64,
+        // blue 1.45) with green at the sensor's ceiling, red a little above
+        // it once balanced and blue a little below. Lifting green to red alone
+        // made a yellow blot where the camera shows a white cloud.
+        let cloud = reconstruct([0.4415, 1.0254, 0.6306], [2.640_625, 1.0, 1.453_125]);
+        close(cloud[0], cloud[1]);
+        assert!(cloud[2] > 1.05 && cloud[0] / cloud[2] < 1.1,
+                "the cloud stayed yellow: {cloud:?}");
         // Well below the clip onset nothing is touched at all.
-        let unclipped = reconstruct([0.4, 0.5, 0.6]);
+        let unclipped = reconstruct([0.4, 0.5, 0.6], daylight);
         close(unclipped[0], 0.88);
         close(unclipped[1], 0.5);
         close(unclipped[2], 0.9);
