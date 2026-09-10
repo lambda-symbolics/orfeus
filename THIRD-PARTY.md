@@ -44,9 +44,9 @@ unless otherwise specified. Its notice is preserved in
 does not claim ownership of the LUTs and that they may remain subject to their
 respective owners' rights and trademarks.
 
-## JSZ CEDAR looks
+## Agfalike looks
 
-The eight `data/luts/JSZ-CEDAR *.cube` files were baked from the JSZ CEDAR
+The eight `data/luts/Agfalike *.cube` files were baked from the JSZ CEDAR
 Lightroom presets (`crs:Version` 10.5, Process Version 2012) by
 `scripts/lightroom-preset-lut.lisp`, which approximates Camera Raw's colour
 controls; the presets' sharpening, grain, vignette, clarity and dehaze are not

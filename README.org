@@ -101,8 +101,8 @@ actions kept visible. White-balance mode, LUT state, and preview source remain
 visible in the status bar.
 
 The bundled LUT library includes Agfa APX, Precisa, Ultra Color, and Vista looks,
-plus Kodachrome 25, 64, 64 Generic, and 200, and the eight JSZ CEDAR looks baked
-from Lightroom presets by =scripts/lightroom-preset-lut.lisp=. Their pinned
+plus Kodachrome 25, 64, 64 Generic, and 200, and the eight Agfalike looks, baked
+from the JSZ CEDAR Lightroom presets by =scripts/lightroom-preset-lut.lisp=. Their pinned
 provenance, checksums, and license notice are recorded in =THIRD-PARTY.md=. CUBE
 files dropped into =~/.local/share/orfeus/luts/= appear in the Film panel too.
 

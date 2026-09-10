@@ -1529,24 +1529,24 @@ would silently ignore whatever the Destination field said."
 (defun test-bundled-film-lut-menu ()
   (let ((names (mapcar #'file-namestring (orfeus/gui::gui-bundled-lut-paths))))
     (check (equal names
-                  ;; Sorted case-insensitively, so the IWLTBAP stocks land
-                  ;; between the Agfa and Kodak ones.
+                  ;; Sorted case-insensitively, so the Agfalike looks follow
+                  ;; the Agfa stocks and the IWLTBAP ones land before Kodak.
                   '("agfa_apx_100.cube"
                     "agfa_apx_25.cube"
                     "agfa_precisa_100.cube"
                     "agfa_ultra_color_100.cube"
                     "agfa_vista_200.cube"
+                    "Agfalike A.cube"
+                    "Agfalike B.cube"
+                    "Agfalike C.cube"
+                    "Agfalike D.cube"
+                    "Agfalike E.cube"
+                    "Agfalike F.cube"
+                    "Agfalike G.cube"
+                    "Agfalike H.cube"
                     "IWLTBAP K25.cube"
                     "IWLTBAP K64.cube"
                     "IWLTBAP K99.cube"
-                    "JSZ-CEDAR A.cube"
-                    "JSZ-CEDAR B.cube"
-                    "JSZ-CEDAR C.cube"
-                    "JSZ-CEDAR D.cube"
-                    "JSZ-CEDAR E.cube"
-                    "JSZ-CEDAR F.cube"
-                    "JSZ-CEDAR G.cube"
-                    "JSZ-CEDAR H.cube"
                     "kodak_kodachrome_200.cube"
                     "kodak_kodachrome_25.cube"
                     "kodak_kodachrome_64.cube"
