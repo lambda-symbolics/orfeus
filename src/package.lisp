@@ -59,6 +59,7 @@
    #:orfeus-build-description
    #:output-file-exists
    #:photo-capture-description
+   #:photo-dimensions
    #:photo-extract-embedded-preview
    #:photo-embedded-preview
    #:photo-lens-description

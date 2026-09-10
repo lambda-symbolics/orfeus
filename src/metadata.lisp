@@ -34,7 +34,16 @@ the grouping this feeds, and a shoot does not cross a time zone mid-burst."
           (encode-universal-time (part 12 14) (part 10 12) (part 8 10)
                                  (part 6 8) (part 4 6) (part 0 4)))))))
 
-(defun capture-description (model iso aperture shutter)
+(defun dimensions-description (dimensions)
+  "\"5184×3888 (20 MP)\" for DIMENSIONS, a (WIDTH . HEIGHT) in pixels."
+  (let ((width (car dimensions))
+        (height (cdr dimensions)))
+    (format nil "~D×~D (~D MP)" width height (round (* width height) 1000000))))
+
+(defun capture-description (model iso aperture shutter &optional dimensions)
+  "One line of what the camera recorded, the parts it did record joined by
+bars: body, ISO, aperture, shutter, and the developed size with its megapixels
+when DIMENSIONS, a (WIDTH . HEIGHT) in pixels, is known."
   (let ((parts
           (remove nil
                   (list (and (usable-metadata-value-p model) model)
@@ -42,9 +51,21 @@ the grouping this feeds, and a shoot does not cross a time zone mid-burst."
                              (format nil "ISO ~A" iso))
                         (and (usable-metadata-value-p aperture)
                              (format nil "f/~A" aperture))
-                        (and (usable-metadata-value-p shutter) shutter)))))
+                        (and (usable-metadata-value-p shutter) shutter)
+                        (and dimensions (dimensions-description dimensions))))))
     (when parts
       (format nil "~{~A~^ | ~}" parts))))
+
+(defun parsed-dimensions (values)
+  "The first (WIDTH . HEIGHT) among VALUES, ExifTool width and height strings
+taken in pairs, whose two sides are positive integers; or NIL."
+  (loop for (width height) on values by #'cddr
+        for w = (and (usable-metadata-value-p width)
+                     (ignore-errors (parse-integer width)))
+        for h = (and (usable-metadata-value-p height)
+                     (ignore-errors (parse-integer height)))
+        when (and w h (plusp w) (plusp h))
+          return (cons w h)))
 
 (defun parsed-rating (value)
   "Return VALUE as a star rating in 1..5, or NIL when it says nothing.
@@ -62,7 +83,13 @@ five — nobody rates anything zero — so it reads as unrated."
     "-DateTimeOriginal" "-CreateDate"
     "-Model" "-ISO" "-FNumber" "-ExposureTime"
     "-Make" "-FocalLength#"
-    "-RollAngle" "-StackedImage")
+    "-RollAngle" "-StackedImage"
+    ;; The developed size, from the most exact source that has it: the
+    ;; maker's crop, the EXIF picture size, a DNG's raw sub-image, the file.
+    "-Olympus:CropWidth" "-Olympus:CropHeight"
+    "-ExifImageWidth" "-ExifImageHeight"
+    "-SubIFD:ImageWidth" "-SubIFD:ImageHeight"
+    "-ImageWidth" "-ImageHeight")
   "Everything read out of a photograph, in one ExifTool run.
 
 Asked for together because the subprocess is the cost, not the tags: the lens,
@@ -90,7 +117,9 @@ output as a dash, which is what keeps the answers positional.")
   (roll-angle nil)
   ;; :HDR1 or :HDR2 when the frame was shot in one of the camera's HDR modes,
   ;; which the OM-1 marks only in the JPEG it writes beside the RAW.
-  (hdr-mode nil))
+  (hdr-mode nil)
+  ;; The developed picture's (WIDTH . HEIGHT) in pixels, or NIL.
+  (dimensions nil))
 
 (defun parsed-hdr-mode (value)
   "Return :HDR1 or :HDR2 for ExifTool's StackedImage VALUE, or NIL."
@@ -166,7 +195,10 @@ the JPEG's after it."
                                 (uiop:split-string output :separator
                                                    '(#\Newline))))
                  (dates (remove-if-not #'usable-metadata-value-p
-                                       (list (nth 6 lines) (nth 7 lines)))))
+                                       (list (nth 6 lines) (nth 7 lines))))
+                 (dimensions (parsed-dimensions
+                              (subseq lines (min 16 (length lines))
+                                      (min 24 (length lines))))))
             (flet ((field (index)
                      (let ((value (nth index lines)))
                        (and (usable-metadata-value-p value) value))))
@@ -180,7 +212,9 @@ the JPEG's after it."
                :timestamp (some #'timestamp-token dates)
                :seconds (some #'capture-universal-time dates)
                :capture-summary (capture-description (field 8) (field 9)
-                                                     (field 10) (field 11))
+                                                     (field 10) (field 11)
+                                                     dimensions)
+               :dimensions dimensions
                :camera-make (field 12)
                :camera-model (field 8)
                :focal-length (parsed-focal-length (nth 13 lines))
@@ -264,8 +298,12 @@ are opened the way the camera opened them; see *HDR-PRESETS*."
   (photo-metadata-seconds (photo-metadata pathname)))
 
 (defun photo-capture-description (pathname)
-  "Return PATHNAME's camera, ISO, aperture, and shutter summary, or NIL."
+  "Return PATHNAME's camera, ISO, aperture, shutter and size summary, or NIL."
   (photo-metadata-capture-summary (photo-metadata pathname)))
+
+(defun photo-dimensions (pathname)
+  "Return PATHNAME's developed (WIDTH . HEIGHT) in pixels, or NIL."
+  (photo-metadata-dimensions (photo-metadata pathname)))
 
 (defvar *photo-as-shot-kelvin-cache*
   (make-hash-table :test #'equal #+sbcl :synchronized #+sbcl t)

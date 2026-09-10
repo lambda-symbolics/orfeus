@@ -1313,7 +1313,20 @@ and then quietly relocated them would be lying about where a click puts things."
                 (uiop:symbol-call '#:orfeus '#:capture-description
                                   "PEN-F" "800" "-" "-"))
        (null (uiop:symbol-call '#:orfeus '#:capture-description
-                               "-" "" "none" "unknown"))))
+                               "-" "" "none" "unknown"))
+       ;; The developed size joins the line when it is known, with its megapixels.
+       (string= "OM-1 | ISO 200 | f/5.6 | 1/50 | 5184×3888 (20 MP)"
+                (uiop:symbol-call '#:orfeus '#:capture-description
+                                  "OM-1" "200" "5.6" "1/50" '(5184 . 3888)))
+       ;; Width and height come in pairs, the first complete pair winning.
+       (equal '(8160 . 6120)
+              (uiop:symbol-call '#:orfeus '#:parsed-dimensions
+                                '("8160" "6120" "-" "-" "8180" "6132")))
+       (equal '(10400 . 7792)
+              (uiop:symbol-call '#:orfeus '#:parsed-dimensions
+                                '("-" "-" "-" "-" "10400" "7792")))
+       (null (uiop:symbol-call '#:orfeus '#:parsed-dimensions
+                               '("-" "-" "0" "12")))))
 
 (defun adapted-lens-aliases-p ()
   (multiple-value-bind (model reducer crop-factor)
