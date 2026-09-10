@@ -1983,7 +1983,26 @@ would silently ignore whatever the Destination field said."
              "Selected local still applied the same-name project preset"))
     (check (string= "local still"
                     (orfeus/gui::gallery-still-origin-description local-still))
-           "Still status description lost provenance")))
+           "Still status description lost provenance")
+    ;; The looks shipped with Orfeus are a third origin: same name as a local
+    ;; still, different key, and a whole graph to apply.
+    (let ((bundled-still (orfeus/gui::make-bundled-gallery-still local-preset)))
+      (check (string= "bundled still"
+                      (orfeus/gui::gallery-still-origin-description bundled-still))
+             "Bundled still description lost provenance")
+      (check (not (equal (orfeus/gui::gallery-still-key bundled-still)
+                         (orfeus/gui::gallery-still-key local-still)))
+             "Bundled still shares its key with a same-name local still"))
+    (let ((looks (orfeus:bundled-still-list)))
+      (check (= 8 (length looks))
+             "Expected eight bundled looks, found ~D" (length looks))
+      (check (every (lambda (preset)
+                      (find :film
+                            (orfeus:processing-graph-nodes
+                             (orfeus/gui::gui-model-preset-graph preset))
+                            :key #'orfeus:graph-node-kind))
+                    looks)
+             "A bundled look has no film node to apply"))))
 
 (defun test-empty-graph-editor-geometry ()
   (check (>= orfeus/gui::*inspector-min-height* 378)

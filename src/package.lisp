@@ -194,6 +194,8 @@
    #:photo-display-stem
    #:intern-raw-file
    #:intern-photo-job
+   #:bundled-still-directory
+   #:bundled-still-list
    #:still-store-directory
    #:still-store-identity
    #:still-store-list

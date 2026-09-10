@@ -752,7 +752,7 @@ channel carries anywhere from its two endpoints to a full film-stock shape."
   "Height of one still cell in the gallery grid.")
 
 (defstruct gallery-still
-  "One gallery row with an explicit project or local origin.
+  "One gallery row with an explicit bundled, local, or project origin.
 
 UNAVAILABLE-P records that neither the source photograph nor a persisted
 thumbnail could be found, so the cell will never fill in and says so rather
@@ -828,6 +828,13 @@ Existing positions are preserved so dragged nodes remain where the user put them
 
 (defun make-local-gallery-still (preset)
   (make-gallery-still :origin :local
+                      :identity (orfeus:still-store-identity
+                                 (processing-preset-name preset))
+                      :preset preset))
+
+(defun make-bundled-gallery-still (preset)
+  "A look shipped with Orfeus: applied like any still, never edited or deleted."
+  (make-gallery-still :origin :bundled
                       :identity (orfeus:still-store-identity
                                  (processing-preset-name preset))
                       :preset preset))
@@ -1677,6 +1684,8 @@ behind is memory. Best effort; returns how many directories went."
            preset-apply-button preset-save-button
            (gallery-scroll 0)
            (gallery-selected nil)
+           ;; The photograph the bundled stills were last previewed on.
+           (bundled-thumb-source nil)
            (gallery-stills '())
            (gallery-generation 0)
            (gallery-thumbs (make-hash-table :test #'equal))
@@ -4603,13 +4612,20 @@ behind is memory. Best effort; returns how many directories went."
                (discard-gui-tasks background-queue :still)
                (clrhash gallery-thumbs)
                (setf gallery-stills
-                     ;; The gallery is global, like a PowerGrade album: stills
-                     ;; live in the per-user store and are the same in every
-                     ;; project. Presets carried by an older project file are
-                     ;; still shown, after the global ones and only when the
-                     ;; store has nothing of that name, so nothing grabbed
-                     ;; before the gallery went global disappears.
-                     (let* ((global (handler-case
+                     ;; The gallery is global, like a PowerGrade album: the
+                     ;; looks shipped with Orfeus come first, then the stills
+                     ;; in the per-user store, the same in every project.
+                     ;; Presets carried by an older project file are still
+                     ;; shown, after those and only when the store has nothing
+                     ;; of that name, so nothing grabbed before the gallery
+                     ;; went global disappears.
+                     (let* ((bundled (handler-case
+                                         (mapcar #'make-bundled-gallery-still
+                                                 (orfeus:bundled-still-list))
+                                       (error (condition)
+                                         (set-status (princ-to-string condition))
+                                         '())))
+                            (global (handler-case
                                         (mapcar #'make-local-gallery-still
                                                 (orfeus:still-store-list))
                                       (error (condition)
@@ -4617,6 +4633,7 @@ behind is memory. Best effort; returns how many directories went."
                                         '())))
                             (names (mapcar #'gallery-still-identity global)))
                        (append
+                        bundled
                         global
                         (remove-if
                          (lambda (still)
@@ -4664,9 +4681,8 @@ behind is memory. Best effort; returns how many directories went."
                  (orfeus::settings-apply-stage-bypass
                   (processing-preset-settings preset)
                   (processing-preset-disabled-stages preset))))
-           (still-thumbnail-pathname (still)
+           (still-thumbnail-pathname (still source)
              (let* ((preset (gallery-still-preset still))
-                    (source (processing-preset-source-photo preset))
                     (source-identity
                       (orfeus:still-store-identity
                        (if source
@@ -4690,21 +4706,49 @@ behind is memory. Best effort; returns how many directories went."
                                          (still-recipe preset))))
                    :type "jpg")
                   preview-directory))))
+           (bundled-thumbnail-source ()
+             ;; A bundled still is a look with no photograph of its own, so it
+             ;; previews on the photograph being worked on, or the first one
+             ;; open when nothing is selected.
+             (let ((job (or (gui-model-selected-job model)
+                            (first (project-photos project)))))
+               (and job (photo-job-input-path job))))
+           (refresh-bundled-thumbnails ()
+             ;; Previewing on the selected photograph means a new selection
+             ;; redraws the bundled cells; local stills keep their own.
+             (let ((source (bundled-thumbnail-source)))
+               (unless (equal source bundled-thumb-source)
+                 (setf bundled-thumb-source source)
+                 (when (find :bundled gallery-stills :key #'gallery-still-origin)
+                   (incf gallery-generation)
+                   (discard-gui-tasks background-queue :still)
+                   (dolist (still gallery-stills)
+                     (when (eq :bundled (gallery-still-origin still))
+                       (remhash (gallery-still-key still) gallery-thumbs)))
+                   (when gallery-canvas
+                     (dolist (still gallery-stills)
+                       (request-still-thumbnail still))
+                     (lightfast:redraw gallery-canvas))))))
            (request-still-thumbnail (still)
              (let* ((preset (gallery-still-preset still))
                     (key (gallery-still-key still))
                     (generation gallery-generation)
                     (name (processing-preset-name preset))
-                    (source (processing-preset-source-photo preset))
-                    ;; Both origins keep the local thumbnail warm, so the
-                    ;; fallback copy stays usable once the project row is the
-                    ;; only one shown.
-                    (stored (ignore-errors
-                              (orfeus:still-store-thumbnail-pathname name))))
+                    (bundled-p (eq :bundled (gallery-still-origin still)))
+                    (source (if bundled-p
+                                (bundled-thumbnail-source)
+                                (processing-preset-source-photo preset)))
+                    ;; Project and local origins keep the local thumbnail
+                    ;; warm, so the fallback copy stays usable once the project
+                    ;; row is the only one shown. A bundled preview is of
+                    ;; whatever is selected, so it is never kept.
+                    (stored (and (not bundled-p)
+                                 (ignore-errors
+                                   (orfeus:still-store-thumbnail-pathname name)))))
                (when (null (gethash key gallery-thumbs))
                  (cond
                    ((and source (probe-file source))
-                    (let* ((output (still-thumbnail-pathname still))
+                    (let* ((output (still-thumbnail-pathname still source))
                            (recipe (still-recipe preset))
                            (graph-p (typep recipe
                                            'orfeus:processing-graph)))
@@ -4747,9 +4791,13 @@ behind is memory. Best effort; returns how many directories went."
                    ;; the persisted local copy of the thumbnail.
                    ((and stored (probe-file stored))
                     (setf (gethash key gallery-thumbs) stored))
-                   (t (setf (gallery-still-unavailable-p still) t))))))
+                   ;; A bundled still with nothing open is not missing
+                   ;; anything; it waits for a photograph.
+                   ((not bundled-p)
+                    (setf (gallery-still-unavailable-p still) t))))))
            (refresh-gallery ()
              (reload-gallery-stills)
+             (setf bundled-thumb-source (bundled-thumbnail-source))
              (when gallery-canvas
                (dolist (still gallery-stills)
                  (request-still-thumbnail still))
@@ -4875,6 +4923,9 @@ behind is memory. Best effort; returns how many directories went."
                  (error (condition)
                    (set-status (princ-to-string condition))))))
            (delete-still (still)
+             (when (eq :bundled (gallery-still-origin still))
+               (set-status "The looks shipped with Orfeus stay")
+               (return-from delete-still))
              (let ((preset (gallery-still-preset still)))
                (ecase (gallery-still-origin still)
                  (:project
@@ -4967,29 +5018,33 @@ behind is memory. Best effort; returns how many directories went."
                                           condition))))))))
            (gallery-context-menu (still)
              (let ((actions
-                     (list (cons (format nil "Apply Graph to ~D Photo~:P"
-                                         (selected-photo-count))
-                                 (lambda () (apply-still still)))
-                           (cons "Apply Without Optics"
-                                 (lambda ()
-                                   (apply-still still
-                                                :bypass-kinds '(:optics)
-                                                :description
-                                                "without optics")))
-                           (cons "Apply Without White Balance"
-                                 (lambda ()
-                                   (apply-still still
-                                                :bypass-kinds
-                                                '(:white-balance)
-                                                :description
-                                                "without white balance")))
-                           (cons "-" nil)
-                           (cons "Rename Still..."
-                                 (lambda () (rename-still still)))
-                           (cons "Keep Source RAW"
-                                 (lambda () (intern-still-source still)))
-                           (cons "Delete Still"
-                                 (lambda () (delete-still still))))))
+                     (append
+                      (list (cons (format nil "Apply Graph to ~D Photo~:P"
+                                          (selected-photo-count))
+                                  (lambda () (apply-still still)))
+                            (cons "Apply Without Optics"
+                                  (lambda ()
+                                    (apply-still still
+                                                 :bypass-kinds '(:optics)
+                                                 :description
+                                                 "without optics")))
+                            (cons "Apply Without White Balance"
+                                  (lambda ()
+                                    (apply-still still
+                                                 :bypass-kinds
+                                                 '(:white-balance)
+                                                 :description
+                                                 "without white balance"))))
+                      ;; The looks shipped with Orfeus are not the user's to
+                      ;; rename, re-source or delete.
+                      (unless (eq :bundled (gallery-still-origin still))
+                        (list (cons "-" nil)
+                              (cons "Rename Still..."
+                                    (lambda () (rename-still still)))
+                              (cons "Keep Source RAW"
+                                    (lambda () (intern-still-source still)))
+                              (cons "Delete Still"
+                                    (lambda () (delete-still still))))))))
                (let ((chosen (lightfast:popup-menu (mapcar #'first actions))))
                  (when chosen
                    (let ((action (rest (nth chosen actions))))
@@ -5109,7 +5164,8 @@ behind is memory. Best effort; returns how many directories went."
                       (gui-model-setting model :demosaic))))
              (sync-export-controls)
              (sync-preset-action-label)
-             (sync-window-title))
+             (sync-window-title)
+             (refresh-bundled-thumbnails))
            (refresh-photo-groups ()
              ;; Reading a capture time spawns ExifTool the first time, and a
              ;; card's worth of photographs is a card's worth of spawns, so the

@@ -699,6 +699,25 @@ IF-EXISTS is either :SUPERSEDE or :ERROR."
           (project-invalid sexp "expected an (:orfeus-still 1 ...) file"))
         (sexp->processing-preset (third sexp))))))
 
+(defun bundled-still-directory ()
+  "Where the stills shipped with Orfeus live: data/stills in the checkout."
+  (asdf:system-relative-pathname "orfeus" #P"data/stills/"))
+
+(defun bundled-still-list ()
+  "Return the stills shipped with Orfeus, in name order.
+
+A bundled still's film node names its LUT relative to Orfeus's data directory,
+so the committed file reads the same wherever the checkout lives; the paths
+come back resolved. Unlike the local gallery, a bundled still that does not
+read is an error: the files are ours."
+  (let ((data (asdf:system-relative-pathname "orfeus" #P"data/")))
+    (loop for file in (sort (directory (merge-pathnames "*.sexp"
+                                                        (bundled-still-directory)))
+                            #'string-lessp :key #'file-namestring)
+          for preset = (still-store-read file)
+          do (project-resolve-graph-lut-paths (processing-preset-graph preset) data)
+          collect preset)))
+
 (defun still-store-list (&key (directory (still-store-directory)))
   "Return every readable still in the local gallery, oldest first."
   (call-with-still-store-lock

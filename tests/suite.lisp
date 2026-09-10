@@ -358,6 +358,43 @@ the failure list, and both ON-ERROR modes without needing real RAW files."
       (when (probe-file pathname)
         (delete-file pathname)))))
 
+(defun bundled-stills-load-and-resolve-p ()
+  "The looks shipped in data/stills read, validate, name LUTs that exist, and
+start with the graph a fresh photograph gets, grade for grade."
+  (let* ((stills (bundled-still-list))
+         (default (processing-graph-nodes
+                   (settings->graph (make-processing-settings)))))
+    (and (equal (mapcar #'processing-preset-name stills)
+                '("Agfalike A" "Agfalike B" "Agfalike C" "Agfalike D"
+                  "Agfalike E" "Agfalike F" "Agfalike G" "Agfalike H"))
+         (every (lambda (preset)
+                  (let* ((graph (processing-preset-graph preset))
+                         (nodes (and graph (processing-graph-nodes graph)))
+                         (film (find :film nodes :key #'graph-node-kind))
+                         (lut (and film (getf (graph-node-params film) :lut-path))))
+                    (and graph
+                         (progn (graph-validate graph) t)
+                         (null (processing-preset-source-photo preset))
+                         ;; The LUT is named relative to data/ in the file and
+                         ;; comes back resolved to the bundled copy.
+                         (stringp lut)
+                         (uiop:absolute-pathname-p (pathname lut))
+                         (probe-file lut)
+                         (find :clarity nodes :key #'graph-node-kind)
+                         (every (lambda (node)
+                                  (let ((twin (find (graph-node-kind node) nodes
+                                                    :key #'graph-node-kind)))
+                                    (and twin
+                                         (equal (graph-node-params twin)
+                                                (graph-node-params node)))))
+                                default))))
+                stills)
+         (let ((d (find "Agfalike D" stills :key #'processing-preset-name
+                                            :test #'string=)))
+           (and d (find :dehaze (processing-graph-nodes (processing-preset-graph d))
+                        :key #'graph-node-kind)
+                t)))))
+
 (defun still-store-round-trip-p ()
   (let ((directory (merge-pathnames
                     (format nil "orfeus-still-store-~D-~D/"
@@ -2304,6 +2341,8 @@ neither way."
              (still-names-increment-p))
       (check "the local still store writes, renames, and deletes stills"
              (still-store-round-trip-p))
+      (check "the bundled stills load and start from the default graph"
+             (bundled-stills-load-and-resolve-p))
       (check "graphs round trip through S-expressions"
              (graph-round-trip-p))
       (check "graph validation rejects malformed graphs"

@@ -3,9 +3,13 @@
 ;;;;
 ;;;;   sbcl --script scripts/lightroom-preset-lut.lisp OUT-DIRECTORY PRESET.xmp...
 ;;;;   sbcl --script scripts/lightroom-preset-lut.lisp OUT-DIRECTORY "Name=PRESET.xmp"...
+;;;;   sbcl --script scripts/lightroom-preset-lut.lisp data/luts --stills data/stills ...
 ;;;;
 ;;;; Self-contained SBCL; no dependencies. One .cube per preset, 33 steps a
 ;;;; side, named after the preset's crs:Name unless the argument gives a name.
+;;;; With --stills, also one .sexp still per preset for Orfeus's gallery: the
+;;;; whole look as a node graph, the LUT plus the nodes for what a LUT cannot
+;;;; hold, at the values the preset asked for.
 ;;;;
 ;;;; What is baked: the colour work of the preset -- camera calibration
 ;;;; (primary hue and saturation), a custom white balance taken relative to
@@ -631,6 +635,89 @@ luminance moved by up to a stop, each by the bands the colour belongs to."
           (apply #'split-tone er eg eb (preset-split preset)))
         (values (clamp er 0d0 1d0) (clamp eg 0d0 1d0) (clamp eb 0d0 1d0))))))
 
+;;; ------------------------------------------------------------------ stills
+;;;
+;;; A still is what Orfeus's gallery applies: a whole node graph. A preset's
+;;; still is the graph a fresh photograph gets -- optics, noise reduction,
+;;; sharpening -- then the nodes for what the LUT cannot hold, then the Film
+;;; node with the LUT and the preset's grain. The LUT is named relative to
+;;; Orfeus's data directory, where bundled stills live, so the file reads the
+;;; same on every machine. Lightroom's sharpening is not carried over: Orfeus's
+;;; default sharpening is set against the camera's own JPEG, and a preset's
+;;; sharpening number means something only against Lightroom's.
+
+(defparameter *default-graph-nodes*
+  '((:optics (:lens-correction-p t :lens-correction-strength 1.0
+              :chromatic-aberration-correction-p t
+              :chromatic-aberration-source :measured
+              :lens-distortion 0.0 :lens-profile nil :lens-focal-length nil
+              :demosaic :rcd))
+    (:noise-reduction (:noise-reduction 0.45 :neural-noise-reduction 0.0))
+    (:sharpen (:sharpen-amount 0.5 :sharpen-radius 1.5 :sharpen-threshold 2.0)))
+  "The graph a fresh photograph gets in Orfeus, kind by kind. A copy: Orfeus's
+test suite checks the bundled stills still start this way.")
+
+(defparameter *clarity-radius* 150.0
+  "Pixels of the photograph Orfeus's Clarity node measures against; Lightroom's
+clarity has one radius, and this is the node's default.")
+
+(defun hundredth (text name &optional (default 0d0))
+  "The attribute NAME on -100..100 as a single float on -1..1."
+  (coerce (/ (round (number-attribute text name default)) 100) 'single-float))
+
+(defun still-nodes (text lut-name)
+  "The (kind params) chain of the preset's still, in execution order."
+  (let* ((dehaze (hundredth text "Dehaze"))
+         (clarity (hundredth text "Clarity2012"))
+         (vignette (hundredth text "PostCropVignetteAmount"))
+         (grain (hundredth text "GrainAmount"))
+         (base *default-graph-nodes*))
+    (append
+     ;; Dehaze measures the whole frame, so it goes right after the optics.
+     (list (first base))
+     (unless (zerop dehaze)
+       (list (list :dehaze (list :amount dehaze))))
+     (rest base)
+     (unless (zerop clarity)
+       (list (list :clarity (list :amount clarity :radius *clarity-radius*))))
+     (unless (zerop vignette)
+       (list (list :vignette
+                   (list :amount vignette
+                         :midpoint (hundredth text "PostCropVignetteMidpoint" 50d0)
+                         :feather (hundredth text "PostCropVignetteFeather" 50d0)
+                         :roundness (hundredth text "PostCropVignetteRoundness")))))
+     (list (list :film
+                 (list :lut-path (format nil "luts/~A.cube" lut-name)
+                       :lut-strength 1.0
+                       :grain-amount grain
+                       ;; Lightroom's grain size 25 is its default, fine grain;
+                       ;; Orfeus's size 1.0 is the same idea.
+                       :grain-size (if (zerop grain)
+                                       1.0
+                                       (coerce (/ (number-attribute text "GrainSize" 25d0) 25d0)
+                                               'single-float))))))))
+
+(defun still-sexp (name text)
+  (let ((id 0))
+    (list :orfeus-still 1
+          (list :name name
+                :graph (list :nodes
+                             (loop for (kind params) in (still-nodes text name)
+                                   collect (list :id (incf id) :kind kind
+                                                 :inputs (list (1- id)) :params params))
+                             :output id)))))
+
+(defun write-still (name text path)
+  (with-open-file (stream path :direction :output :if-exists :supersede
+                               :external-format :utf-8)
+    (format stream ";; ~A: the whole look for Orfeus's gallery, written by~%;; scripts/lightroom-preset-lut.lisp from the Lightroom preset ~S.~%"
+            name (read-preset-name text))
+    (with-standard-io-syntax
+      (let ((*print-pretty* t) (*print-readably* nil) (*print-case* :downcase)
+            (*print-right-margin* 80))
+        (write (still-sexp name text) :stream stream)
+        (terpri stream)))))
+
 ;;; ------------------------------------------------------------------ output
 
 (defun write-cube (preset path)
@@ -651,13 +738,19 @@ luminance moved by up to a stop, each by the bands the colour belongs to."
                 (develop preset (/ ri steps) (/ gi steps) (/ bi steps))
               (format stream "~,6F ~,6F ~,6F~%" r g b))))))))
 
-(defun convert (xmp-path out-directory &key name)
-  "Bake XMP-PATH into OUT-DIRECTORY, as NAME or the preset's own name."
+(defun convert (xmp-path out-directory &key name still-directory)
+  "Bake XMP-PATH into OUT-DIRECTORY, as NAME or the preset's own name; with
+STILL-DIRECTORY, write the look's still there too."
   (let* ((preset (read-preset xmp-path :name name))
          (out (merge-pathnames (make-pathname :name (preset-name preset) :type "cube")
                                (uiop:ensure-directory-pathname out-directory))))
     (write-cube preset out)
     (format t "~A -> ~A~@[  (not baked: ~{~A~^; ~})~]~%" xmp-path out (preset-notes preset))
+    (when still-directory
+      (let ((still (merge-pathnames (make-pathname :name (preset-name preset) :type "sexp")
+                                    (uiop:ensure-directory-pathname still-directory))))
+        (write-still (preset-name preset) (slurp xmp-path) still)
+        (format t "   still -> ~A~%" still)))
     out))
 
 (defun parse-argument (argument)
@@ -668,14 +761,24 @@ luminance moved by up to a stop, each by the bands the colour belongs to."
         (values argument nil))))
 
 (defun main (arguments)
-  (when (< (length arguments) 2)
-    (format *error-output* "usage: lightroom-preset-lut.lisp OUT-DIRECTORY [NAME=]PRESET.xmp...~%")
-    (uiop:quit 2))
-  (let ((out (first arguments)))
+  (let ((out (first arguments))
+        (stills nil)
+        (presets '()))
+    (loop with rest = (rest arguments)
+          while rest
+          do (let ((argument (pop rest)))
+               (if (string= argument "--stills")
+                   (setf stills (pop rest))
+                   (push argument presets))))
+    (when (or (null out) (null presets))
+      (format *error-output* "usage: lightroom-preset-lut.lisp OUT-DIRECTORY [--stills STILL-DIRECTORY] [NAME=]PRESET.xmp...~%")
+      (uiop:quit 2))
     (ensure-directories-exist (uiop:ensure-directory-pathname out))
-    (dolist (argument (rest arguments))
+    (when stills
+      (ensure-directories-exist (uiop:ensure-directory-pathname stills)))
+    (dolist (argument (reverse presets))
       (multiple-value-bind (xmp name) (parse-argument argument)
-        (convert xmp out :name name))))
+        (convert xmp out :name name :still-directory stills))))
   (uiop:quit 0))
 
 (when (and (boundp 'sb-ext:*posix-argv*)
