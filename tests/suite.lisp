@@ -2316,6 +2316,80 @@ neither way."
                        :error-stream errors))
          (search "Unknown command" (get-output-stream-string errors)))))
 
+(defun dng-directory-replacement-p ()
+  "Verified originals replace DNGs one at a time and never clobber an ORF."
+  (let* ((root (merge-pathnames "orfeus-dng-replace-check/"
+                                (uiop:temporary-directory)))
+         (first-dng (merge-pathnames "one.DNG" root))
+         (second-dng (merge-pathnames "nested/two.dNg" root))
+         (blocked-dng (merge-pathnames "taken.dng" root))
+         (first-orf (merge-pathnames "one.ORF" root))
+         (second-orf (merge-pathnames "nested/two.ORF" root))
+         (blocked-orf (merge-pathnames "taken.ORF" root)))
+    (uiop:delete-directory-tree root :validate t :if-does-not-exist :ignore)
+    (unwind-protect
+         (progn
+           (dolist (pathname (list first-dng second-dng blocked-dng blocked-orf))
+             (ensure-directories-exist pathname))
+           (loop for (pathname content) in
+                 (list (list first-dng "first")
+                       (list second-dng "second")
+                       (list blocked-dng "blocked")
+                       (list blocked-orf "already present"))
+                 do (with-open-file (stream pathname :direction :output)
+                      (write-string content stream)))
+           (let ((extractions 0)
+                 (progress '()))
+             (multiple-value-bind (completed failures)
+                 (orfeus::dng-replace-directory-originals-using-functions
+                  root
+                  (lambda (input output &key if-exists)
+                    (unless (eq :error if-exists)
+                      (error "Unexpected output policy: ~S" if-exists))
+                    (incf extractions)
+                    (uiop:copy-file input output))
+                  (lambda (input)
+                    (format nil "~A.ORF" (pathname-name input)))
+                  :progress-callback
+                  (lambda (index total input output condition)
+                    (push (list index total input output condition) progress)))
+               (let ((progress (nreverse progress)))
+                 (and (= 2 (length completed))
+                      (= 1 (length failures))
+                      (= 2 extractions)
+                      (not (probe-file first-dng))
+                      (not (probe-file second-dng))
+                      (probe-file first-orf)
+                      (probe-file second-orf)
+                      (probe-file blocked-dng)
+                      (string= "already present"
+                               (uiop:read-file-string blocked-orf))
+                      (typep (rest (first failures)) 'output-file-exists)
+                      (equal '(1 2 3) (mapcar #'first progress))
+                      (every (lambda (record) (= 3 (second record))) progress)
+                      (= 1 (count-if #'fifth progress))))))
+      (uiop:delete-directory-tree root :validate t :if-does-not-exist :ignore)))))
+
+(defun cli-restores-empty-directory-p ()
+  "The CLI accepts the directory command and reports an empty scan."
+  (let ((root (merge-pathnames "orfeus-empty-dng-replace-check/"
+                               (uiop:temporary-directory)))
+        (output (make-string-output-stream))
+        (errors (make-string-output-stream)))
+    (uiop:delete-directory-tree root :validate t :if-does-not-exist :ignore)
+    (unwind-protect
+         (progn
+           (ensure-directories-exist (merge-pathnames "placeholder" root))
+           (and (zerop (cli-run (list "restore-originals" (namestring root))
+                                :output-stream output
+                                :error-stream errors))
+                (search "Replaced 0 DNG files; 0 failures."
+                        (get-output-stream-string output))
+                (string= "" (get-output-stream-string errors))
+                (string= "[##############################] 100% 1/1"
+                         (orfeus::cli-progress-bar 1 1))))
+      (uiop:delete-directory-tree root :validate t :if-does-not-exist :ignore))))
+
 (defun run-tests ()
   "Run the dependency-free Orfeus test suite."
   (let ((failures 0))
@@ -2474,6 +2548,9 @@ neither way."
              (publish-race-does-not-clobber-p))
       (check "bundled film LUTs match pinned digests"
              (bundled-film-luts-match-pinned-digests-p))
+      (check "embedded originals replace DNGs without clobbering existing RAWs"
+             (dng-directory-replacement-p))
+      (check "CLI restores an empty DNG directory" (cli-restores-empty-directory-p))
       (check "CLI reports its version" (cli-version-p))
       (check "CLI rejects unknown commands" (cli-rejects-unknown-command-p)))
     (zerop failures)))

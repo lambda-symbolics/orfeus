@@ -22,6 +22,7 @@
                (:file "src/types")
                (:file "src/digest")
                (:file "src/native")
+                (:file "src/dng")
                (:file "src/metadata")
                (:file "src/grouping")
                (:file "src/focus")

@@ -2,7 +2,7 @@
 
 (defun cli-print-help (stream)
   (format stream
-          "Orfeus ~A~%~%Usage:~%  orfeus info DNG~%  orfeus extract DNG [OUTPUT.ORF]~%  orfeus preview INPUT.ORF OUTPUT.JPG [PROJECT.sexp]~%  orfeus render INPUT.ORF OUTPUT.(JPG|TIFF) [PROJECT.sexp]~%  orfeus batch PROJECT.sexp~%  orfeus init PROJECT.sexp OUTPUT-DIR INPUT...~%  orfeus --version~%"
+          "Orfeus ~A~%~%Usage:~%  orfeus info DNG~%  orfeus extract DNG [OUTPUT.ORF]~%  orfeus restore-originals DIRECTORY~%  orfeus preview INPUT.ORF OUTPUT.JPG [PROJECT.sexp]~%  orfeus render INPUT.ORF OUTPUT.(JPG|TIFF) [PROJECT.sexp]~%  orfeus batch PROJECT.sexp~%  orfeus init PROJECT.sexp OUTPUT-DIR INPUT...~%  orfeus --version~%"
           (orfeus-version)))
 
 (defun cli-extract (arguments output-stream)
@@ -17,6 +17,42 @@
     (dng-extract-original dng-pathname output-pathname)
     (format output-stream "~A~%" (namestring output-pathname))
     0))
+
+(defun cli-progress-bar (index total)
+  "Return a fixed-width terminal progress bar for INDEX of TOTAL."
+  (let* ((width 30)
+         (filled (if (zerop total) 0 (round (* width (/ index total)))))
+         (percent (if (zerop total) 0 (round (* 100 (/ index total))))))
+    (format nil "[~A~A] ~3D% ~D/~D"
+            (make-string filled :initial-element #\#)
+            (make-string (- width filled) :initial-element #\-)
+            percent index total)))
+
+(defun cli-restore-originals (arguments output-stream error-stream)
+  "Replace every DNG below a directory with its embedded original RAW."
+  (unless (= 1 (length arguments))
+    (error "restore-originals expects DIRECTORY"))
+  (let ((directory (pathname (first arguments))))
+    (unless (uiop:directory-exists-p directory)
+      (error "restore-originals expects an existing directory: ~A" directory))
+    (multiple-value-bind (completed failures)
+        (dng-replace-directory-originals
+         directory
+         :progress-callback
+         (lambda (index total dng-pathname output-pathname condition)
+           (declare (ignore output-pathname))
+           (format output-stream "~C[2K~C~A ~A"
+                   #\Escape #\Return
+                   (cli-progress-bar index total)
+                   (namestring dng-pathname))
+           (finish-output output-stream)
+           (when condition
+             (format error-stream "Failed ~A: ~A~%" dng-pathname condition))))
+      (when (plusp (+ (length completed) (length failures)))
+        (terpri output-stream))
+      (format output-stream "Replaced ~D DNG file~:P; ~D failure~:P.~%"
+              (length completed) (length failures))
+      (if failures 1 0))))
 
 (defun cli-info (arguments output-stream)
   (unless (= 1 (length arguments))
@@ -96,6 +132,8 @@
          0)
         ((string= (first arguments) "extract")
          (cli-extract (rest arguments) output-stream))
+        ((string= (first arguments) "restore-originals")
+         (cli-restore-originals (rest arguments) output-stream error-stream))
         ((string= (first arguments) "info")
          (cli-info (rest arguments) output-stream))
         ((string= (first arguments) "preview")

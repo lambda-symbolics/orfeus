@@ -23,6 +23,7 @@
   (:export
    #:cli-run
    #:dng-extract-original
+   #:dng-replace-directory-originals
    #:dng-original-error
    #:dng-original-filename
    #:export-settings
