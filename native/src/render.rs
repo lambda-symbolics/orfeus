@@ -5146,7 +5146,16 @@ pub(crate) fn apply_clarity(image: &mut RgbImage, amount: f32, radius: f32) {
     let log_luma: Vec<f32> = image
         .data
         .par_chunks(3)
-        .map(|pixel| (0.2126 * pixel[0] + 0.7152 * pixel[1] + 0.0722 * pixel[2] + FLOOR).log2())
+        .map(|pixel| {
+            let luminance = 0.2126 * pixel[0] + 0.7152 * pixel[1] + 0.0722 * pixel[2];
+            // A pixel the camera matrix pushed below zero, or one a stage left
+            // non-finite, counts as black here. The log of anything else is
+            // NaN, and the tent blur's prefix sums carry one NaN to every
+            // pixel below and to the right of it: a single saturated pixel
+            // used to paint the rest of the frame black.
+            let luminance = if luminance.is_finite() { luminance.max(0.0) } else { 0.0 };
+            (luminance + FLOOR).log2()
+        })
         .collect();
     let blurred = tent_blur(&log_luma, width, height, radius);
     let strength = 0.8 * amount;
@@ -9233,6 +9242,59 @@ mod tests {
         };
         apply_clarity(&mut flat, 1.0, 8.0);
         assert!(flat.data.iter().all(|value| (value - 0.3).abs() < 1.0e-5));
+    }
+
+    #[test]
+    fn clarity_treats_a_negative_pixel_as_black_rather_than_blacking_out_the_frame() {
+        // A saturated colour the camera matrix pushed below zero in luminance,
+        // sitting in soft texture. Its log used to be NaN, and the blur's
+        // prefix sums carried that NaN to every pixel below and to the right,
+        // which the tone then painted black: the lower-right corner of an
+        // export, from one pixel.
+        let (width, height) = (96, 64);
+        let mut image = RgbImage {
+            width,
+            height,
+            data: vec![0.0; width * height * 3],
+        };
+        for row in 0..height {
+            for column in 0..width {
+                let value = 0.2
+                    + 0.1 * (column as f32 * 0.3).sin()
+                    + 0.05 * (row as f32 * 0.2).cos();
+                for channel in 0..3 {
+                    image.data[(row * width + column) * 3 + channel] = value;
+                }
+            }
+        }
+        let mut clean = image.clone();
+        apply_clarity(&mut clean, 0.5, 6.0);
+        let seed = (10 * width + 12) * 3;
+        image.data[seed..seed + 3].copy_from_slice(&[-0.02, -0.01, 0.03]);
+        let mut with_black = image.clone();
+        with_black.data[seed..seed + 3].copy_from_slice(&[0.0; 3]);
+        apply_clarity(&mut image, 0.5, 6.0);
+        apply_clarity(&mut with_black, 0.5, 6.0);
+        assert!(
+            image.data.iter().all(|value| value.is_finite()),
+            "clarity left non-finite pixels"
+        );
+        // The far corner develops as it does without the pixel at all.
+        let far = ((height - 1) * width + (width - 1)) * 3;
+        assert!(
+            (image.data[far] - clean.data[far]).abs() < 1.0e-5,
+            "far corner {} against {}",
+            image.data[far],
+            clean.data[far]
+        );
+        // And the pixel counts as black: every other pixel comes out exactly
+        // as it does when it is black.
+        for (index, (seeded, black)) in image.data.iter().zip(&with_black.data).enumerate() {
+            if index / 3 == seed / 3 {
+                continue;
+            }
+            assert_eq!(seeded, black, "pixel {} differs", index / 3);
+        }
     }
 
     #[test]
