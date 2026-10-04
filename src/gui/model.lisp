@@ -1027,6 +1027,55 @@ when the roll is past *AUTO-LEVEL-LIMIT*."
         while node
         when (eq kind (orfeus:graph-node-kind node)) return node))
 
+(defun fresh-node-params (model graph kind after-id)
+  "The parameters a KIND node added to GRAPH after AFTER-ID starts with."
+  (case kind
+    (:crop (default-crop-params :angle (crop-start-angle model)))
+    (:vignette (orfeus:vignette-default-params))
+    (:clarity (orfeus:clarity-default-params))
+    (:dehaze (orfeus:dehaze-default-params))
+    ;; Light specks once a negative has been inverted, dark before it and
+    ;; anywhere else.
+    (:dust (orfeus:dust-default-params
+            :specks (if (graph-chain-node-of-kind graph :negative after-id)
+                        :light
+                        :dark)))))
+
+(defun node-default-params (model graph node)
+  "The parameters NODE goes back to when it is reset.
+
+What a fresh photograph's graph gives a node of its kind when it has one, so
+a reset optics node corrects the lens again; otherwise what the same kind
+starts with when it is added in NODE's place."
+  (let* ((kind (orfeus:graph-node-kind node))
+         (stock (find kind
+                      (orfeus:processing-graph-nodes
+                       (orfeus:default-processing-graph))
+                      :key #'orfeus:graph-node-kind)))
+    (if stock
+        (copy-tree (orfeus:graph-node-params stock))
+        (fresh-node-params model graph kind
+                           (first (orfeus:graph-node-inputs node))))))
+
+(defun gui-model-reset-node (model node)
+  "Put NODE's parameters back to their defaults; a blend to an even mix."
+  (gui-model-checkpoint model)
+  (let* ((job (gui-model-selected-job model))
+         (graph (and job (photo-job-graph job))))
+    (when (and graph (member node (orfeus:processing-graph-nodes graph)))
+      (let ((params (orfeus:graph-node-params node))
+            (opacity (orfeus:graph-node-opacity node)))
+        (if (orfeus:graph-node-blend-p node)
+            (setf (orfeus:graph-node-opacity node) 0.5)
+            (setf (orfeus:graph-node-params node)
+                  (node-default-params model graph node)))
+        (handler-case (orfeus:graph-validate graph)
+          (error (condition)
+            (setf (orfeus:graph-node-params node) params
+                  (orfeus:graph-node-opacity node) opacity)
+            (error condition)))
+        node))))
+
 (defun gui-model-add-node (model kind &key after params)
   "Insert a KIND node into the selected photo's graph and select it.
 
@@ -1058,19 +1107,7 @@ film-domain rules."
              (node (orfeus:graph-insert-node
                     graph after-id kind
                     :params (or params
-                                (case kind
-                                  (:crop (default-crop-params
-                                          :angle (crop-start-angle model)))
-                                  (:vignette (orfeus:vignette-default-params))
-                                  (:clarity (orfeus:clarity-default-params))
-                                  (:dehaze (orfeus:dehaze-default-params))
-                                  ;; Light specks once a negative has been
-                                  ;; inverted, dark before it and anywhere else.
-                                  (:dust (orfeus:dust-default-params
-                                          :specks (if (graph-chain-node-of-kind
-                                                       graph :negative after-id)
-                                                      :light
-                                                      :dark))))))))
+                                (fresh-node-params model graph kind after-id)))))
         (reflow-graph-node-positions graph node)
         (setf (gui-model-selected-node model) node)
         node))))

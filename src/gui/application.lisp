@@ -4229,6 +4229,20 @@ behind is memory. Best effort; returns how many directories went."
                           (+ ox (getf (rest node-drag) :x))
                           (+ oy (getf (rest node-drag) :y))))))))
                (lightfast:draw-pop-clip)))
+           (reset-selected-node ()
+             (let ((node (gui-model-selected-graph-node model)))
+               (when node (reset-node node))))
+           (reset-node (node)
+             (handler-case
+                 (progn
+                   (gui-model-reset-node model node)
+                   (when (eq :crop (orfeus:graph-node-kind node))
+                     (setf crop-aspect :original))
+                   (after-graph-edit
+                    (format nil "~A reset"
+                            (node-kind-label (orfeus:graph-node-kind node)))))
+               (error (condition)
+                 (set-status (princ-to-string condition)))))
            (after-graph-edit (message)
              (sync-controls)
              (sync-node-tools)
@@ -4291,13 +4305,7 @@ behind is memory. Best effort; returns how many directories went."
                         (cons "Level From Photo"
                               (lambda () (level-crop-from-photo node)))
                         (cons "Autocrop Negative"
-                              (lambda () (autocrop-negative node)))
-                        (cons "Reset Crop"
-                              (lambda ()
-                                (gui-model-set-node-params
-                                 model node (default-crop-params))
-                                (setf crop-aspect :original)
-                                (after-graph-edit "Crop reset")))))
+                              (lambda () (autocrop-negative node)))))
                 (when (eq kind :hdr)
                   (list (cons "-" nil)
                         (cons "Camera HDR1"
@@ -4315,6 +4323,7 @@ behind is memory. Best effort; returns how many directories went."
                         (cons "Auto Base From Border"
                               (lambda () (auto-base-from-border node)))))
                 (list (cons "-" nil)
+                      (cons "Reset Node" (lambda () (reset-node node)))
                       (cons "Delete Node"
                             (lambda ()
                               (gui-model-delete-node model node)
@@ -7036,7 +7045,7 @@ behind is memory. Best effort; returns how many directories went."
              (declare (ignore ignored))
              (let* ((right (lightfast:widget-width inspector))
                     (main-height (lightfast:widget-height inspector))
-                    (page-height (max 150 (- main-height 108)))
+                    (page-height (max 150 (- main-height 76)))
                     ;; The curves panel splits whatever the page has left
                     ;; between the waveform and the chart, with the reset
                     ;; button pinned to the last row.
@@ -7045,7 +7054,7 @@ behind is memory. Best effort; returns how many directories went."
                     (chart-height (max 70 (- curve-space scope-height 8))))
                (lightfast:resize-widget tabs :x 4 :y 40
                                       :width (- right 8)
-                                      :height (- main-height 80))
+                                      :height (- main-height 48))
                (dolist (page (list node-page export-page))
                  (lightfast:resize-widget page :x 2 :y 24
                                         :width (- right 12)
@@ -7157,8 +7166,8 @@ behind is memory. Best effort; returns how many directories went."
                  ;; Kept in step with the toolbar's last button rather than
                  ;; pinned: the resize runs on every window change and would
                  ;; otherwise drag the label back over the zoom controls.
-                 (lightfast:resize-widget lens-name :x 402 :y 6
-                                        :width (max 120 (- width 412)) :height 28))
+                 (lightfast:resize-widget lens-name :x 474 :y 6
+                                        :width (max 120 (- width 484)) :height 28))
                (lightfast:resize-widget left-column :x 0 :y 0
                                       :width left :height main-height)
                (lightfast:resize-widget center-pane :x left :y 0
@@ -7643,20 +7652,28 @@ behind is memory. Best effort; returns how many directories went."
                           #'remove-selected-photo)
           (rule 142 7 1 24 150 150 150)
           (toolbar-button 150 :export "Export photographs..." #'open-export-dialog)
-          (toolbar-button 180 :compare "Show or hide Before and After"
-                          #'toggle-comparison)
-          (toolbar-button 210 :focus "Select photographs that look out of focus"
-                          #'find-and-select-blurry-photos)
+          (toolbar-button 180 :send "Export the selected photographs now"
+                          #'render-selected)
+          (toolbar-button 210 :reload
+                          "Reset the selected photographs to the default grade"
+                          (lambda ()
+                            (gui-model-reset-selected model)
+                            (after-graph-edit "Grade reset")))
           (rule 244 7 1 24 150 150 150)
-          (toolbar-button 252 :zoom-out "Zoom out" (lambda () (zoom-preview .8d0)))
-          (toolbar-button 282 :fit "Fit preview" #'reset-preview-view)
-          (toolbar-button 312 :zoom-in "Zoom in" (lambda () (zoom-preview 1.25d0)))
-          (toolbar-button 342 :actual-pixels "Show image pixels at 1:1"
+          (toolbar-button 252 :compare "Show or hide Before and After"
+                          #'toggle-comparison)
+          (toolbar-button 282 :focus "Select photographs that look out of focus"
+                          #'find-and-select-blurry-photos)
+          (rule 316 7 1 24 150 150 150)
+          (toolbar-button 324 :zoom-out "Zoom out" (lambda () (zoom-preview .8d0)))
+          (toolbar-button 354 :fit "Fit preview" #'reset-preview-view)
+          (toolbar-button 384 :zoom-in "Zoom in" (lambda () (zoom-preview 1.25d0)))
+          (toolbar-button 414 :actual-pixels "Show image pixels at 1:1"
                           #'preview-one-to-one)
-          (rule 376 7 1 24 150 150 150)
+          (rule 448 7 1 24 150 150 150)
           (setf toolbar-bottom-rule (rule 0 38 1280 2 145 145 145)))
-        (setf lens-name (lightfast:make-label :parent toolbar :x 402 :y 6
-                                            :width 852 :height 28
+        (setf lens-name (lightfast:make-label :parent toolbar :x 474 :y 6
+                                            :width 780 :height 28
                                             :label "Lens: No photograph selected"))
         (lightfast:set-label-font lens-name 1)
         (setf main-tile (lightfast:make-tile :parent window :x 0 :y 64
@@ -8032,9 +8049,7 @@ behind is memory. Best effort; returns how many directories went."
         (build-group
          :picker
          (lambda ()
-           (setf kind-choice
-                 (lightfast:field-control
-                  (register-field
+           (let* ((field
                    (lightfast:make-labeled-choice
                     :parent node-page :x 12 :y 8 :width 292 :height 26
                     :label "Correction" :label-width 88
@@ -8066,8 +8081,29 @@ behind is memory. Best effort; returns how many directories went."
                             (error (condition)
                               (sync-node-tools)
                               (set-status
-                               (princ-to-string condition))))))))
-                   8 :page)))))
+                               (princ-to-string condition)))))))))
+                  (reset (lightfast:set-stock-icon
+                          (lightfast:make-button
+                           :parent node-page :x 278 :y 8 :width 26 :height 26
+                           :label ""
+                           :callback (lambda (&rest ignored)
+                                       (declare (ignore ignored))
+                                       (reset-selected-node)))
+                          :reload)))
+             (lightfast:set-tooltip reset "Reset this node to its defaults")
+             (setf kind-choice (lightfast:field-control field))
+             (register-inspector-row
+              (lightfast:make-layout-row
+               :gap 8
+               :children
+               (list (lightfast:make-layout-item (lightfast:field-label field)
+                                                 :basis 88 :shrink 0)
+                     (lightfast:make-layout-item kind-choice
+                                                 :basis 0 :grow 1
+                                                 :min-width 100)
+                     (lightfast:make-layout-item reset :basis 26 :shrink 0)))
+              (list (lightfast:field-label field) kind-choice reset)
+              node-page 12 8 26 :page))))
         (build-group
          :none
          (lambda ()
@@ -8718,24 +8754,7 @@ behind is memory. Best effort; returns how many directories went."
                           (let ((node (crop-editing-node)))
                             (when node (autocrop-negative node)))))
              :crop)
-            12 268 :fill 26 :page)
-           (register-inspector
-            (lightfast:make-button
-             :parent node-page :x 12 :y 300 :width 292 :height 26
-             :label "Reset Crop"
-             :callback (lambda (&rest ignored)
-                         (declare (ignore ignored))
-                         (let ((node (crop-editing-node)))
-                           (when node
-                             ;; Back to the inset a fresh crop starts on, not to
-                             ;; the frame edge: resetting is for starting over,
-                             ;; and a rectangle whose handles sit on the edge of
-                             ;; the picture cannot be grabbed to start with.
-                             (gui-model-set-node-params
-                              model node (default-crop-params))
-                             (setf crop-aspect :original)
-                             (after-graph-edit "Crop reset")))))
-            12 300 :fill 26 :page)))
+            12 268 :fill 26 :page)))
         (build-group
          :curves
          (lambda ()
@@ -8808,36 +8827,6 @@ behind is memory. Best effort; returns how many directories went."
                          (declare (ignore ignored))
                          (reset-curve-channel)))
             12 :page-action-row :fill 26 :page)))
-        ;; The two footer buttons split the inspector's width evenly, which the
-        ;; flex engine does directly instead of two mirrored width modes that
-        ;; each had to recompute the same half.
-        (register-inspector-row
-         (lightfast:make-layout-row
-          :gap 12
-          :children
-          (list (lightfast:make-layout-item
-                 (lightfast:set-stock-icon
-                  (lightfast:make-button
-                   :parent inspector :x 12 :y 674
-                   :width 140 :height 26 :label "Reset selected"
-                   :callback (lambda (&rest ignored)
-                               (declare (ignore ignored))
-                               (gui-model-reset-selected model)
-                               (sync-controls)
-                               (schedule-edited-preview)))
-                  :reload)
-                 :basis 0 :grow 1)
-                (lightfast:make-layout-item
-                 (lightfast:set-stock-icon
-                  (lightfast:make-button
-                   :parent inspector :x 166 :y 674
-                   :width 142 :height 26 :label "Export current"
-                   :callback (lambda (&rest ignored)
-                               (declare (ignore ignored))
-                               (render-selected)))
-                  :export)
-                 :basis 0 :grow 1)))
-         '() inspector 12 :action-row 26)
         (setf progress (lightfast:make-progress :parent window :x 0 :y 772
                                               :width 180 :height 28 :value "0")
               status (lightfast:make-status-bar :parent window :x 180 :y 772

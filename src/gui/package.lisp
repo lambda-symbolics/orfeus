@@ -28,6 +28,7 @@
            #:*default-crop-inset* #:default-crop-params
            #:crop-rect-within-turned-frame #:crop-start-angle
            #:crop-rect-placed #:crop-rect-with-area #:crop-rect-maximized
+           #:gui-model-reset-node
            #:*auto-level-limit*
            #:gui-model-apply-preset #:gui-model-apply-preset-graph
            #:gui-model-copy-grade #:gui-model-copy-graph

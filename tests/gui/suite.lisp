@@ -138,6 +138,42 @@ than the preview had photographs, under the wrong thumbnails."
       (check (null (getf (orfeus:photo-job-overrides (first jobs)) :exposure))
              "Undo left the edit on the photograph"))))
 
+(defun test-a-node-resets-to-its-defaults ()
+  "Resetting a node replaces its parameters with the ones it started with: a
+fresh photograph's for a kind the default graph has, the added kind's own
+otherwise; and the reset can be undone."
+  (let* ((job (orfeus:make-photo-job :input-path #P"reset.orf"))
+         (model (orfeus/gui:make-gui-model
+                 :project (orfeus:make-project :output-directory #P"exports/"
+                                               :photos (list job))))
+         (clarity (orfeus/gui:gui-model-add-node model :clarity)))
+    (orfeus/gui::gui-model-set-node-params model clarity '(:amount 0.9))
+    (orfeus/gui:gui-model-reset-node model clarity)
+    (check (equal (orfeus:clarity-default-params)
+                  (orfeus:graph-node-params clarity))
+           "A reset clarity node kept ~S" (orfeus:graph-node-params clarity))
+    (let ((optics (find :optics
+                        (orfeus:processing-graph-nodes (orfeus:photo-job-graph job))
+                        :key #'orfeus:graph-node-kind)))
+      (orfeus/gui::gui-model-set-node-params
+       model optics '(:lens-correction-p nil :lens-distortion 0.2))
+      (orfeus/gui:gui-model-reset-node model optics)
+      (check (equal (orfeus:graph-node-params
+                     (find :optics (orfeus:processing-graph-nodes
+                                    (orfeus:default-processing-graph))
+                           :key #'orfeus:graph-node-kind))
+                    (orfeus:graph-node-params optics))
+             "A reset optics node did not correct the lens again: ~S"
+             (orfeus:graph-node-params optics))
+      (check (orfeus/gui:gui-model-undo model) "Undo refused the reset")
+      (let ((restored (find :optics
+                            (orfeus:processing-graph-nodes
+                             (orfeus:photo-job-graph job))
+                            :key #'orfeus:graph-node-kind)))
+        (check (eql 0.2 (getf (orfeus:graph-node-params restored)
+                              :lens-distortion))
+               "Undo did not bring the reset node's settings back")))))
+
 (defun test-dust-goes-in-front-of-the-negative ()
   "A dust node asked for on a negative goes in front of the inversion looking
 for dark specks — dust blocks light — while one placed after the inversion looks
@@ -2370,6 +2406,7 @@ would silently ignore whatever the Destination field said."
   (test-undo-history)
   (test-undo-after-a-removal-keeps-the-project-and-its-survivors)
   (test-dust-goes-in-front-of-the-negative)
+  (test-a-node-resets-to-its-defaults)
   (test-graph-node-placement)
   (test-thumbnail-context-menu)
   (test-node-adds-land-where-they-are-legal)
