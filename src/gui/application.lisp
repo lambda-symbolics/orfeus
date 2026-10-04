@@ -1646,7 +1646,7 @@ behind is memory. Best effort; returns how many directories went."
            right-column graph-pane graph-canvas graph-scrollbar graph-title
            (graph-scroll-x 0)
            (graph-scroll-y 0)
-           pick-color-node crop-drag node-drag
+           pick-color-node pick-crop-centre-node crop-drag node-drag
            ;; A sort waiting for the next pass over the photographs' metadata:
            ;; :AUTOMATIC when the photographs have just arrived and take the
            ;; default order, :CHOSEN when the photographer asked from the menu.
@@ -1665,6 +1665,7 @@ behind is memory. Best effort; returns how many directories went."
            negative-red-input negative-green-input negative-blue-input
            negative-swatch
            crop-aspect-input crop-width-input crop-height-input
+           crop-megapixel-slider crop-megapixel-input
            ;; NIL is a free crop; otherwise an entry from
            ;; *CROP-ASPECT-CHOICES*. An editing mode, not a render parameter:
            ;; the rectangle itself is what the graph stores and what the render
@@ -2305,6 +2306,130 @@ behind is memory. Best effort; returns how many directories went."
                                       (- center-u (/ new-width 2))
                                       (- center-v (/ new-height 2))
                                       new-width new-height))))))
+           (crop-frame-aspect (node)
+             ;; Width over height of the frame NODE crops from, which is the
+             ;; preview's frame with any quarter turns below the node undone.
+             (multiple-value-bind (frame-width frame-height) (crop-frame-size)
+               (if frame-width
+                   (let ((turns (loop for step in (crop-node-geometry node)
+                                      when (eq :turn (first step))
+                                        sum (second step))))
+                     (if (oddp turns)
+                         (/ frame-height (float frame-width 1d0))
+                         (/ frame-width (float frame-height 1d0))))
+                   4/3)))
+           (crop-frame-pixels (node)
+             ;; Pixels in the frame NODE crops from: the developed size, less
+             ;; what any crop above it has already taken.
+             (let* ((job (selected-job))
+                    (dimensions (and job
+                                     (ignore-errors
+                                       (orfeus:photo-dimensions
+                                        (photo-job-input-path job)))))
+                    (graph (gui-model-display-graph model)))
+               (when dimensions
+                 (loop with pixels = (float (* (car dimensions)
+                                               (cdr dimensions))
+                                            1d0)
+                       for id = (first (orfeus:graph-node-inputs node))
+                         then (first (orfeus:graph-node-inputs upstream))
+                       for upstream = (and id graph
+                                           (not (eql id orfeus:*graph-source-id*))
+                                           (orfeus:graph-find-node graph id))
+                       while upstream
+                       when (and (eq :crop (orfeus:graph-node-kind upstream))
+                                 (not (orfeus:graph-node-bypassed-p upstream)))
+                         do (let ((params (orfeus:graph-node-params upstream)))
+                              (setf pixels (* pixels
+                                              (getf params :width 1.0)
+                                              (getf params :height 1.0))))
+                       finally (return pixels)))))
+           (crop-node-megapixels (node)
+             (let ((pixels (crop-frame-pixels node))
+                   (params (orfeus:graph-node-params node)))
+               (and pixels
+                    (/ (* pixels (getf params :width 1.0)
+                          (getf params :height 1.0))
+                       1d6))))
+           (store-crop-rect (node left top width height message)
+             ;; LEFT TOP WIDTH HEIGHT in the frame NODE itself crops from.
+             (handler-case
+                 (progn
+                   (gui-model-set-node-params
+                    model node
+                    (list :left (float left 1.0) :top (float top 1.0)
+                          :width (float width 1.0) :height (float height 1.0)))
+                   (after-graph-edit message))
+               (error (condition)
+                 (set-status (princ-to-string condition)))))
+           (set-crop-megapixels (node megapixels)
+             (let ((pixels (crop-frame-pixels node))
+                   (params (orfeus:graph-node-params node)))
+               (if (null pixels)
+                   (set-status "The photograph's size is not known")
+                   (multiple-value-bind (left top width height)
+                       (crop-rect-with-area
+                        (float (getf params :left 0.0) 1d0)
+                        (float (getf params :top 0.0) 1d0)
+                        (float (getf params :width 1.0) 1d0)
+                        (float (getf params :height 1.0) 1d0)
+                        (min 1d0 (/ (* megapixels 1d6) pixels))
+                        (getf params :angle 0.0)
+                        :aspect (crop-frame-aspect node))
+                     (store-crop-rect
+                      node left top width height
+                      (format nil "Crop ~,1F MP"
+                              (/ (* pixels width height) 1d6)))))))
+           (maximize-crop (node)
+             ;; As large as the turned frame allows in the crop's own
+             ;; proportions, so levelling costs no more of the picture than
+             ;; it has to.
+             (let ((params (orfeus:graph-node-params node)))
+               (multiple-value-bind (left top width height)
+                   (crop-rect-maximized (float (getf params :width 1.0) 1d0)
+                                        (float (getf params :height 1.0) 1d0)
+                                        (getf params :angle 0.0)
+                                        :aspect (crop-frame-aspect node))
+                 (let ((pixels (crop-frame-pixels node)))
+                   (store-crop-rect
+                    node left top width height
+                    (if pixels
+                        (format nil "Crop maximized: ~,1F MP"
+                                (/ (* pixels width height) 1d6))
+                        "Crop maximized"))))))
+           (begin-pick-crop-centre (node)
+             (setf pick-color-node nil
+                   pick-crop-centre-node node)
+             (set-preview-cursor :cross)
+             (set-status "Click the preview to centre the crop"))
+           (place-crop-centre-at (canvas x y)
+             (let ((node pick-crop-centre-node)
+                   (path (preview-path-for-canvas canvas)))
+               (setf pick-crop-centre-node nil)
+               (set-preview-cursor :default)
+               (when (and node path (eq node (crop-editing-node)))
+                 (multiple-value-bind (frame-x frame-y frame-width frame-height)
+                     (preview-image-frame canvas path)
+                   (when frame-x
+                     ;; The click is on the picture as shown; the rectangle
+                     ;; is kept in the frame the crop node reads.
+                     (destructuring-bind (centre-x centre-y &rest ignored)
+                         (rect-through-geometry
+                          (list (/ (- x frame-x) frame-width)
+                                (/ (- y frame-y) frame-height)
+                                0d0 0d0)
+                          (crop-node-geometry node) t)
+                       (declare (ignore ignored))
+                       (let ((params (orfeus:graph-node-params node)))
+                         (multiple-value-bind (left top width height)
+                             (crop-rect-placed
+                              centre-x centre-y
+                              (getf params :width 1.0)
+                              (getf params :height 1.0)
+                              (getf params :angle 0.0)
+                              :aspect (crop-frame-aspect node))
+                           (store-crop-rect node left top width height
+                                            "Crop centred")))))))))
            (set-crop-node-angle (node angle)
              ;; The preview shows the straightening, so an angle change is a
              ;; change to the picture and not merely to the overlay.
@@ -2941,6 +3066,8 @@ behind is memory. Best effort; returns how many directories went."
                     (cond
                       (pick-color-node
                        (sample-base-at canvas x y))
+                      (pick-crop-centre-node
+                       (place-crop-centre-at canvas x y))
                       ((and (= button 1) (begin-crop-drag canvas x y)))
                       ((or (= button 1) (= button 2))
                        (setf preview-drag-p t
@@ -3208,7 +3335,8 @@ behind is memory. Best effort; returns how many directories went."
              (setf thumbnail-anchor anchor)
              (gui-model-move-cursor model focus-index)
              (setf (gui-model-selected-node model) nil
-                   pick-color-node nil)
+                   pick-color-node nil
+                   pick-crop-centre-node nil)
              (set-preview-cursor :default)
              (clear-previews)
              (sync-controls)
@@ -3221,7 +3349,8 @@ behind is memory. Best effort; returns how many directories went."
              (when (member focus-index selection)
                (setf (gui-model-selected-index model) focus-index))
              (setf (gui-model-selected-node model) nil
-                   pick-color-node nil)
+                   pick-color-node nil
+                   pick-crop-centre-node nil)
              (set-preview-cursor :default)
              (clear-previews)
              (sync-controls)
@@ -3755,7 +3884,21 @@ behind is memory. Best effort; returns how many directories went."
                            (format nil "~,1F" (* 100 height)))))
                  (when crop-aspect-input
                    (setf (lightfast:value crop-aspect-input)
-                         (or (crop-aspect-label crop-aspect) "Free"))))
+                         (or (crop-aspect-label crop-aspect) "Free")))
+                 (when crop-megapixel-input
+                   (let ((megapixels (crop-node-megapixels node))
+                         (frame (crop-frame-pixels node)))
+                     (when frame
+                       ;; Up to the whole frame: 20 MP on most bodies, 80 on
+                       ;; a high-resolution shot.
+                       (lightfast:set-range crop-megapixel-slider 1
+                                            (max 2 (ceiling frame 1d6))))
+                     (dolist (widget (list crop-megapixel-slider
+                                           crop-megapixel-input))
+                       (setf (lightfast:value widget)
+                             (if megapixels
+                                 (format nil "~,1F" megapixels)
+                                 ""))))))
                (when (and node (member kind '(:contrast :negative :hdr :dust :vignette :clarity
                                               :dehaze)))
                  (let ((params (orfeus:graph-node-params node)))
@@ -4520,7 +4663,7 @@ behind is memory. Best effort; returns how many directories went."
                    (crop-rect-within-turned-frame
                     (getf params :left 0.0) (getf params :top 0.0)
                     (getf params :width 1.0) (getf params :height 1.0)
-                    angle)
+                    angle :aspect (crop-frame-aspect node))
                  (gui-model-set-node-params
                   model node
                   (list :left left :top top :width width :height height
@@ -5430,7 +5573,8 @@ behind is memory. Best effort; returns how many directories went."
              (clrhash gallery-thumbs)
              (setf gallery-selected nil
                    gallery-scroll 0
-                   pick-color-node nil)
+                   pick-color-node nil
+                   pick-crop-centre-node nil)
              (set-preview-cursor :default)
              (gui-model-replace-project model new-project path)
              (setf (gui-model-selected-node model) nil)
@@ -8470,6 +8614,70 @@ behind is memory. Best effort; returns how many directories went."
                       spinner)))
              (setf crop-width-input (size-field :width "Width %" 108)
                    crop-height-input (size-field :height "Height %" 140)))
+           ;; The size as the pixels it will deliver, for a crop meant for a
+           ;; given screen or print rather than a share of the frame.
+           (let ((label (lightfast:make-label :parent node-page :x 12 :y 172
+                                              :width 88 :height 26
+                                              :label "Megapixels"))
+                 (callback
+                   (lambda (widget event value)
+                     (declare (ignore event value))
+                     (let ((node (crop-editing-node)))
+                       (when node
+                         (handler-case
+                             (set-crop-megapixels
+                              node (max 0.1d0 (float (parse-number
+                                                      (lightfast:value widget))
+                                                     1d0)))
+                           (error (condition)
+                             (set-status (princ-to-string condition)))))))))
+             (setf crop-megapixel-slider
+                   (lightfast:make-slider :parent node-page :x 110 :y 172
+                                          :width 84 :height 26
+                                          :callback callback)
+                   crop-megapixel-input
+                   (lightfast:make-spinner :parent node-page :x 202 :y 172
+                                           :width 78 :height 26
+                                           :callback callback))
+             (lightfast:set-range crop-megapixel-slider 1 80)
+             (lightfast:set-step crop-megapixel-slider 0.1)
+             (lightfast:set-range crop-megapixel-input 0.1 200)
+             (lightfast:set-step crop-megapixel-input 0.1)
+             (dolist (widget (list crop-megapixel-slider crop-megapixel-input))
+               (lightfast:set-tooltip
+                widget
+                "Size the crop to this many megapixels, keeping its proportions and centre"))
+             (register-inspector-row
+              (number-field-layout label crop-megapixel-slider
+                                   crop-megapixel-input)
+              (list label crop-megapixel-slider crop-megapixel-input)
+              node-page 12 172 26 :page))
+           (lightfast:set-tooltip
+            (register-inspector
+             (lightfast:set-stock-icon
+              (lightfast:make-button
+               :parent node-page :x 12 :y 204 :width 140 :height 26
+               :label "Maximize"
+               :callback (lambda (&rest ignored)
+                           (declare (ignore ignored))
+                           (let ((node (crop-editing-node)))
+                             (when node (maximize-crop node)))))
+              :maximize)
+             '(:column 0) 204 '(:share 2) 26 :page)
+            "The largest crop of these proportions the levelled frame covers")
+           (lightfast:set-tooltip
+            (register-inspector
+             (lightfast:set-stock-icon
+              (lightfast:make-button
+               :parent node-page :x 160 :y 204 :width 140 :height 26
+               :label "Pick Centre"
+               :callback (lambda (&rest ignored)
+                           (declare (ignore ignored))
+                           (let ((node (crop-editing-node)))
+                             (when node (begin-pick-crop-centre node)))))
+              :crosshair)
+             '(:column 1) 204 '(:share 2) 26 :page)
+            "Click the preview to move the crop's centre there")
            ;; Straightening without the slider. The camera's level gauge is
            ;; written into the maker notes as the roll at exposure, so the
            ;; exact correction is usually in the file already; the picture's
@@ -8478,42 +8686,42 @@ behind is memory. Best effort; returns how many directories went."
             (register-inspector
              (lightfast:set-stock-icon
               (lightfast:make-button
-               :parent node-page :x 12 :y 172 :width 140 :height 26
+               :parent node-page :x 12 :y 236 :width 140 :height 26
                :label "Level From Camera"
                :callback (lambda (&rest ignored)
                            (declare (ignore ignored))
                            (let ((node (crop-editing-node)))
                              (when node (level-crop-from-camera node)))))
               :camera)
-             '(:column 0) 172 '(:share 2) 26 :page)
+             '(:column 0) 236 '(:share 2) 26 :page)
             "Turn the picture back by the roll the camera's level gauge recorded")
            (lightfast:set-tooltip
             (register-inspector
              (lightfast:set-stock-icon
               (lightfast:make-button
-               :parent node-page :x 160 :y 172 :width 140 :height 26
+               :parent node-page :x 160 :y 236 :width 140 :height 26
                :label "Level From Photo"
                :callback (lambda (&rest ignored)
                            (declare (ignore ignored))
                            (let ((node (crop-editing-node)))
                              (when node (level-crop-from-photo node)))))
               :photo)
-             '(:column 1) 172 '(:share 2) 26 :page)
+             '(:column 1) 236 '(:share 2) 26 :page)
             "Stand the picture's strongest straight edges upright")
            (register-inspector
             (lightfast:set-stock-icon
              (lightfast:make-button
-              :parent node-page :x 12 :y 204 :width 292 :height 26
+              :parent node-page :x 12 :y 268 :width 292 :height 26
               :label "Autocrop Negative"
               :callback (lambda (&rest ignored)
                           (declare (ignore ignored))
                           (let ((node (crop-editing-node)))
                             (when node (autocrop-negative node)))))
              :crop)
-            12 204 :fill 26 :page)
+            12 268 :fill 26 :page)
            (register-inspector
             (lightfast:make-button
-             :parent node-page :x 12 :y 236 :width 292 :height 26
+             :parent node-page :x 12 :y 300 :width 292 :height 26
              :label "Reset Crop"
              :callback (lambda (&rest ignored)
                          (declare (ignore ignored))
@@ -8527,7 +8735,7 @@ behind is memory. Best effort; returns how many directories went."
                               model node (default-crop-params))
                              (setf crop-aspect :original)
                              (after-graph-edit "Crop reset")))))
-            12 236 :fill 26 :page)))
+            12 300 :fill 26 :page)))
         (build-group
          :curves
          (lambda ()

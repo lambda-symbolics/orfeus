@@ -419,6 +419,78 @@ the last mark out hands the selection back to the cursor."
     (check (equal '(2 3) (orfeus/gui::gui-model-selected-indices model))
            "Marking a folded row did not select every frame of it")))
 
+(defun crop-corners-covered-p (left top width height angle aspect)
+  "Whether every corner of the rectangle lies inside the frame turned by ANGLE."
+  (let ((radians (* (/ pi 180) angle)))
+    (every (lambda (corner)
+             (let* ((x (* aspect (- (car corner) 0.5)))
+                    (y (- (cdr corner) 0.5))
+                    (along (+ (* x (cos radians)) (* y (sin radians))))
+                    (across (+ (* x (- (sin radians))) (* y (cos radians)))))
+               (and (<= (abs along) (+ (/ aspect 2) 1e-4))
+                    (<= (abs across) (+ 0.5 1e-4)))))
+           (list (cons left top) (cons (+ left width) top)
+                 (cons left (+ top height))
+                 (cons (+ left width) (+ top height))))))
+
+(defun test-crop-sizing-keeps-the-crop-level-correct ()
+  "Sizing to an area, maximizing and placing a centre keep the crop's
+proportions and never leave a corner the turned frame does not cover."
+  ;; Half the area of a level frame: each side by the square root of a half,
+  ;; about the same centre.
+  (multiple-value-bind (left top width height)
+      (orfeus/gui:crop-rect-with-area 0.1d0 0.1d0 0.8d0 0.6d0 0.24d0 0.0)
+    (check (and (< (abs (- (* width height) 0.24)) 1e-5)
+                (< (abs (- (/ width height) 4/3)) 1e-4))
+           "Sizing to an area changed the proportions or missed the area")
+    (check (and (< (abs (- (+ left (/ width 2)) 0.5)) 1e-5)
+                (< (abs (- (+ top (/ height 2)) 0.4)) 1e-5))
+           "Sizing to an area moved the centre"))
+  ;; More than a turned frame can hold comes back as large as it can.
+  (multiple-value-bind (left top width height)
+      (orfeus/gui:crop-rect-with-area 0.1d0 0.1d0 0.8d0 0.8d0 1d0 6.0
+                                      :aspect 4/3)
+    (check (crop-corners-covered-p left top width height 6.0 4/3)
+           "An area past the turned frame printed black corners")
+    (check (< (abs (- width height)) 1e-5)
+           "A capped area changed the proportions"))
+  ;; Maximized at ten degrees: centred, covered, and touching the turned
+  ;; frame, so a hair larger would not be covered.
+  (multiple-value-bind (left top width height)
+      (orfeus/gui:crop-rect-maximized 0.6d0 0.5d0 10.0 :aspect 4/3)
+    (check (and (< (abs (- (+ left (/ width 2)) 0.5)) 1e-5)
+                (< (abs (- (+ top (/ height 2)) 0.5)) 1e-5)
+                (< (abs (- (/ width height) 1.2)) 1e-4))
+           "A maximized crop was off centre or lost its proportions")
+    (check (crop-corners-covered-p left top width height 10.0 4/3)
+           "A maximized crop printed black corners")
+    (let ((grown-width (* width 1.01)) (grown-height (* height 1.01)))
+      (check (not (crop-corners-covered-p (- 0.5 (/ grown-width 2))
+                                          (- 0.5 (/ grown-height 2))
+                                          grown-width grown-height 10.0 4/3))
+             "A maximized crop could have been larger")))
+  ;; Level, it fills the frame along one side.
+  (multiple-value-bind (left top width height)
+      (orfeus/gui:crop-rect-maximized 0.5d0 0.5d0 0.0 :aspect 4/3)
+    (declare (ignore left top))
+    (check (and (< (abs (- width 1)) 1e-5) (< (abs (- height 1)) 1e-5))
+           "A level maximized crop did not reach the frame's edges"))
+  ;; A centre the size fits around is taken exactly; one too near the edge
+  ;; of a turned frame is pulled in, the size kept.
+  (multiple-value-bind (left top width height)
+      (orfeus/gui:crop-rect-placed 0.4d0 0.6d0 0.3d0 0.3d0 0.0)
+    (check (and (< (abs (- left 0.25)) 1e-5) (< (abs (- top 0.45)) 1e-5)
+                (< (abs (- width 0.3)) 1e-5) (< (abs (- height 0.3)) 1e-5))
+           "A centre with room around it was not taken as given"))
+  (multiple-value-bind (left top width height)
+      (orfeus/gui:crop-rect-placed 0.95d0 0.95d0 0.4d0 0.4d0 8.0 :aspect 4/3)
+    (check (and (< (abs (- width 0.4)) 1e-5) (< (abs (- height 0.4)) 1e-5))
+           "Placing a centre changed the size")
+    (check (crop-corners-covered-p left top width height 8.0 4/3)
+           "A centre near the corner printed black corners")
+    (check (and (> (+ left (/ width 2)) 0.6) (> (+ top (/ height 2)) 0.6))
+           "A centre near the corner was pulled further than it had to be")))
+
 (defun test-a-turned-crop-stays-inside-the-frame ()
   "A crop that is turned shrinks about its centre until the turned frame covers
 every corner; a level one is left exactly as it was."
@@ -2288,6 +2360,7 @@ would silently ignore whatever the Destination field said."
   (test-cursor-walks-past-a-marked-selection)
   (test-photographs-sort-and-keep-their-places)
   (test-a-turned-crop-stays-inside-the-frame)
+  (test-crop-sizing-keeps-the-crop-level-correct)
   (test-the-picker-decides-without-a-window)
   (test-session-settings-and-recent-projects)
   (test-display-copies-are-let-go-when-nothing-shows-them)

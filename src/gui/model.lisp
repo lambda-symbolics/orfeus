@@ -862,16 +862,13 @@ A hand that meant to hold the camera straight is off by a degree or three; a
 frame rolled further than this was composed that way, or is a shot of the
 ground, and levelling it unasked would be a surprise.")
 
-(defun crop-rect-within-turned-frame (left top width height angle
-                                      &key (aspect 4/3))
-  "Shrink the crop rectangle about its centre until the turned frame covers it.
+(defun turned-frame-cover-scale (left top width height angle aspect)
+  "How far the crop rectangle may grow about its centre and stay covered.
 
 LEFT TOP WIDTH HEIGHT are fractions of the frame, ANGLE the crop's clockwise
-turn in degrees and ASPECT the frame's width over its height, which is what
-turns the fractions into a shape. The picture is turned about the frame's
-centre and the upright rectangle cut from it, so a corner of the rectangle
-that the turned frame no longer reaches would print black. Returns the four
-fractions, unchanged when the frame covers them all."
+turn in degrees and ASPECT the frame's width over its height. One or more
+means the turned frame covers every corner; below one, the factor the
+rectangle has to shrink by about its centre so that it does."
   (let* ((radians (* (/ pi 180) angle))
          (cosine (cos radians))
          (sine (sin radians))
@@ -881,7 +878,7 @@ fractions, unchanged when the frame covers them all."
          (centre-y (* frame-height (- (+ top (/ height 2)) 0.5d0)))
          (half-width (* frame-width (/ width 2)))
          (half-height (* frame-height (/ height 2)))
-         (scale 1d0))
+         (scale most-positive-double-float))
     ;; Each corner is centre + scale * half-diagonal, and it sits inside the
     ;; turned frame when both its projections onto the frame's turned axes
     ;; are within the half extents: a linear bound on the scale per corner
@@ -889,7 +886,8 @@ fractions, unchanged when the frame covers them all."
     (dolist (corner (list (list half-width half-height)
                           (list half-width (- half-height))
                           (list (- half-width) half-height)
-                          (list (- half-width) (- half-height))))
+                          (list (- half-width) (- half-height)))
+                    scale)
       (destructuring-bind (offset-x offset-y) corner
         (loop for (axis-x axis-y limit)
                 in (list (list cosine sine (/ frame-width 2))
@@ -900,12 +898,26 @@ fractions, unchanged when the frame covers them all."
                           (setf scale (min scale (/ (- limit centre) reach))))
                          ((< reach -1d-9)
                           (setf scale (min scale (/ (- (- limit) centre)
-                                                    reach)))))))))
+                                                    reach)))))))))))
+
+(defun crop-rect-within-turned-frame (left top width height angle
+                                      &key (aspect 4/3))
+  "Shrink the crop rectangle about its centre until the turned frame covers it.
+
+LEFT TOP WIDTH HEIGHT are fractions of the frame, ANGLE the crop's clockwise
+turn in degrees and ASPECT the frame's width over its height, which is what
+turns the fractions into a shape. The picture is turned about the frame's
+centre and the upright rectangle cut from it, so a corner of the rectangle
+that the turned frame no longer reaches would print black. Returns the four
+fractions, unchanged when the frame covers them all."
+  (let ((scale (turned-frame-cover-scale left top width height angle aspect)))
     (cond ((>= scale 1d0)
            (values left top width height))
           ;; A centre the turned frame does not even reach cannot be shrunk
-          ;; towards; start over from the middle of the frame instead.
-          ((< scale 0.05d0)
+          ;; towards; start over from the middle of the frame instead. The
+          ;; middle always has room, so this recurses once at most.
+          ((and (< scale 0.05d0)
+                (> (abs (- (+ left (/ width 2)) 0.5)) 1d-6))
            (crop-rect-within-turned-frame (- 0.5 (/ width 2)) (- 0.5 (/ height 2))
                                           width height angle :aspect aspect))
           (t
@@ -915,6 +927,66 @@ fractions, unchanged when the frame covers them all."
                      (float (- (+ top (/ height 2)) (/ new-height 2)) 1.0)
                      (float new-width 1.0)
                      (float new-height 1.0)))))))
+
+(defun crop-rect-placed (centre-x centre-y width height angle &key (aspect 4/3))
+  "The WIDTH by HEIGHT crop as near CENTRE-X CENTRE-Y as the turned frame allows.
+
+All fractions of the frame, ANGLE and ASPECT as for
+CROP-RECT-WITHIN-TURNED-FRAME. The size is kept and the centre moved towards
+the middle of the frame until no corner prints black; only a rectangle too big
+to fit anywhere at this angle shrinks, about the middle. Returns left, top,
+width and height."
+  (let* ((width (min 1d0 (max 0.05d0 (float width 1d0))))
+         (height (min 1d0 (max 0.05d0 (float height 1d0))))
+         (centre-x (min (- 1 (/ width 2)) (max (/ width 2) centre-x)))
+         (centre-y (min (- 1 (/ height 2)) (max (/ height 2) centre-y))))
+    (flet ((fits-p (x y)
+             (>= (turned-frame-cover-scale (- x (/ width 2)) (- y (/ height 2))
+                                           width height angle aspect)
+                 (- 1d0 1d-9)))
+           (rect (x y)
+             (values (float (- x (/ width 2)) 1.0) (float (- y (/ height 2)) 1.0)
+                     (float width 1.0) (float height 1.0))))
+      (cond ((fits-p centre-x centre-y) (rect centre-x centre-y))
+            ((not (fits-p 0.5d0 0.5d0))
+             (crop-rect-within-turned-frame (- 0.5 (/ width 2))
+                                            (- 0.5 (/ height 2))
+                                            width height angle :aspect aspect))
+            (t
+             ;; Where the rectangle fits is convex and holds the middle, so
+             ;; along the line from the asked centre to the middle it starts
+             ;; fitting once and keeps fitting.
+             (let ((low 0d0) (high 1d0))
+               (loop repeat 40
+                     do (let ((middle (/ (+ low high) 2)))
+                          (if (fits-p (+ centre-x (* middle (- 0.5d0 centre-x)))
+                                      (+ centre-y (* middle (- 0.5d0 centre-y))))
+                              (setf high middle)
+                              (setf low middle))))
+               (rect (+ centre-x (* high (- 0.5d0 centre-x)))
+                     (+ centre-y (* high (- 0.5d0 centre-y))))))))))
+
+(defun crop-rect-with-area (left top width height area angle &key (aspect 4/3))
+  "The crop resized to AREA of the frame, its proportions and centre kept.
+
+AREA is the fraction of the frame the crop should hold; the rectangle is
+scaled about its centre to it and then placed as CROP-RECT-PLACED places it,
+so a size the levelled frame cannot hold comes back as large as it can."
+  (let* ((scale (sqrt (/ area (* width height))))
+         (scale (min scale (/ 1d0 width) (/ 1d0 height))))
+    (crop-rect-placed (+ left (/ width 2)) (+ top (/ height 2))
+                      (* width scale) (* height scale) angle :aspect aspect)))
+
+(defun crop-rect-maximized (width height angle &key (aspect 4/3))
+  "The largest crop of WIDTH by HEIGHT's proportions the turned frame covers.
+
+Centred, because the turned frame is symmetric about its middle and the
+largest rectangle of a given shape inside it is too."
+  (let ((scale (min (/ 1d0 width) (/ 1d0 height))))
+    (crop-rect-within-turned-frame (- 0.5 (/ (* width scale) 2))
+                                   (- 0.5 (/ (* height scale) 2))
+                                   (* width scale) (* height scale) angle
+                                   :aspect aspect)))
 
 (defun default-crop-params (&key (angle 0.0) (aspect 4/3))
   "The parameters a crop node starts with: the inset rectangle, turned by ANGLE.
