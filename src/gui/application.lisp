@@ -1673,6 +1673,10 @@ behind is memory. Best effort; returns how many directories went."
            ;; The proportions a crop keeps while it is dragged. The frame's own
            ;; by default: most crops trim a picture rather than reshape it.
            (crop-aspect :original)
+           ;; Each crop node's own lock, so choosing 16:9 on one photograph
+           ;; does not lock the next one's crop to it. Weak, because a node
+           ;; that is deleted or whose photograph is closed has no use for it.
+           (crop-aspects (make-hash-table :test #'eq :weakness :key))
            curve-canvas curve-drag scope-canvas
            (curve-channel :master-points)
            (curve-channel-buttons '())
@@ -3869,6 +3873,7 @@ behind is memory. Best effort; returns how many directories went."
                        (format nil "~,2F"
                                (orfeus:graph-node-opacity node))))
                (when (and node (eq kind :crop))
+                 (setf crop-aspect (gethash node crop-aspects :original))
                  (let ((angle (getf (orfeus:graph-node-params node) :angle 0.0)))
                    (dolist (entry crop-angle-controls)
                      (setf (lightfast:value (second entry))
@@ -4237,7 +4242,7 @@ behind is memory. Best effort; returns how many directories went."
                  (progn
                    (gui-model-reset-node model node)
                    (when (eq :crop (orfeus:graph-node-kind node))
-                     (setf crop-aspect :original))
+                     (remhash node crop-aspects))
                    (after-graph-edit
                     (format nil "~A reset"
                             (node-kind-label (orfeus:graph-node-kind node)))))
@@ -8606,6 +8611,7 @@ behind is memory. Best effort; returns how many directories went."
                             (crop-aspect-for-label (lightfast:value widget)))
                       (let ((node (crop-editing-node)))
                         (when node
+                          (setf (gethash node crop-aspects) crop-aspect)
                           (reshape-crop-to-aspect node)
                           (sync-node-tools)
                           (schedule-edited-preview)))
