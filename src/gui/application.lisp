@@ -1625,6 +1625,9 @@ behind is memory. Best effort; returns how many directories went."
            ;; line can name the stage rather than the queue depth.
            render-stage
            (render-stage-fraction 0.0)
+           ;; How far an export batch has got, in photographs. A batch is one
+           ;; queue task, so the queue depth says nothing about it.
+           export-fraction
            (photo-groups (make-hash-table :test #'eq))
            ;; Which bursts the photographer has folded. Stored the way round
            ;; that makes open the default without a pass to open them: absence
@@ -6138,6 +6141,7 @@ behind is memory. Best effort; returns how many directories went."
              ;; A batch used to show one line for its whole run, so a long
              ;; export looked stalled. Name the file about to be written.
              (declare (ignore job))
+             (queue-event queue (list :export-progress (/ (1- index) total)))
              (queue-event queue
                           (list :status nil
                                 (format nil "Exporting ~D of ~D: ~A"
@@ -7292,6 +7296,8 @@ behind is memory. Best effort; returns how many directories went."
                   (when (fifth event)
                     (seed-hdr-nodes (fifth event)))
                   (redraw-thumbnails))
+                 (:export-progress
+                  (setf export-fraction (second event)))
                  (:render-stage
                   ;; Only the render the interface is waiting for; a stale one
                   ;; still finishing must not narrate over it.
@@ -7363,13 +7369,20 @@ behind is memory. Best effort; returns how many directories went."
                        progress-generation generation)
                  ;; A render that is reporting its own stages knows better than
                  ;; the queue does: the queue counts jobs, and one job is the
-                 ;; whole wait. Its own fraction wins for as long as it lasts,
-                 ;; and an export batch — many jobs, each short — keeps the
-                 ;; count.
-                 (if (and render-stage (zerop export-load))
-                     (show-render-progress)
-                     (setf (lightfast:value progress)
-                           (format nil "~D" percent)))))))
+                 ;; whole wait. Its own fraction wins for as long as it lasts.
+                 ;; An export batch is one job too, so it goes by the
+                 ;; photographs it has written.
+                 (when (zerop export-load)
+                   (setf export-fraction nil))
+                 (cond ((and export-fraction (plusp export-load))
+                        (setf (lightfast:value progress)
+                              (format nil "~D"
+                                      (max 2 (min 99 (round (* 100 export-fraction)))))))
+                       ((and render-stage (zerop export-load))
+                        (show-render-progress))
+                       (t
+                        (setf (lightfast:value progress)
+                              (format nil "~D" percent))))))))
         (setf after-live-capacity
               (* *gui-live-preview-size* *gui-live-preview-size* 3)
               after-live-front (cffi:foreign-alloc
