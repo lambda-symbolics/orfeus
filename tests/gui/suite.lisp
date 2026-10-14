@@ -138,6 +138,52 @@ than the preview had photographs, under the wrong thumbnails."
       (check (null (getf (orfeus:photo-job-overrides (first jobs)) :exposure))
              "Undo left the edit on the photograph"))))
 
+(defun test-brackets-fold-unfold-and-undo ()
+  "A detected bracket folds into its first frame, which then stands for it and
+gets the camera's HDR look; unfolding puts the frames back and keeps them back;
+both are undoable, and the renderer follows every step."
+  (let* ((jobs (loop for name in '("b1" "b2" "b3" "b4" "b5" "lone")
+                     collect (orfeus:make-photo-job
+                              :input-path (pathname (format nil "/tmp/~A.orf" name)))))
+         (reference (first jobs))
+         (model (orfeus/gui:make-gui-model
+                 :project (orfeus:make-project :output-directory #P"exports/"
+                                               :photos (copy-list jobs))))
+         (project (orfeus/gui:gui-model-project model)))
+    (unwind-protect
+         (progn
+           (setf (orfeus/gui:gui-model-selected-index model) 2)
+           (check (= 1 (orfeus/gui:gui-model-fold-brackets model (list (subseq jobs 0 5))))
+                  "The bracket was not folded")
+           (check (equal (list reference (sixth jobs)) (orfeus:project-photos project))
+                  "Folding left ~S" (orfeus:project-photos project))
+           (check (eq reference (orfeus/gui:gui-model-selected-job model))
+                  "The cursor did not move to the photograph standing for its frame")
+           (check (= 5 (length (orfeus:bracket-frames (orfeus:photo-job-input-path reference))))
+                  "The renderer was not told about the bracket")
+           (check (find :hdr (orfeus:processing-graph-nodes (orfeus:photo-job-graph reference))
+                        :key #'orfeus:graph-node-kind)
+                  "A folded bracket got no HDR node")
+           (orfeus/gui:gui-model-unfold-bracket model reference)
+           (check (= 6 (length (orfeus:project-photos project)))
+                  "Unfolding did not put the frames back")
+           (check (null (orfeus:bracket-frames (orfeus:photo-job-input-path reference)))
+                  "The renderer still merges an unfolded bracket")
+           (check (zerop (orfeus/gui:gui-model-fold-brackets
+                          model (list (subseq (orfeus:project-photos project) 0 5))))
+                  "An unfolded bracket was folded again")
+           (orfeus/gui:gui-model-undo model)
+           (check (and (= 2 (length (orfeus:project-photos project)))
+                       (= 5 (length (orfeus:bracket-frames
+                                     (orfeus:photo-job-input-path reference)))))
+                  "Undoing the unfold did not fold the bracket again")
+           (orfeus/gui:gui-model-undo model)
+           (check (and (= 6 (length (orfeus:project-photos project)))
+                       (null (orfeus:bracket-frames
+                              (orfeus:photo-job-input-path reference))))
+                  "Undoing the fold did not put the frames back"))
+      (orfeus:register-bracket (orfeus:photo-job-input-path reference) nil))))
+
 (defun test-a-node-resets-to-its-defaults ()
   "Resetting a node replaces its parameters with the ones it started with: a
 fresh photograph's for a kind the default graph has, the added kind's own
@@ -1625,7 +1671,7 @@ would silently ignore whatever the Destination field said."
          "Right-clicking a selected thumbnail did not preserve the selection")
   (check (equal '(3) (orfeus/gui::thumbnail-context-selection '(1 4) 3))
          "Right-clicking an unselected thumbnail did not select only that row")
-  (check (equal '(:export :apply-still :reset-edits :copy-paths :divider
+  (check (equal '(:export :apply-still :reset-edits :copy-paths :unfold :divider
                   :select-all :intern :remove)
                 (loop for index below
                       (length (orfeus/gui::thumbnail-context-menu-items))
@@ -2407,6 +2453,7 @@ would silently ignore whatever the Destination field said."
   (test-undo-after-a-removal-keeps-the-project-and-its-survivors)
   (test-dust-goes-in-front-of-the-negative)
   (test-a-node-resets-to-its-defaults)
+  (test-brackets-fold-unfold-and-undo)
   (test-graph-node-placement)
   (test-thumbnail-context-menu)
   (test-node-adds-land-where-they-are-legal)

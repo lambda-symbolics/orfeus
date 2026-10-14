@@ -132,8 +132,11 @@ it is: nothing is known about it any more."
                              (photo-job-disabled-stages job)
                              (photo-job-disabled-stages copy)
                              (photo-job-graph job) (photo-job-graph copy))
+                       ;; Through the setter, so the renderer hears that a
+                       ;; fold or an unfold was undone.
+                       (orfeus:photo-job-set-bracket job (orfeus:photo-job-bracket copy))
                        job)
-                      (t copy))))
+                      (t (orfeus:photo-job-set-bracket copy (orfeus:photo-job-bracket copy))))))
             restored)))
 
 (defun gui-model-restore (model snapshot)
@@ -152,6 +155,7 @@ kept by the same rule, see ADOPT-PHOTO-JOBS."
           (project-defaults project) (project-defaults restored)
           (project-export-settings project) (project-export-settings restored)
           (project-presets project) (project-presets restored)
+          (orfeus:project-unmerged project) (orfeus:project-unmerged restored)
           (project-photos project)
           (adopt-photo-jobs (project-photos restored) (project-photos project))))
   (setf (gui-model-selected-index model) (gui-snapshot-selected-index snapshot)
@@ -1134,6 +1138,75 @@ lands. Returns the node, or NIL when nothing was done."
               (orfeus:photo-job-disabled-stages job) '())
         (reflow-graph-node-positions graph node)
         node))))
+
+(defun gui-model-fold-brackets (model brackets)
+  "Fold each exposure bracket in BRACKETS into its first frame, which then
+renders as the merge of all of them. BRACKETS lists lists of photo jobs in shot
+order. A bracket is left alone when any of its frames has left the project or
+already stands for a bracket, or when the photographer unfolded it before.
+Each folded photograph nobody had graded gets the camera's HDR look to start
+from: the stronger one for five frames or more. One undo step for the lot;
+returns how many brackets were folded, and the jobs that left the project."
+  (let* ((project (gui-model-project model))
+         (unmerged (orfeus:project-unmerged project))
+         (foldable
+           (remove-if-not
+            (lambda (jobs)
+              (and (rest jobs)
+                   (every (lambda (job)
+                            (and (member job (project-photos project) :test #'eq)
+                                 (null (orfeus:photo-job-bracket job))))
+                          jobs)
+                   (not (member (namestring (photo-job-input-path (first jobs)))
+                                unmerged :test #'string=))))
+            brackets)))
+    (if (null foldable)
+      0
+      (let ((selected (gui-model-selected-job model))
+            (folded '()))
+        (gui-model-checkpoint model)
+        (dolist (jobs foldable)
+          (let ((reference (first jobs)))
+            (orfeus:photo-job-set-bracket
+             reference (mapcar #'photo-job-input-path jobs))
+            (let ((*inside-model-edit* t))
+              (gui-model-seed-hdr-node model reference
+                                       (if (>= (length jobs) 5) :hdr2 :hdr1)))
+            (dolist (job (rest jobs))
+              (push (cons job reference) folded))))
+        (setf (project-photos project)
+              (remove-if (lambda (job) (assoc job folded :test #'eq))
+                         (project-photos project)))
+        ;; The cursor stays on its photograph, or moves to the one that now
+        ;; stands for it.
+        (let* ((target (or (cdr (assoc selected folded :test #'eq)) selected))
+               (index (or (position target (project-photos project) :test #'eq) 0)))
+          (setf (gui-model-selected-index model) index
+                (gui-model-selected-indices model)
+                (if (project-photos project) (list index) '())
+                (gui-model-marked-p model) nil))
+        (values (length foldable) (mapcar #'car folded))))))
+
+(defun gui-model-unfold-bracket (model job)
+  "Put the frames of the bracket JOB stands for back in the project, after it,
+each as a photograph of its own, and remember not to fold them again. Returns
+the frames' jobs, JOB first, or NIL when JOB stands for no bracket."
+  (let ((frames (orfeus:photo-job-bracket job)))
+    (when frames
+      (gui-model-checkpoint model)
+      (let* ((project (gui-model-project model))
+             (others (mapcar (lambda (frame) (make-photo-job :input-path frame))
+                             (rest frames)))
+             (photos (project-photos project))
+             (position (position job photos :test #'eq)))
+        (orfeus:photo-job-set-bracket job nil)
+        (pushnew (namestring (photo-job-input-path job))
+                 (orfeus:project-unmerged project) :test #'string=)
+        (setf (project-photos project)
+              (append (subseq photos 0 (1+ position))
+                      others
+                      (subseq photos (1+ position))))
+        (cons job others)))))
 
 (defun gui-model-delete-node (model node)
   "Delete NODE from the selected photo's graph."

@@ -895,6 +895,7 @@ from the anchor, and control-shift adds that range to the selection."
     (:apply-still . "Apply selected still to selection")
     (:reset-edits . "Remove edits from selection")
     (:copy-paths . "Copy source paths")
+    (:unfold . "Unfold exposure bracket")
     (:divider . "-")
     (:select-all . "Select all photographs")
     (:intern . "Intern selection (copy off the card)")
@@ -3686,6 +3687,7 @@ behind is memory. Best effort; returns how many directories went."
                  (:copy-paths (copy-selected-photo-paths))
                  (:select-all (select-all-thumbnails))
                  (:intern (intern-selected-photos))
+                 (:unfold (unfold-selected-bracket))
                  (:remove (remove-selected-photo-with-confirmation))))))
            (handle-thumbnail-mouse (canvas event value)
              (multiple-value-bind (x y button dx dy state)
@@ -5523,14 +5525,58 @@ behind is memory. Best effort; returns how many directories went."
                                  for mode = (ignore-errors
                                               (orfeus:photo-hdr-mode
                                                (photo-job-input-path job)))
-                                 when mode collect (cons job mode))))
+                                 when mode collect (cons job mode)))
+                         ;; And which frames the camera shot as an exposure
+                         ;; bracket, to be merged into one photograph each.
+                         (brackets
+                           (orfeus:group-brackets
+                            (mapcar (lambda (entry)
+                                      (list (first entry)
+                                            (second entry)
+                                            (ignore-errors
+                                              (orfeus:photo-bracket-shot
+                                               (photo-job-input-path
+                                                (first entry))))))
+                                    entries))))
                     (queue-event queue
                                  (list :photo-groups
                                        (orfeus:group-index-of
                                         (orfeus:group-captures entries))
                                        order
                                        sorting
-                                       hdr-frames)))))))
+                                       hdr-frames
+                                       brackets)))))))
+           (fold-brackets (brackets)
+             ;; Each bracket becomes the photograph its first frame was, now
+             ;; developed from all of them; the other frames leave the strip.
+             (multiple-value-bind (count removed)
+                 (gui-model-fold-brackets model brackets)
+               (when (and count (plusp count))
+                 (retire-jobs removed)
+                 (sync-window-title)
+                 (sync-controls)
+                 (sync-node-tools)
+                 (when graph-canvas (lightfast:redraw graph-canvas))
+                 (redraw-thumbnails)
+                 (refresh-photo-groups)
+                 (when (selected-job)
+                   (schedule-initial-preview))
+                 (set-status
+                  (format nil "Merged ~D exposure bracket~:P" count)))))
+           (unfold-selected-bracket ()
+             (let* ((job (selected-job))
+                    (frames (and job (gui-model-unfold-bracket model job))))
+               (if frames
+                   (progn
+                     (sync-window-title)
+                     (sync-controls)
+                     (sync-node-tools)
+                     (redraw-thumbnails)
+                     (refresh-photo-groups)
+                     (schedule-initial-preview)
+                     (set-status
+                      (format nil "Unfolded ~D bracketed frames" (length frames))))
+                   (set-status "Not a merged bracket"))))
            (seed-hdr-nodes (frames)
              ;; FRAMES: (job . mode) for every photograph the camera shot in
              ;; an HDR mode. Each untouched one gets, once, the node its JPEG
@@ -7463,6 +7509,8 @@ behind is memory. Best effort; returns how many directories went."
                   (setf photo-groups (second event))
                   (when (fifth event)
                     (seed-hdr-nodes (fifth event)))
+                  (when (sixth event)
+                    (fold-brackets (sixth event)))
                   (redraw-thumbnails))
                  (:export-progress
                   (setf export-fraction (second event)))
@@ -7945,6 +7993,14 @@ behind is memory. Best effort; returns how many directories went."
                                 ;; clear air between them.
                                 (draw-photo-rating job (+ x 102) (+ row-y 42))
                                 (draw-focus-mark job (+ x 102) (+ row-y 62))
+                                (let ((frames (orfeus:photo-job-bracket job)))
+                                  (when frames
+                                    (lightfast:draw-color-rgb :red 230 :green 190 :blue 90)
+                                    (lightfast:draw-font :size 10)
+                                    (lightfast:draw-text
+                                     (format nil "Bracket of ~D" (length frames))
+                                     (+ x 102) (+ row-y 95))
+                                    (lightfast:draw-font :size 12)))
                                 (if leader
                                     (draw-burst-chevron x row-y t (length indices))
                                     (progn

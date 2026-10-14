@@ -25,6 +25,7 @@
                 #:render-photo-job #:render-photo-jobs #:render-preview
                 #:render-preview-rgb)
   (:export #:gui-model #:gui-model-add-photos #:gui-model-add-node
+           #:gui-model-fold-brackets #:gui-model-unfold-bracket
            #:*default-crop-inset* #:default-crop-params
            #:crop-rect-within-turned-frame #:crop-start-angle
            #:crop-rect-placed #:crop-rect-with-area #:crop-rect-maximized
