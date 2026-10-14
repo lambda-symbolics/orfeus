@@ -89,7 +89,10 @@ five — nobody rates anything zero — so it reads as unrated."
     "-Olympus:CropWidth" "-Olympus:CropHeight"
     "-ExifImageWidth" "-ExifImageHeight"
     "-SubIFD:ImageWidth" "-SubIFD:ImageHeight"
-    "-ImageWidth" "-ImageHeight")
+    "-ImageWidth" "-ImageHeight"
+    ;; Numeric, because the words ExifTool makes of it drop the shot number's
+    ;; meaning for anything but the plainest bracket.
+    "-Olympus:DriveMode#")
   "Everything read out of a photograph, in one ExifTool run.
 
 Asked for together because the subprocess is the cost, not the tags: the lens,
@@ -119,7 +122,30 @@ output as a dash, which is what keeps the answers positional.")
   ;; which the OM-1 marks only in the JPEG it writes beside the RAW.
   (hdr-mode nil)
   ;; The developed picture's (WIDTH . HEIGHT) in pixels, or NIL.
-  (dimensions nil))
+  (dimensions nil)
+  ;; Which frame of an exposure bracket this is, counting from 1, or NIL when
+  ;; the camera was not bracketing exposure.
+  (bracket-shot nil))
+
+(defun parsed-bracket-shot (value)
+  "Return the shot number Olympus's numeric DriveMode VALUE gives for a frame
+of an exposure bracket, or NIL.
+
+The first number 5 means bracketing, the second is the shot, and the third says
+what was bracketed: bit 0 is exposure, bit 5 the OM-1's automatic exposure
+bracket. White balance, flash, focus or ISO brackets are not exposure brackets
+and are not merged."
+  (when (usable-metadata-value-p value)
+    (let ((numbers (ignore-errors
+                    (mapcar #'parse-integer
+                            (remove "" (uiop:split-string value :separator " ")
+                                    :test #'string=)))))
+      (destructuring-bind (&optional mode shot (bits 0) &rest rest) numbers
+        (declare (ignore rest))
+        (when (and (eql mode 5) (integerp shot) (plusp shot) (integerp bits)
+                   (or (logbitp 0 bits) (logbitp 5 bits))
+                   (not (logtest bits #b1011110)))
+          shot)))))
 
 (defun parsed-hdr-mode (value)
   "Return :HDR1 or :HDR2 for ExifTool's StackedImage VALUE, or NIL."
@@ -222,7 +248,8 @@ the JPEG's after it."
                ;; The JPEG's word first: it is where the camera puts the mark.
                :hdr-mode (or (and sibling
                                   (parsed-hdr-mode (nth (+ count 15) lines)))
-                             (parsed-hdr-mode (nth 15 lines))))))
+                             (parsed-hdr-mode (nth 15 lines)))
+               :bracket-shot (parsed-bracket-shot (nth 24 lines)))))
           (%make-photo-metadata)))))
 
 (defun photo-metadata (pathname)
@@ -284,6 +311,10 @@ The OM-1 records the RAW of such a frame half a stop under the setting and
 merges the bracket only into its JPEG, so the RAW looks dark until its shadows
 are opened the way the camera opened them; see *HDR-PRESETS*."
   (photo-metadata-hdr-mode (photo-metadata pathname)))
+
+(defun photo-bracket-shot (pathname)
+  "Return which frame of an exposure bracket PATHNAME is, from 1, or NIL."
+  (photo-metadata-bracket-shot (photo-metadata pathname)))
 
 (defun photo-rating (pathname)
   "Return the star rating the photographer gave PATHNAME, 1 to 5, or NIL."

@@ -44,7 +44,18 @@ when present, replaces the flat pipeline with an explicit node graph."
   output-path
   (overrides '())
   (disabled-stages '())
-  (graph nil))
+  (graph nil)
+  ;; Every frame of the exposure bracket this photograph stands for, its own
+  ;; input first, or NIL for a single frame. Set it with PHOTO-JOB-SET-BRACKET,
+  ;; which also tells the renderer.
+  (bracket nil))
+
+(defun photo-job-set-bracket (job frames)
+  "Make JOB stand for the exposure bracket FRAMES (its own input first), or
+for its own frame alone when FRAMES is NIL."
+  (setf (photo-job-bracket job) (and (rest frames) (mapcar #'pathname frames)))
+  (register-bracket (photo-job-input-path job) (photo-job-bracket job))
+  job)
 
 (defstruct project
   "A batch of photographs sharing processing defaults and an output directory."
@@ -52,7 +63,10 @@ when present, replaces the flat pipeline with an explicit node graph."
   (defaults (make-processing-settings))
   (export-settings (make-export-settings))
   (presets '())
-  (photos '()))
+  (photos '())
+  ;; Reference frames of brackets the photographer unfolded, as namestrings:
+  ;; detection must not fold them again.
+  (unmerged '()))
 
 (declaim (ftype (function (t) t) graph->sexp graph->render-sexp sexp->graph))
 (declaim (ftype (function (t) t) graph-copy))
@@ -64,6 +78,7 @@ when present, replaces the flat pipeline with an explicit node graph."
    :output-path (photo-job-output-path job)
    :overrides (copy-list (photo-job-overrides job))
    :disabled-stages (copy-list (photo-job-disabled-stages job))
+   :bracket (copy-list (photo-job-bracket job))
    :graph (let ((graph (photo-job-graph job)))
             (when graph (graph-copy graph)))))
 
@@ -89,7 +104,8 @@ frontend keep undo snapshots."
    :defaults (copy-processing-settings (project-defaults project))
    :export-settings (copy-export-settings (project-export-settings project))
    :presets (mapcar #'copy-processing-preset-deep (project-presets project))
-   :photos (mapcar #'copy-photo-job-deep (project-photos project))))
+   :photos (mapcar #'copy-photo-job-deep (project-photos project))
+   :unmerged (copy-list (project-unmerged project))))
 
 (defun project-invalid (datum control &rest arguments)
   (error 'invalid-project-data
@@ -293,29 +309,37 @@ frontend keep undo snapshots."
      (list :disabled-stages
            (copy-list (photo-job-disabled-stages photo))))
    (when (photo-job-graph photo)
-     (list :graph (graph->sexp (photo-job-graph photo))))))
+     (list :graph (graph->sexp (photo-job-graph photo))))
+   (when (photo-job-bracket photo)
+     (list :bracket (mapcar #'namestring (photo-job-bracket photo))))))
 
 (defun sexp->photo-job (sexp)
   (unless (and (listp sexp)
                (plist-known-keys-p
-                sexp '(:input :output :overrides :disabled-stages :graph)))
+                sexp '(:input :output :overrides :disabled-stages :graph :bracket)))
     (project-invalid sexp "expected a photo property list"))
   (let ((input (getf sexp :input))
         (output (getf sexp :output))
         (overrides (getf sexp :overrides '()))
         (disabled-stages (getf sexp :disabled-stages '()))
-        (graph (getf sexp :graph)))
+        (graph (getf sexp :graph))
+        (bracket (getf sexp :bracket)))
     (unless (stringp input)
       (project-invalid sexp ":input must be a pathname string"))
+    (unless (and (listp bracket) (every #'stringp bracket)
+                 (or (null bracket) (string= (first bracket) input)))
+      (project-invalid sexp ":bracket must list frame pathnames, this photo's first"))
     (unless (or (null output) (stringp output))
       (project-invalid sexp ":output must be NIL or a pathname string"))
     (processing-plist-validate overrides)
     (disabled-stages-validate disabled-stages)
-    (make-photo-job :input-path (pathname input)
-                    :output-path (when output (pathname output))
-                    :overrides overrides
-                    :disabled-stages disabled-stages
-                    :graph (when graph (sexp->graph graph)))))
+    (photo-job-set-bracket
+     (make-photo-job :input-path (pathname input)
+                     :output-path (when output (pathname output))
+                     :overrides overrides
+                     :disabled-stages disabled-stages
+                     :graph (when graph (sexp->graph graph)))
+     bracket)))
 
 (defun processing-settings-with-overrides (settings overrides)
   "Return a copy of SETTINGS with validated OVERRIDES applied."
@@ -462,7 +486,8 @@ so pasting a grade also carries which nodes were switched off."
         :defaults (processing-settings->sexp (project-defaults project))
         :export-settings (export-settings->sexp (project-export-settings project))
         :presets (mapcar #'processing-preset->sexp (project-presets project))
-        :photos (mapcar #'photo-job->sexp (project-photos project))))
+        :photos (mapcar #'photo-job->sexp (project-photos project))
+        :unmerged (copy-list (project-unmerged project))))
 
 (defun sexp->project (sexp)
   "Validate and convert a project S-expression into a PROJECT."
@@ -471,13 +496,17 @@ so pasting a grade also carries which nodes were switched off."
                (member (second sexp) '(1 2 3 4))
                (plist-known-keys-p
                 (cddr sexp)
-                '(:output-directory :defaults :export-settings :presets :photos)))
+                '(:output-directory :defaults :export-settings :presets :photos
+                  :unmerged)))
     (project-invalid sexp "expected (:ORFEUS-PROJECT 1|2|3|4 ...)"))
   (let ((output-directory (getf (cddr sexp) :output-directory))
         (defaults (getf (cddr sexp) :defaults))
         (export-settings (getf (cddr sexp) :export-settings))
         (presets (getf (cddr sexp) :presets '()))
-        (photos (getf (cddr sexp) :photos)))
+        (photos (getf (cddr sexp) :photos))
+        (unmerged (getf (cddr sexp) :unmerged '())))
+    (unless (and (listp unmerged) (every #'stringp unmerged))
+      (project-invalid sexp ":unmerged must list pathname strings"))
     (unless (stringp output-directory)
       (project-invalid sexp ":output-directory must be a pathname string"))
     (unless (listp photos)
@@ -486,7 +515,8 @@ so pasting a grade also carries which nodes were switched off."
                   :defaults (sexp->processing-settings defaults)
                   :export-settings (sexp->export-settings export-settings)
                   :presets (sexp->processing-presets presets)
-                  :photos (mapcar #'sexp->photo-job photos))))
+                  :photos (mapcar #'sexp->photo-job photos)
+                  :unmerged unmerged)))
 
 (defun project-resolve-pathname (pathname base-directory)
   (if (uiop:absolute-pathname-p pathname)
@@ -523,6 +553,10 @@ so pasting a grade also carries which nodes were switched off."
     (setf (photo-job-input-path photo)
           (project-resolve-pathname (photo-job-input-path photo)
                                     base-directory))
+    (when (photo-job-bracket photo)
+      (photo-job-set-bracket
+       photo (mapcar (lambda (frame) (project-resolve-pathname frame base-directory))
+                     (photo-job-bracket photo))))
     (let ((overrides (copy-list (photo-job-overrides photo))))
       (when (getf overrides :lut-path)
         (setf (getf overrides :lut-path)
@@ -914,7 +948,16 @@ intern never leaves a half-written RAW that looks complete."
 
 Repointing is the point: leaving the job on the card would mean the intern
 bought nothing."
-  (let ((interned (intern-raw-file (photo-job-input-path job)
+  (let ((bracket (photo-job-bracket job))
+        (interned (intern-raw-file (photo-job-input-path job)
                                    :directory directory)))
+    ;; A bracket goes with its photograph: every frame of it, or the merge
+    ;; would still read the card.
+    (photo-job-set-bracket job nil)
     (setf (photo-job-input-path job) interned)
+    (when bracket
+      (photo-job-set-bracket
+       job (cons interned (mapcar (lambda (frame)
+                                    (intern-raw-file frame :directory directory))
+                                  (rest bracket)))))
     interned))

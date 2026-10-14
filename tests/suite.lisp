@@ -2189,6 +2189,54 @@ neither way."
      (search "sharp" (orfeus:focus-description (report 0.45 1.2 0.8)))
      (null (orfeus:focus-description nil)))))
 
+(defun bracket-detection-p ()
+  "The camera's drive mode names a bracket's frames, and only a whole run of
+them, starting at its first shot, is merged."
+  (let ((base 3989487541))
+    (flet ((brackets (entries) (orfeus:group-brackets entries)))
+      (and
+       ;; Measured on OM-1 files: the automatic exposure bracket, shots 1-3.
+       (eql 1 (orfeus::parsed-bracket-shot "5 1 32 0 4 39"))
+       (eql 3 (orfeus::parsed-bracket-shot "5 3 32 0 4 39"))
+       ;; Exposure bracketing on older bodies, bit 0.
+       (eql 2 (orfeus::parsed-bracket-shot "5 2 1"))
+       ;; Single shot, sequential, a white balance bracket, nothing at all.
+       (null (orfeus::parsed-bracket-shot "0 0 0 0 0 1"))
+       (null (orfeus::parsed-bracket-shot "0 0 0 0 4 33"))
+       (null (orfeus::parsed-bracket-shot "5 2 2"))
+       (null (orfeus::parsed-bracket-shot "-"))
+       (string= "-Olympus:DriveMode#" (nth 24 orfeus::*photo-metadata-tags*))
+       ;; Two brackets back to back, a stray frame between.
+       (equal '(("a" "b" "c") ("e" "f" "g" "h" "i"))
+              (brackets (list (list "a" base 1) (list "b" base 2)
+                              (list "c" (+ base 1) 3) (list "d" (+ base 9) nil)
+                              (list "e" (+ base 20) 1) (list "f" (+ base 20) 2)
+                              (list "g" (+ base 20) 3) (list "h" (+ base 21) 4)
+                              (list "i" (+ base 21) 5))))
+       ;; A bracket missing its first frame, and one whose frames are minutes
+       ;; apart, are not merged; a lone first shot is not a bracket.
+       (null (brackets (list (list "b" base 2) (list "c" base 3))))
+       (null (brackets (list (list "a" base 1) (list "b" (+ base 300) 2))))
+       (null (brackets (list (list "a" base 1) (list "x" base nil))))))))
+
+(defun bracket-round-trip-p ()
+  "A photograph standing for a bracket keeps its frames through a save, and the
+renderer is told about them."
+  (let* ((frames '(#p"/tmp/a1.ORF" #p"/tmp/a2.ORF" #p"/tmp/a3.ORF"))
+         (job (orfeus:photo-job-set-bracket
+               (orfeus:make-photo-job :input-path (first frames)) frames))
+         (back (orfeus::sexp->photo-job (orfeus::photo-job->sexp job))))
+    (unwind-protect
+         (and (equal (mapcar #'namestring frames)
+                     (mapcar #'namestring (orfeus:photo-job-bracket back)))
+              (equal (mapcar #'namestring frames)
+                     (mapcar #'namestring (orfeus:bracket-frames (first frames))))
+              (search (format nil "~%") (orfeus::render-source-namestring
+                                         (first frames)))
+              (progn (orfeus:photo-job-set-bracket back nil)
+                     (null (orfeus:bracket-frames (first frames)))))
+      (orfeus:photo-job-set-bracket back nil))))
+
 (defun burst-grouping-p ()
   "Frames close in time and alike belong together; the rest do not."
   (let ((base 3989487541))
@@ -2465,6 +2513,9 @@ neither way."
       (check "blends require compatible crop geometry on both branches"
              (graph-crop-branch-compatibility-p))
       (check "bursts group by clock and likeness together" (burst-grouping-p))
+      (check "brackets come from the drive mode, whole runs only"
+             (bracket-detection-p))
+      (check "a bracket's frames survive a save" (bracket-round-trip-p))
       (check "a blur radius past the threshold reads soft"
              (focus-verdict-reading-p))
       (check "an unrated frame reads as unrated" (star-rating-reading-p))

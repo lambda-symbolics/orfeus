@@ -670,14 +670,14 @@ by definition."
                                (:invalid :divide-by-zero :overflow
                                 :underflow :inexact)
                              (%raw-render-v3
-                              (namestring input-pathname)
+                              (render-source-namestring input-pathname)
                               (namestring output-pathname)
                               frame buffer (length program)
                               (if cache-p 1 0) error-buffer
                               *native-error-buffer-size*))
                            #-sbcl
                            (%raw-render-v3
-                            (namestring input-pathname)
+                            (render-source-namestring input-pathname)
                             (namestring output-pathname)
                             frame buffer (length program)
                             (if cache-p 1 0) error-buffer
@@ -761,7 +761,7 @@ image width and height as two values."
                                    (:invalid :divide-by-zero :overflow
                                     :underflow :inexact)
                                  (%raw-render-rgb-v1
-                                  (namestring input-pathname)
+                                  (render-source-namestring input-pathname)
                                   frame program-buffer (length program)
                                   rgb-buffer capacity
                                   out-width out-height
@@ -769,7 +769,7 @@ image width and height as two values."
                                   *native-error-buffer-size*))
                                #-sbcl
                                (%raw-render-rgb-v1
-                                (namestring input-pathname)
+                                (render-source-namestring input-pathname)
                                 frame program-buffer (length program)
                                 rgb-buffer capacity
                                 out-width out-height

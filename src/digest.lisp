@@ -116,6 +116,16 @@ photograph as slow as rendering it. Memoizing on the stat costs a syscall.
 
 Derived from contents rather than from the stat itself so that copying a RAW —
 interning it off a card — keeps every preview already rendered for it."
+  (let ((frames (bracket-frames pathname)))
+    (if frames
+        ;; Every frame counts: a preview of the merge is stale when any of
+        ;; them changes, and is a different picture from the reference's own.
+        (string-fast-digest
+         (format nil "bracket~{ ~A~}" (mapcar #'single-file-content-key frames)))
+        (single-file-content-key pathname))))
+
+(defun single-file-content-key (pathname)
+  "FILE-CONTENT-KEY of PATHNAME's own bytes, bracket or not."
   (let* ((identity (file-stat-identity pathname))
          (memoizable (and identity (file-settled-p identity))))
     (or (when memoizable
@@ -140,3 +150,50 @@ the stat may not have caught up."
       (sb-thread:with-mutex (*content-key-memo-lock*)
         (remhash identity *content-key-memo*)))
     identity))
+
+;;; Exposure brackets.
+;;;
+;;; A bracket renders as one photograph: its reference frame stands for it
+;;; everywhere a path is asked for — metadata, lens, the filmstrip — and only
+;;; the renderer is handed every frame, which it merges before anything else.
+;;; Kept here, keyed by the reference's path, so that every render of that path
+;;; is a render of the bracket without each caller having to carry the list.
+
+(defvar *brackets* (make-hash-table :test #'equal)
+  "Reference namestring -> the bracket's frames, reference first.")
+
+(defvar *brackets-lock* (sb-thread:make-mutex :name "Orfeus brackets"))
+
+(defun register-bracket (reference frames)
+  "Render REFERENCE as the merge of FRAMES from now on. FRAMES lists every
+frame, REFERENCE first; one frame or none forgets the bracket instead."
+  (let ((key (namestring reference)))
+    (sb-thread:with-mutex (*brackets-lock*)
+      (if (rest frames)
+          (setf (gethash key *brackets*) (mapcar #'pathname frames))
+          (remhash key *brackets*))))
+  frames)
+
+(defun bracket-frames (pathname)
+  "The frames PATHNAME renders as, reference first, or NIL for a single frame."
+  (sb-thread:with-mutex (*brackets-lock*)
+    (values (gethash (namestring pathname) *brackets*))))
+
+(defun render-source-namestring (pathname)
+  "What the renderer is handed for PATHNAME: its namestring, or for a bracket
+every frame's, one per line."
+  (let ((frames (bracket-frames pathname)))
+    (if frames
+        (format nil "~{~A~^~%~}" (mapcar #'namestring frames))
+        (namestring pathname))))
+
+(defun string-fast-digest (string)
+  "A 128-bit hex digest of STRING, FNV-1a in two lanes; a key, not a signature."
+  (let ((low 14695981039346656037)
+        (high 1099511628211))
+    (declare (type (unsigned-byte 64) low high))
+    (loop for character across string
+          for code = (char-code character)
+          do (setf low (ldb (byte 64 0) (* (logxor low code) +fnv-prime+))
+                   high (ldb (byte 64 0) (* (logxor high (logxor code 165)) +fnv-prime+))))
+    (format nil "~16,'0X~16,'0X" high low)))

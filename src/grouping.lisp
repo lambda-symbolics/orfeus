@@ -73,6 +73,45 @@ show them in, and regrouping would move photographs around under the cursor."
       (push (nreverse current) groups))
     (nreverse groups)))
 
+(defparameter *bracket-within-seconds* 4
+  "Longest gap between consecutive frames of one exposure bracket.
+
+A five-frame bracket whose longest frame is a quarter of a second takes about a
+second; the clock only has whole seconds, so two frames a second apart can read
+two seconds apart, and the margin above that covers a slow card.")
+
+(defun group-brackets (entries &key (within-seconds *bracket-within-seconds*))
+  "Find exposure brackets in ENTRIES, which are in capture order.
+
+Each entry is (KEY SECONDS SHOT): SHOT is the frame's number in its bracket as
+the camera recorded it, or NIL. A bracket is a run that starts at shot 1 and
+counts up by one, frame after frame, each within WITHIN-SECONDS of the last.
+Anything else — a run broken by a frame from outside it, a bracket whose first
+frame was deleted — is not merged: a merge of the wrong frames is worse than
+none. Returns a list of brackets, each a list of keys in shot order, of two
+frames or more."
+  (let ((brackets '())
+        (current '())
+        (previous nil))
+    (flet ((close-current ()
+             (when (rest current)
+               (push (nreverse current) brackets))
+             (setf current '())))
+      (dolist (entry entries)
+        (destructuring-bind (key seconds shot) entry
+          (cond ((and shot (= shot 1))
+                 (close-current)
+                 (push key current))
+                ((and shot current previous
+                      (= shot (1+ (third previous)))
+                      (second previous) seconds
+                      (<= (abs (- seconds (second previous))) within-seconds))
+                 (push key current))
+                (t (close-current)))
+          (setf previous (if current entry nil))))
+      (close-current))
+    (nreverse brackets)))
+
 (defun group-index-of (groups)
   "Return a hash table from each key to (GROUP-NUMBER POSITION SIZE).
 

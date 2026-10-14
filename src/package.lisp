@@ -79,6 +79,13 @@
    #:photo-rating
    #:photo-roll-angle
    #:photo-hdr-mode
+   #:photo-bracket-shot
+   #:group-brackets
+   #:register-bracket
+   #:bracket-frames
+   #:photo-job-bracket
+   #:photo-job-set-bracket
+   #:project-unmerged
    #:photo-capture-seconds
    #:photo-signature
    #:group-captures
