@@ -5822,7 +5822,37 @@ fn key_memo() -> &'static Mutex<Vec<(StatIdentity, DecodeCacheKey)>> {
 /// size, and modification time reuse the previous hash. Anything that
 /// rewrites the file changes at least one of those, and callers that must
 /// be certain use `file_content_digest`.
+/// The frames of an exposure bracket, when INPUT names one: their paths, one
+/// per line, the reference first. A bracket travels through the bridge as a
+/// single input so that every cache keyed by input — decoded frames, scaled
+/// sources, graph checkpoints — holds the merged frame like any other.
+pub(crate) fn bracket_members(input: &Path) -> Option<Vec<PathBuf>> {
+    let text = input.to_str()?;
+    text.contains('\n').then(|| {
+        text.lines()
+            .filter(|line| !line.is_empty())
+            .map(PathBuf::from)
+            .collect()
+    })
+}
+
+/// One digest standing for every frame of a bracket, in order.
+fn bracket_digest(
+    members: &[PathBuf],
+    digest: impl Fn(&Path) -> Result<DecodeCacheKey, Error>,
+) -> Result<DecodeCacheKey, Error> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"orfeus-bracket-v1");
+    for member in members {
+        hasher.update(digest(member)?);
+    }
+    Ok(hasher.finalize().into())
+}
+
 pub(crate) fn decode_cache_key(input: &Path) -> Result<DecodeCacheKey, Error> {
+    if let Some(members) = bracket_members(input) {
+        return bracket_digest(&members, decode_cache_key);
+    }
     let identity = stat_identity(input)?;
     {
         let mut memo = key_memo()
@@ -5848,6 +5878,9 @@ pub(crate) fn decode_cache_key(input: &Path) -> Result<DecodeCacheKey, Error> {
 }
 
 pub(crate) fn file_content_digest(input: &Path) -> Result<DecodeCacheKey, Error> {
+    if let Some(members) = bracket_members(input) {
+        return bracket_digest(&members, file_content_digest);
+    }
     let mut file = File::open(input)?;
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];
@@ -6315,12 +6348,127 @@ pub(crate) fn as_shot_kelvin(input: &Path) -> Result<Option<f32>, Error> {
     Ok(super::color::as_shot_kelvin(&raw.color_matrix, raw.wb_coeffs))
 }
 
+/// One frame developed as far as camera RGB: demosaiced (or binned) and
+/// scaled so the sensor's white level is 1.0 in every channel, before white
+/// balance and the camera matrix. That is the one place every channel clips at
+/// the same known value, which is what merging a bracket needs to know.
+pub(crate) struct DevelopedFrame {
+    pub(crate) developed: Intermediate,
+    pub(crate) white_balance: [f32; 4],
+    pub(crate) color_matrix: std::collections::HashMap<
+        rawler::imgop::xyz::Illuminant,
+        rawler::imgop::xyz::FlatColorMatrix,
+    >,
+    pub(crate) metadata: rawler::decoders::RawMetadata,
+    pub(crate) full_pixels: usize,
+}
+
+impl DevelopedFrame {
+    /// The ISO the frame was taken at, or 200 when it does not say.
+    pub(crate) fn iso(&self) -> f32 {
+        let exif = &self.metadata.exif;
+        exif.iso_speed_ratings
+            .map(f32::from)
+            .or(exif.iso_speed.map(|value| value as f32))
+            .or(exif.recommended_exposure_index.map(|value| value as f32))
+            .filter(|iso| *iso > 0.0)
+            .unwrap_or(200.0)
+    }
+
+    /// Light gathered, relative: shutter time, ISO and aperture area.
+    pub(crate) fn exposure(&self) -> Option<f32> {
+        let exif = &self.metadata.exif;
+        let time = exif.exposure_time.filter(|value| value.d != 0)?;
+        let time = time.n as f32 / time.d as f32;
+        let iso = exif
+            .iso_speed_ratings
+            .map(f32::from)
+            .or(exif.iso_speed.map(|value| value as f32))
+            .or(exif.recommended_exposure_index.map(|value| value as f32))
+            .unwrap_or(100.0);
+        let fnumber = exif
+            .fnumber
+            .filter(|value| value.d != 0 && value.n != 0)
+            .map_or(1.0, |value| value.n as f32 / value.d as f32);
+        (time > 0.0).then(|| time * iso / (fnumber * fnumber))
+    }
+
+    pub(crate) fn into_decoded(self) -> Result<DecodedRaw, Error> {
+        let as_shot_kelvin =
+            super::color::as_shot_kelvin(&self.color_matrix, self.white_balance);
+        let linear_srgb =
+            intermediate_to_linear_srgb(self.developed, &self.color_matrix, self.white_balance)
+                .map_err(Error::Color)?;
+        let metadata = self.metadata;
+        Ok(DecodedRaw {
+            width: linear_srgb.width,
+            height: linear_srgb.height,
+            data: linear_srgb.data,
+            orientation: metadata.exif.orientation.unwrap_or(1),
+            make: metadata.make.clone(),
+            model: metadata.model.clone(),
+            lens_name: metadata
+                .lens
+                .as_ref()
+                .map_or_else(String::new, |lens| lens.lens_name.clone()),
+            focal: metadata
+                .exif
+                .focal_length
+                .as_ref()
+                .map_or(0.0, |value| value.as_f32()),
+            as_shot_kelvin,
+            full_pixels: self.full_pixels,
+        })
+    }
+}
+
+/// Develops one RAW file to camera RGB; see `DevelopedFrame`.
+pub(crate) fn develop_frame(
+    input: &Path,
+    draft: bool,
+    method: Demosaic,
+    profiling: bool,
+) -> Result<DevelopedFrame, Error> {
+    let source = RawSource::new(input)?;
+    let container_error = match develop_source(&source, draft, method, profiling) {
+        Ok(developed) => return Ok(developed),
+        Err(error) => error,
+    };
+    let Ok(original) = super::embedded_original(source.buf()) else {
+        return Err(container_error);
+    };
+    let source = RawSource::new_from_shared_vec(Arc::new(original)).with_path(input);
+    develop_source(&source, draft, method, profiling).map_err(|original_error| {
+        Error::Render(format!(
+            "{container_error}, and its embedded original: {original_error}"
+        ))
+    })
+}
+
 fn decode_source(
     source: &RawSource,
     draft: bool,
     method: Demosaic,
     profiling: bool,
 ) -> Result<DecodedRaw, Error> {
+    let started = Instant::now();
+    let developed = develop_source(source, draft, method, profiling)?;
+    let decoded = developed.into_decoded();
+    if profiling {
+        eprintln!(
+            "orfeus-profile stage=camera-to-srgb milliseconds={:.3}",
+            started.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+    decoded
+}
+
+fn develop_source(
+    source: &RawSource,
+    draft: bool,
+    method: Demosaic,
+    profiling: bool,
+) -> Result<DevelopedFrame, Error> {
     let mut stage_started = Instant::now();
     macro_rules! profile_stage {
         ($name:literal) => {
@@ -6391,34 +6539,16 @@ fn decode_source(
         },
     };
     profile_stage!("develop");
+    let _ = stage_started;
     // Start from the camera's neutral rendering for both as-shot and custom
     // temperature. Custom Kelvin is a relative chromatic adaptation around D65;
     // dropping the sensor WB coefficients leaves Bayer green dominant.
-    let white_balance = raw.wb_coeffs;
-    let as_shot_kelvin = super::color::as_shot_kelvin(&raw.color_matrix, white_balance);
-    let full_pixels = roi.d.w * roi.d.h;
-    let linear_srgb = intermediate_to_linear_srgb(developed, &raw.color_matrix, white_balance)
-        .map_err(Error::Color)?;
-    profile_stage!("camera-to-srgb");
-    let _ = stage_started;
-    Ok(DecodedRaw {
-        width: linear_srgb.width,
-        height: linear_srgb.height,
-        data: linear_srgb.data,
-        orientation: metadata.exif.orientation.unwrap_or(1),
-        make: metadata.make.clone(),
-        model: metadata.model.clone(),
-        lens_name: metadata
-            .lens
-            .as_ref()
-            .map_or_else(String::new, |lens| lens.lens_name.clone()),
-        focal: metadata
-            .exif
-            .focal_length
-            .as_ref()
-            .map_or(0.0, |value| value.as_f32()),
-        as_shot_kelvin,
-        full_pixels,
+    Ok(DevelopedFrame {
+        developed,
+        white_balance: raw.wb_coeffs,
+        color_matrix: raw.color_matrix.clone(),
+        metadata,
+        full_pixels: roi.d.w * roi.d.h,
     })
 }
 
@@ -6557,7 +6687,13 @@ pub(crate) fn decoded_for_render_with_identity(
     profiling: bool,
 ) -> Result<(Arc<DecodedRaw>, Option<DecodeCacheKey>), Error> {
     decoded_for_render_with_identity_using(input, cache_mode, draft, method, profiling, || {
-        decode_linear_srgb(input, draft, method, profiling)
+        match bracket_members(input) {
+            Some(members) => {
+                let members: Vec<&Path> = members.iter().map(PathBuf::as_path).collect();
+                super::bracket::merge_bracket(&members, draft, method, profiling)
+            }
+            None => decode_linear_srgb(input, draft, method, profiling),
+        }
     })
 }
 

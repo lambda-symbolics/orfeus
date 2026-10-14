@@ -2102,14 +2102,18 @@ pub fn render_graph(
     graph_bytes: &[u8],
     cache_mode: u32,
 ) -> Result<(), Error> {
-    if render::same_file(input, output)? {
+    // A bracket's reference stands for it wherever a file is wanted.
+    let reference = render::bracket_members(input)
+        .and_then(|members| members.into_iter().next())
+        .unwrap_or_else(|| input.to_path_buf());
+    if render::same_file(&reference, output)? {
         return Err(Error::InvalidArgument(
             "input and output refer to the same file",
         ));
     }
     let image = render_graph_image(input, frame, graph_bytes, cache_mode)?;
     render::atomic_encode(
-        input,
+        &reference,
         output,
         &image,
         frame.output_format,
