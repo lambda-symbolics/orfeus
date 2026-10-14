@@ -6137,16 +6137,31 @@ behind is memory. Best effort; returns how many directories went."
                    (when graph-canvas (lightfast:redraw graph-canvas))
                    (schedule-edited-preview))
                (error (condition) (set-status (princ-to-string condition)))))
-           (report-export-progress (index total job output)
-             ;; A batch used to show one line for its whole run, so a long
-             ;; export looked stalled. Name the file about to be written.
-             (declare (ignore job))
-             (queue-event queue (list :export-progress (/ (1- index) total)))
-             (queue-event queue
-                          (list :status nil
-                                (format nil "Exporting ~D of ~D: ~A"
-                                        index total (file-namestring output))))
-             (values))
+           (export-reporters ()
+             ;; Two callbacks for one export: the batch names the photograph
+             ;; about to be written, and the render says how far into it it
+             ;; is. The bar shows both, so neither a long batch nor one big
+             ;; frame sits still.
+             (let ((base 0) (span 1))
+               (values
+                (lambda (index total job output)
+                  ;; A batch used to show one line for its whole run, so a
+                  ;; long export looked stalled. Name the file being written.
+                  (declare (ignore job))
+                  (setf base (/ (1- index) total)
+                        span (/ 1 total))
+                  (queue-event queue (list :export-progress base))
+                  (queue-event queue
+                               (list :status nil
+                                     (format nil "Exporting ~D of ~D: ~A"
+                                             index total
+                                             (file-namestring output))))
+                  (values))
+                (lambda (stage fraction)
+                  (declare (ignore stage))
+                  (queue-event queue
+                               (list :export-progress
+                                     (+ base (* span fraction))))))))
            (render-selected ()
              (setf progress-total 0
                    progress-generation preview-generation)
@@ -6160,7 +6175,10 @@ behind is memory. Best effort; returns how many directories went."
                       (queue-event queue (list :status nil "Exporting current photo..."))
                       (handler-case
                           (progn
-                            (render-photo-job project job :if-exists :supersede)
+                            (render-photo-job project job
+                                              :if-exists :supersede
+                                              :progress (nth-value
+                                                         1 (export-reporters)))
                             (queue-event queue (list :done output)))
                         (error (condition)
                           (queue-event queue
@@ -6178,9 +6196,11 @@ behind is memory. Best effort; returns how many directories went."
                 (lambda ()
                   (queue-event queue (list :status nil "Exporting all photos..."))
                   (multiple-value-bind (completed failures)
-                      (project-render
-                       project :if-exists :supersede :on-error :continue
-                       :progress-callback #'report-export-progress)
+                      (multiple-value-bind (batch render) (export-reporters)
+                        (project-render
+                         project :if-exists :supersede :on-error :continue
+                         :progress-callback batch
+                         :render-progress render))
                     (if failures
                         (queue-event queue
                                      (list :error
@@ -6209,10 +6229,12 @@ behind is memory. Best effort; returns how many directories went."
                                    (list :status nil
                                          (format nil "Exporting ~A..." label)))
                       (multiple-value-bind (completed failures)
-                          (render-photo-jobs
-                           project jobs
-                           :if-exists :supersede :on-error :continue
-                           :progress-callback #'report-export-progress)
+                          (multiple-value-bind (batch render) (export-reporters)
+                            (render-photo-jobs
+                             project jobs
+                             :if-exists :supersede :on-error :continue
+                             :progress-callback batch
+                             :render-progress render))
                         (queue-event
                          queue
                          (if failures
@@ -7370,8 +7392,8 @@ behind is memory. Best effort; returns how many directories went."
                  ;; A render that is reporting its own stages knows better than
                  ;; the queue does: the queue counts jobs, and one job is the
                  ;; whole wait. Its own fraction wins for as long as it lasts.
-                 ;; An export batch is one job too, so it goes by the
-                 ;; photographs it has written.
+                 ;; An export is one job too, so it goes by the photographs
+                 ;; written and the render's own stages within each.
                  (when (zerop export-load)
                    (setf export-fraction nil))
                  (cond ((and export-fraction (plusp export-load))

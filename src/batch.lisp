@@ -59,11 +59,13 @@ one-based suffix. Explicit :output paths are never rewritten."
            (project-output-directory project))))))
 
 (defun render-photo-job (project photo &key (if-exists :error)
-                                            (finisher #'funcall))
+                                            (finisher #'funcall)
+                                            progress)
   "Render PHOTO using PROJECT's processing and export settings.
 
 FINISHER is passed on to RENDER-PHOTO: it decides when the metadata copy and
-the publishing of the file happen."
+the publishing of the file happen. PROGRESS, when given, is called with a stage
+name and a fraction while the render runs."
   (let ((export (project-export-settings project)))
     (render-photo
      (photo-job-input-path photo)
@@ -75,17 +77,20 @@ the publishing of the file happen."
      :max-width (export-settings-max-width export)
      :max-height (export-settings-max-height export)
      :preserve-metadata-p (export-settings-preserve-metadata-p export)
-     :finisher finisher)))
+     :finisher finisher
+     :progress progress)))
 
 (defun render-photo-jobs (project photos &key (if-exists :error)
                                               (on-error :abort)
-                                              progress-callback)
+                                              progress-callback
+                                              render-progress)
   "Render PHOTOS of PROJECT through the shared processing pipeline, in order.
 
 Returns two values: completed output pathnames and `(PHOTO . CONDITION)`
 failures, both in the order of PHOTOS. ON-ERROR accepts :ABORT or :CONTINUE.
 PROGRESS-CALLBACK, when provided, receives index, total, photo job, and output
-pathname before each render starts.
+pathname before each render starts. RENDER-PROGRESS is passed to each render
+as its PROGRESS: a stage name and a fraction of that one photograph.
 
 Renders run one at a time on purpose. Overlapping them was measured on a
 13700H over six 20 MP frames: one at a time 11.3 s, two 12.1 s, three 11.6 s.
@@ -137,6 +142,7 @@ before this function returns."
                (handler-case
                    (render-photo-job project photo
                                      :if-exists if-exists
+                                     :progress render-progress
                                      :finisher (lambda (thunk)
                                                  (finish-later index thunk)))
                  (error (condition)
@@ -156,9 +162,10 @@ before this function returns."
       (values (nreverse completed) (nreverse failures)))))
 
 (defun project-render (project &key (if-exists :error) (on-error :abort)
-                                  progress-callback)
+                                  progress-callback render-progress)
   "Render every photo in PROJECT; see RENDER-PHOTO-JOBS for the contract."
   (render-photo-jobs project (project-photos project)
                      :if-exists if-exists
                      :on-error on-error
-                     :progress-callback progress-callback))
+                     :progress-callback progress-callback
+                     :render-progress render-progress))
