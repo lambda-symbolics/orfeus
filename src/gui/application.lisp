@@ -116,6 +116,10 @@ photograph visibly zoom out and then back in as the full render landed. The
 frame a photographer is looking at should not move because a node was retimed."
   (<= (* canvas-pixels zoom) (* 2 draft-bound)))
 
+(defvar *live-latency-log* (uiop:getenv "ORFEUS_LIVE_LATENCY")
+  "When true, each live frame shown reports to standard error how long after
+the edit it answers it arrived.")
+
 (defparameter *gui-live-preview-size* 1600
   "Bounding size of live drag previews rendered straight into the canvas
 buffer, with no JPEG or file on the path.")
@@ -1729,6 +1733,18 @@ behind is memory. Best effort; returns how many directories went."
            (after-live-height 0)
            (after-live-generation 0)
            after-live-p live-settle-id
+           ;; The live path keeps one render in flight. An edit that arrives
+           ;; while it runs only marks itself pending; the render's completion
+           ;; starts the next one from whatever the settings are by then. So
+           ;; a drag gets frames as fast as they can be made, and the newest
+           ;; finished frame is shown even though the slider has moved on.
+           live-busy-p live-pending-p
+           (live-epoch 0)
+           (live-sequence 0)
+           (live-shown-sequence 0)
+           ;; When the oldest edit not yet taken up by a live render arrived:
+           ;; what input-to-frame latency is measured from.
+           live-edit-since
            (progress-generation -1)
            (thumbnail-scroll 0)
            (thumbnail-anchor 0)
@@ -6039,53 +6055,64 @@ behind is memory. Best effort; returns how many directories went."
              (setf render-stage nil
                    render-stage-fraction 0.0)
              (incf preview-generation)
+             (incf live-epoch)
              (setf progress-total 0
                    progress-generation preview-generation)
              (discard-gui-tasks queue :before)
              (discard-gui-tasks queue :after)
              (enqueue-preview t))
+           (live-path-p ()
+             ;; The drag hot path renders straight into the back buffer,
+             ;; swapped onto the canvas by the poll loop. Photos still on
+             ;; flat settings take the file path.
+             (let ((job (selected-job)))
+               (and job after-live-back
+                    (<= preview-zoom 1.0001d0)
+                    (typep (current-settings) 'orfeus:processing-graph))))
            (enqueue-live-preview ()
-             ;; The drag hot path: bounded render straight into the back
-             ;; buffer, swapped onto the canvas by the poll loop. Falls
-             ;; back to the file path for photos still on flat settings.
+             (cond ((not (live-path-p)) (enqueue-preview nil))
+                   (live-busy-p (setf live-pending-p t))
+                   (t (start-live-render))))
+           (start-live-render ()
              (let* ((job (selected-job))
-                    (generation preview-generation)
-                    (recipe (and job (current-settings))))
-               (if (and job after-live-back
-                        (<= preview-zoom 1.0001d0)
-                        (typep recipe 'orfeus:processing-graph))
-                   (let ((snapshot (preview-recipe-snapshot recipe))
-                         (input (photo-job-input-path job)))
-                     (enqueue-gui-task
-                      queue :live
-                      (lambda ()
-                        (when (= generation preview-generation)
-                          (let ((started (get-internal-real-time)))
-                            (handler-case
-                                (multiple-value-bind (width height)
-                                    (orfeus:render-preview-rgb
-                                     input snapshot
-                                     after-live-back after-live-capacity
-                                     :max-width *gui-live-preview-size*
-                                     :max-height *gui-live-preview-size*
-                                     :cache-p t)
-                                  (setf live-render-ms
-                                        (/ (* 1000.0
-                                              (- (get-internal-real-time)
-                                                 started))
-                                           internal-time-units-per-second))
-                                  (when (= generation preview-generation)
-                                    (queue-event
-                                     queue
-                                     (list :live-preview generation job
-                                           width height))))
-                              (error (condition)
-                                (queue-event
-                                 queue
-                                 (list :error
-                                       (princ-to-string condition))))))))
-                      :replace-kind :live :front-p t))
-                   (enqueue-preview nil))))
+                    (snapshot (preview-recipe-snapshot (current-settings)))
+                    (input (photo-job-input-path job))
+                    (epoch live-epoch)
+                    (sequence (incf live-sequence))
+                    (since live-edit-since))
+               (setf live-busy-p t
+                     live-pending-p nil
+                     live-edit-since nil)
+               (enqueue-gui-task
+                queue :live
+                (lambda ()
+                  (let ((started (get-internal-real-time))
+                        width height)
+                    ;; Whatever happens, the interface hears that the
+                    ;; render is over, or no live render would start again.
+                    (unwind-protect
+                         (handler-case
+                             (progn
+                               (multiple-value-setq (width height)
+                                 (orfeus:render-preview-rgb
+                                  input snapshot
+                                  after-live-back after-live-capacity
+                                  :max-width *gui-live-preview-size*
+                                  :max-height *gui-live-preview-size*
+                                  :cache-p t))
+                               (setf live-render-ms
+                                     (/ (* 1000.0
+                                           (- (get-internal-real-time) started))
+                                        internal-time-units-per-second)))
+                           (error (condition)
+                             (setf width nil)
+                             (queue-event queue
+                                          (list :error
+                                                (princ-to-string condition)))))
+                      (queue-event queue
+                                   (list :live-preview epoch sequence job
+                                         width height since)))))
+                :replace-kind :live :front-p t)))
            (schedule-live-settle ()
              ;; Once the drag quiets down, one file render persists the
              ;; result: the content-keyed cache, histogram, thumbnails,
@@ -6107,18 +6134,28 @@ behind is memory. Best effort; returns how many directories went."
              ;; follows every edit.
              (sync-window-title)
              (when debounce-id
-               (ignore-errors (lightfast:remove-timeout debounce-id)))
-             (setf debounce-id
-                   (lightfast:add-timeout
-                    ;; Checkpointed live renders come back in tens of
-                    ;; milliseconds, so track drags tightly.
-                    (if (< live-render-ms 250) 0.04d0
-                        *preview-debounce-seconds*)
-                    (lambda ()
-                      (setf debounce-id nil)
-                      (discard-gui-tasks queue :after)
-                      (enqueue-live-preview)
-                      (schedule-live-settle)))))
+               (ignore-errors (lightfast:remove-timeout debounce-id))
+               (setf debounce-id nil))
+             ;; A debounce here used to restart on every edit, so a steady
+             ;; drag never let a render start until the hand paused. The live
+             ;; path starts at once and paces itself by its one render in
+             ;; flight; only the file path still waits for a pause.
+             (if (live-path-p)
+                 (progn
+                   (unless live-edit-since
+                     (setf live-edit-since (get-internal-real-time)))
+                   (discard-gui-tasks queue :after)
+                   (enqueue-live-preview)
+                   (schedule-live-settle))
+                 (setf debounce-id
+                       (lightfast:add-timeout
+                        (if (< live-render-ms 250) 0.04d0
+                            *preview-debounce-seconds*)
+                        (lambda ()
+                          (setf debounce-id nil)
+                          (discard-gui-tasks queue :after)
+                          (enqueue-live-preview)
+                          (schedule-live-settle))))))
            (setting-changed (key widget &optional allow-empty)
              (handler-case
                  (let ((new-value (parse-number (lightfast:value widget)
@@ -7270,16 +7307,34 @@ behind is memory. Best effort; returns how many directories went."
                       ;; Arrived for a photograph or a grade no longer shown.
                       (discard-display (sixth event))))
                  (:live-preview
-                  (when (and (= (second event) preview-generation)
-                             (eq (third event) (selected-job)))
-                    (rotatef after-live-front after-live-back)
-                    (setf after-live-width (fourth event)
-                          after-live-height (fifth event)
-                          after-live-p t)
-                    (incf after-live-generation)
-                    (when after-canvas (lightfast:redraw after-canvas))
-                    ;; The scope now trails the image, so repaint its notice.
-                    (when scope-canvas (lightfast:redraw scope-canvas))))
+                  (destructuring-bind (epoch sequence job width height since)
+                      (rest event)
+                    (setf live-busy-p nil)
+                    ;; Newer than what is on screen and for the photograph
+                    ;; still shown: worth showing, even with another edit
+                    ;; already waiting.
+                    (when (and width
+                               (= epoch live-epoch)
+                               (> sequence live-shown-sequence)
+                               (eq job (selected-job)))
+                      (rotatef after-live-front after-live-back)
+                      (setf live-shown-sequence sequence
+                            after-live-width width
+                            after-live-height height
+                            after-live-p t)
+                      (when (and since *live-latency-log*)
+                        (format *error-output* "live frame ~D: ~D ms after edit, render ~D ms~%"
+                                sequence
+                                (round (* 1000 (- (get-internal-real-time) since))
+                                       internal-time-units-per-second)
+                                (round live-render-ms))
+                        (force-output *error-output*))
+                      (incf after-live-generation)
+                      (when after-canvas (lightfast:redraw after-canvas))
+                      ;; The scope now trails the image, so repaint its notice.
+                      (when scope-canvas (lightfast:redraw scope-canvas)))
+                    (when live-pending-p
+                      (enqueue-live-preview))))
                  (:histogram
                   (if (and (= (second event) preview-generation)
                            (equal (third event) after-preview-file))
@@ -8898,6 +8953,12 @@ behind is memory. Best effort; returns how many directories went."
         (sync-node-tools)
         (layout-ui)
         (setf poll-id (lightfast:add-timeout 0.08d0 #'poll :repeat t))
+        ;; The poll alone left a finished live frame waiting up to 80 ms to be
+        ;; noticed — more than the render took. The foreground queue wakes
+        ;; the interface as soon as it has something to say.
+        (let ((wakeup (lightfast:add-wakeup #'poll)))
+          (setf (gui-queue-notify queue)
+                (lambda () (lightfast:wake wakeup))))
         ;; Best-effort housekeeping of the persistent preview cache.
         (enqueue-gui-task background-queue :evict
                           (lambda ()
@@ -8916,6 +8977,7 @@ behind is memory. Best effort; returns how many directories went."
              (progn (lightfast:show window) (lightfast:run))
           (when poll-id (ignore-errors (lightfast:remove-timeout poll-id)))
           (when debounce-id (ignore-errors (lightfast:remove-timeout debounce-id)))
+          (setf (gui-queue-notify queue) nil)
           (stop-gui-queue queue)
           (stop-gui-queue background-queue)
           (stop-gui-queue histogram-queue)

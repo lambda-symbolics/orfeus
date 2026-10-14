@@ -13,7 +13,11 @@
   (running 0 :type fixnum)
   (running-kinds '())
   (workers '())
-  stopping-p)
+  stopping-p
+  ;; Called, from whichever thread queued it, after each event: lets the
+  ;; interface thread hear of a finished render now rather than at its next
+  ;; poll.
+  notify)
 
 (defun make-gui-queue (&key (workers 1) (name "Orfeus GUI render worker"))
   "Create a render queue serviced by WORKERS bounded worker threads."
@@ -31,7 +35,10 @@
 (defun queue-event (queue event)
   (sb-thread:with-mutex ((gui-queue-lock queue))
     (setf (gui-queue-events queue)
-          (nconc (gui-queue-events queue) (list event)))))
+          (nconc (gui-queue-events queue) (list event))))
+  (let ((notify (gui-queue-notify queue)))
+    (when notify
+      (ignore-errors (funcall notify)))))
 
 (defun drain-events (queue)
   (sb-thread:with-mutex ((gui-queue-lock queue))
