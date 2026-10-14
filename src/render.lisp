@@ -517,10 +517,11 @@ reported, because that render will fail again and say so properly."
 
 (defun render-preview-rgb (input-pathname graph rgb-buffer capacity
                            &key (max-width 2048) (max-height 2048)
-                             (grain-seed 0) (cache-p t))
+                             (grain-seed 0) (cache-p t) viewport)
   "Render a bounded live preview through GRAPH into the foreign RGB-BUFFER.
 
-The interactive hot path: no JPEG encode, no file, no metadata copy.
+The interactive hot path: no JPEG encode, no file, no metadata copy. VIEWPORT,
+as for RENDER-PREVIEW, develops only that part of the frame.
 Returns the oriented image width and height as two values."
   (check-type graph processing-graph)
   (multiple-value-bind (chosen-profile chosen-focal demosaic)
@@ -545,6 +546,7 @@ Returns the oriented image width and height as two values."
                  :focal-reducer focal-reducer
                  :lens-crop-factor lens-crop-factor
                  :grain-seed grain-seed
+                 :viewport viewport
                  :max-width max-width
                  :max-height max-height)))
          (let ((graph (if (and (graph-active-optics-p graph)

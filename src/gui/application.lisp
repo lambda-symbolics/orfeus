@@ -120,6 +120,10 @@ frame a photographer is looking at should not move because a node was retimed."
   "When true, each live frame shown reports to standard error how long after
 the edit it answers it arrived.")
 
+(defparameter *gui-live-buffer-limit* (* 96 1024 1024)
+  "Bytes beyond which a zoomed live render goes to the file path instead: a
+whole frame at a high zoom bound is a full-size render, not a live one.")
+
 (defparameter *gui-live-preview-size* 1600
   "Bounding size of live drag previews rendered straight into the canvas
 buffer, with no JPEG or file on the path.")
@@ -1728,7 +1732,14 @@ behind is memory. Best effort; returns how many directories went."
            (graph-view-state :unset)
            (last-render-ms 10000)
            (live-render-ms 10000)
-           after-live-front after-live-back after-live-capacity
+           ;; Each buffer's size in bytes travels with it through the swap:
+           ;; a zoomed window can need more than the fit view did, and only
+           ;; the back buffer, which no one is drawing, may be regrown.
+           after-live-front after-live-back
+           (after-live-front-capacity 0)
+           (after-live-back-capacity 0)
+           ;; The part of the frame the front buffer holds, or NIL for all of it.
+           after-live-region
            (after-live-width 0)
            (after-live-height 0)
            (after-live-generation 0)
@@ -1745,6 +1756,8 @@ behind is memory. Best effort; returns how many directories went."
            ;; When the oldest edit not yet taken up by a live render arrived:
            ;; what input-to-frame latency is measured from.
            live-edit-since
+           ;; When the latest edit arrived, for the file path's latency.
+           last-edit-time
            (progress-generation -1)
            (thumbnail-scroll 0)
            (thumbnail-anchor 0)
@@ -1900,49 +1913,58 @@ behind is memory. Best effort; returns how many directories went."
                         *gui-preview-minimum-bound*)
                     preview-zoom))))
            (live-view-p (&optional canvas)
-             ;; The live buffer is bounded, so its zoom ceiling is lower
-             ;; than the full-resolution preview's. Showing it only at fit
-             ;; keeps framing identical across the swap; zoomed in, the
-             ;; file preview stays on screen and stays sharp.
              (and after-live-p after-live-front (plusp after-live-width)
-                  (<= preview-zoom 1.0001d0)
                   (or (null canvas) (eq canvas after-canvas))))
-           (draw-current-preview (widget path)
-             ;; The adapter fits, zooms and pans a file about its own centre, so
-             ;; a file that is only part of the frame is drawn by restating the
-             ;; frame's placement in the file's own terms: the same screen
+           (windowed-placement (widget frame-width frame-height
+                                source-width source-height region)
+             ;; The adapter fits, zooms and pans an image about its own centre,
+             ;; so an image that is only part of the frame is drawn by restating
+             ;; the frame's placement in the image's own terms: the same screen
              ;; pixels per render pixel, and the frame point that belongs at the
              ;; canvas centre expressed as a fraction of the window instead of
-             ;; of the frame.
-             (let ((region (preview-region-for widget)))
-               (multiple-value-bind (frame-width frame-height)
-                   (preview-frame-size widget path)
-                 (multiple-value-bind (file-width file-height)
-                     (preview-file-size path)
-                   (if (and region frame-width file-width
-                            (plusp file-width) (plusp file-height))
-                       (destructuring-bind (left top width height) region
-                         (let* ((canvas-width (lightfast:widget-width widget))
-                                (canvas-height (lightfast:widget-height widget))
-                                (frame-fit
-                                  (min (/ canvas-width (float frame-width 1d0))
-                                       (/ canvas-height (float frame-height 1d0))))
-                                (scale (min (max frame-fit 2d0)
-                                            (* frame-fit preview-zoom)))
-                                (file-fit
-                                  (min (/ canvas-width (float file-width 1d0))
-                                       (/ canvas-height (float file-height 1d0)))))
-                           (draw-preview-file
-                            widget path
-                            :zoom (max 1d0 (/ scale file-fit))
-                            :center-x (/ (- preview-center-x left)
-                                         (max 1d-6 width))
-                            :center-y (/ (- preview-center-y top)
-                                         (max 1d-6 height)))))
-                       (draw-preview-file widget path
-                                          :zoom preview-zoom
-                                          :center-x preview-center-x
-                                          :center-y preview-center-y))))))
+             ;; of the frame. Returns zoom, centre x and centre y.
+             (if (and region frame-width source-width
+                      (plusp source-width) (plusp source-height))
+                 (destructuring-bind (left top width height) region
+                   (let* ((canvas-width (lightfast:widget-width widget))
+                          (canvas-height (lightfast:widget-height widget))
+                          (frame-fit
+                            (min (/ canvas-width (float frame-width 1d0))
+                                 (/ canvas-height (float frame-height 1d0))))
+                          (scale (min (max frame-fit 2d0)
+                                      (* frame-fit preview-zoom)))
+                          (source-fit
+                            (min (/ canvas-width (float source-width 1d0))
+                                 (/ canvas-height (float source-height 1d0)))))
+                     (values (max 1d0 (/ scale source-fit))
+                             (/ (- preview-center-x left) (max 1d-6 width))
+                             (/ (- preview-center-y top) (max 1d-6 height)))))
+                 (values preview-zoom preview-center-x preview-center-y)))
+           (draw-current-preview (widget path)
+             (multiple-value-bind (frame-width frame-height)
+                 (preview-frame-size widget path)
+               (multiple-value-bind (file-width file-height)
+                   (preview-file-size path)
+                 (multiple-value-bind (zoom center-x center-y)
+                     (windowed-placement widget frame-width frame-height
+                                         file-width file-height
+                                         (preview-region-for widget))
+                   (draw-preview-file widget path :zoom zoom
+                                                  :center-x center-x
+                                                  :center-y center-y)))))
+           (draw-live-preview (widget)
+             (multiple-value-bind (frame-width frame-height)
+                 (preview-frame-size widget nil)
+               (multiple-value-bind (zoom center-x center-y)
+                   (windowed-placement widget frame-width frame-height
+                                       after-live-width after-live-height
+                                       after-live-region)
+                 (draw-preview-buffer widget after-live-front
+                                      after-live-width after-live-height
+                                      after-live-generation
+                                      :zoom zoom
+                                      :center-x center-x
+                                      :center-y center-y))))
            (preview-region-for (canvas)
              (if (eq canvas before-canvas)
                  before-preview-region
@@ -1961,8 +1983,9 @@ behind is memory. Best effort; returns how many directories went."
                        ;; frame, and no window to ask for.
                        ((null path) (values nil nil))
                        (t (preview-file-size path)))
-               (let ((region (and (not (live-view-p canvas))
-                                  (preview-region-for canvas))))
+               (let ((region (if (live-view-p canvas)
+                                 after-live-region
+                                 (preview-region-for canvas))))
                  (if (and source-width region)
                      (values (/ source-width (max 1d-6 (third region)))
                              (/ source-height (max 1d-6 (fourth region))))
@@ -1985,6 +2008,11 @@ behind is memory. Best effort; returns how many directories went."
              ;; free; this is what asks for more once the margin is nearly
              ;; spent, while the developed window is still on screen to look at.
              (let ((job (selected-job)))
+               ;; A live frame on screen is moved on by another live frame,
+               ;; or the pan would uncover the older grade the file holds.
+               (when (and job (live-view-p)
+                          (not (region-covers-view-p after-live-region)))
+                 (enqueue-live-preview))
                (when (and job (not (live-view-p)))
                  (let ((needed (viewport-request))
                        (current (or requested-viewport-region after-preview-region)))
@@ -2094,13 +2122,13 @@ behind is memory. Best effort; returns how many directories went."
                              (- source-y (* (- source-y preview-center-y) ratio)))))))
                (let ((previous-bound (viewport-render-bound)))
                  (setf preview-zoom new-zoom)
-                 ;; Leaving fit hands the canvas back to the file preview, so
-                 ;; a pending live edit must be settled now instead of after
-                 ;; the drag timer, or the sharp image would lag behind. A
+                 ;; A live frame is developed for the view it was asked for,
+                 ;; so a zoom settles a pending live edit now instead of after
+                 ;; the drag timer, or a soft image would linger. A
                  ;; zoom that crosses a doubling of the bound needs the same
                  ;; render for a different reason: the proxy on screen has
                  ;; fewer pixels than the canvas is about to ask of it.
-                 (when (or (and after-live-p (> new-zoom 1.0001d0))
+                 (when (or after-live-p
                            (/= previous-bound (viewport-render-bound)))
                    (when live-settle-id
                      (ignore-errors (lightfast:remove-timeout live-settle-id))
@@ -3777,7 +3805,14 @@ behind is memory. Best effort; returns how many directories went."
                  (:before (setf before-preview-region region)
                           (setf before-preview-file path)
                           (lightfast:redraw before-canvas))
-                 (:after (setf after-preview-region region
+                 (:after (when (and last-edit-time *live-latency-log*)
+                           (format *error-output* "file frame: ~D ms after the last edit~@[ (window)~]~%"
+                                   (round (* 1000 (- (get-internal-real-time)
+                                                     last-edit-time))
+                                          internal-time-units-per-second)
+                                   region)
+                           (force-output *error-output*))
+                         (setf after-preview-region region
                                after-preview-geometry geometry
                                after-preview-file path
                                after-preview-generation generation
@@ -6066,17 +6101,46 @@ behind is memory. Best effort; returns how many directories went."
              ;; swapped onto the canvas by the poll loop. Photos still on
              ;; flat settings take the file path.
              (let ((job (selected-job)))
+               ;; Not the 1:1 view: its bound is the sensor, which no
+               ;; buffer is sized for ahead of time.
                (and job after-live-back
-                    (<= preview-zoom 1.0001d0)
-                    (typep (current-settings) 'orfeus:processing-graph))))
+                    (not preview-native-p)
+                    (typep (current-settings) 'orfeus:processing-graph)
+                    (<= (nth-value 2 (live-request)) *gui-live-buffer-limit*))))
+           (live-request ()
+             ;; What a live render should develop: the fit view at the live
+             ;; size, or, zoomed in, the same bound and window the file path
+             ;; would ask for. Returns the bound, the region, and the bytes
+             ;; the answer can take.
+             (if (<= preview-zoom 1.0001d0)
+                 (values *gui-live-preview-size* nil
+                         (* *gui-live-preview-size* *gui-live-preview-size* 3))
+                 (let* ((bound (viewport-render-bound))
+                        (region (viewport-request))
+                        (width (if region (third region) 1d0))
+                        (height (if region (fourth region) 1d0)))
+                   (values bound region
+                           (* 3 (+ 2 (ceiling (* bound width)))
+                              (+ 2 (ceiling (* bound height))))))))
+           (ensure-live-back-capacity (bytes)
+             ;; Only the back buffer: nobody draws it, and no render is
+             ;; writing it while none is in flight.
+             (when (< after-live-back-capacity bytes)
+               (cffi:foreign-free after-live-back)
+               (setf after-live-back (cffi:foreign-alloc :uint8 :count bytes)
+                     after-live-back-capacity bytes)))
            (enqueue-live-preview ()
              (cond ((not (live-path-p)) (enqueue-preview nil))
                    (live-busy-p (setf live-pending-p t))
                    (t (start-live-render))))
            (start-live-render ()
-             (let* ((job (selected-job))
+             (multiple-value-bind (bound region bytes) (live-request)
+               (ensure-live-back-capacity bytes)
+              (let* ((job (selected-job))
                     (snapshot (preview-recipe-snapshot (current-settings)))
                     (input (photo-job-input-path job))
+                    (buffer after-live-back)
+                    (capacity after-live-back-capacity)
                     (epoch live-epoch)
                     (sequence (incf live-sequence))
                     (since live-edit-since))
@@ -6095,10 +6159,10 @@ behind is memory. Best effort; returns how many directories went."
                              (progn
                                (multiple-value-setq (width height)
                                  (orfeus:render-preview-rgb
-                                  input snapshot
-                                  after-live-back after-live-capacity
-                                  :max-width *gui-live-preview-size*
-                                  :max-height *gui-live-preview-size*
+                                  input snapshot buffer capacity
+                                  :max-width bound
+                                  :max-height bound
+                                  :viewport region
                                   :cache-p t))
                                (setf live-render-ms
                                      (/ (* 1000.0
@@ -6111,8 +6175,8 @@ behind is memory. Best effort; returns how many directories went."
                                                 (princ-to-string condition)))))
                       (queue-event queue
                                    (list :live-preview epoch sequence job
-                                         width height since)))))
-                :replace-kind :live :front-p t)))
+                                         width height since region bound)))))
+                :replace-kind :live :front-p t))))
            (schedule-live-settle ()
              ;; Once the drag quiets down, one file render persists the
              ;; result: the content-keyed cache, histogram, thumbnails,
@@ -6133,6 +6197,7 @@ behind is memory. Best effort; returns how many directories went."
              ;; Every edit comes through here, so the title's unsaved mark
              ;; follows every edit.
              (sync-window-title)
+             (setf last-edit-time (get-internal-real-time))
              (when debounce-id
                (ignore-errors (lightfast:remove-timeout debounce-id))
                (setf debounce-id nil))
@@ -7307,8 +7372,14 @@ behind is memory. Best effort; returns how many directories went."
                       ;; Arrived for a photograph or a grade no longer shown.
                       (discard-display (sixth event))))
                  (:live-preview
-                  (destructuring-bind (epoch sequence job width height since)
+                  (destructuring-bind (epoch sequence job width height since
+                                       region bound)
                       (rest event)
+                    ;; As for files: an answer as big as the whole bound is
+                    ;; the whole frame, whatever window was asked for.
+                    (when (and region width
+                               (>= (max width height) (* 0.98 bound)))
+                      (setf region nil))
                     (setf live-busy-p nil)
                     ;; Newer than what is on screen and for the photograph
                     ;; still shown: worth showing, even with another edit
@@ -7318,7 +7389,9 @@ behind is memory. Best effort; returns how many directories went."
                                (> sequence live-shown-sequence)
                                (eq job (selected-job)))
                       (rotatef after-live-front after-live-back)
+                      (rotatef after-live-front-capacity after-live-back-capacity)
                       (setf live-shown-sequence sequence
+                            after-live-region region
                             after-live-width width
                             after-live-height height
                             after-live-p t)
@@ -7460,12 +7533,11 @@ behind is memory. Best effort; returns how many directories went."
                        (t
                         (setf (lightfast:value progress)
                               (format nil "~D" percent))))))))
-        (setf after-live-capacity
-              (* *gui-live-preview-size* *gui-live-preview-size* 3)
-              after-live-front (cffi:foreign-alloc
-                                :uint8 :count after-live-capacity)
-              after-live-back (cffi:foreign-alloc
-                               :uint8 :count after-live-capacity))
+        (let ((capacity (* *gui-live-preview-size* *gui-live-preview-size* 3)))
+          (setf after-live-front-capacity capacity
+                after-live-back-capacity capacity
+                after-live-front (cffi:foreign-alloc :uint8 :count capacity)
+                after-live-back (cffi:foreign-alloc :uint8 :count capacity)))
         (setf window (lightfast:make-window :width 1280 :height 800
                                           :label "Orfeus"
                                           :app-id "org.orfeus.Orfeus"))
@@ -7929,13 +8001,7 @@ behind is memory. Best effort; returns how many directories went."
                                        (live-view-p widget))))
                       (cond
                         (live-p
-                         (draw-preview-buffer widget after-live-front
-                                              after-live-width
-                                              after-live-height
-                                              after-live-generation
-                                              :zoom preview-zoom
-                                              :center-x preview-center-x
-                                              :center-y preview-center-y)
+                         (draw-live-preview widget)
                          (draw-crop-overlay widget))
                         (path
                          (draw-current-preview widget path)
