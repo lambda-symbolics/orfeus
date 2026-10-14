@@ -1922,6 +1922,11 @@ fn execute_graph_into(
         if same {
             let entry = windows.as_mut().expect("checked above");
             entry.ops = ops.to_vec();
+            // The same window of a frame cropped differently is a different
+            // window: what it holds and where it sits come from this render.
+            entry.origin = window_origin;
+            entry.frame = window_frame;
+            entry.inner = window_inner;
             // Only what this render resumed through is still the same state.
             entry
                 .checkpoints
@@ -3563,6 +3568,48 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn a_crop_change_under_a_cached_window_does_not_keep_its_old_geometry() {
+        let program = |crop_width: f32, shadows: f32| {
+            parse_graph(
+                &GraphBuilder::new()
+                    .node(NODE_CROP, 0, -1, &[0.05, 0.05, crop_width, 0.9, 0.0], None)
+                    .node(NODE_EXPOSURE, 1, -1, &[0.4], None)
+                    .node(NODE_NOISE_REDUCTION, 2, -1, &[0.6, 0.0], None)
+                    .node(NODE_TONE, 3, -1, &[shadows, 0.1, 0.0, -0.1, 0.0, 0.1, 0.0], None)
+                    .build(),
+            )
+            .unwrap()
+        };
+        let graph_context = context(5);
+        let key = test_prefix_key("window-crop-test", &graph_context);
+        let rect = [0.3_f32, 0.25, 0.3, 0.35];
+        // Render the window, change the crop under the same window, then
+        // drag the tone: the last must resume with the new crop's geometry.
+        for (crop_width, shadows) in [(0.9, 0.1), (0.9, 0.2), (0.6, 0.2), (0.6, 0.3), (0.6, 0.4)] {
+            let ops = program(crop_width, shadows);
+            let cached = execute_graph_windowed_cached(
+                &ops,
+                noisy_scene(320, 240),
+                &graph_context,
+                rect,
+                key.clone(),
+            )
+            .unwrap();
+            let cold =
+                execute_graph_windowed(&ops, noisy_scene(320, 240), &graph_context, rect).unwrap();
+            assert_eq!(
+                (cached.width, cached.height),
+                (cold.width, cold.height),
+                "crop {crop_width} tone {shadows} came back the wrong size"
+            );
+            assert!(
+                max_difference(&cached, &cold) == 0.0,
+                "crop {crop_width} tone {shadows} differs from a cold render"
+            );
         }
     }
 
