@@ -66,12 +66,46 @@
                         (format t "    drag tick ~D ~,1F ms~%" index drag))))
         (cffi:foreign-free buffer)))))
 
+;;; Zoomed in: the GUI asks for a window of a frame developed at a larger bound.
+;;; Denoising runs inside the window, so a curve drag pays for it again on every
+;;; tick unless the window's own result is kept; a pan keeps the geometry but
+;;; moves the window.
+
+(defparameter *zoom-bound* 4096)
+(defparameter *zoom-window* '(0.40 0.35 0.22 0.30))
+(defparameter *pan-window* '(0.44 0.37 0.22 0.30))
+
+(defun bench-zoomed (path)
+  (let* ((capacity (* 3 12000 12000))
+         (buffer (cffi:foreign-alloc :unsigned-char :count capacity)))
+    (format t "  --- bound ~D, window ~{~,2F~^ ~} ---~%" *zoom-bound* *zoom-window*)
+    (unwind-protect
+         (flet ((tick (label lift window)
+                  (multiple-value-bind (size ms)
+                      (timing (multiple-value-list
+                               (orfeus:render-preview-rgb
+                                path (curve-graph lift) buffer capacity
+                                :max-width *zoom-bound* :max-height *zoom-bound*
+                                :viewport window)))
+                    (format t "    ~12A ~,1F ms  -> ~{~A~^x~}~%" label ms size))))
+           (tick "cold" 0.33 *zoom-window*)
+           (tick "same again" 0.33 *zoom-window*)
+           (loop for lift in '(0.30 0.36 0.40 0.44 0.48)
+                 for index from 1
+                 do (tick (format nil "drag tick ~D" index) lift *zoom-window*))
+           (tick "pan" 0.48 *pan-window*)
+           (loop for lift in '(0.44 0.40 0.36)
+                 for index from 1
+                 do (tick (format nil "pan tick ~D" index) lift *pan-window*)))
+      (cffi:foreign-free buffer))))
+
 (let ((files (rest sb-ext:*posix-argv*))
       (bounds (list 1600 2048 0)))
   (when (null files)
     (format t "usage: bench-interactive.lisp FILE [FILE...]~%")
     (sb-ext:quit :unix-status 2))
   (dolist (path files)
-    (handler-case (bench-file (pathname path) bounds)
+    (handler-case (progn (bench-file (pathname path) bounds)
+                         (bench-zoomed (pathname path)))
       (error (condition)
         (format t "  failed: ~A~%" condition)))))

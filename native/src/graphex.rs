@@ -856,7 +856,9 @@ fn rotate_crop_image(
 /// A saved register entering one op boundary, for interactive resumes.
 struct PrefixSnapshot {
     register: usize,
-    image: RgbImage,
+    /// Shared, so a resume takes a reference under the cache lock rather than
+    /// a copy, and a zoomed resume copies only the window it needs.
+    image: Arc<RgbImage>,
     domain: Domain,
     oriented: bool,
     /// What the sensor's noise was before any denoiser, for a sharpener that
@@ -946,6 +948,34 @@ fn prefix_cache() -> &'static Mutex<Vec<(PrefixKey, PrefixEntry)>> {
     CACHE.get_or_init(|| Mutex::new(Vec::new()))
 }
 
+/// The zoomed view's own checkpoints: the state past the point where a render
+/// narrows to its window. The whole-frame checkpoints stop at that point, since
+/// what lies past it holds one particular window; without this, a curve drag
+/// on a zoomed view ran the window's noise reduction again on every tick.
+///
+/// One entry: it is for the window on screen. A pan misses it and rebuilds
+/// from the whole-frame checkpoint at the narrowing point, which is the cheap
+/// part of a pan anyway.
+struct WindowEntry {
+    key: PrefixKey,
+    rect_bits: [u32; 4],
+    halo: usize,
+    ops: Vec<GraphOp>,
+    origin: (usize, usize),
+    frame: Option<(usize, usize)>,
+    inner: Option<(usize, usize, usize, usize)>,
+    checkpoints: Vec<(StagePoint, Vec<PrefixSnapshot>)>,
+}
+
+fn window_cache() -> &'static Mutex<Option<WindowEntry>> {
+    static CACHE: OnceLock<Mutex<Option<WindowEntry>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(None))
+}
+
+fn rect_bits(rect: &[f32; 4]) -> [u32; 4] {
+    rect.map(f32::to_bits)
+}
+
 fn common_prefix_length(previous: &[GraphOp], current: &[GraphOp]) -> usize {
     previous
         .iter()
@@ -1005,6 +1035,26 @@ pub(crate) fn execute_graph_windowed(
         Some(viewport),
         Reporter::none(),
         None,
+        None,
+    )
+    .map(|(_, _, image)| image.expect("no byte buffer was asked for"))
+}
+
+#[cfg(test)]
+pub(crate) fn execute_graph_windowed_cached(
+    ops: &[GraphOp],
+    source: RgbImage,
+    context: &GraphContext<'_>,
+    viewport: [f32; 4],
+    cache_key: PrefixKey,
+) -> Result<RgbImage, Error> {
+    execute_graph_into(
+        ops,
+        Arc::new(source),
+        context,
+        Some(viewport),
+        Reporter::none(),
+        Some(cache_key),
         None,
     )
     .map(|(_, _, image)| image.expect("no byte buffer was asked for"))
@@ -1154,6 +1204,20 @@ fn crop_to_viewport(
     orientation: u16,
     oriented: bool,
 ) -> (RgbImage, (usize, usize), (usize, usize, usize, usize)) {
+    let (window, origin, inner) = crop_viewport_from(&image, rect, halo, orientation, oriented);
+    (window.unwrap_or(image), origin, inner)
+}
+
+/// CROP-TO-VIEWPORT reading a borrowed image, so a window can be taken from a
+/// cached checkpoint without copying the whole frame first. NONE for the
+/// window means the window is the whole frame.
+fn crop_viewport_from(
+    image: &RgbImage,
+    rect: [f32; 4],
+    halo: usize,
+    orientation: u16,
+    oriented: bool,
+) -> (Option<RgbImage>, (usize, usize), (usize, usize, usize, usize)) {
     let (frame_width, frame_height) = if oriented || orientation < 5 {
         (image.width, image.height)
     } else {
@@ -1178,7 +1242,7 @@ fn crop_to_viewport(
         ((rect[3] * frame_height as f32).ceil() as usize).max(1),
     );
     if width == 0 || height == 0 || (width >= frame_width && height >= frame_height) {
-        return (image, (0, 0), (0, 0, frame_width, frame_height));
+        return (None, (0, 0), (0, 0, frame_width, frame_height));
     }
     let inside = |placed: (usize, usize, usize, usize)| {
         let offset_x = asked.0.saturating_sub(placed.0);
@@ -1193,7 +1257,7 @@ fn crop_to_viewport(
     if oriented {
         let placed = (left, top, width, height);
         return (
-            render::crop_rect(&image, left, top, width, height),
+            Some(render::crop_rect(image, left, top, width, height)),
             (left, top),
             inside(placed),
         );
@@ -1222,9 +1286,9 @@ fn crop_to_viewport(
         (image.width, image.height),
         (source_left, source_top, source_width, source_height),
     );
-    let window = render::crop_rect(&image, source_left, source_top, source_width, source_height);
+    let window = render::crop_rect(image, source_left, source_top, source_width, source_height);
     (
-        render::orient(window, orientation),
+        Some(render::orient(window, orientation)),
         (placed.0, placed.1),
         inside(placed),
     )
@@ -1258,6 +1322,10 @@ fn execute_graph_into(
     // The requested region inside the window that was developed, so the halo
     // can come off before the result is handed back.
     let mut window_inner: Option<(usize, usize, usize, usize)> = None;
+    // Whether the registers already hold the window: a resume from the window
+    // cache, or from the whole-frame checkpoint at the narrowing point, which
+    // is cut down while it is restored.
+    let mut narrowed = false;
     // Interactive resume: reuse the deepest checkpoint of the previous
     // program that still lies on this program's unchanged prefix.
     let mut resume: Option<(StagePoint, Vec<PrefixSnapshot>)> = None;
@@ -1279,19 +1347,9 @@ fn execute_graph_into(
                 .filter(|(point, _)| *point > (0, STAGE_ENTRY) && *point <= deepest)
                 .max_by_key(|(point, _)| *point)
             {
-                resume = Some((
-                    *point,
-                    snapshots
-                        .iter()
-                        .map(|snapshot| PrefixSnapshot {
-                            register: snapshot.register,
-                            image: snapshot.image.clone(),
-                            domain: snapshot.domain,
-                            oriented: snapshot.oriented,
-                            sensor: snapshot.sensor,
-                        })
-                        .collect(),
-                ));
+                // References only: the pixels are copied, if at all, after
+                // the lock is released, and then only as much as is needed.
+                resume = Some((*point, snapshots.iter().map(PrefixSnapshot::share).collect()));
             }
             let held = cache.remove(position);
             cache.insert(0, held);
@@ -1319,9 +1377,42 @@ fn execute_graph_into(
         // geometry that does not change when the view moves, and everything
         // after it now costs what the window costs. Saving exactly there is what
         // makes a pan re-run the cheap part and nothing else.
-        if let Some((_, plan)) = &plan {
-            capture_points.retain(|point| *point < (plan.barrier, STAGE_ENTRY));
+        // Points past it are still captured, into the window cache: they
+        // hold this window, and are offered back only for this window.
+        let mut window_limit = limit;
+        if let Some((rect, plan)) = &plan {
             capture_points.push((plan.barrier, STAGE_ENTRY));
+            drop(cache);
+            let windows = window_cache()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(entry) = windows.as_ref()
+                && entry.key == *key
+                && entry.rect_bits == rect_bits(rect)
+                && entry.halo == plan.halo
+            {
+                let limit = resume_limit(&entry.ops, ops);
+                window_limit = Some(limit);
+                if let Some((point, snapshots)) = entry
+                    .checkpoints
+                    .iter()
+                    .filter(|(point, _)| *point > (plan.barrier, STAGE_ENTRY) && *point <= limit)
+                    .max_by_key(|(point, _)| *point)
+                {
+                    resume = Some((*point, snapshots.iter().map(PrefixSnapshot::share).collect()));
+                    window_origin = entry.origin;
+                    window_frame = entry.frame;
+                    window_inner = entry.inner;
+                    narrowed = true;
+                }
+            }
+            // The divergence point matters inside the window too: dragging a
+            // node past the narrowing point resumes from just before it.
+            if let Some((common, _)) = window_limit
+                && common < count
+            {
+                capture_points.push((common, STAGE_ENTRY));
+            }
         }
         capture_points.sort_unstable();
         capture_points.dedup();
@@ -1361,11 +1452,53 @@ fn execute_graph_into(
     let mut film_ordinal = 0_u64;
     match resume {
         Some((_, snapshots)) => {
+            // Resuming exactly where the render narrows: take the window
+            // straight out of the cached frame instead of copying the frame
+            // and then cutting the window out of the copy.
+            let narrow_at = match &plan {
+                Some((rect, plan))
+                    if !narrowed
+                        && (boundary, entry_stage) == (plan.barrier, STAGE_ENTRY)
+                        && plan.barrier < count =>
+                {
+                    Some((*rect, plan.halo, ops[plan.barrier].input_a))
+                }
+                _ => None,
+            };
             for snapshot in snapshots {
                 if uses[snapshot.register] > 0 {
-                    registers[snapshot.register] = Some(snapshot.image);
+                    let mut is_oriented = snapshot.oriented;
+                    let image = match narrow_at {
+                        Some((rect, halo, register)) if register == snapshot.register => {
+                            let whole = &*snapshot.image;
+                            window_frame = Some(if is_oriented || context.orientation < 5 {
+                                (whole.width, whole.height)
+                            } else {
+                                (whole.height, whole.width)
+                            });
+                            let (window, origin, inner) = crop_viewport_from(
+                                whole,
+                                rect,
+                                halo,
+                                context.orientation,
+                                is_oriented,
+                            );
+                            window_origin = origin;
+                            window_inner = Some(inner);
+                            narrowed = true;
+                            match window {
+                                Some(window) => {
+                                    is_oriented = true;
+                                    window
+                                }
+                                None => whole.clone(),
+                            }
+                        }
+                        _ => Arc::unwrap_or_clone(snapshot.image),
+                    };
+                    registers[snapshot.register] = Some(image);
                     domains[snapshot.register] = snapshot.domain;
-                    oriented[snapshot.register] = snapshot.oriented;
+                    oriented[snapshot.register] = is_oriented;
                     sensors[snapshot.register] = snapshot.sensor;
                 }
             }
@@ -1411,8 +1544,10 @@ fn execute_graph_into(
         if let Some((rect, plan)) = &plan
             && index == plan.barrier
             && stage == STAGE_ENTRY
+            && !narrowed
             && let Some(whole) = registers[op.input_a].take()
         {
+            narrowed = true;
             window_frame = Some(if oriented[op.input_a] || context.orientation < 5 {
                 (whole.width, whole.height)
             } else {
@@ -1765,6 +1900,49 @@ fn execute_graph_into(
     {
         captured.push(((count, STAGE_ENTRY), snapshots));
     }
+    // Past the narrowing point a checkpoint holds this window, so it goes to
+    // the window cache and the whole-frame cache keeps only what precedes it.
+    let window_captured: Vec<(StagePoint, Vec<PrefixSnapshot>)> = match &plan {
+        Some((_, plan)) => {
+            let (window, whole): (Vec<_>, Vec<_>) = captured
+                .into_iter()
+                .partition(|(point, _)| *point > (plan.barrier, STAGE_ENTRY));
+            captured = whole;
+            window
+        }
+        None => Vec::new(),
+    };
+    if let (Some(key), Some((rect, plan))) = (&cache_key, &plan) {
+        let mut windows = window_cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let same = windows.as_ref().is_some_and(|entry| {
+            entry.key == *key && entry.rect_bits == rect_bits(rect) && entry.halo == plan.halo
+        });
+        if same {
+            let entry = windows.as_mut().expect("checked above");
+            entry.ops = ops.to_vec();
+            // Only what this render resumed through is still the same state.
+            entry
+                .checkpoints
+                .retain(|(point, _)| *point <= (boundary, entry_stage));
+            for (point, snapshots) in window_captured {
+                entry.checkpoints.retain(|(held, _)| *held != point);
+                entry.checkpoints.push((point, snapshots));
+            }
+        } else if !window_captured.is_empty() {
+            *windows = Some(WindowEntry {
+                key: key.clone(),
+                rect_bits: rect_bits(rect),
+                halo: plan.halo,
+                ops: ops.to_vec(),
+                origin: window_origin,
+                frame: window_frame,
+                inner: window_inner,
+                checkpoints: window_captured,
+            });
+        }
+    }
     if let Some(key) = &cache_key {
         let mut cache = prefix_cache()
             .lock()
@@ -1861,6 +2039,18 @@ fn finish(
 }
 
 /// Clones every live register: one checkpoint's worth of resume state.
+impl PrefixSnapshot {
+    fn share(&self) -> Self {
+        Self {
+            register: self.register,
+            image: Arc::clone(&self.image),
+            domain: self.domain,
+            oriented: self.oriented,
+            sensor: self.sensor,
+        }
+    }
+}
+
 fn collect_snapshots(
     registers: &[Option<RgbImage>],
     domains: &[Domain],
@@ -1872,7 +2062,7 @@ fn collect_snapshots(
         if let Some(image) = image {
             snapshots.push(PrefixSnapshot {
                 register,
-                image: image.clone(),
+                image: Arc::new(image.clone()),
                 domain: domains[register],
                 oriented: oriented[register],
                 sensor: sensors[register],
@@ -3310,6 +3500,70 @@ mod tests {
             execute_graph_cached(&third, Arc::new(source.clone()), &context(7), Some(key)).unwrap();
         let cold = execute_graph(&third, source, &context(7)).unwrap();
         assert!(max_difference(&resumed, &cold) == 0.0);
+    }
+
+    #[test]
+    fn a_zoomed_drag_resumes_inside_its_window_and_matches_a_cold_render() {
+        // A crop is where the render narrows; the denoiser after it runs in
+        // the window, and the tone after that is what the drag moves.
+        let program = |shadows: f32| {
+            parse_graph(
+                &GraphBuilder::new()
+                    .node(NODE_CROP, 0, -1, &[0.05, 0.05, 0.9, 0.9, 0.0], None)
+                    .node(NODE_EXPOSURE, 1, -1, &[0.4], None)
+                    .node(NODE_NOISE_REDUCTION, 2, -1, &[0.6, 0.0], None)
+                    .node(NODE_TONE, 3, -1, &[shadows, 0.1, 0.0, -0.1, 0.0, 0.1, 0.0], None)
+                    .build(),
+            )
+            .unwrap()
+        };
+        for orientation in [1_u16, 6] {
+            let mut graph_context = context(5);
+            graph_context.orientation = orientation;
+            let key = test_prefix_key(&format!("window-test-{orientation}"), &graph_context);
+            let window = [0.3_f32, 0.25, 0.3, 0.35];
+            let panned = [0.35_f32, 0.3, 0.3, 0.35];
+            for (step, (shadows, rect)) in [
+                (0.1, window),
+                (0.2, window),
+                (0.3, window),
+                (0.3, panned),
+                (0.4, panned),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let ops = program(shadows);
+                let cached = execute_graph_windowed_cached(
+                    &ops,
+                    noisy_scene(320, 240),
+                    &graph_context,
+                    rect,
+                    key.clone(),
+                )
+                .unwrap();
+                let cold =
+                    execute_graph_windowed(&ops, noisy_scene(320, 240), &graph_context, rect)
+                        .unwrap();
+                assert_eq!((cached.width, cached.height), (cold.width, cold.height));
+                assert!(
+                    max_difference(&cached, &cold) == 0.0,
+                    "step {step} at orientation {orientation} differs from a cold render"
+                );
+                // From the second tick on, the window's own checkpoint past the
+                // denoiser is there to resume from.
+                if step >= 1 {
+                    let windows = window_cache()
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let entry = windows.as_ref().expect("a window entry was kept");
+                    assert!(
+                        entry.checkpoints.iter().any(|(point, _)| point.0 > 1),
+                        "no checkpoint past the narrowing point at step {step}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
