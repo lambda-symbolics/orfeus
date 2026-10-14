@@ -1756,6 +1756,9 @@ behind is memory. Best effort; returns how many directories went."
            ;; When the oldest edit not yet taken up by a live render arrived:
            ;; what input-to-frame latency is measured from.
            live-edit-since
+           ;; For the latency log: when the edit behind the frame on screen
+           ;; arrived, until that frame has been painted once.
+           live-shown-since
            ;; When the latest edit arrived, for the file path's latency.
            last-edit-time
            (progress-generation -1)
@@ -1953,6 +1956,20 @@ behind is memory. Best effort; returns how many directories went."
                                                   :center-x center-x
                                                   :center-y center-y)))))
            (draw-live-preview (widget)
+             (when (and live-shown-since *live-latency-log*)
+               (let ((started (get-internal-real-time)))
+                 (unwind-protect (draw-live-preview-now widget)
+                   (format *error-output* "live frame ~D painted: ~D ms after edit, draw ~D ms~%"
+                           live-shown-sequence
+                           (round (* 1000 (- (get-internal-real-time) live-shown-since))
+                                  internal-time-units-per-second)
+                           (round (* 1000 (- (get-internal-real-time) started))
+                                  internal-time-units-per-second))
+                   (force-output *error-output*)
+                   (setf live-shown-since nil)))
+               (return-from draw-live-preview))
+             (draw-live-preview-now widget))
+           (draw-live-preview-now (widget)
              (multiple-value-bind (frame-width frame-height)
                  (preview-frame-size widget nil)
                (multiple-value-bind (zoom center-x center-y)
@@ -7391,6 +7408,7 @@ behind is memory. Best effort; returns how many directories went."
                       (rotatef after-live-front after-live-back)
                       (rotatef after-live-front-capacity after-live-back-capacity)
                       (setf live-shown-sequence sequence
+                            live-shown-since since
                             after-live-region region
                             after-live-width width
                             after-live-height height
