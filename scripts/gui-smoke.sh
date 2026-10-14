@@ -27,7 +27,10 @@ DISPLAY="$display" nix develop --command sbcl --non-interactive \
   --eval "(sb-thread:make-thread
             (lambda ()
               (sleep 12)
-              (uiop:run-program (list \"import\" \"-window\" \"root\" \"$shot\")
+              ;; The dev shell puts /usr/lib on LD_LIBRARY_PATH for the host's
+              ;; GPU drivers, and nix's ImageMagick then loads the host libm.
+              (uiop:run-program (list \"env\" \"-u\" \"LD_LIBRARY_PATH\"
+                                      \"import\" \"-window\" \"root\" \"$shot\")
                                 :ignore-error-status t)
               (sb-ext:quit)))" \
   --eval '(orfeus/gui:run-gui)' >"$log" 2>&1
