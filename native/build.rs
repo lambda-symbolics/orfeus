@@ -20,7 +20,7 @@ fn main() {
         let shader = format!("shaders/{stage}.comp");
         println!("cargo:rerun-if-changed={shader}");
         let output = out_dir.join(format!("{stage}.spv"));
-        let status = Command::new("glslc")
+        let status = match Command::new("glslc")
             .args([
                 "--target-env=vulkan1.1",
                 "-O",
@@ -31,7 +31,18 @@ fn main() {
             ])
             .arg(&output)
             .status()
-            .expect("failed to run glslc; enter the Nix development shell");
-        assert!(status.success(), "glslc failed for {shader}");
+        {
+            // Where shaderc is not installed, glslang's own compiler builds
+            // the same SPIR-V, without glslc's optimisation pass.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Command::new("glslangValidator")
+                    .args(["-V", "--target-env", "vulkan1.1", "-Ishaders", &shader, "-o"])
+                    .arg(&output)
+                    .status()
+                    .expect("failed to run glslc or glslangValidator; enter the Nix development shell")
+            }
+            result => result.expect("failed to run glslc; enter the Nix development shell"),
+        };
+        assert!(status.success(), "compiling {shader} failed");
     }
 }
