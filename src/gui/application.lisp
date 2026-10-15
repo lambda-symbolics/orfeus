@@ -1739,8 +1739,10 @@ behind is memory. Best effort; returns how many directories went."
            after-live-front after-live-back
            (after-live-front-capacity 0)
            (after-live-back-capacity 0)
-           ;; The part of the frame the front buffer holds, or NIL for all of it.
+           ;; The part of the frame the front buffer holds, or NIL for all of
+           ;; it, and the bound it was developed at.
            after-live-region
+           after-live-bound
            (after-live-width 0)
            (after-live-height 0)
            (after-live-generation 0)
@@ -6164,27 +6166,54 @@ behind is memory. Best effort; returns how many directories went."
              ;; swapped onto the canvas by the poll loop. Photos still on
              ;; flat settings take the file path.
              (let ((job (selected-job)))
-               ;; Not the 1:1 view: its bound is the sensor, which no
-               ;; buffer is sized for ahead of time.
                (and job after-live-back
-                    (not preview-native-p)
                     (typep (current-settings) 'orfeus:processing-graph)
-                    (<= (nth-value 2 (live-request)) *gui-live-buffer-limit*))))
+                    (let ((bytes (nth-value 2 (live-request))))
+                      (and bytes (<= bytes *gui-live-buffer-limit*))))))
            (live-request ()
              ;; What a live render should develop: the fit view at the live
              ;; size, or, zoomed in, the same bound and window the file path
              ;; would ask for. Returns the bound, the region, and the bytes
-             ;; the answer can take.
-             (if (<= preview-zoom 1.0001d0)
+             ;; the answer can take, or no bytes when that is not known yet.
+             (cond
+               ;; At 1:1 the bound is the sensor, so the answer is sized from
+               ;; the frame the last 1:1 picture measured, while the crop
+               ;; still gives that frame.
+               (preview-native-p
+                (let ((region (steady-viewport-request 0)))
+                  (multiple-value-bind (frame-width frame-height)
+                      (and (not preview-one-to-one-pending-p)
+                           (equal (recipe-geometry-key (current-settings))
+                                  after-preview-geometry)
+                           (preview-frame-size after-canvas after-preview-file))
+                    (values 0 region
+                            (and frame-width
+                                 (* 3 (+ 8 (ceiling (* frame-width
+                                                       (if region (third region) 1d0))))
+                                    (+ 8 (ceiling (* frame-height
+                                                     (if region (fourth region) 1d0))))))))))
+               ((<= preview-zoom 1.0001d0)
                  (values *gui-live-preview-size* nil
-                         (* *gui-live-preview-size* *gui-live-preview-size* 3))
+                         (* *gui-live-preview-size* *gui-live-preview-size* 3)))
+               (t
                  (let* ((bound (viewport-render-bound))
-                        (region (viewport-request))
+                        (region (steady-viewport-request bound))
                         (width (if region (third region) 1d0))
                         (height (if region (fourth region) 1d0)))
                    (values bound region
                            (* 3 (+ 2 (ceiling (* bound width)))
-                              (+ 2 (ceiling (* bound height))))))))
+                              (+ 2 (ceiling (* bound height)))))))))
+           (steady-viewport-request (bound)
+             ;; The window on screen, while it still covers the view at this
+             ;; bound: asked for afresh, the rectangle wanders in its last
+             ;; digits with every frame's rounding, and a window that is not
+             ;; the same window cannot resume from its own checkpoints.
+             (let ((fresh (viewport-request)))
+               (if (and fresh (live-view-p) after-live-region
+                        (eql bound after-live-bound)
+                        (region-covers-view-p after-live-region))
+                   after-live-region
+                   fresh)))
            (ensure-live-back-capacity (bytes)
              ;; Only the back buffer: nobody draws it, and no render is
              ;; writing it while none is in flight.
@@ -7440,7 +7469,7 @@ behind is memory. Best effort; returns how many directories went."
                       (rest event)
                     ;; As for files: an answer as big as the whole bound is
                     ;; the whole frame, whatever window was asked for.
-                    (when (and region width
+                    (when (and region width (plusp bound)
                                (>= (max width height) (* 0.98 bound)))
                       (setf region nil))
                     (setf live-busy-p nil)
@@ -7456,6 +7485,7 @@ behind is memory. Best effort; returns how many directories went."
                       (setf live-shown-sequence sequence
                             live-shown-since since
                             after-live-region region
+                            after-live-bound bound
                             after-live-width width
                             after-live-height height
                             after-live-p t)
