@@ -1,4 +1,5 @@
 #version 450
+#extension GL_GOOGLE_include_directive : require
 
 // 3x3 median, the chroma pass's first defence against isolated speckles.
 // Paeth's 19-exchange network, the same one `render::median_of_9` uses.

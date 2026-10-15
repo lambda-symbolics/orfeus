@@ -1,4 +1,5 @@
 #version 450
+#extension GL_GOOGLE_include_directive : require
 
 // One axis of the edge-guided 5-tap blur. Taps are spaced `counts.w` apart, and
 // each is weighted by a binomial kernel divided by how far the guide plane

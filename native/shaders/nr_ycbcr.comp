@@ -1,4 +1,5 @@
 #version 450
+#extension GL_GOOGLE_include_directive : require
 
 // Interleaved linear RGB to and from the luma/chroma planes the noise reduction
 // works in. Mode 0 splits, mode 1 recombines. Mirrors the two loops that open
