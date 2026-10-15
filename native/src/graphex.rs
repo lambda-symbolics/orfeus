@@ -1030,7 +1030,7 @@ pub(crate) fn execute_graph_windowed(
 ) -> Result<RgbImage, Error> {
     execute_graph_into(
         ops,
-        Arc::new(source),
+        move || source,
         context,
         Some(viewport),
         Reporter::none(),
@@ -1050,7 +1050,7 @@ pub(crate) fn execute_graph_windowed_cached(
 ) -> Result<RgbImage, Error> {
     execute_graph_into(
         ops,
-        Arc::new(source),
+        move || source,
         context,
         Some(viewport),
         Reporter::none(),
@@ -1076,7 +1076,15 @@ pub(crate) fn execute_graph_cached(
     cache_key: Option<PrefixKey>,
 ) -> Result<RgbImage, Error> {
     let (width, height, image) =
-        execute_graph_into(ops, source, context, None, Reporter::none(), cache_key, None)?;
+        execute_graph_into(
+            ops,
+            move || render::own_source(source),
+            context,
+            None,
+            Reporter::none(),
+            cache_key,
+            None,
+        )?;
     let _ = (width, height);
     Ok(image.expect("a graph run without a byte buffer returns its image"))
 }
@@ -1297,7 +1305,7 @@ fn crop_viewport_from(
 #[allow(clippy::too_many_arguments)]
 fn execute_graph_into(
     ops: &[GraphOp],
-    source: Arc<RgbImage>,
+    source: impl FnOnce() -> RgbImage,
     context: &GraphContext<'_>,
     viewport: Option<[f32; 4]>,
     reporter: Reporter,
@@ -1306,7 +1314,7 @@ fn execute_graph_into(
 ) -> Result<(usize, usize, Option<RgbImage>), Error> {
     let count = ops.len();
     if count == 0 {
-        let image = render::orient(render::own_source(source), context.orientation);
+        let image = render::orient(source(), context.orientation);
         let image = match viewport {
             Some(rect) => crop_to_viewport(image, rect, 0, context.orientation, true).0,
             None => image,
@@ -1330,6 +1338,21 @@ fn execute_graph_into(
     // program that still lies on this program's unchanged prefix.
     let mut resume: Option<(StagePoint, Vec<PrefixSnapshot>)> = None;
     let mut capture_points: Vec<StagePoint> = Vec::new();
+    // At the sensor's own size a whole-frame checkpoint is the size of the
+    // decode, a quarter of a gigabyte at 20 MP: only windows are kept.
+    let window_only = cache_key
+        .as_ref()
+        .is_some_and(|key| key.max_width == 0 && key.max_height == 0);
+    // Which checkpoints hold a window. With no whole-frame checkpoints the one
+    // at the narrowing point is taken just after the cut instead, so it holds
+    // the window too, and a drag of the node there skips the whole frame.
+    let in_window = |point: StagePoint, barrier: usize| {
+        if window_only {
+            point >= (barrier, STAGE_ENTRY)
+        } else {
+            point > (barrier, STAGE_ENTRY)
+        }
+    };
     if let Some(key) = &cache_key {
         let mut cache = prefix_cache()
             .lock()
@@ -1396,7 +1419,7 @@ fn execute_graph_into(
                 if let Some((point, snapshots)) = entry
                     .checkpoints
                     .iter()
-                    .filter(|(point, _)| *point > (plan.barrier, STAGE_ENTRY) && *point <= limit)
+                    .filter(|(point, _)| in_window(*point, plan.barrier) && *point <= limit)
                     .max_by_key(|(point, _)| *point)
                 {
                     resume = Some((*point, snapshots.iter().map(PrefixSnapshot::share).collect()));
@@ -1416,6 +1439,15 @@ fn execute_graph_into(
         }
         capture_points.sort_unstable();
         capture_points.dedup();
+        if window_only {
+            match &plan {
+                // A graph that narrows only at its end has no window to keep.
+                Some((_, plan)) if plan.barrier < count => {
+                    capture_points.retain(|point| in_window(*point, plan.barrier))
+                }
+                _ => capture_points.clear(),
+            }
+        }
     }
     let (boundary, entry_stage) = resume
         .as_ref()
@@ -1503,7 +1535,7 @@ fn execute_graph_into(
                 }
             }
             if uses[0] > 0 && registers[0].is_none() {
-                registers[0] = Some(render::own_source(source));
+                registers[0] = Some(source());
             }
             // Only grainy film nodes advance the seed, matching the loop, and
             // a stage 1 resume has not laid down its own grain yet.
@@ -1512,7 +1544,7 @@ fn execute_graph_into(
                 .filter(|op| op.kind == NODE_FILM && op.params[1] > 0.0)
                 .count() as u64;
         }
-        None => registers[0] = Some(render::own_source(source)),
+        None => registers[0] = Some(source()),
     }
     let profiling = std::env::var_os("ORFEUS_PROFILE").is_some();
     let mut captured: Vec<(StagePoint, Vec<PrefixSnapshot>)> = Vec::new();
@@ -1531,7 +1563,11 @@ fn execute_graph_into(
         } else {
             STAGE_ENTRY
         };
+        let narrows_here = plan
+            .as_ref()
+            .is_some_and(|(_, plan)| index == plan.barrier && stage == STAGE_ENTRY && !narrowed);
         if stage == STAGE_ENTRY
+            && !(window_only && narrows_here)
             && capture_points.contains(&(index, STAGE_ENTRY))
             && let Some(snapshots) = collect_snapshots(&registers, &domains, &oriented, &sensors)
         {
@@ -1564,6 +1600,13 @@ fn execute_graph_into(
             window_inner = Some(inner);
             oriented[op.input_a] = true;
             registers[op.input_a] = Some(window);
+            if window_only
+                && capture_points.contains(&(index, STAGE_ENTRY))
+                && let Some(snapshots) =
+                    collect_snapshots(&registers, &domains, &oriented, &sensors)
+            {
+                captured.push(((index, STAGE_ENTRY), snapshots));
+            }
         }
         let take = |registers: &mut Vec<Option<RgbImage>>,
                     uses: &mut Vec<usize>,
@@ -1906,7 +1949,7 @@ fn execute_graph_into(
         Some((_, plan)) => {
             let (window, whole): (Vec<_>, Vec<_>) = captured
                 .into_iter()
-                .partition(|(point, _)| *point > (plan.barrier, STAGE_ENTRY));
+                .partition(|(point, _)| in_window(*point, plan.barrier));
             captured = whole;
             window
         }
@@ -1949,7 +1992,9 @@ fn execute_graph_into(
             });
         }
     }
-    if let Some(key) = &cache_key {
+    if let Some(key) = &cache_key
+        && !window_only
+    {
         let mut cache = prefix_cache()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -2264,7 +2309,7 @@ fn render_graph_frame(
     let full_pixels = decoded.full_pixels;
     // A full-resolution render works on the whole decode, so it takes the
     // buffer rather than copying it — nearly a gigabyte at 80 MP.
-    let source = if bounded {
+    let source = bounded.then(|| {
         render::scaled_source_for_render(
             &decoded,
             input,
@@ -2272,9 +2317,7 @@ fn render_graph_frame(
             native_max_height,
             cache_mode,
         )
-    } else {
-        Arc::new(render::own_decoded(decoded))
-    };
+    });
     profile_stage!("scaled-source");
     let explicit_profile = if frame.lens_profile_model.is_null() {
         None
@@ -2298,7 +2341,10 @@ fn render_graph_frame(
             height.clamp(0.0, 1.0),
         ])
     };
-    let scaled_pixels = source.width * source.height;
+    let scaled_pixels = match &source {
+        Some(source) => source.width * source.height,
+        None => decoded_width * decoded_height,
+    };
     let context = GraphContext {
         as_shot_kelvin,
         full_pixels,
@@ -2313,7 +2359,8 @@ fn render_graph_frame(
         grain_seed: frame.grain_seed,
         orientation,
     };
-    let prefix_key = if cache_mode == render::CACHE_USE && bounded {
+    // Unbounded too: the 1:1 view is interactive, and keeps window checkpoints.
+    let prefix_key = if cache_mode == render::CACHE_USE {
         Some(PrefixKey {
             input_path: input.to_string_lossy().into_owned(),
             decoded_width,
@@ -2329,6 +2376,12 @@ fn render_graph_frame(
     };
     profile_stage!("prefix-key");
     let _ = stage_started;
+    // Taken only if the render does not resume: at full resolution that is
+    // a copy of the whole decode while the decode cache holds it.
+    let source = move || match source {
+        Some(source) => render::own_source(source),
+        None => render::own_decoded(decoded),
+    };
     execute_graph_into(&ops, source, &context, viewport, reporter, prefix_key, bytes)
 }
 
@@ -3662,6 +3715,52 @@ mod tests {
         let cached = whole(0.4);
         let cold = execute_graph(&program(0.4), noisy_scene(320, 240), &graph_context).unwrap();
         assert!(max_difference(&cached, &cold) == 0.0);
+    }
+
+    #[test]
+    fn an_unbounded_window_matches_a_cold_render_and_keeps_nothing_whole() {
+        let program = |exposure: f32, shadows: f32| {
+            parse_graph(
+                &GraphBuilder::new()
+                    .node(NODE_CROP, 0, -1, &[0.05, 0.05, 0.9, 0.9, 0.0], None)
+                    .node(NODE_EXPOSURE, 1, -1, &[exposure], None)
+                    .node(NODE_NOISE_REDUCTION, 2, -1, &[0.6, 0.0], None)
+                    .node(NODE_TONE, 3, -1, &[shadows, 0.1, 0.0, -0.1, 0.0, 0.1, 0.0], None)
+                    .build(),
+            )
+            .unwrap()
+        };
+        let graph_context = context(5);
+        let key = PrefixKey {
+            max_width: 0,
+            max_height: 0,
+            ..test_prefix_key("unbounded-window-test", &graph_context)
+        };
+        let rect = [0.3_f32, 0.25, 0.3, 0.35];
+        for (exposure, shadows) in [(0.4, 0.1), (0.4, 0.2), (0.6, 0.2), (0.6, 0.3), (0.6, 0.4)] {
+            let ops = program(exposure, shadows);
+            let cached = execute_graph_windowed_cached(
+                &ops,
+                noisy_scene(320, 240),
+                &graph_context,
+                rect,
+                key.clone(),
+            )
+            .unwrap();
+            let cold =
+                execute_graph_windowed(&ops, noisy_scene(320, 240), &graph_context, rect).unwrap();
+            assert!(max_difference(&cached, &cold) == 0.0, "exposure {exposure} tone {shadows} differs");
+        }
+        // The window slot is shared with tests running alongside, so only the
+        // whole-frame cache, which no other test files under this key, is
+        // checked for what it holds.
+        assert!(
+            !prefix_cache()
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(held, _)| *held == key)
+        );
     }
 
     #[test]
