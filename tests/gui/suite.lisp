@@ -138,6 +138,42 @@ than the preview had photographs, under the wrong thumbnails."
       (check (null (getf (orfeus:photo-job-overrides (first jobs)) :exposure))
              "Undo left the edit on the photograph"))))
 
+;; Entering 1:1 on a slow photo can queue a draft ahead of the sensor-sized
+;; render. The draft must neither finish the switch nor size a live render.
+(defun test-one-to-one-waits-for-the-native-frame ()
+  (let ((view (orfeus/gui::make-native-view))
+        (geometry '(:crop 0.1 0.1 0.8 0.8))
+        (region '(0.4d0 0.3d0 0.2d0 0.25d0)))
+    (orfeus/gui::native-view-begin view)
+    ;; The 2048 draft lands first.
+    (check (not (orfeus/gui::native-view-publish view 2048 2048 1536 geometry))
+           "A draft finished the switch to 1:1")
+    (check (orfeus/gui::native-view-pending-p view)
+           "The draft cleared the pending 1:1 switch")
+    ;; An edit now must not size a sensor-sized render from the draft.
+    (check (null (orfeus/gui::native-view-live-bytes view geometry region))
+           "A live 1:1 render was sized before the sensor-sized frame arrived")
+    ;; Then the sensor-sized frame.
+    (check (orfeus/gui::native-view-publish view 0 5184 3888 geometry)
+           "The sensor-sized frame did not finish the switch to 1:1")
+    (check (not (orfeus/gui::native-view-pending-p view))
+           "The switch to 1:1 stayed pending")
+    (let ((bytes (orfeus/gui::native-view-live-bytes view geometry region)))
+      (check (and bytes (>= bytes (* 3 (ceiling (* 5184 0.2d0))
+                                     (ceiling (* 3888 0.25d0)))))
+             "A live 1:1 render was sized below its window"))
+    (check (null (orfeus/gui::native-view-live-bytes view '(:crop 0 0 1 1) region))
+           "A live 1:1 render was sized from another crop")
+    ;; One image pixel per screen pixel: the scale the drawing uses.
+    (let* ((zoom (orfeus/gui::one-to-one-zoom 900 700 5184 3888))
+           (fit (min (/ 900 5184d0) (/ 700 3888d0)))
+           (scale (min (max fit 2d0) (* fit zoom))))
+      (check (< (abs (- scale 1d0)) 1d-9)
+             "1:1 did not show one image pixel per screen pixel"))
+    (orfeus/gui::native-view-reset view)
+    (check (null (orfeus/gui::native-view-live-bytes view geometry region))
+           "A fitted view kept its sensor-sized frame")))
+
 (defun test-brackets-fold-unfold-and-undo ()
   "A detected bracket folds into its first frame, which then stands for it and
 gets the camera's HDR look; unfolding puts the frames back and keeps them back;
@@ -2454,6 +2490,7 @@ would silently ignore whatever the Destination field said."
   (test-dust-goes-in-front-of-the-negative)
   (test-a-node-resets-to-its-defaults)
   (test-brackets-fold-unfold-and-undo)
+  (test-one-to-one-waits-for-the-native-frame)
   (test-graph-node-placement)
   (test-thumbnail-context-menu)
   (test-node-adds-land-where-they-are-legal)

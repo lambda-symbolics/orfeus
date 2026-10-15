@@ -1775,7 +1775,9 @@ behind is memory. Best effort; returns how many directories went."
            preview-drag-center-x preview-drag-center-y
            ;; Set only by "1:1 pixels": every other view renders a proxy sized
            ;; for the canvas rather than for the sensor.
-           preview-native-p preview-one-to-one-pending-p)
+           preview-native-p
+           ;; The switch to it in progress, and the sensor-sized frame.
+           (native-view (make-native-view)))
       (labels
           ((picker-preset ()
              ;; The folder the project dialogs open in: where photographs were
@@ -1896,6 +1898,7 @@ behind is memory. Best effort; returns how many directories went."
                      preview-center-x .5d0
                      preview-center-y .5d0
                      preview-native-p nil)
+               (native-view-reset native-view)
                ;; Coming back from 1:1 drops to a canvas-sized render, which is
                ;; a cache hit if this photo has been fitted before.
                (when was-native
@@ -2169,11 +2172,13 @@ behind is memory. Best effort; returns how many directories went."
              ;; landed, so APPLY-ONE-TO-ONE calls this again from the event.
              (let ((path (or after-preview-file before-preview-file)))
                (when path
-                 (multiple-value-bind (scaled-width scaled-height fit)
-                     (preview-scaled-size after-canvas path 1d0)
-                   (declare (ignore scaled-width scaled-height))
-                   (when fit
-                     (setf preview-zoom (min 32d0 (max 1d0 (/ fit)))
+                 (multiple-value-bind (frame-width frame-height)
+                     (preview-frame-size after-canvas path)
+                   (when frame-width
+                     (setf preview-zoom (one-to-one-zoom
+                                         (lightfast:widget-width after-canvas)
+                                         (lightfast:widget-height after-canvas)
+                                         frame-width frame-height)
                            preview-center-x .5d0
                            preview-center-y .5d0)
                      (redraw-previews)
@@ -2186,8 +2191,8 @@ behind is memory. Best effort; returns how many directories went."
                     (fit-preview-to-source-pixels)
                     (set-status "Preview at 1:1 pixels"))
                    (t
-                    (setf preview-native-p t
-                          preview-one-to-one-pending-p t)
+                    (setf preview-native-p t)
+                    (native-view-begin native-view)
                     (discard-gui-tasks queue :after)
                     (enqueue-preview nil)
                     (set-status "Developing 1:1 preview"))))
@@ -3788,8 +3793,8 @@ behind is memory. Best effort; returns how many directories went."
                    preview-drag-p nil
                    after-live-p nil
                    ;; A new photograph starts fitted, so it starts on a proxy.
-                   preview-native-p nil
-                   preview-one-to-one-pending-p nil)
+                   preview-native-p nil)
+             (native-view-reset native-view)
              (dolist (path (list before-preview-file after-preview-file))
                (release-display path))
              (setf before-preview-file nil
@@ -3815,7 +3820,7 @@ behind is memory. Best effort; returns how many directories went."
                      ((null file-width) nil)
                      ((< (max file-width file-height) (* 0.98 bound)) region)
                      (t nil))))
-           (publish-preview (role path generation region geometry)
+           (publish-preview (role path generation region geometry bound)
              (let ((old-path (ecase role
                                (:before before-preview-file)
                                (:after after-preview-file))))
@@ -3843,9 +3848,16 @@ behind is memory. Best effort; returns how many directories went."
                          ;; window is not a thumbnail of anything.
                          (when (null region)
                            (set-thumbnail (selected-job) path :graded))
-                         (when preview-one-to-one-pending-p
-                           (setf preview-one-to-one-pending-p nil)
-                           (fit-preview-to-source-pixels))
+                         ;; Only the sensor-sized answer finishes the switch
+                         ;; to 1:1: a draft queued ahead of it would set the
+                         ;; zoom from its own, smaller pixels.
+                         (when (and preview-native-p (eql bound 0))
+                           (multiple-value-bind (frame-width frame-height)
+                               (preview-frame-size after-canvas path)
+                             (when (native-view-publish native-view bound
+                                                        frame-width frame-height
+                                                        geometry)
+                               (fit-preview-to-source-pixels))))
                          (schedule-curve-histogram path generation)
                          (lightfast:redraw after-canvas)
                          (when curve-canvas
@@ -6138,6 +6150,7 @@ behind is memory. Best effort; returns how many directories went."
                        (window (viewport-request)))
                    (when (and (>= last-render-ms 300) (not (live-view-p))
                               (null window)
+                              (not (native-view-pending-p native-view))
                               (draft-preview-fits-the-view-p))
                      (enqueue-render queue :after job index settings
                                      generation t
@@ -6181,17 +6194,11 @@ behind is memory. Best effort; returns how many directories went."
                ;; still gives that frame.
                (preview-native-p
                 (let ((region (steady-viewport-request 0)))
-                  (multiple-value-bind (frame-width frame-height)
-                      (and (not preview-one-to-one-pending-p)
-                           (equal (recipe-geometry-key (current-settings))
-                                  after-preview-geometry)
-                           (preview-frame-size after-canvas after-preview-file))
-                    (values 0 region
-                            (and frame-width
-                                 (* 3 (+ 8 (ceiling (* frame-width
-                                                       (if region (third region) 1d0))))
-                                    (+ 8 (ceiling (* frame-height
-                                                     (if region (fourth region) 1d0))))))))))
+                  (values 0 region
+                          (native-view-live-bytes
+                           native-view
+                           (recipe-geometry-key (current-settings))
+                           region))))
                ((<= preview-zoom 1.0001d0)
                  (values *gui-live-preview-size* nil
                          (* *gui-live-preview-size* *gui-live-preview-size* 3)))
@@ -7457,7 +7464,8 @@ behind is memory. Best effort; returns how many directories went."
                                          (published-region (sixth event)
                                                            (seventh event)
                                                            (eighth event))
-                                         (ninth event))
+                                         (ninth event)
+                                         (eighth event))
                         (setf render-stage nil
                               render-stage-fraction 0.0)
                         (set-status (render-summary-text)))

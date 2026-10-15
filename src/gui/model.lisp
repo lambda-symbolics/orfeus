@@ -1413,3 +1413,54 @@ can be taken without, say, its optics or white balance. Returns the count."
          (= (second event) generation)
          (= (third event) (gui-model-selected-index model))
          (eq (fourth event) job))))
+
+;;; The 1:1 view's handoff. Entering it asks for a render at the sensor's
+;;; size, and a draft can arrive first: only the sensor-sized answer may
+;;; finish the switch, and only its size may size a live render.
+
+(defstruct (native-view (:constructor make-native-view ()))
+  (pending-p nil)
+  ;; The whole frame at the sensor's size, and the crop geometry it was for,
+  ;; as the last sensor-sized render measured them.
+  (frame-width nil)
+  (frame-height nil)
+  (geometry nil))
+
+(defun native-view-begin (view)
+  "Mark VIEW as waiting for its first sensor-sized render."
+  (setf (native-view-pending-p view) t))
+
+(defun native-view-reset (view)
+  "Forget everything VIEW knew: a fitted view or another photograph."
+  (setf (native-view-pending-p view) nil
+        (native-view-frame-width view) nil
+        (native-view-frame-height view) nil
+        (native-view-geometry view) nil))
+
+(defun native-view-publish (view bound frame-width frame-height geometry)
+  "Note a finished render at BOUND whose whole frame measures FRAME-WIDTH by
+FRAME-HEIGHT for crop GEOMETRY. Returns true when it finishes the switch to
+1:1, so the view should now be fitted to its pixels."
+  (when (eql bound 0)
+    (setf (native-view-frame-width view) frame-width
+          (native-view-frame-height view) frame-height
+          (native-view-geometry view) geometry)
+    (shiftf (native-view-pending-p view) nil)))
+
+(defun native-view-live-bytes (view geometry region)
+  "Bytes a sensor-sized live render of REGION can take, or NIL while VIEW has
+no sensor-sized frame for crop GEOMETRY to size it from."
+  (let ((width (native-view-frame-width view))
+        (height (native-view-frame-height view)))
+    (and (not (native-view-pending-p view))
+         width height
+         (equal geometry (native-view-geometry view))
+         (* 3 (+ 8 (ceiling (* width (if region (third region) 1d0))))
+            (+ 8 (ceiling (* height (if region (fourth region) 1d0))))))))
+
+(defun one-to-one-zoom (canvas-width canvas-height frame-width frame-height)
+  "The preview zoom that shows a FRAME-WIDTH by FRAME-HEIGHT frame at one of
+its pixels per screen pixel on a CANVAS-WIDTH by CANVAS-HEIGHT canvas."
+  (let ((fit (min (/ canvas-width (float frame-width 1d0))
+                  (/ canvas-height (float frame-height 1d0)))))
+    (min 32d0 (max 1d0 (/ fit)))))
