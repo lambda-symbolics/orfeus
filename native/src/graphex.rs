@@ -1921,16 +1921,17 @@ fn execute_graph_into(
         });
         if same {
             let entry = windows.as_mut().expect("checked above");
+            // Only what this render resumed through is still the same state,
+            // and only as far as this entry's own program agrees: the resume
+            // may have come from the other cache.
+            let valid_through = resume_limit(&entry.ops, ops).min((boundary, entry_stage));
+            entry.checkpoints.retain(|(point, _)| *point <= valid_through);
             entry.ops = ops.to_vec();
             // The same window of a frame cropped differently is a different
             // window: what it holds and where it sits come from this render.
             entry.origin = window_origin;
             entry.frame = window_frame;
             entry.inner = window_inner;
-            // Only what this render resumed through is still the same state.
-            entry
-                .checkpoints
-                .retain(|(point, _)| *point <= (boundary, entry_stage));
             for (point, snapshots) in window_captured {
                 entry.checkpoints.retain(|(held, _)| *held != point);
                 entry.checkpoints.push((point, snapshots));
@@ -1958,10 +1959,11 @@ fn execute_graph_into(
         // image every tick.
         if let Some(position) = cache.iter().position(|(held, _)| held == key) {
             let entry = &mut cache[position].1;
+            // A resume from the window cache vouches for nothing here: what
+            // stays is what this entry's own program shares with this one.
+            let valid_through = resume_limit(&entry.ops, ops).min((boundary, entry_stage));
+            entry.checkpoints.retain(|(point, _)| *point <= valid_through);
             entry.ops = ops.to_vec();
-            entry
-                .checkpoints
-                .retain(|(point, _)| *point <= (boundary, entry_stage));
             for (point, snapshots) in captured {
                 entry.checkpoints.retain(|(held, _)| *held != point);
                 entry.checkpoints.push((point, snapshots));
@@ -3615,6 +3617,51 @@ mod tests {
                 "crop {crop_width} tone {shadows} differs from a cold render"
             );
         }
+    }
+
+    #[test]
+    fn a_window_resume_does_not_vouch_for_the_whole_frame_cache() {
+        let program = |exposure: f32| {
+            parse_graph(
+                &GraphBuilder::new()
+                    .node(NODE_CROP, 0, -1, &[0.05, 0.05, 0.9, 0.9, 0.0], None)
+                    .node(NODE_EXPOSURE, 1, -1, &[exposure], None)
+                    .node(NODE_NOISE_REDUCTION, 2, -1, &[0.6, 0.0], None)
+                    .node(NODE_TONE, 3, -1, &[0.1, 0.1, 0.0, -0.1, 0.0, 0.1, 0.0], None)
+                    .build(),
+            )
+            .unwrap()
+        };
+        let graph_context = context(5);
+        let key = test_prefix_key("window-whole-test", &graph_context);
+        let rect = [0.3_f32, 0.25, 0.3, 0.35];
+        let window = |exposure: f32| {
+            execute_graph_windowed_cached(
+                &program(exposure),
+                noisy_scene(320, 240),
+                &graph_context,
+                rect,
+                key.clone(),
+            )
+            .unwrap()
+        };
+        let whole = |exposure: f32| {
+            execute_graph_cached(
+                &program(exposure),
+                Arc::new(noisy_scene(320, 240)),
+                &graph_context,
+                Some(key.clone()),
+            )
+            .unwrap()
+        };
+        // The window resumes from its own checkpoint; that says nothing about
+        // the whole-frame checkpoint the +1.4 EV render left behind.
+        window(0.4);
+        whole(1.4);
+        window(0.4);
+        let cached = whole(0.4);
+        let cold = execute_graph(&program(0.4), noisy_scene(320, 240), &graph_context).unwrap();
+        assert!(max_difference(&cached, &cold) == 0.0);
     }
 
     #[test]
