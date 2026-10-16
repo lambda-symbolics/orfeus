@@ -6,7 +6,7 @@ GUI_PREVIEW_SRC := native/gui-preview.cpp
 GUI_CXXFLAGS := -std=c++17 -fPIC -O2 -Wall -Wextra $(shell $(FLTK_CONFIG) --cxxflags)
 GUI_LDFLAGS := -shared $(shell $(FLTK_CONFIG) --use-images --ldflags) -L$(LIGHTFAST)/build -llightfast -Wl,-rpath,$(abspath $(LIGHTFAST)/build)
 
-.PHONY: gui-native clean-gui-native
+.PHONY: gui-native clean-gui-native clean
 
 gui-native: $(GUI_PREVIEW)
 
@@ -23,3 +23,9 @@ $(LIGHTFAST)/build/liblightfast.so: $(LIGHTFAST_SOURCES)
 
 clean-gui-native:
 	rm -rf native/build
+
+# Everything this repo built, including the Rust crate's own target
+# directory -- which respects CARGO_TARGET_DIR, so this cleans whichever one
+# the calling environment actually built into.
+clean: clean-gui-native
+	cd native && cargo clean
