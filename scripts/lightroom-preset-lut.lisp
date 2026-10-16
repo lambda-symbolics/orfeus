@@ -425,7 +425,7 @@ yellow, green, aqua, blue, purple, magenta.")
     (loop for i below 8
           for c = (nth i *hsl-centres*)
           for next = (if (= i 7) 360d0 (nth (1+ i) *hsl-centres*))
-          when (<= c h next)
+          when (and (<= c h) (< h next))
             do (let ((u (/ (- h c) (- next c))))
                  (incf (nth i weights) (- 1d0 u))
                  (incf (nth (mod (1+ i) 8) weights) u)))
