@@ -1740,7 +1740,8 @@ would silently ignore whatever the Destination field said."
                     "kodak_kodachrome_200.cube"
                     "kodak_kodachrome_25.cube"
                     "kodak_kodachrome_64.cube"
-                    "kodak_kodachrome_64_generic.cube"))
+                    "kodak_kodachrome_64_generic.cube"
+                    "Reala 500D.cube"))
            "Bundled LUT menu does not contain the pinned film set")))
 
 (defun test-file-filter-syntax ()

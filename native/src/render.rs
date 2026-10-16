@@ -9477,7 +9477,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         paths.sort();
-        assert_eq!(paths.len(), 20, "unexpected bundled LUT count");
+        assert_eq!(paths.len(), 21, "unexpected bundled LUT count");
         for path in &paths {
             CubeLut::read(path)
                 .unwrap_or_else(|error| panic!("invalid bundled LUT {}: {error}", path.display()));
