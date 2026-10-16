@@ -5304,6 +5304,98 @@ pub(crate) fn apply_clarity(image: &mut RgbImage, amount: f32, radius: f32) {
         });
 }
 
+/// Where Lightroom's eight colour bands sit on the hue circle: red, orange,
+/// yellow, green, aqua, blue, purple, magenta. Matches the centres
+/// `scripts/lightroom-preset-lut.lisp`'s own HSL panel conversion uses, so a
+/// hand-authored preset and this node agree on what "orange" means.
+const SATURATION_BAND_CENTRES: [f32; 8] = [0.0, 30.0, 60.0, 120.0, 180.0, 240.0, 280.0, 320.0];
+
+/// Tent weights of the eight bands at HUE (degrees), summing to one.
+fn saturation_band_weights(hue: f32) -> [f32; 8] {
+    let mut weights = [0.0_f32; 8];
+    let h = hue.rem_euclid(360.0);
+    for i in 0..8 {
+        let centre = SATURATION_BAND_CENTRES[i];
+        let next = if i == 7 { 360.0 } else { SATURATION_BAND_CENTRES[i + 1] };
+        if centre <= h && h < next {
+            let u = (h - centre) / (next - centre);
+            weights[i] += 1.0 - u;
+            weights[(i + 1) % 8] += u;
+        }
+    }
+    weights
+}
+
+/// Encoded RGB (each 0..1) to hue in degrees, saturation, and value.
+fn rgb_to_hsv(r: f32, g: f32, b: f32) -> (f32, f32, f32) {
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let d = max - min;
+    let hue = if d <= 1.0e-6 {
+        0.0
+    } else if max == r {
+        (60.0 * ((g - b) / d)).rem_euclid(360.0)
+    } else if max == g {
+        120.0 + 60.0 * ((b - r) / d)
+    } else {
+        240.0 + 60.0 * ((r - g) / d)
+    };
+    let saturation = if max <= 1.0e-6 { 0.0 } else { d / max };
+    (hue, saturation, max)
+}
+
+/// Hue in degrees, saturation, and value back to encoded RGB (each 0..1).
+fn hsv_to_rgb(hue: f32, saturation: f32, value: f32) -> (f32, f32, f32) {
+    let hh = hue.rem_euclid(360.0) / 60.0;
+    let i = hh.floor() as i32;
+    let f = hh - i as f32;
+    let p = value * (1.0 - saturation);
+    let q = value * (1.0 - saturation * f);
+    let u = value * (1.0 - saturation * (1.0 - f));
+    match i.rem_euclid(6) {
+        0 => (value, u, p),
+        1 => (q, value, p),
+        2 => (p, value, u),
+        3 => (p, q, value),
+        4 => (u, p, value),
+        _ => (value, p, q),
+    }
+}
+
+/// Scales saturation globally by AMOUNT and selectively by BANDS (red, orange,
+/// yellow, green, aqua, blue, purple, magenta in that order), each -1..1.
+///
+/// Works in encoded (gamma) RGB, converted to HSV and back per pixel: hue and
+/// saturation in linear light do not match what a colour looks like once
+/// displayed, the same reason `scripts/lightroom-preset-lut.lisp`'s own HSL
+/// panel works in sRGB HSV rather than a scene-linear or ProPhoto one. Like
+/// `apply_contrast`, this does not know or care whether the register it is
+/// given is still scene-linear or already past a film node's display
+/// transform -- it treats whatever is there as encoded-enough to reason about
+/// in HSV terms, which is what lets it run on either side of a look.
+pub(crate) fn apply_saturation(image: &mut RgbImage, amount: f32, bands: &[f32]) {
+    debug_assert_eq!(bands.len(), 8);
+    if amount == 0.0 && bands.iter().all(|&value| value == 0.0) {
+        return;
+    }
+    image.data.par_chunks_mut(3).for_each(|pixel| {
+        let r = srgb_encode(pixel[0].max(0.0)).clamp(0.0, 1.0);
+        let g = srgb_encode(pixel[1].max(0.0)).clamp(0.0, 1.0);
+        let b = srgb_encode(pixel[2].max(0.0)).clamp(0.0, 1.0);
+        let (hue, saturation, value) = rgb_to_hsv(r, g, b);
+        if saturation <= 1.0e-6 {
+            return;
+        }
+        let weights = saturation_band_weights(hue);
+        let band_component: f32 = weights.iter().zip(bands.iter()).map(|(w, b)| w * b).sum();
+        let factor = (1.0 + amount) * (1.0 + band_component);
+        let new_saturation = (saturation * factor).clamp(0.0, 1.0);
+        let (nr, ng, nb) = hsv_to_rgb(hue, new_saturation, value);
+        pixel[0] = srgb_decode(nr);
+        pixel[1] = srgb_decode(ng);
+        pixel[2] = srgb_decode(nb);
+    });
+}
 
 /// Width the frame is reduced to for estimating haze: coarse enough that the
 /// estimate costs nothing, fine enough that the transmission follows the scene.
@@ -9678,6 +9770,112 @@ mod tests {
         };
         apply_dehaze(&mut veiled, -1.0);
         assert!(spread(&veiled.data) < spread(&hazy));
+    }
+
+    #[test]
+    fn saturation_hsv_round_trips_exactly() {
+        for &(r, g, b) in &[
+            (0.8_f32, 0.2, 0.1),
+            (0.1, 0.9, 0.3),
+            (0.05, 0.2, 0.95),
+            (0.5, 0.5, 0.5),
+            (1.0, 1.0, 1.0),
+            (0.0, 0.0, 0.0),
+        ] {
+            let (h, s, v) = rgb_to_hsv(r, g, b);
+            let (nr, ng, nb) = hsv_to_rgb(h, s, v);
+            assert!((r - nr).abs() < 1.0e-5, "{r} {g} {b} -> r {nr}");
+            assert!((g - ng).abs() < 1.0e-5, "{r} {g} {b} -> g {ng}");
+            assert!((b - nb).abs() < 1.0e-5, "{r} {g} {b} -> b {nb}");
+        }
+    }
+
+    #[test]
+    fn saturation_band_weights_always_sum_to_one_and_peak_at_their_centre() {
+        for degrees in 0..360 {
+            let weights = saturation_band_weights(degrees as f32);
+            let total: f32 = weights.iter().sum();
+            assert!((total - 1.0).abs() < 1.0e-5, "{degrees} sums to {total}");
+        }
+        for (index, &centre) in SATURATION_BAND_CENTRES.iter().enumerate() {
+            let weights = saturation_band_weights(centre);
+            assert!(
+                (weights[index] - 1.0).abs() < 1.0e-5,
+                "band {index} at its own centre {centre} has weight {}",
+                weights[index]
+            );
+        }
+    }
+
+    #[test]
+    fn saturation_amount_zero_and_bands_zero_is_a_no_op() {
+        let mut image = RgbImage {
+            width: 4,
+            height: 4,
+            data: (0..48).map(|i| (i % 7) as f32 / 7.0).collect(),
+        };
+        let before = image.data.clone();
+        apply_saturation(&mut image, 0.0, &[0.0; 8]);
+        assert_eq!(image.data, before);
+    }
+
+    #[test]
+    fn saturation_leaves_an_exact_neutral_pixel_untouched() {
+        let mut image = RgbImage {
+            width: 1,
+            height: 1,
+            data: vec![0.4, 0.4, 0.4],
+        };
+        apply_saturation(&mut image, 1.0, &[1.0; 8]);
+        assert_eq!(image.data, vec![0.4, 0.4, 0.4]);
+    }
+
+    #[test]
+    fn saturation_global_amount_scales_a_saturated_pixel_up_and_down() {
+        // A clearly red pixel, away from every band boundary.
+        let pixel = [0.8_f32, 0.2, 0.2];
+        let saturation_of = |amount: f32| {
+            let mut image = RgbImage {
+                width: 1,
+                height: 1,
+                data: pixel.to_vec(),
+            };
+            apply_saturation(&mut image, amount, &[0.0; 8]);
+            let encoded: Vec<f32> = image.data.iter().map(|v| srgb_encode(v.max(0.0))).collect();
+            rgb_to_hsv(encoded[0], encoded[1], encoded[2]).1
+        };
+        let (r, g, b) = (srgb_encode(pixel[0]), srgb_encode(pixel[1]), srgb_encode(pixel[2]));
+        let original = rgb_to_hsv(r, g, b).1;
+        assert!(saturation_of(0.5) > original, "a positive amount did not add saturation");
+        assert!(saturation_of(-0.5) < original, "a negative amount did not remove saturation");
+        assert!((saturation_of(0.0) - original).abs() < 1.0e-5);
+    }
+
+    #[test]
+    fn saturation_band_only_affects_its_own_hue() {
+        // Pure red (band 0) and pure green (band 3), both fully saturated.
+        let mut bands = [0.0_f32; 8];
+        bands[0] = 1.0;
+        let saturation_after = |pixel: [f32; 3], bands: &[f32; 8]| {
+            let mut image = RgbImage { width: 1, height: 1, data: pixel.to_vec() };
+            apply_saturation(&mut image, 0.0, bands);
+            let encoded: Vec<f32> = image.data.iter().map(|v| srgb_encode(v.max(0.0))).collect();
+            rgb_to_hsv(encoded[0], encoded[1], encoded[2]).1
+        };
+        // A moderately saturated red and green, so a boost toward 1.0 is visible.
+        let red = [0.8_f32, 0.3, 0.3];
+        let green = [0.3_f32, 0.8, 0.3];
+        let red_saturation = rgb_to_hsv(srgb_encode(red[0]), srgb_encode(red[1]), srgb_encode(red[2])).1;
+        let green_saturation =
+            rgb_to_hsv(srgb_encode(green[0]), srgb_encode(green[1]), srgb_encode(green[2])).1;
+        assert!(
+            saturation_after(red, &bands) > red_saturation,
+            "boosting red did not boost a red pixel"
+        );
+        assert!(
+            (saturation_after(green, &bands) - green_saturation).abs() < 1.0e-4,
+            "boosting red changed a green pixel"
+        );
     }
 
     #[test]

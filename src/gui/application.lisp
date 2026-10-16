@@ -398,6 +398,7 @@ width, but a spinner cannot shrink below its digits.")
     (:vignette . "Vignette")
     (:clarity . "Clarity")
     (:dehaze . "Dehaze")
+    (:saturation . "Satur")
     (:sharpen . "Sharp")
     (:crop . "Crop")
     (:rotate . "Rotate")
@@ -423,6 +424,7 @@ width, but a spinner cannot shrink below its digits.")
     ("Vignette" . :vignette)
     ("Clarity" . :clarity)
     ("Dehaze" . :dehaze)
+    ("Saturation" . :saturation)
     ("Sharpen" . :sharpen)
     ("Crop" . :crop)
     ("Rotate" . :rotate)
@@ -617,6 +619,8 @@ sliders and nothing else has to be recomputed."
               (:rect 5 5 2 2))
     (:dehaze (:line 0 7 4 2) (:line 4 2 8 7) (:line 7 6 9 4) (:line 9 4 12 7)
              (:rect 0 9 12 1) (:rect 0 11 12 1))
+    (:saturation (:line 6 0 6 4) (:line 6 8 6 12) (:line 0 6 4 6) (:line 8 6 12 6)
+                 (:rect 5 5 2 2))
     (:sharpen (:line 6 0 1 11) (:line 6 0 11 11) (:line 1 11 11 11))
     (:crop (:line 3 0 3 9) (:line 0 3 9 3) (:line 8 2 8 11) (:line 2 8 11 8))
     (:rotate (:line 1 10 1 2) (:line 1 2 9 2) (:line 6 0 9 2) (:line 6 4 9 2))
@@ -752,6 +756,9 @@ channel carries anywhere from its two endpoints to a full film-stock shape."
     (:vignette (/= 0.0 (getf (orfeus:graph-node-params node) :amount -0.25)))
     (:clarity (/= 0.0 (getf (orfeus:graph-node-params node) :amount 0.25)))
     (:dehaze (/= 0.0 (getf (orfeus:graph-node-params node) :amount 0.3)))
+    (:saturation (let ((params (orfeus:graph-node-params node)))
+                   (loop for key in orfeus:*saturation-keys*
+                           thereis (/= 0.0 (getf params key 0.0)))))
     (:contrast (/= 1.0 (getf (orfeus:graph-node-params node) :contrast 1.0)))
     (:hdr (let ((params (orfeus:graph-node-params node)))
             (or (plusp (getf params :strength 0.4))
@@ -8801,6 +8808,23 @@ behind is memory. Best effort; returns how many directories went."
             (make-node-number-field :amount "Amount" -1.0 1.0 0.05 0.3 44
                                     node-page)
             "How much of the haze to take out; negative lays it on")))
+        (build-group
+         :saturation
+         (lambda ()
+           (lightfast:set-tooltip
+            (make-node-number-field :amount "Amount" -1.0 1.0 0.05 0.0 44
+                                    node-page)
+            "Saturation overall, before any one colour's own adjustment")
+           (loop for (key label y)
+                   in '((:red "Red" 76) (:orange "Orange" 108)
+                        (:yellow "Yellow" 140) (:green "Green" 172)
+                        (:aqua "Aqua" 204) (:blue "Blue" 236)
+                        (:purple "Purple" 268) (:magenta "Magenta" 300))
+                 do (lightfast:set-tooltip
+                     (make-node-number-field key label -1.0 1.0 0.05 0.0 y
+                                             node-page)
+                     (format nil "Saturation for colours nearest ~A, on top of Amount"
+                             (string-downcase label))))))
         (build-group
          :sharpen
          (lambda ()

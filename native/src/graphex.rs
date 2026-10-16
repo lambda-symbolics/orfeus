@@ -45,6 +45,7 @@ pub const NODE_DUST: u32 = 17;
 pub const NODE_VIGNETTE: u32 = 18;
 pub const NODE_CLARITY: u32 = 19;
 pub const NODE_DEHAZE: u32 = 20;
+pub const NODE_SATURATION: u32 = 21;
 
 /// Frame-level settings shared by every node of one graph render.
 #[repr(C)]
@@ -281,6 +282,7 @@ fn param_arity(kind: u32) -> Result<ParamArity, Error> {
         NODE_VIGNETTE => ParamArity::Exact(4),      // amount, midpoint, feather, roundness
         NODE_CLARITY => ParamArity::Exact(2),       // amount, radius px
         NODE_DEHAZE => ParamArity::Exact(1),        // amount
+        NODE_SATURATION => ParamArity::Exact(9),    // amount, then 8 bands
         _ => return Err(Error::InvalidArgument("unknown graph node kind")),
     })
 }
@@ -522,6 +524,7 @@ fn validate_param(kind: u32, index: usize, value: f32) -> Result<(), Error> {
         (NODE_CLARITY, 0) => (-1.0..=1.0).contains(&value),
         (NODE_CLARITY, 1) => (10.0..=1000.0).contains(&value),
         (NODE_DEHAZE, 0) => (-1.0..=1.0).contains(&value),
+        (NODE_SATURATION, _) => (-1.0..=1.0).contains(&value),
         // The four leading parameters are point counts, not signal levels.
         (NODE_CURVES, index) if index < CURVE_CHANNELS => {
             (MIN_CURVE_POINTS as f32..=MAX_CURVE_POINTS as f32).contains(&value)
@@ -644,7 +647,7 @@ pub(crate) fn parse_graph(bytes: &[u8]) -> Result<Vec<GraphOp>, Error> {
             // was nowhere at all to lift a shadow the LUT had buried, because
             // everything a photographer could reach ran before the transform
             // that then crushed it again.
-            NODE_TONE | NODE_CURVES | NODE_CONTRAST | NODE_SHARPEN => {
+            NODE_TONE | NODE_CURVES | NODE_CONTRAST | NODE_SHARPEN | NODE_SATURATION => {
                 display[index] = display[input_a];
             }
             _ => {
@@ -1248,6 +1251,7 @@ fn node_stage_name(kind: u32) -> &'static str {
         NODE_VIGNETTE => "vignetting\0",
         NODE_CLARITY => "adding clarity\0",
         NODE_DEHAZE => "removing haze\0",
+        NODE_SATURATION => "saturation\0",
         NODE_CONTRAST => "contrast\0",
         NODE_SHARPEN => "sharpening\0",
         _ => "developing\0",
@@ -1795,6 +1799,7 @@ fn execute_graph_into(
                     | NODE_VIGNETTE
                     | NODE_CLARITY
                     | NODE_DEHAZE
+                    | NODE_SATURATION
                     | NODE_CROP
                     | NODE_ROTATE
                     | NODE_FLIP
@@ -1914,6 +1919,9 @@ fn execute_graph_into(
                         render::apply_dehaze_prepared(&mut image, prepared, amount);
                     }
                 }
+            }
+            NODE_SATURATION => {
+                render::apply_saturation(&mut image, op.params[0], &op.params[1..9]);
             }
             NODE_CLARITY => {
                 // The radius is stated for the photograph, like the sharpening
@@ -3186,12 +3194,13 @@ mod tests {
         // was nowhere to lift a shadow a film LUT had buried, because every
         // control a photographer could reach ran before the transform that then
         // crushed it again.
-        for kind in [NODE_TONE, NODE_CURVES, NODE_CONTRAST, NODE_SHARPEN] {
+        for kind in [NODE_TONE, NODE_CURVES, NODE_CONTRAST, NODE_SHARPEN, NODE_SATURATION] {
             let params: &[f32] = match kind {
                 NODE_TONE => &[0.0; 7],
                 NODE_CURVES => &[2.0, 2.0, 2.0, 2.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0,
                                  0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0],
                 NODE_CONTRAST => &[1.2, 0.435],
+                NODE_SATURATION => &[0.0; 9],
                 _ => &[0.5, 1.0, 2.0],
             };
             assert!(

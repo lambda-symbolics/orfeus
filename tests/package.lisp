@@ -20,6 +20,7 @@
                 #:vignette-default-params
                 #:clarity-default-params
                 #:dehaze-default-params
+                #:saturation-default-params
                 #:resolve-lens-profile-alias
                 #:make-export-settings
                 #:make-photo-job

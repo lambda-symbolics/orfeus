@@ -132,6 +132,15 @@
       (graph-invalid params "dehaze amount must be within -1..1")))
   params)
 
+(defun saturation-params-validate (params)
+  (unless (and (listp params) (plist-known-keys-p params *saturation-keys*))
+    (graph-invalid params "expected amount and eight band parameters"))
+  (dolist (key *saturation-keys*)
+    (let ((value (getf params key 0)))
+      (unless (and (realp value) (<= -1 value 1))
+        (graph-invalid params "saturation ~A must be within -1..1" key))))
+  params)
+
 (defparameter *legacy-sharpen-keys*
   '((:amount . :sharpen-amount) (:radius . :sharpen-radius)
     (:threshold . :sharpen-threshold))
@@ -295,6 +304,7 @@ whose frame has already moved, whichever of the two moved it."
     ((eq kind :vignette) (vignette-params-validate params))
     ((eq kind :clarity) (clarity-params-validate params))
     ((eq kind :dehaze) (dehaze-params-validate params))
+    ((eq kind :saturation) (saturation-params-validate params))
     ((graph-filter-kind-p kind)
      (graph-node-params-validate
       (make-graph-node :kind kind :params params)))
@@ -398,19 +408,22 @@ while blends stay scene-linear."
            ;; like a crop.
            (when (member (first inputs) display)
              (push id display)))
-          ((member kind '(:curves :contrast :sharpen))
+          ((member kind '(:curves :contrast :sharpen :saturation))
            ;; Tone shaping carries its branch's domain rather than refusing it.
            ;; Shaping tone after a look is the point of having a look: without
            ;; this there was nowhere to lift a shadow a film LUT had buried,
            ;; because everything a photographer could reach ran before the
            ;; transform that then crushed it again. :TONE takes the same route
-           ;; through GRAPH-FILTER-KIND-P below.
+           ;; through GRAPH-FILTER-KIND-P below. :SATURATION is a colour grade
+           ;; in the same sense -- as meaningful to refine a film look with as
+           ;; to apply before one.
            (unless (= 1 (length inputs))
              (graph-invalid node "filter node ~S needs exactly one input" id))
            (ecase kind
              (:curves (curves-params-validate (graph-node-params node)))
              (:contrast (contrast-params-validate (graph-node-params node)))
-             (:sharpen (graph-node-params-validate node)))
+             (:sharpen (graph-node-params-validate node))
+             (:saturation (saturation-params-validate (graph-node-params node))))
            (when (member (first inputs) display)
              (push id display)))
           ((eq kind :node)

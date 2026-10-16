@@ -135,8 +135,8 @@ them as a copyable node chain.")
   "Rotation amounts a rotate node offers, as quarter turns clockwise.")
 
 (defparameter *graph-only-node-kinds*
-  '(:blend :color-subtract :negative :contrast :hdr :dust :vignette :clarity :dehaze :crop
-    :rotate :flip :curves)
+  '(:blend :color-subtract :negative :contrast :hdr :dust :vignette :clarity :dehaze
+    :saturation :crop :rotate :flip :curves)
   "Node kinds that exist only in graphs, beyond the flat pipeline stages.
 
 :COLOR-SUBTRACT computes picked-color minus pixel per channel in scene-linear
@@ -246,6 +246,19 @@ negative laying veiling light over the frame instead.")
 (defun dehaze-default-params ()
   "A dehaze node's parameters as the panel first shows them."
   (list :amount 0.3))
+
+(defparameter *saturation-keys*
+  '(:amount :red :orange :yellow :green :aqua :blue :purple :magenta)
+  "Parameters of a saturation node: an overall amount, then how much more or
+less of it each of Lightroom's eight hue bands gets on top, every one -1 to 1.
+Works by hue the way Camera Raw's HSL panel does: a colour belongs to the one
+or two bands nearest its own hue, tented between their centres, so a slider
+only ever reaches the colours its name promises.")
+
+(defun saturation-default-params ()
+  "A saturation node's parameters as the panel first shows them: untouched."
+  (list :amount 0.0 :red 0.0 :orange 0.0 :yellow 0.0 :green 0.0 :aqua 0.0
+        :blue 0.0 :purple 0.0 :magenta 0.0))
 
 (defparameter *color-subtract-keys* '(:red :green :blue))
 

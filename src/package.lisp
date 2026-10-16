@@ -168,6 +168,8 @@
    #:clarity-default-params
    #:*dehaze-keys*
    #:dehaze-default-params
+   #:*saturation-keys*
+   #:saturation-default-params
    #:*negative-default-gamma*
    #:*negative-default-balance*
    #:*rotate-keys*
