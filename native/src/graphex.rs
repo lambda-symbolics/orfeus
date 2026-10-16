@@ -1108,6 +1108,11 @@ fn sharpen_prepared_cache() -> &'static Mutex<Vec<NodeMeasurement<Option<render:
     CACHE.get_or_init(|| Mutex::new(Vec::new()))
 }
 
+fn dehaze_measurement_cache() -> &'static Mutex<Vec<NodeMeasurement<Option<render::DehazePrepared>>>> {
+    static CACHE: OnceLock<Mutex<Vec<NodeMeasurement<Option<render::DehazePrepared>>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(Vec::new()))
+}
+
 fn default_snapshot_boundary(ops: &[GraphOp]) -> StagePoint {
     let index = ops
         .iter()
@@ -1886,7 +1891,22 @@ fn execute_graph_into(
                 );
             }
             NODE_DEHAZE => {
-                render::apply_dehaze(&mut image, op.params[0]);
+                let amount = op.params[0];
+                // The dark-channel map and atmospheric light depend on the
+                // whole frame's pixels, not on AMOUNT, which a drag moves on
+                // every tick while the frame underneath does not.
+                if amount != 0.0 {
+                    let prepared = node_measurement_cached(
+                        dehaze_measurement_cache(),
+                        cache_key.as_ref(),
+                        index,
+                        ops,
+                        || render::prepare_dehaze(&image),
+                    );
+                    if let Some(prepared) = prepared.as_ref() {
+                        render::apply_dehaze_prepared(&mut image, prepared, amount);
+                    }
+                }
             }
             NODE_CLARITY => {
                 // The radius is stated for the photograph, like the sharpening
@@ -3972,6 +3992,36 @@ mod tests {
         let fourth = node_measurement_cached(&cache, None, index, &ops, compute(33));
         assert_eq!(*fourth, 33);
         assert_eq!(calls.get(), 3);
+    }
+
+    #[test]
+    fn dehaze_measurement_is_reused_across_an_amount_drag_and_invalidated_by_a_crop_change() {
+        let program = |crop_width: f32, amount: f32| {
+            parse_graph(
+                &GraphBuilder::new()
+                    .node(NODE_CROP, 0, -1, &[0.05, 0.05, crop_width, 0.9, 0.0], None)
+                    .node(NODE_DEHAZE, 1, -1, &[amount], None)
+                    .build(),
+            )
+            .unwrap()
+        };
+        let graph_context = context(5);
+        let key = test_prefix_key("dehaze-measurement-test", &graph_context);
+        for (crop_width, amount) in [(0.9, 0.3), (0.9, -0.4), (0.6, 0.3), (0.6, 0.7)] {
+            let ops = program(crop_width, amount);
+            let cached = execute_graph_cached(
+                &ops,
+                Arc::new(noisy_scene(320, 240)),
+                &graph_context,
+                Some(key.clone()),
+            )
+            .unwrap();
+            let cold = execute_graph(&ops, noisy_scene(320, 240), &graph_context).unwrap();
+            assert!(
+                max_difference(&cached, &cold) == 0.0,
+                "crop {crop_width} amount {amount} differs from a cold render"
+            );
+        }
     }
 
     #[test]

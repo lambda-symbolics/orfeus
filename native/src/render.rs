@@ -5351,22 +5351,26 @@ fn sample_plane(plane: &[f32], width: usize, height: usize, x: f32, y: f32) -> f
     top * (1.0 - fy) + bottom * fy
 }
 
-/// Lightroom's Dehaze, by the dark channel prior.
-///
-/// Haze adds the same veiling light everywhere, so the darkest channel of a
-/// neighbourhood says how much of it there is. The frame is reduced to a few
-/// hundred pixels across; the least channel is eroded and smoothed into a
-/// dark channel; the atmospheric light is the mean colour of the small pixels
-/// whose dark channel is brightest; and the transmission is one minus AMOUNT
-/// times the dark channel relative to that light, no lower than a floor.
-/// Every pixel then has the light subtracted, is divided by the transmission
-/// read from the small map, and has the light added back. A negative AMOUNT
-/// lays veiling light over the frame instead. Measured from the whole frame,
-/// so it runs whole like the negative does: a window of sky must not decide
-/// the haze of the frame.
-pub(crate) fn apply_dehaze(image: &mut RgbImage, amount: f32) {
-    if amount == 0.0 || image.width < 8 || image.height < 8 {
-        return;
+/// Everything APPLY_DEHAZE_PREPARED needs that depends on the pixels
+/// entering the node, never on AMOUNT, which a drag moves on every tick
+/// while the pixels underneath -- and so the haze read off them -- do not.
+pub(crate) struct DehazePrepared {
+    small_width: usize,
+    small_height: usize,
+    smooth: Vec<f32>,
+    air: [f32; 3],
+    air_dark: f32,
+    factor: usize,
+}
+
+/// The preparation half of dehazing: the dark-channel map and the
+/// atmospheric light, both read once from the whole frame -- a window of sky
+/// must not decide the haze of the frame, which is why dehaze still runs on
+/// the whole frame rather than a zoomed view's window. None for a frame too
+/// small to read.
+pub(crate) fn prepare_dehaze(image: &RgbImage) -> Option<DehazePrepared> {
+    if image.width < 8 || image.height < 8 {
+        return None;
     }
     let factor = (image.width / DEHAZE_SMALL_WIDTH).max(1);
     let (small, small_width, small_height) = box_downscale(image, factor);
@@ -5391,13 +5395,42 @@ pub(crate) fn apply_dehaze(image: &mut RgbImage, amount: f32) {
         *value = (*value / count as f32).max(1.0e-4);
     }
     let air_dark = air[0].min(air[1]).min(air[2]);
+    Some(DehazePrepared {
+        small_width,
+        small_height,
+        smooth,
+        air,
+        air_dark,
+        factor,
+    })
+}
+
+/// Lightroom's Dehaze, by the dark channel prior.
+///
+/// Haze adds the same veiling light everywhere, so the darkest channel of a
+/// neighbourhood says how much of it there is. The frame is reduced to a few
+/// hundred pixels across; the least channel is eroded and smoothed into a
+/// dark channel; the atmospheric light is the mean colour of the small pixels
+/// whose dark channel is brightest; and the transmission is one minus AMOUNT
+/// times the dark channel relative to that light, no lower than a floor.
+///
+/// The application half: every pixel has the light subtracted, is divided by
+/// the transmission read from the small map, and has the light added back. A
+/// negative AMOUNT lays veiling light over the frame instead.
+pub(crate) fn apply_dehaze_prepared(image: &mut RgbImage, prepared: &DehazePrepared, amount: f32) {
+    if amount == 0.0 {
+        return;
+    }
     let width = image.width;
-    let scale = 1.0 / factor as f32;
+    let scale = 1.0 / prepared.factor as f32;
     if amount > 0.0 {
         let strength = 0.9 * amount;
-        let transmission: Vec<f32> = smooth
+        let transmission: Vec<f32> = prepared
+            .smooth
             .iter()
-            .map(|dark| (1.0 - strength * (dark / air_dark).min(1.0)).max(DEHAZE_TRANSMISSION_FLOOR))
+            .map(|dark| {
+                (1.0 - strength * (dark / prepared.air_dark).min(1.0)).max(DEHAZE_TRANSMISSION_FLOOR)
+            })
             .collect();
         image
             .data
@@ -5407,8 +5440,8 @@ pub(crate) fn apply_dehaze(image: &mut RgbImage, amount: f32) {
                 let y = (row as f32 + 0.5) * scale - 0.5;
                 for (column, pixel) in line.as_chunks_mut::<3>().0.iter_mut().enumerate() {
                     let x = (column as f32 + 0.5) * scale - 0.5;
-                    let t = sample_plane(&transmission, small_width, small_height, x, y);
-                    for (value, light) in pixel.iter_mut().zip(air) {
+                    let t = sample_plane(&transmission, prepared.small_width, prepared.small_height, x, y);
+                    for (value, light) in pixel.iter_mut().zip(prepared.air) {
                         *value = ((*value - light) / t + light).max(0.0);
                     }
                 }
@@ -5418,11 +5451,23 @@ pub(crate) fn apply_dehaze(image: &mut RgbImage, amount: f32) {
         let veil = 0.4 * -amount;
         image.data.par_chunks_mut(3 * 8192).for_each(|chunk| {
             for pixel in chunk.as_chunks_mut::<3>().0 {
-                for (value, light) in pixel.iter_mut().zip(air) {
+                for (value, light) in pixel.iter_mut().zip(prepared.air) {
                     *value += (light - *value) * veil;
                 }
             }
         });
+    }
+}
+
+/// Prepares then applies in one call, for a caller with nothing to cache the
+/// preparation against -- a cold render, or a test.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn apply_dehaze(image: &mut RgbImage, amount: f32) {
+    if amount == 0.0 || image.width < 8 || image.height < 8 {
+        return;
+    }
+    if let Some(prepared) = prepare_dehaze(image) {
+        apply_dehaze_prepared(image, &prepared, amount);
     }
 }
 
