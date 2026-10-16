@@ -1359,7 +1359,7 @@ fn execute_graph_into(
             Some(rect) => crop_to_viewport(image, rect, 0, context.orientation, true).0,
             None => image,
         };
-        return finish(image, Domain::Linear, bytes);
+        return finish(image, Domain::Linear, None, bytes);
     }
     // Where the window may narrow, if it may at all.
     let plan = viewport.and_then(|rect| plan_viewport(ops).map(|plan| (rect, plan)));
@@ -2090,13 +2090,8 @@ fn execute_graph_into(
         image = window;
         window_inner = Some(inner);
     }
-    if let Some((left, top, width, height)) = window_inner
-        && (width < image.width || height < image.height)
-    {
-        image = render::crop_rect(&image, left, top, width, height);
-    }
     reporter.report("writing\0", 0.95);
-    let result = finish(image, domains[count], bytes)?;
+    let result = finish(image, domains[count], window_inner, bytes)?;
     reporter.report("done\0", 1.0);
     if let Some(started) = tail_started {
         eprintln!(
@@ -2112,25 +2107,59 @@ fn execute_graph_into(
 /// Delivers a finished graph: display-space pixels either as an image or
 /// written straight into the caller's 8-bit buffer.
 fn finish(
-    mut image: RgbImage,
+    image: RgbImage,
     domain: Domain,
+    window: Option<(usize, usize, usize, usize)>,
     bytes: Option<&mut [u8]>,
 ) -> Result<(usize, usize, Option<RgbImage>), Error> {
-    let (width, height) = (image.width, image.height);
-    match bytes {
-        None => {
-            if domain == Domain::Linear {
-                to_display(&mut image);
-            }
-            Ok((width, height, Some(image)))
-        }
-        Some(bytes) => {
+    // A window still holding its halo, worth trimming before anything else
+    // sees it. Only the direct-to-bytes path below can skip actually copying
+    // it out: the owned-image path hands the result back to more Lisp code,
+    // which needs it contiguous as its own image.
+    let window = window.filter(|&(_, _, width, height)| width < image.width || height < image.height);
+    match (window, bytes) {
+        (Some((left, top, width, height)), Some(bytes)) => {
             let needed = width * height * 3;
             if bytes.len() < needed {
                 return Err(Error::InvalidArgument("preview buffer is too small"));
             }
-            render::write_display_bytes(&image, &mut bytes[..needed], domain == Domain::Linear);
+            // The window's halo is trimmed by reading the kept rectangle
+            // directly, rather than copying it into its own image first and
+            // converting that copy: one traversal of the window in place of
+            // two.
+            render::write_display_rect(
+                &image,
+                left,
+                top,
+                width,
+                height,
+                &mut bytes[..needed],
+                domain == Domain::Linear,
+            );
             Ok((width, height, None))
+        }
+        (window, bytes) => {
+            let mut image = match window {
+                Some((left, top, width, height)) => render::crop_rect(&image, left, top, width, height),
+                None => image,
+            };
+            let (width, height) = (image.width, image.height);
+            match bytes {
+                None => {
+                    if domain == Domain::Linear {
+                        to_display(&mut image);
+                    }
+                    Ok((width, height, Some(image)))
+                }
+                Some(bytes) => {
+                    let needed = width * height * 3;
+                    if bytes.len() < needed {
+                        return Err(Error::InvalidArgument("preview buffer is too small"));
+                    }
+                    render::write_display_bytes(&image, &mut bytes[..needed], domain == Domain::Linear);
+                    Ok((width, height, None))
+                }
+            }
         }
     }
 }
@@ -3734,6 +3763,46 @@ mod tests {
             !graph_reaches_a_sharpener(&ops, 1),
             "a sharpener behind curves was wrongly reached"
         );
+    }
+
+    #[test]
+    fn writing_a_windowed_result_straight_to_bytes_matches_the_owned_image() {
+        // A denoiser gives the window a halo, so the final trim this exercises
+        // actually removes pixels: the inner rectangle must come out smaller
+        // than the window the graph ran on.
+        let ops = parse_graph(
+            &GraphBuilder::new()
+                .node(NODE_CROP, 0, -1, &[0.1, 0.1, 0.8, 0.8, 0.0], None)
+                .node(NODE_NOISE_REDUCTION, 1, -1, &[0.6, 0.0], None)
+                .node(NODE_TONE, 2, -1, &[0.1, 0.1, 0.0, -0.1, 0.0, 0.1, 0.0], None)
+                .build(),
+        )
+        .unwrap();
+        let graph_context = context(5);
+        let rect = [0.3_f32, 0.25, 0.3, 0.35];
+        let scene = noisy_scene(320, 240);
+
+        let owned = execute_graph_windowed(&ops, scene.clone(), &graph_context, rect).unwrap();
+        let expected: Vec<u8> = owned
+            .data
+            .iter()
+            .map(|value| (value.clamp(0.0, 1.0) * 255.0 + 0.5) as u8)
+            .collect();
+
+        let mut bytes = vec![0_u8; owned.width * owned.height * 3];
+        let (width, height, image) = execute_graph_into(
+            &ops,
+            move || scene,
+            &graph_context,
+            Some(rect),
+            Reporter::none(),
+            None,
+            Some(&mut bytes),
+        )
+        .unwrap();
+        assert!(image.is_none(), "a byte buffer was supplied but an image came back too");
+        assert_eq!((width, height), (owned.width, owned.height));
+        assert_eq!(&bytes[..expected.len()], &expected[..], "direct and copied writes differ");
     }
 
     #[test]

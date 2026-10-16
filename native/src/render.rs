@@ -3939,16 +3939,50 @@ pub(crate) fn write_display_bytes(image: &RgbImage, bytes: &mut [u8], scene_line
         .for_each(|(out, source)| {
             for (out, pixel) in out.as_chunks_mut::<3>().0.iter_mut().zip(source.as_chunks::<3>().0)
             {
-                let mut pixel = *pixel;
-                if scene_linear {
-                    super::tone::tone_pixel(&mut pixel);
-                    for value in pixel.iter_mut() {
-                        *value = srgb_encode(*value);
-                    }
-                }
-                for (byte, value) in out.iter_mut().zip(pixel) {
-                    *byte = (value.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
-                }
+                *out = display_pixel(*pixel, scene_linear);
+            }
+        });
+}
+
+/// Converts one pixel from scene-linear to a display byte triple, matching
+/// WRITE_DISPLAY_BYTES's inner loop exactly.
+#[inline]
+fn display_pixel(mut pixel: [f32; 3], scene_linear: bool) -> [u8; 3] {
+    if scene_linear {
+        super::tone::tone_pixel(&mut pixel);
+        for value in pixel.iter_mut() {
+            *value = srgb_encode(*value);
+        }
+    }
+    pixel.map(|value| (value.clamp(0.0, 1.0) * 255.0 + 0.5) as u8)
+}
+
+/// WRITE_DISPLAY_BYTES for one LEFT, TOP, WIDTH, HEIGHT rectangle of IMAGE,
+/// read where it sits rather than copied out first.
+///
+/// The window a zoomed preview develops keeps a halo around the part actually
+/// asked for, trimmed off only here. Trimming it by copying the interior into
+/// its own image first, then converting that, read and wrote it twice; this
+/// reads the halo'd image once, at the rectangle's own offset per row.
+pub(crate) fn write_display_rect(
+    image: &RgbImage,
+    left: usize,
+    top: usize,
+    width: usize,
+    height: usize,
+    bytes: &mut [u8],
+    scene_linear: bool,
+) {
+    debug_assert!(bytes.len() >= width * height * 3);
+    bytes
+        .par_chunks_mut(width * 3)
+        .enumerate()
+        .for_each(|(row, out)| {
+            let start = ((top + row) * image.width + left) * 3;
+            let source = &image.data[start..start + width * 3];
+            for (out, pixel) in out.as_chunks_mut::<3>().0.iter_mut().zip(source.as_chunks::<3>().0)
+            {
+                *out = display_pixel(*pixel, scene_linear);
             }
         });
 }
@@ -9665,6 +9699,50 @@ mod tests {
             }
         }
         output
+    }
+
+    #[test]
+    fn write_display_bytes_matches_write_display_rect_for_the_whole_image() {
+        // A direct, by-hand reference for scene-linear content: tone map,
+        // sRGB-encode, quantise. Independent of both functions under test.
+        fn reference_bytes(image: &RgbImage, scene_linear: bool) -> Vec<u8> {
+            image
+                .data
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .flat_map(|pixel| {
+                    let mut pixel = *pixel;
+                    if scene_linear {
+                        super::super::tone::tone_pixel(&mut pixel);
+                        for value in pixel.iter_mut() {
+                            *value = srgb_encode(*value);
+                        }
+                    }
+                    pixel.map(|value| (value.clamp(0.0, 1.0) * 255.0 + 0.5) as u8)
+                })
+                .collect()
+        }
+        let (width, height) = (37, 29);
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            // A few values past 1.0, so the highlight clamp is exercised too.
+            1.3 * (state >> 40) as f32 / (1_u32 << 24) as f32
+        };
+        let data: Vec<f32> = (0..width * height * 3).map(|_| next()).collect();
+        let image = RgbImage { width, height, data };
+        for scene_linear in [false, true] {
+            let expected = reference_bytes(&image, scene_linear);
+            let mut whole = vec![0_u8; width * height * 3];
+            write_display_bytes(&image, &mut whole, scene_linear);
+            assert_eq!(whole, expected, "write_display_bytes (scene_linear={scene_linear})");
+            let mut rect = vec![0_u8; width * height * 3];
+            write_display_rect(&image, 0, 0, width, height, &mut rect, scene_linear);
+            assert_eq!(rect, expected, "write_display_rect (scene_linear={scene_linear})");
+        }
     }
 
     #[test]
