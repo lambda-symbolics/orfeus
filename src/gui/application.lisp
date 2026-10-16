@@ -74,6 +74,16 @@ whole sensor quads instead of interpolating every photosite, which is the entire
 reason a draft is fast. Raising it past that would make the draft cost what the
 full render costs.")
 
+(defparameter *gui-background-preview-size* 1600
+  "Bounding size of a speculative neighbour-photo preview.
+
+Background renders used to inherit the selected photo's own viewport bound,
+which is zero -- the sensor's own size -- at 1:1. Editing one photo at 1:1 then
+silently developed every nearby photograph at full sensor resolution to warm
+its cache entry, which nobody was about to look at. A neighbour's own eventual
+render, at whatever bound its own view needs, still gets the cheap part: the
+RAW decode this one warms is cached by content alone, not by bound.")
+
 (defun recipe-geometry-key (recipe)
   "What in RECIPE decides the *shape* of the developed frame.
 
@@ -5918,15 +5928,15 @@ behind is memory. Best effort; returns how many directories went."
                                        :height 1.0 :angle angle)))))))
                settings))
            (enqueue-render (target-queue role job index settings generation publish-p
-                            &key front-p draft-p cache-p viewport)
+                            &key front-p draft-p cache-p viewport bound)
              ;; Scheduling is constant-time on the FLTK thread. Content hashing,
              ;; cache lookup, rendering, and hit materialization all run here.
              (let* ((settings (preview-recipe-snapshot settings))
                     (input (photo-job-input-path job))
                     (file-role (if draft-p :draft role))
-                    (bound (if draft-p
-                               *gui-draft-preview-size*
-                               (viewport-render-bound)))
+                    (bound (cond (draft-p *gui-draft-preview-size*)
+                                 (bound bound)
+                                 (t (viewport-render-bound))))
                     (max-width bound)
                     (max-height bound)
                     ;; Part of the cache name, not decoration: two renders of
@@ -6124,11 +6134,17 @@ behind is memory. Best effort; returns how many directories went."
                        ((:developed :graded))
                        (:camera (enqueue-thumbnail job generation :camera-p nil))
                        (t (enqueue-thumbnail job generation))))))
-               (dolist (index indices)
-                 (unless (= index selected-index)
-                   (let ((job (nth index photos)))
-                     (enqueue-render background-queue :after job index
-                                     (settings-for-job job) nil nil))))))
+               ;; Only on an actual selection change: a neighbour's own
+               ;; settings do not move when the SELECTED photo's edit settles,
+               ;; so re-running every neighbour's preview on every settle was
+               ;; pure churn against an unchanged cache.
+               (when selected-before-p
+                 (dolist (index indices)
+                   (unless (= index selected-index)
+                     (let ((job (nth index photos)))
+                       (enqueue-render background-queue :after job index
+                                       (settings-for-job job) nil nil
+                                       :bound *gui-background-preview-size*)))))))
            (draft-preview-fits-the-view-p ()
              (let* ((canvas (or after-canvas before-canvas))
                     (pixels (if canvas
