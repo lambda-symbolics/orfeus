@@ -1026,6 +1026,78 @@ fn graph_reaches_a_sharpener(ops: &[GraphOp], from_index: usize) -> bool {
     false
 }
 
+/// A value a node measures from its own input, cached against the exact ops
+/// that produced that input.
+///
+/// The checkpoint system only resumes at whole-node boundaries: dragging a
+/// node's own amount, threshold, gamma or balance makes that node the
+/// resume point, so its whole match arm -- whatever it measures from its
+/// input AND the parameter-dependent work that follows -- re-runs on every
+/// tick, even on the measurement half, which cannot have changed since the
+/// pixels entering the node did not. This is the general shape of that
+/// waste, applied once for negative, dehaze, sensor noise, and the
+/// sharpener's own preparation, rather than reinvented at each one.
+struct NodeMeasurement<T> {
+    key: PrefixKey,
+    index: usize,
+    upstream: Vec<GraphOp>,
+    value: Arc<T>,
+}
+
+/// How many of a kind's measurements stay cached at once: the live photo, the
+/// one being compared against in before/after, and a little slack for a
+/// background render that lands mid-drag -- not a number ever worth growing,
+/// since every entry past the ones actually in view is dead weight.
+const NODE_MEASUREMENT_CAPACITY: usize = 4;
+
+/// Returns CACHE's entry for INDEX in OPS under CACHE_KEY, computing it with
+/// COMPUTE when nothing before INDEX has changed since the last time this
+/// cache_key and index were asked for -- regardless of how far INDEX's own
+/// node's parameters, or anything after it, have moved. Without a cache_key
+/// (no interactive session to cache against) COMPUTE just runs every time.
+fn node_measurement_cached<T>(
+    cache: &Mutex<Vec<NodeMeasurement<T>>>,
+    cache_key: Option<&PrefixKey>,
+    index: usize,
+    ops: &[GraphOp],
+    compute: impl FnOnce() -> T,
+) -> Arc<T> {
+    let Some(cache_key) = cache_key else {
+        return Arc::new(compute());
+    };
+    let upstream = &ops[..index];
+    {
+        let mut cache = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(position) = cache.iter().position(|entry| {
+            &entry.key == cache_key && entry.index == index && entry.upstream == upstream
+        }) {
+            let value = Arc::clone(&cache[position].value);
+            let entry = cache.remove(position);
+            cache.insert(0, entry);
+            return value;
+        }
+    }
+    let value = Arc::new(compute());
+    let mut cache = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    cache.retain(|entry| !(&entry.key == cache_key && entry.index == index));
+    cache.insert(
+        0,
+        NodeMeasurement {
+            key: cache_key.clone(),
+            index,
+            upstream: upstream.to_vec(),
+            value: Arc::clone(&value),
+        },
+    );
+    cache.truncate(NODE_MEASUREMENT_CAPACITY);
+    value
+}
+
+fn negative_measurement_cache() -> &'static Mutex<Vec<NodeMeasurement<render::NegativeMeasure>>> {
+    static CACHE: OnceLock<Mutex<Vec<NodeMeasurement<render::NegativeMeasure>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(Vec::new()))
+}
+
 fn default_snapshot_boundary(ops: &[GraphOp]) -> StagePoint {
     let index = ops
         .iter()
@@ -1763,12 +1835,15 @@ fn execute_graph_into(
                 render::apply_flip(&mut image, op.params[0] != 0.0, op.params[1] != 0.0);
             }
             NODE_NEGATIVE => {
-                render::apply_negative(
-                    &mut image,
-                    [op.params[0], op.params[1], op.params[2]],
-                    op.params[3],
-                    op.params[4],
+                let picked = [op.params[0], op.params[1], op.params[2]];
+                let measure = node_measurement_cached(
+                    negative_measurement_cache(),
+                    cache_key.as_ref(),
+                    index,
+                    ops,
+                    || render::measure_negative(&image, picked),
                 );
+                render::apply_negative_measured(&mut image, &measure, op.params[3], op.params[4]);
             }
             NODE_HDR => {
                 render::apply_hdr(
@@ -3803,6 +3878,98 @@ mod tests {
         assert!(image.is_none(), "a byte buffer was supplied but an image came back too");
         assert_eq!((width, height), (owned.width, owned.height));
         assert_eq!(&bytes[..expected.len()], &expected[..], "direct and copied writes differ");
+    }
+
+    #[test]
+    fn node_measurement_cache_reuses_across_a_params_only_change_and_not_otherwise() {
+        use std::cell::Cell;
+        let cache: Mutex<Vec<NodeMeasurement<u32>>> = Mutex::new(Vec::new());
+        let calls = Cell::new(0);
+        // Counts when the returned closure actually RUNS, not when this
+        // factory is called -- a cache hit must build no closure call at all.
+        let compute = |value: u32| {
+            let calls = &calls;
+            move || {
+                calls.set(calls.get() + 1);
+                value
+            }
+        };
+        let graph_context = context(5);
+        let key = test_prefix_key("node-measurement-cache-test", &graph_context);
+        let upstream = parse_graph(
+            &GraphBuilder::new()
+                .node(NODE_CROP, 0, -1, &[0.0, 0.0, 1.0, 1.0, 0.0], None)
+                .build(),
+        )
+        .unwrap();
+        let mut ops = upstream.clone();
+        // The node being measured itself, standing in for e.g. negative or
+        // sharpen: present in the program but not part of "upstream".
+        ops.push(GraphOp {
+            kind: NODE_TONE,
+            input_a: 1,
+            input_b: 0,
+            params: vec![0.0; 7],
+            text: None,
+        });
+        let index = 1;
+
+        let first = node_measurement_cached(&cache, Some(&key), index, &ops, compute(11));
+        assert_eq!(*first, 11);
+        assert_eq!(calls.get(), 1);
+
+        // Only this node's own params moved (modelled here by nothing at all
+        // changing upstream of INDEX): the cached value comes back, uncalled.
+        let second = node_measurement_cached(&cache, Some(&key), index, &ops, compute(99));
+        assert_eq!(*second, 11, "a cache hit still ran compute");
+        assert_eq!(calls.get(), 1, "compute ran again though nothing upstream changed");
+
+        // Something upstream of INDEX changed: the cache must not answer with
+        // what the old upstream measured.
+        let mut changed = ops.clone();
+        changed[0].params[2] = 0.5;
+        let third = node_measurement_cached(&cache, Some(&key), index, &changed, compute(22));
+        assert_eq!(*third, 22, "a changed upstream still returned the stale value");
+        assert_eq!(calls.get(), 2);
+
+        // No cache_key at all (no interactive session to cache against):
+        // always computed fresh.
+        let fourth = node_measurement_cached(&cache, None, index, &ops, compute(33));
+        assert_eq!(*fourth, 33);
+        assert_eq!(calls.get(), 3);
+    }
+
+    #[test]
+    fn negative_measurement_is_reused_across_a_gamma_drag_and_invalidated_by_a_crop_change() {
+        let program = |crop_width: f32, gamma: f32| {
+            parse_graph(
+                &GraphBuilder::new()
+                    .node(NODE_CROP, 0, -1, &[0.05, 0.05, crop_width, 0.9, 0.0], None)
+                    .node(NODE_NEGATIVE, 1, -1, &[0.5, 0.3, 0.2, gamma, 1.0], None)
+                    .build(),
+            )
+            .unwrap()
+        };
+        let graph_context = context(5);
+        let key = test_prefix_key("negative-measurement-test", &graph_context);
+        // A gamma-only drag under the same crop, then a crop change, then
+        // another gamma-only drag under the new crop: each must match an
+        // independent cold render, whether the cache hits or has to recompute.
+        for (crop_width, gamma) in [(0.9, 2.2), (0.9, 2.8), (0.6, 2.2), (0.6, 3.2)] {
+            let ops = program(crop_width, gamma);
+            let cached = execute_graph_cached(
+                &ops,
+                Arc::new(noisy_scene(320, 240)),
+                &graph_context,
+                Some(key.clone()),
+            )
+            .unwrap();
+            let cold = execute_graph(&ops, noisy_scene(320, 240), &graph_context).unwrap();
+            assert!(
+                max_difference(&cached, &cold) == 0.0,
+                "crop {crop_width} gamma {gamma} differs from a cold render"
+            );
+        }
     }
 
     #[test]
