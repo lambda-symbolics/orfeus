@@ -153,18 +153,6 @@ extern "C" int orfeus_gui_preview_draw(long long widget_id,
     return 1;
 }
 
-namespace {
-// The live preview: one borrowed RGB8 buffer drawn without any JPEG or
-// file round trip. The scaled copy is cached per generation and size.
-struct LiveView {
-    std::unique_ptr<Fl_Image> scaled;
-    int generation = -1;
-    int scaled_width = 0;
-    int scaled_height = 0;
-};
-LiveView live_view;
-}
-
 extern "C" int orfeus_gui_preview_draw_buffer(long long widget_id,
                                               const unsigned char *rgb,
                                               int width,
@@ -173,6 +161,9 @@ extern "C" int orfeus_gui_preview_draw_buffer(long long widget_id,
                                               double zoom,
                                               double center_x,
                                               double center_y) {
+    // Every live tick hands this a different buffer, so there was never a
+    // frame to find again by GENERATION; kept only so the ABI need not change.
+    (void)generation;
     std::lock_guard<std::mutex> lock(images_mutex);
     Fl_Widget *widget = clfl_bridge::find_widget(widget_id);
     if (!widget || !rgb || width <= 0 || height <= 0 ||
@@ -189,16 +180,6 @@ extern "C" int orfeus_gui_preview_draw_buffer(long long widget_id,
                                               fit_scale, maximum_scale);
     const int scaled_width = scaled_dimension(width, effective_scale);
     const int scaled_height = scaled_dimension(height, effective_scale);
-    if (!live_view.scaled || live_view.generation != generation ||
-        live_view.scaled_width != scaled_width ||
-        live_view.scaled_height != scaled_height) {
-        Fl_RGB_Image source(rgb, width, height, 3, 0);
-        live_view.scaled.reset(source.copy(scaled_width, scaled_height));
-        if (!live_view.scaled) return 0;
-        live_view.generation = generation;
-        live_view.scaled_width = scaled_width;
-        live_view.scaled_height = scaled_height;
-    }
 
     const double visible_x =
         std::min(1.0, static_cast<double>(widget->w()) / scaled_width);
@@ -212,7 +193,14 @@ extern "C" int orfeus_gui_preview_draw_buffer(long long widget_id,
                   static_cast<int>(std::lround(clamped_x * scaled_width));
     const int y = widget->y() + widget->h() / 2 -
                   static_cast<int>(std::lround(clamped_y * scaled_height));
-    live_view.scaled->draw(x, y);
+
+    // A fresh wrapper over the caller's own buffer costs nothing: the
+    // constructor only stores the pointer. SCALE sets the size to draw at and
+    // DRAW resamples straight from RGB at that size, in place of a resized
+    // copy this bridge used to allocate and fill itself on every live tick.
+    Fl_RGB_Image source(rgb, width, height, 3, 0);
+    source.scale(scaled_width, scaled_height, 1, 1);
+    source.draw(x, y);
     return 1;
 }
 
