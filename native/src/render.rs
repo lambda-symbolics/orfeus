@@ -933,12 +933,7 @@ pub(crate) fn measure_sensor_noise(image: &RgbImage) -> Option<SensorNoise> {
     let encoded: Vec<f32> = luma.par_iter().map(|value| value.max(0.0).sqrt()).collect();
     let kernel = gaussian_kernel(SENSOR_NOISE_REFERENCE_RADIUS);
     let mut blurred = vec![0.0_f32; width * height];
-    let mut turned = vec![0.0_f32; width * height];
-    let mut turned_blur = vec![0.0_f32; width * height];
-    blur_rows(&encoded, &mut blurred, width, height, &kernel);
-    transpose_plane(&blurred, &mut turned, width, height);
-    blur_rows(&turned, &mut turned_blur, height, width, &kernel);
-    transpose_plane(&turned_blur, &mut blurred, height, width);
+    gaussian_blur(&encoded, &mut blurred, width, height, &kernel);
     let mut detail = blurred;
     detail
         .par_chunks_mut(8192)
@@ -4827,35 +4822,60 @@ const MIN_SHARPEN_RADIUS: f32 = 0.6;
 /// How far the sharpening reads around each pixel it writes.
 pub(crate) const SHARPEN_MAX_REACH: usize = 16;
 
-/// One separable Gaussian pass along the rows of a plane.
-fn blur_rows(source: &[f32], output: &mut [f32], width: usize, height: usize, kernel: &[f32]) {
+/// Rows processed per band of a separable blur: the horizontal pass for the
+/// band plus the halo its vertical pass needs is kept in a small per-band
+/// buffer, so the vertical pass reads straight down it. The transpose this
+/// replaced copied the whole plane and then read every column of the copy —
+/// a stride of one row's width, a cache miss on nearly every sample at 20 MP.
+const GAUSSIAN_BAND_ROWS: usize = 64;
+
+/// A separable Gaussian blur of SOURCE (WIDTH by HEIGHT) under KERNEL,
+/// written to OUTPUT. Used wherever a plane needs blurring in both
+/// directions: the sharpener's detail band and the sensor-noise reading it
+/// shares the kernel and reference radius with.
+fn gaussian_blur(source: &[f32], output: &mut [f32], width: usize, height: usize, kernel: &[f32]) {
     let radius = (kernel.len() / 2) as isize;
     output
-        .par_chunks_mut(width)
+        .par_chunks_mut(width * GAUSSIAN_BAND_ROWS)
         .enumerate()
-        .for_each(|(row, out)| {
-            let base = row * width;
-            for (column, value) in out.iter_mut().enumerate() {
-                let mut sum = 0.0;
-                for (index, weight) in kernel.iter().enumerate() {
-                    let at = (column as isize + index as isize - radius)
-                        .clamp(0, width as isize - 1) as usize;
-                    sum += weight * source[base + at];
+        .for_each_init(Vec::<f32>::new, |band_buffer, (band_index, band_output)| {
+            let y0 = band_index * GAUSSIAN_BAND_ROWS;
+            let band_rows = band_output.len() / width;
+            let halo_lo = (y0 as isize - radius).max(0) as usize;
+            let halo_hi = ((y0 + band_rows) as isize + radius).min(height as isize) as usize;
+            let halo_rows = halo_hi - halo_lo;
+            band_buffer.clear();
+            band_buffer.resize(halo_rows * width, 0.0);
+            // Horizontal pass: the band plus its halo, small enough to stay
+            // resident in cache for the vertical pass right below.
+            for row in 0..halo_rows {
+                let y = halo_lo + row;
+                let source_row = &source[y * width..(y + 1) * width];
+                let out_row = &mut band_buffer[row * width..(row + 1) * width];
+                for (column, value) in out_row.iter_mut().enumerate() {
+                    let mut sum = 0.0;
+                    for (index, weight) in kernel.iter().enumerate() {
+                        let at = (column as isize + index as isize - radius)
+                            .clamp(0, width as isize - 1) as usize;
+                        sum += weight * source_row[at];
+                    }
+                    *value = sum;
                 }
-                *value = sum;
             }
-        });
-    let _ = height;
-}
-
-/// Transposes a plane, so one row kernel serves both axes.
-fn transpose_plane(source: &[f32], output: &mut [f32], width: usize, height: usize) {
-    output
-        .par_chunks_mut(height)
-        .enumerate()
-        .for_each(|(column, out)| {
-            for (row, value) in out.iter_mut().enumerate() {
-                *value = source[row * width + column];
+            // Vertical pass: reads the band buffer above, never the plane.
+            for row in 0..band_rows {
+                let y = y0 + row;
+                let out_row = &mut band_output[row * width..(row + 1) * width];
+                for (column, value) in out_row.iter_mut().enumerate() {
+                    let mut sum = 0.0;
+                    for (index, weight) in kernel.iter().enumerate() {
+                        let source_row = ((y as isize + index as isize - radius)
+                            .clamp(0, height as isize - 1) as usize)
+                            - halo_lo;
+                        sum += weight * band_buffer[source_row * width + column];
+                    }
+                    *value = sum;
+                }
             }
         });
 }
@@ -4948,12 +4968,7 @@ pub(crate) fn apply_sharpen(
     let encoded: Vec<f32> = luma.par_iter().map(|value| value.max(0.0).sqrt()).collect();
     let kernel = gaussian_kernel(radius);
     let mut blurred = vec![0.0_f32; width * height];
-    let mut turned = vec![0.0_f32; width * height];
-    let mut turned_blur = vec![0.0_f32; width * height];
-    blur_rows(&encoded, &mut blurred, width, height, &kernel);
-    transpose_plane(&blurred, &mut turned, width, height);
-    blur_rows(&turned, &mut turned_blur, height, width, &kernel);
-    transpose_plane(&turned_blur, &mut blurred, height, width);
+    gaussian_blur(&encoded, &mut blurred, width, height, &kernel);
     // The detail band and how much of it is noise, judged as the denoiser
     // judges its bands: local power against the power flat areas carry.
     let mut detail = blurred;
@@ -5006,7 +5021,8 @@ pub(crate) fn apply_sharpen(
     // The darkest and brightest value along each row within the blur's reach;
     // the column direction is folded into the pass below, a few rows at a time.
     let reach = (radius.ceil() as usize).clamp(1, 3);
-    let (mut lowest, mut highest) = (turned, turned_blur);
+    let mut lowest = vec![0.0_f32; width * height];
+    let mut highest = vec![0.0_f32; width * height];
     lowest
         .par_chunks_mut(width)
         .zip(highest.par_chunks_mut(width))
@@ -9611,5 +9627,104 @@ mod tests {
         assert!(fs::read(&output).unwrap().starts_with(&[0xff, 0xd8]));
         let _ = fs::remove_file(input);
         let _ = fs::remove_file(output);
+    }
+
+    /// A separable Gaussian blur, computed the straightforward way with no
+    /// band buffer: one pass along rows, one along columns, each reading
+    /// SOURCE (or its own first pass) directly. Independent of GAUSSIAN_BLUR,
+    /// so a bug shared between them would not hide here too.
+    fn reference_gaussian_blur(
+        source: &[f32],
+        width: usize,
+        height: usize,
+        kernel: &[f32],
+    ) -> Vec<f32> {
+        let radius = (kernel.len() / 2) as isize;
+        let mut rows_blurred = vec![0.0_f32; width * height];
+        for y in 0..height {
+            for x in 0..width {
+                let mut sum = 0.0;
+                for (index, weight) in kernel.iter().enumerate() {
+                    let at =
+                        (x as isize + index as isize - radius).clamp(0, width as isize - 1) as usize;
+                    sum += weight * source[y * width + at];
+                }
+                rows_blurred[y * width + x] = sum;
+            }
+        }
+        let mut output = vec![0.0_f32; width * height];
+        for y in 0..height {
+            for x in 0..width {
+                let mut sum = 0.0;
+                for (index, weight) in kernel.iter().enumerate() {
+                    let at = (y as isize + index as isize - radius)
+                        .clamp(0, height as isize - 1) as usize;
+                    sum += weight * rows_blurred[at * width + x];
+                }
+                output[y * width + x] = sum;
+            }
+        }
+        output
+    }
+
+    #[test]
+    fn gaussian_blur_matches_a_plain_two_pass_reference() {
+        // Sizes that do not divide GAUSSIAN_BAND_ROWS evenly, so a band at
+        // the bottom edge is partial in both this test and the real callers.
+        for (width, height) in [(37, 29), (130, 200), (64, 64), (5, 300)] {
+            let mut state = 0x2545_f491_4f6c_dd1d_u64;
+            let mut next = move || {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 40) as f32 / (1_u32 << 24) as f32
+            };
+            let source: Vec<f32> = (0..width * height).map(|_| next()).collect();
+            for radius in [0.6_f32, 1.5, 3.0] {
+                let kernel = gaussian_kernel(radius);
+                let mut actual = vec![0.0_f32; width * height];
+                gaussian_blur(&source, &mut actual, width, height, &kernel);
+                let expected = reference_gaussian_blur(&source, width, height, &kernel);
+                for (index, (a, e)) in actual.iter().zip(&expected).enumerate() {
+                    assert!(
+                        (a - e).abs() < 1.0e-5,
+                        "{width}x{height} radius {radius}: pixel {index} got {a}, expected {e}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// `cargo test --release bench_apply_sharpen_20mp -- --ignored --nocapture`.
+/// A synthetic 20 MP frame, timed over three calls each so the first one's
+/// cold allocator pages do not stand for the steady state a drag actually
+/// sees.
+#[cfg(test)]
+mod sharpen_bench {
+    use super::*;
+    #[test]
+    #[ignore]
+    fn bench_apply_sharpen_20mp() {
+        let (width, height) = (5184, 3888);
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 40) as f32 / (1_u32 << 24) as f32
+        };
+        let data: Vec<f32> = (0..width * height * 3).map(|_| next()).collect();
+        let mut image = RgbImage { width, height, data };
+        for _ in 0..3 {
+            let started = std::time::Instant::now();
+            apply_sharpen(&mut image, 0.5, 1.5, 2.0, None);
+            eprintln!("apply_sharpen: {:.1} ms", started.elapsed().as_secs_f64() * 1000.0);
+        }
+        for _ in 0..3 {
+            let started = std::time::Instant::now();
+            let _ = measure_sensor_noise(&image);
+            eprintln!("measure_sensor_noise: {:.1} ms", started.elapsed().as_secs_f64() * 1000.0);
+        }
     }
 }
