@@ -327,6 +327,7 @@ be found and keeps what the photographer typed in."
 (defun render-native-photo-graph (input-pathname output-pathname graph
                                   &key max-width max-height jpeg-quality
                                     grain-seed cache-p draft-p viewport progress
+                                    (durable-p t)
                                     (report-input-pathname input-pathname))
   (multiple-value-bind (chosen-profile chosen-focal demosaic)
       (graph-optics-overrides graph)
@@ -339,6 +340,7 @@ be found and keeps what the photographer typed in."
               :lens-focal-length focal-length
               :cache-p cache-p
               :draft-p draft-p
+              :durable-p durable-p
               :demosaic demosaic
               :viewport viewport
               :progress progress
@@ -372,6 +374,7 @@ be found and keeps what the photographer typed in."
                        (max-width 0) (max-height 0)
                        (jpeg-quality 92) (grain-seed 0)
                        (preserve-metadata-p t) cache-p graph draft-p viewport
+                       (durable-p t)
                        progress (finisher #'funcall))
   "Render INPUT-PATHNAME to JPEG or TIFF using PROCESSING-SETTINGS.
 
@@ -388,6 +391,12 @@ VIEWPORT, when given, names the part of the frame to develop as four fractions
 of the oriented frame: left, top, width, height. Only an interactive preview
 gives one, and only when it is zoomed in far enough that most of the frame is
 off screen; an export is the whole photograph by definition.
+
+DURABLE-P, true by default, asks the bridge to fsync the written file before
+returning, so it survives a crash the moment this returns. A disposable
+preview-cache entry asks for NIL instead: losing one costs a re-render, not a
+photograph, and the fsyncs it then skips are themselves most of a cache
+write's own latency.
 
 PROGRESS, when given, is called with a stage name and a fraction as the render
 passes each stage, on this thread. A render takes anywhere from forty
@@ -461,6 +470,7 @@ has every other core busy, and the two have nothing to say to each other."
                    :jpeg-quality jpeg-quality
                    :cache-p cache-p
                    :draft-p draft-p
+                   :durable-p durable-p
                    :viewport viewport
                    :progress progress)))
                (setf rendered t))
@@ -481,7 +491,10 @@ has every other core busy, and the two have nothing to say to each other."
 
 Develops a draft by default: this is what the editor looks at, not what it
 delivers, and the bridge ignores the request when the bound is large enough that
-binning would drop detail the downscale would have kept."
+binning would drop detail the downscale would have kept.
+
+Not durable: a preview is the cache's own disposable entry, not a photograph
+to lose, and skipping the write's fsyncs is most of what a cache fill costs."
   (render-photo input-pathname output-pathname settings
                 :draft-p draft-p
                 :max-width max-width
@@ -489,6 +502,7 @@ binning would drop detail the downscale would have kept."
                 :jpeg-quality jpeg-quality
                 :grain-seed grain-seed
                 :preserve-metadata-p nil
+                :durable-p nil
                 :if-exists if-exists
                 :cache-p cache-p
                 :viewport viewport

@@ -113,10 +113,18 @@ form by hand for each of them buried the call it guards."
 (defparameter +frame-flag-rcd+ 2
   "RENDER-FRAME-V1 flag asking for the RCD demosaic; clear, the bridge uses PPG.")
 
-(defun frame-flags (draft-p demosaic)
-  "The RENDER-FRAME-V1 flag word for a DRAFT-P render developed by DEMOSAIC."
+(defparameter +frame-flag-durable+ 4
+  "RENDER-FRAME-V1 flag asking the bridge to fsync a file write before
+returning. An export or anything else kept wants that; a disposable preview
+cache entry does not, and the fsyncs it then skips are themselves most of a
+cache write's own latency.")
+
+(defun frame-flags (draft-p demosaic &optional (durable-p t))
+  "The RENDER-FRAME-V1 flag word for a DRAFT-P render developed by DEMOSAIC,
+fsynced before returning when DURABLE-P."
   (logior (if draft-p +frame-flag-draft+ 0)
-          (if (eq demosaic :rcd) +frame-flag-rcd+ 0)))
+          (if (eq demosaic :rcd) +frame-flag-rcd+ 0)
+          (if durable-p +frame-flag-durable+ 0)))
 
 (defparameter *native-error-buffer-size* 1024
   "Bytes reserved for a diagnostic returned by the Rust bridge.")
@@ -604,9 +612,15 @@ reaches it and there is nothing to keep alive across threads.")
                                   (max-width 0) (max-height 0)
                                   (jpeg-quality 92) output-format cache-p
                                   draft-p viewport progress
+                                  (durable-p t)
                                   (demosaic (getf *stage-identity-plist*
                                                   :demosaic)))
   "Render INPUT-PATHNAME through the node GRAPH via the version 3 bridge.
+
+DURABLE-P asks the bridge to fsync the written file before returning. An
+export wants that; a preview-cache entry does not, since losing one costs a
+re-render rather than a photograph, and the fsyncs it then skips were
+themselves most of a cache write's own latency.
 
 DRAFT-P asks the bridge to develop at half resolution. Only a preview may.
 
@@ -643,7 +657,7 @@ by definition."
                           (float (or lens-crop-factor 0.0) 0.0))
                  (setting 'lens-profile-model lens-pointer)
                  (setting 'lens-name name-pointer)
-                 (setting 'flags (frame-flags draft-p demosaic))
+                 (setting 'flags (frame-flags draft-p demosaic durable-p))
                  (setting 'progress
                           (if progress
                               (cffi:callback render-progress-trampoline)

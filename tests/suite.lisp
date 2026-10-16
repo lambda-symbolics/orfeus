@@ -211,9 +211,13 @@ the failure list, and both ON-ERROR modes without needing real RAW files."
          (eq :ppg (getf (graph-node-params optics) :demosaic))
          (eq :ppg (nth-value 2 (orfeus::graph-optics-overrides graph)))
          (eq :ppg (processing-settings-demosaic (project-defaults decoded)))
-         (= 2 (orfeus::frame-flags nil :rcd))
-         (= 3 (orfeus::frame-flags t :rcd))
-         (= 0 (orfeus::frame-flags nil :ppg))
+         (= 2 (orfeus::frame-flags nil :rcd nil))
+         (= 3 (orfeus::frame-flags t :rcd nil))
+         (= 0 (orfeus::frame-flags nil :ppg nil))
+         ;; Durable by default, and clear when a caller says the write is
+         ;; disposable -- a preview-cache entry, not a photograph to lose.
+         (= 6 (orfeus::frame-flags nil :rcd))
+         (= 4 (orfeus::frame-flags nil :ppg))
          (not (orfeus::processing-value-valid-p :demosaic :amaze))
          (handler-case
              (progn

@@ -139,6 +139,13 @@ pub const FRAME_FLAG_DRAFT: u32 = 1;
 /// node's, read on the Lisp side, because the source itself has no node.
 pub const FRAME_FLAG_RCD: u32 = 2;
 
+/// Fsync the written file and its directory before returning, so the write
+/// survives a crash the moment it does. An export or anything else the
+/// photographer keeps wants that; a preview-cache entry does not, since
+/// losing one costs a re-render rather than a photograph, and the fsyncs
+/// this spares it were themselves most of a cache write's own latency.
+pub const FRAME_FLAG_DURABLE: u32 = 4;
+
 /// The demosaic a frame's flags ask for.
 fn demosaic_for(flags: u32) -> render::Demosaic {
     if flags & FRAME_FLAG_RCD != 0 {
@@ -2369,6 +2376,7 @@ pub fn render_graph(
         &image,
         frame.output_format,
         frame.jpeg_quality,
+        frame.flags & FRAME_FLAG_DURABLE != 0,
     )
 }
 

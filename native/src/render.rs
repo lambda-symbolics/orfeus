@@ -5718,12 +5718,22 @@ fn temporary_path(output: &Path, attempt: u32) -> Result<PathBuf, Error> {
     )))
 }
 
+/// Writes IMAGE to OUTPUT by a temporary file and a rename, so a reader never
+/// sees a half-written file, however the write ends.
+///
+/// DURABLE additionally fsyncs the file and its directory before returning, so
+/// the write survives a crash the moment this returns -- what an export or any
+/// other output the photographer keeps needs. A preview-cache entry does not:
+/// losing one costs a re-render, not a photograph, and the two fsyncs this
+/// skips for it are themselves most of a cache write's latency on a spinning
+/// disk, and never free even on an SSD.
 pub(crate) fn atomic_encode(
     input: &Path,
     output: &Path,
     image: &RgbImage,
     format: u32,
     quality: u32,
+    durable: bool,
 ) -> Result<(), Error> {
     if same_file(input, output)? {
         return Err(Error::InvalidArgument(
@@ -5753,9 +5763,13 @@ pub(crate) fn atomic_encode(
         encode_to(image, &mut writer, format, quality)?;
         writer.flush()?;
         let file = writer.into_inner().map_err(|e| Error::Io(e.into_error()))?;
-        file.sync_all()?;
+        if durable {
+            file.sync_all()?;
+        }
         fs::rename(&temp_path, output)?;
-        File::open(output.parent().unwrap_or_else(|| Path::new(".")))?.sync_all()?;
+        if durable {
+            File::open(output.parent().unwrap_or_else(|| Path::new(".")))?.sync_all()?;
+        }
         Ok(())
     })();
     if result.is_err() {
@@ -7026,12 +7040,16 @@ pub fn render(
         (0, 0),
     );
     profile_stage!("lut-grain");
+    // This older, flat-settings path has had no caller since the graph path
+    // took over rendering for both frontends; always durable, as it always
+    // was, rather than inventing a flag meaning for an ABI nothing exercises.
     atomic_encode(
         input,
         output,
         &image,
         settings.output_format,
         settings.jpeg_quality,
+        true,
     )?;
     profile_stage!("encode");
     let _ = stage_started;
@@ -9751,15 +9769,15 @@ mod tests {
         symlink(&input, &symlink_path).unwrap();
         fs::hard_link(&input, &hardlink_path).unwrap();
         assert!(matches!(
-            atomic_encode(&input, &input, &image(), OUTPUT_JPEG, 90),
+            atomic_encode(&input, &input, &image(), OUTPUT_JPEG, 90, true),
             Err(Error::InvalidArgument(_))
         ));
         assert!(matches!(
-            atomic_encode(&input, &symlink_path, &image(), OUTPUT_JPEG, 90),
+            atomic_encode(&input, &symlink_path, &image(), OUTPUT_JPEG, 90, true),
             Err(Error::InvalidArgument(_))
         ));
         assert!(matches!(
-            atomic_encode(&input, &hardlink_path, &image(), OUTPUT_JPEG, 90),
+            atomic_encode(&input, &hardlink_path, &image(), OUTPUT_JPEG, 90, true),
             Err(Error::InvalidArgument(_))
         ));
         assert_eq!(fs::read(&input).unwrap(), b"raw photograph");
@@ -9774,7 +9792,22 @@ mod tests {
         let output = temp("atomic-output");
         fs::write(&input, b"raw").unwrap();
         fs::write(&output, b"old").unwrap();
-        atomic_encode(&input, &output, &image(), OUTPUT_JPEG, 90).unwrap();
+        atomic_encode(&input, &output, &image(), OUTPUT_JPEG, 90, true).unwrap();
+        assert!(fs::read(&output).unwrap().starts_with(&[0xff, 0xd8]));
+        let _ = fs::remove_file(input);
+        let _ = fs::remove_file(output);
+    }
+
+    #[test]
+    fn a_non_durable_write_still_lands_correctly() {
+        // DURABLE skips two fsyncs, not the write itself or the atomic
+        // rename: a reader still sees either the old file or the whole new
+        // one, never a partial write, whichever way the process asks for it.
+        let input = temp("atomic-input-nondurable");
+        let output = temp("atomic-output-nondurable");
+        fs::write(&input, b"raw").unwrap();
+        fs::write(&output, b"old").unwrap();
+        atomic_encode(&input, &output, &image(), OUTPUT_JPEG, 90, false).unwrap();
         assert!(fs::read(&output).unwrap().starts_with(&[0xff, 0xd8]));
         let _ = fs::remove_file(input);
         let _ = fs::remove_file(output);
