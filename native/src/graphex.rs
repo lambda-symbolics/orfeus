@@ -986,6 +986,46 @@ fn common_prefix_length(previous: &[GraphOp], current: &[GraphOp]) -> usize {
 
 /// The default checkpoint: right after the last expensive stage, so edits
 /// to the cheap grading tail never pay for optics or noise reduction again.
+/// Whether a sensor-noise reading survives through OP's kind, per the match
+/// in the main execution loop: an exposure scales it and keeps going, these
+/// kinds pass it through untouched, and anything else (tone, curves, a LUT,
+/// grain) loses it, since reshaping tone invalidates what it measured.
+fn sensor_noise_carries_through(kind: u32) -> bool {
+    matches!(
+        kind,
+        NODE_WHITE_BALANCE
+            | NODE_OPTICS
+            | NODE_NOISE_REDUCTION
+            | NODE_CROP
+            | NODE_ROTATE
+            | NODE_FLIP
+            | NODE_SHARPEN
+    )
+}
+
+/// Whether the sensor-noise reading a denoise node at FROM_INDEX would take
+/// could still reach a sharpener downstream, carried through the kinds
+/// SENSOR_NOISE_CARRIES_THROUGH names (an exposure scales it but still
+/// carries it). A register can be read by more than one later op, so every
+/// live register is tracked rather than stopping at the first consumer that
+/// loses it.
+fn graph_reaches_a_sharpener(ops: &[GraphOp], from_index: usize) -> bool {
+    let produced = from_index + 1;
+    let mut live = vec![produced];
+    for (index, op) in ops.iter().enumerate().skip(produced) {
+        if !(live.contains(&op.input_a) || live.contains(&op.input_b)) {
+            continue;
+        }
+        if op.kind == NODE_SHARPEN {
+            return true;
+        }
+        if op.kind == NODE_EXPOSURE || sensor_noise_carries_through(op.kind) {
+            live.push(index + 1);
+        }
+    }
+    false
+}
+
 fn default_snapshot_boundary(ops: &[GraphOp]) -> StagePoint {
     let index = ops
         .iter()
@@ -1639,8 +1679,7 @@ fn execute_graph_into(
                 NODE_EXPOSURE => {
                     sensors[op.input_a].map(|sensor| sensor.scaled(2.0_f32.powf(op.params[0])))
                 }
-                NODE_WHITE_BALANCE | NODE_OPTICS | NODE_NOISE_REDUCTION | NODE_CROP | NODE_ROTATE
-                | NODE_FLIP | NODE_SHARPEN => sensors[op.input_a],
+                kind if sensor_noise_carries_through(kind) => sensors[op.input_a],
                 _ => None,
             };
             image
@@ -1697,7 +1736,13 @@ fn execute_graph_into(
                     context.full_pixels,
                 );
                 let neural = op.params[1];
-                if edge > 0.0 || neural > 0.0 {
+                // A sharpener is the measurement's only consumer (the match
+                // above already drops it at anything that reshapes tone), so
+                // there is nothing to read it for an edit that lacks one.
+                // Reading it anyway cost five image-sized float planes and
+                // two transposed Gaussian blurs on every such render — about
+                // 400 MB of scratch at 20 MP — for a number nobody asked for.
+                if (edge > 0.0 || neural > 0.0) && graph_reaches_a_sharpener(ops, index) {
                     sensors[slot] = render::measure_sensor_noise(&image);
                 }
                 if neural > 0.0 {
@@ -3628,6 +3673,67 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn graph_reaches_a_sharpener_only_through_carrying_nodes() {
+        let denoise_params = [0.6_f32, 0.0];
+        let sharpen_params = [0.5_f32, 1.5, 2.0];
+        let identity_curve = curves_params(&IDENTITY_CURVE, &IDENTITY_CURVE, &IDENTITY_CURVE);
+
+        // crop -> denoise -> tone: nothing downstream ever reads it.
+        let ops = parse_graph(
+            &GraphBuilder::new()
+                .node(NODE_CROP, 0, -1, &[0.0, 0.0, 1.0, 1.0, 0.0], None)
+                .node(NODE_NOISE_REDUCTION, 1, -1, &denoise_params, None)
+                .node(NODE_TONE, 2, -1, &[0.0; 7], None)
+                .build(),
+        )
+        .unwrap();
+        assert!(!graph_reaches_a_sharpener(&ops, 1), "tone alone reaches a sharpener");
+
+        // crop -> denoise -> sharpen: the direct case.
+        let ops = parse_graph(
+            &GraphBuilder::new()
+                .node(NODE_CROP, 0, -1, &[0.0, 0.0, 1.0, 1.0, 0.0], None)
+                .node(NODE_NOISE_REDUCTION, 1, -1, &denoise_params, None)
+                .node(NODE_SHARPEN, 2, -1, &sharpen_params, None)
+                .build(),
+        )
+        .unwrap();
+        assert!(graph_reaches_a_sharpener(&ops, 1), "a direct sharpener was missed");
+
+        // crop -> denoise -> exposure -> sharpen: exposure scales the reading
+        // and carries it on.
+        let ops = parse_graph(
+            &GraphBuilder::new()
+                .node(NODE_CROP, 0, -1, &[0.0, 0.0, 1.0, 1.0, 0.0], None)
+                .node(NODE_NOISE_REDUCTION, 1, -1, &denoise_params, None)
+                .node(NODE_EXPOSURE, 2, -1, &[0.3], None)
+                .node(NODE_SHARPEN, 3, -1, &sharpen_params, None)
+                .build(),
+        )
+        .unwrap();
+        assert!(
+            graph_reaches_a_sharpener(&ops, 1),
+            "a sharpener behind an exposure was missed"
+        );
+
+        // crop -> denoise -> curves -> sharpen: curves reshapes tone and
+        // drops the reading, so the sharpener behind it cannot use it.
+        let ops = parse_graph(
+            &GraphBuilder::new()
+                .node(NODE_CROP, 0, -1, &[0.0, 0.0, 1.0, 1.0, 0.0], None)
+                .node(NODE_NOISE_REDUCTION, 1, -1, &denoise_params, None)
+                .node(NODE_CURVES, 2, -1, &identity_curve, None)
+                .node(NODE_SHARPEN, 3, -1, &sharpen_params, None)
+                .build(),
+        )
+        .unwrap();
+        assert!(
+            !graph_reaches_a_sharpener(&ops, 1),
+            "a sharpener behind curves was wrongly reached"
+        );
     }
 
     #[test]
