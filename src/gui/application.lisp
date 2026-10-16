@@ -5014,13 +5014,12 @@ behind is memory. Best effort; returns how many directories went."
                   (processing-preset-settings preset)
                   (processing-preset-disabled-stages preset))))
            (still-thumbnail-pathname (still source)
+             ;; SOURCE is always given here: the one caller already checked
+             ;; it with PROBE-FILE first.
              (let* ((preset (gallery-still-preset still))
                     (source-identity
                       (orfeus:still-store-identity
-                       (if source
-                           (namestring
-                            (or (ignore-errors (truename source)) source))
-                           "none"))))
+                       (namestring (or (ignore-errors (truename source)) source)))))
                ;; Three whole digests overflowed the 255-byte filename limit
                ;; once the atomic write added its dot prefix and temporary
                ;; suffix, so every still preview failed to write. Sixty-four

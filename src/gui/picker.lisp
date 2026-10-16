@@ -1457,7 +1457,7 @@ ON-PICK with the chosen pathnames when the photographer accepts."
   (let ((settings (picker-read-settings)))
     (setf (photo-picker-on-pick picker) on-pick
           (photo-picker-accept-label picker) accept-label
-          (photo-picker-recent picker) (or (getf settings :recent) '()))
+          (photo-picker-recent picker) (getf settings :recent))
     (when (getf settings :filter)
       (setf (photo-picker-filter picker) (getf settings :filter)
             (lightfast:value (photo-picker-filter-choice picker))
@@ -1475,8 +1475,8 @@ ON-PICK with the chosen pathnames when the photographer accepts."
                        (and remembered (probe-file remembered)))
                      (and directory (probe-file directory) directory)
                      (user-homedir-pathname))))
-      (unless (picker-show-directory picker start :remember nil)
-        (picker-show-directory picker (user-homedir-pathname) :remember nil)))
+      (or (picker-show-directory picker start :remember nil)
+          (picker-show-directory picker (user-homedir-pathname) :remember nil)))
     (picker-update-status picker)
     (when (photo-picker-owner picker)
       (place-dialog-over (photo-picker-window picker) (photo-picker-owner picker)))
