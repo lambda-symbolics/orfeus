@@ -1098,6 +1098,11 @@ fn negative_measurement_cache() -> &'static Mutex<Vec<NodeMeasurement<render::Ne
     CACHE.get_or_init(|| Mutex::new(Vec::new()))
 }
 
+fn sensor_noise_measurement_cache() -> &'static Mutex<Vec<NodeMeasurement<Option<render::SensorNoise>>>> {
+    static CACHE: OnceLock<Mutex<Vec<NodeMeasurement<Option<render::SensorNoise>>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(Vec::new()))
+}
+
 fn default_snapshot_boundary(ops: &[GraphOp]) -> StagePoint {
     let index = ops
         .iter()
@@ -1814,8 +1819,18 @@ fn execute_graph_into(
                 // Reading it anyway cost five image-sized float planes and
                 // two transposed Gaussian blurs on every such render — about
                 // 400 MB of scratch at 20 MP — for a number nobody asked for.
+                // The pixels entering this node do not move when only its
+                // own amount or threshold does, so a drag of either reuses
+                // the last measurement instead of paying for it again on
+                // every tick.
                 if (edge > 0.0 || neural > 0.0) && graph_reaches_a_sharpener(ops, index) {
-                    sensors[slot] = render::measure_sensor_noise(&image);
+                    sensors[slot] = *node_measurement_cached(
+                        sensor_noise_measurement_cache(),
+                        cache_key.as_ref(),
+                        index,
+                        ops,
+                        || render::measure_sensor_noise(&image),
+                    );
                 }
                 if neural > 0.0 {
                     super::nn::apply_neural_noise_reduction(
@@ -3937,6 +3952,37 @@ mod tests {
         let fourth = node_measurement_cached(&cache, None, index, &ops, compute(33));
         assert_eq!(*fourth, 33);
         assert_eq!(calls.get(), 3);
+    }
+
+    #[test]
+    fn sensor_noise_is_reused_across_a_denoise_amount_drag_and_invalidated_by_a_crop_change() {
+        let program = |crop_width: f32, denoise: f32| {
+            parse_graph(
+                &GraphBuilder::new()
+                    .node(NODE_CROP, 0, -1, &[0.05, 0.05, crop_width, 0.9, 0.0], None)
+                    .node(NODE_NOISE_REDUCTION, 1, -1, &[denoise, 0.0], None)
+                    .node(NODE_SHARPEN, 2, -1, &[0.5, 1.5, 2.0], None)
+                    .build(),
+            )
+            .unwrap()
+        };
+        let graph_context = context(5);
+        let key = test_prefix_key("sensor-noise-measurement-test", &graph_context);
+        for (crop_width, denoise) in [(0.9, 0.3), (0.9, 0.6), (0.6, 0.3), (0.6, 0.8)] {
+            let ops = program(crop_width, denoise);
+            let cached = execute_graph_cached(
+                &ops,
+                Arc::new(noisy_scene(320, 240)),
+                &graph_context,
+                Some(key.clone()),
+            )
+            .unwrap();
+            let cold = execute_graph(&ops, noisy_scene(320, 240), &graph_context).unwrap();
+            assert!(
+                max_difference(&cached, &cold) == 0.0,
+                "crop {crop_width} denoise {denoise} differs from a cold render"
+            );
+        }
     }
 
     #[test]
