@@ -370,7 +370,8 @@ start with the graph a fresh photograph gets, grade for grade."
                    (settings->graph (make-processing-settings)))))
     (and (equal (mapcar #'processing-preset-name stills)
                 '("Agfalike A" "Agfalike B" "Agfalike C" "Agfalike D"
-                  "Agfalike E" "Agfalike F" "Agfalike G" "Agfalike H"))
+                  "Agfalike E" "Agfalike F" "Agfalike G" "Agfalike H"
+                  "Reala 500D"))
          (every (lambda (preset)
                   (let* ((graph (processing-preset-graph preset))
                          (nodes (and graph (processing-graph-nodes graph)))
@@ -384,7 +385,6 @@ start with the graph a fresh photograph gets, grade for grade."
                          (stringp lut)
                          (uiop:absolute-pathname-p (pathname lut))
                          (probe-file lut)
-                         (find :clarity nodes :key #'graph-node-kind)
                          (every (lambda (node)
                                   (let ((twin (find (graph-node-kind node) nodes
                                                     :key #'graph-node-kind)))
@@ -393,6 +393,14 @@ start with the graph a fresh photograph gets, grade for grade."
                                                 (graph-node-params node)))))
                                 default))))
                 stills)
+         ;; Clarity is an Agfalike-family trait, not a requirement of every
+         ;; bundled still; Reala 500D deliberately has none.
+         (every (lambda (preset)
+                  (find :clarity
+                        (processing-graph-nodes (processing-preset-graph preset))
+                        :key #'graph-node-kind))
+                (remove "Reala 500D" stills
+                        :key #'processing-preset-name :test #'string=))
          (let ((d (find "Agfalike D" stills :key #'processing-preset-name
                                             :test #'string=)))
            (and d (find :dehaze (processing-graph-nodes (processing-preset-graph d))

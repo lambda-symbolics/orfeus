@@ -2185,8 +2185,8 @@ would silently ignore whatever the Destination field said."
                          (orfeus/gui::gallery-still-key local-still)))
              "Bundled still shares its key with a same-name local still"))
     (let ((looks (orfeus:bundled-still-list)))
-      (check (= 8 (length looks))
-             "Expected eight bundled looks, found ~D" (length looks))
+      (check (= 9 (length looks))
+             "Expected nine bundled looks, found ~D" (length looks))
       (check (every (lambda (preset)
                       (find :film
                             (orfeus:processing-graph-nodes
