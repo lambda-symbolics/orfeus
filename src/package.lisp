@@ -245,6 +245,8 @@
    #:processing-settings-with-overrides
    #:photo-job-render-output
    #:project
+   #:project-autosave-pathname
+   #:project-autosave-recoverable-p
    #:project-defaults
    #:project-export-settings
    #:project-output-directory

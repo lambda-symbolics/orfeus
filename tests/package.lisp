@@ -99,6 +99,8 @@
                 #:processing-settings-with-overrides
                 #:settings-grade-plist
                 #:project->sexp
+                #:project-autosave-pathname
+                #:project-autosave-recoverable-p
                 #:project-defaults
                 #:project-export-settings
                 #:project-output-directory

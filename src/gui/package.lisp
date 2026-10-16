@@ -19,7 +19,9 @@
                 #:processing-preset-disabled-stages
                 #:processing-preset-settings #:processing-preset-source-photo
                 #:processing-settings-with-overrides
-                #:project #:project-defaults #:project-export-settings
+                #:project #:project-autosave-pathname
+                #:project-autosave-recoverable-p
+                #:project-defaults #:project-export-settings
                 #:project-output-directory #:project-photos #:project-presets
                 #:project-read #:project-render #:project-write
                 #:render-photo-job #:render-photo-jobs #:render-preview

@@ -1288,6 +1288,76 @@ and then quietly relocated them would be lying about where a click puts things."
   (and (= 0.75 (processing-settings-exposure (project-defaults project)))
        (= 1 (length (project-photos project)))))
 
+(defun project-write-is-atomic-p ()
+  "A write whose rename cannot complete leaves whatever was already at the
+target path untouched and does not leak its own temporary file; a write that
+succeeds leaves no temporary file behind either."
+  (let* ((directory (merge-pathnames
+                     (format nil "orfeus-test-~D-~D/"
+                             (get-universal-time) (random most-positive-fixnum))
+                     #P"/tmp/"))
+         (pathname (merge-pathnames "project.sexp" directory))
+         ;; An existing directory at the target name makes the final RENAME
+         ;; fail (EISDIR) regardless of how this test runs.
+         (blocking (merge-pathnames "project.sexp/" directory)))
+    (ensure-directories-exist blocking)
+    (unwind-protect
+         (let ((failed (handler-case
+                           (progn (project-write (project-test-value) pathname) nil)
+                         (error () t))))
+           (and failed
+                (probe-file blocking)
+                (null (directory (merge-pathnames "*.tmp" directory)))
+                (progn
+                  (uiop:delete-directory-tree blocking :validate t)
+                  (project-write (project-test-value) pathname)
+                  (and (project-round-trip-p-from (project-read pathname))
+                       (null (directory (merge-pathnames "*.tmp" directory)))))))
+      (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
+
+(defun project-autosave-pathname-p ()
+  "An autosave sidecar sits beside a pathed project as a hidden dotfile, and
+a project with no path yet gets Orfeus's one untitled slot."
+  (let ((sidecar (project-autosave-pathname #P"/tmp/example/My Trip.sexp")))
+    (and (equal ".My Trip" (pathname-name sidecar))
+         (equal "sexp.autosave" (pathname-type sidecar))
+         (equal (uiop:pathname-directory-pathname sidecar)
+                (uiop:pathname-directory-pathname #P"/tmp/example/My Trip.sexp"))
+         (equal "untitled.sexp.autosave"
+                (file-namestring (project-autosave-pathname nil))))))
+
+(defun project-autosave-recovery-decisions-p ()
+  (let* ((directory (merge-pathnames
+                     (format nil "orfeus-test-~D-~D/"
+                             (get-universal-time) (random most-positive-fixnum))
+                     #P"/tmp/"))
+         (project-path (merge-pathnames "project.sexp" directory))
+         (autosave-path (merge-pathnames "project.sexp.autosave" directory)))
+    (ensure-directories-exist directory)
+    (unwind-protect
+         (and
+          ;; Nothing saved anywhere yet: nothing to recover.
+          (not (project-autosave-recoverable-p autosave-path project-path))
+          ;; An untitled project (no saved path) with an autosave: recover.
+          (progn (with-open-file (s autosave-path :direction :output)
+                   (write-string "x" s))
+                 (project-autosave-recoverable-p autosave-path nil))
+          ;; A save after that autosave: nothing newer to recover.
+          (progn (with-open-file (s project-path :direction :output)
+                   (write-string "y" s))
+                 (sleep 1.1)
+                 (with-open-file (s project-path :direction :output
+                                                 :if-exists :supersede)
+                   (write-string "y2" s))
+                 (not (project-autosave-recoverable-p autosave-path project-path)))
+          ;; An autosave written after that save: recover again.
+          (progn (sleep 1.1)
+                 (with-open-file (s autosave-path :direction :output
+                                                  :if-exists :supersede)
+                   (write-string "x2" s))
+                 (project-autosave-recoverable-p autosave-path project-path)))
+      (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
+
 (defun project-reader-evaluation-disabled-p ()
   (let ((pathname (test-temporary-pathname "sexp")))
     (unwind-protect
@@ -2469,6 +2539,11 @@ renderer is told about them."
       (check "batch renders report in project order"
              (project-render-batches-in-order-p))
       (check "project files round trip" (project-file-round-trip-p))
+      (check "project writes are atomic" (project-write-is-atomic-p))
+      (check "autosave sidecar paths are derived correctly"
+             (project-autosave-pathname-p))
+      (check "autosave recovery is offered only when it is newer"
+             (project-autosave-recovery-decisions-p))
       (check "export settings round trip" (export-settings-round-trip-p))
       (check "AVIF export format round trips" (avif-export-format-round-trips-p))
       (check "demosaic choice round trips" (demosaic-choice-round-trips-p))

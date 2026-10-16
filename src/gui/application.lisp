@@ -3,6 +3,9 @@
 (defparameter *preview-debounce-seconds* 0.15d0
   "Delay used to coalesce interactive control changes.")
 
+(defparameter *autosave-interval-seconds* 60d0
+  "How often an unsaved project is written to its autosave sidecar.")
+
 (defparameter *gui-preview-minimum-bound* 1024
   "Floor on the viewport render bound, so a tiny window still zooms a little.")
 
@@ -1732,7 +1735,7 @@ behind is memory. Best effort; returns how many directories went."
            (gallery-generation 0)
            (gallery-thumbs (make-hash-table :test #'equal))
            (gallery-click (cons 0 -1))
-           debounce-id poll-id comparison-p layout-initialized-p
+           debounce-id poll-id autosave-id comparison-p layout-initialized-p
            ;; The divider is remembered as a share of the right column, not as
            ;; an absolute height: a window that grows must hand the graph its
            ;; proportion of the new space instead of freezing it at the height
@@ -5842,6 +5845,7 @@ behind is memory. Best effort; returns how many directories went."
                     (handler-case
                         (progn
                           (project-write project (pathname path))
+                          (forget-autosave (pathname path))
                           (setf (gui-model-project-path model) (pathname path))
                           (sync-export-controls)
                           (remember-project path)
@@ -5856,6 +5860,47 @@ behind is memory. Best effort; returns how many directories went."
                    (t
                     ;; Unnamed is still usable; exports settle when it is saved.
                     (set-status "New project"))))))
+           (offer-autosave-recovery ()
+             ;; A photo opened directly has no project identity to recover
+             ;; one for; only a real project path, or none at all (the one
+             ;; untitled slot), is worth checking.
+             (let* ((recovery-path (and initial-path
+                                       (eq (gui-open-kind initial-path) :project)
+                                       initial-path))
+                    (sidecar (project-autosave-pathname recovery-path)))
+               (when (project-autosave-recoverable-p sidecar recovery-path)
+                 (prog1
+                     (when (= 1 (lightfast:choice-box
+                                 (format nil
+                                         "An autosave from an earlier session was found~@[ for ~A~]. Recover it?"
+                                         (and recovery-path (file-namestring recovery-path)))
+                                 :button0 "Discard" :button1 "Recover"))
+                       (handler-case
+                           (progn
+                             (replace-project (project-read sidecar) recovery-path)
+                             (setf (gui-model-modified-p model) t)
+                             (sync-window-title)
+                             (set-status
+                              "Recovered unsaved changes from an earlier session")
+                             t)
+                         (error (condition)
+                           (set-status
+                            (format nil "Could not read the autosave: ~A" condition))
+                           nil)))
+                   (ignore-errors (delete-file sidecar))))))
+           (forget-autosave (path)
+             ;; A file just saved makes its own autosave sidecar moot.
+             (let ((sidecar (project-autosave-pathname path)))
+               (when (probe-file sidecar)
+                 (ignore-errors (delete-file sidecar)))))
+           (autosave-tick ()
+             ;; Quietly keep a recovery copy while there is something to lose;
+             ;; a clean save or a project with nothing unsaved costs nothing.
+             (when (gui-model-modified-p model)
+               (ignore-errors
+                (project-write
+                 (orfeus:copy-project-deep project)
+                 (project-autosave-pathname (gui-model-project-path model))))))
            (save-project (&optional choose-p)
              (let ((path (or (and (not choose-p) (gui-model-project-path model))
                              (lightfast:choose-save-file
@@ -5875,6 +5920,7 @@ behind is memory. Best effort; returns how many directories went."
                    (when moved
                      (gui-model-anchor-export-directory model (pathname path)))
                    (project-write project path)
+                   (forget-autosave (pathname path))
                    (setf (gui-model-project-path model) (pathname path)
                          (gui-model-modified-p model) nil)
                    (sync-export-controls)
@@ -9146,6 +9192,8 @@ behind is memory. Best effort; returns how many directories went."
         (sync-node-tools)
         (layout-ui)
         (setf poll-id (lightfast:add-timeout 0.08d0 #'poll :repeat t))
+        (setf autosave-id (lightfast:add-timeout *autosave-interval-seconds*
+                                                 #'autosave-tick :repeat t))
         ;; The poll alone left a finished live frame waiting up to 80 ms to be
         ;; noticed — more than the render took. The foreground queue wakes
         ;; the interface as soon as it has something to say.
@@ -9164,11 +9212,17 @@ behind is memory. Best effort; returns how many directories went."
                                (uiop:temporary-directory)))))
         (when (and initial-path (eq (gui-open-kind initial-path) :project))
           (remember-project initial-path))
-        (when (selected-job)
-          (schedule-initial-preview))
         (unwind-protect
-             (progn (lightfast:show window) (lightfast:run))
+             (progn
+               (lightfast:show window)
+               ;; The recovery prompt is a modal dialog; it needs the window
+               ;; on screen first, so it runs here rather than before SHOW.
+               (unless (offer-autosave-recovery)
+                 (when (selected-job)
+                   (schedule-initial-preview)))
+               (lightfast:run))
           (when poll-id (ignore-errors (lightfast:remove-timeout poll-id)))
+          (when autosave-id (ignore-errors (lightfast:remove-timeout autosave-id)))
           (when debounce-id (ignore-errors (lightfast:remove-timeout debounce-id)))
           (setf (gui-queue-notify queue) nil)
           (stop-gui-queue queue)

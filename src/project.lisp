@@ -567,18 +567,68 @@ so pasting a grade also carries which nodes were switched off."
   project)
 
 (defun project-write (project pathname)
-  "Write PROJECT readably to PATHNAME, replacing an existing file."
-  (with-open-file (stream pathname
-                          :direction :output
-                          :if-exists :supersede
-                          :if-does-not-exist :create)
-    (with-standard-io-syntax
-      (let ((*print-pretty* t)
-            (*print-readably* nil)
-            (*print-escape* t))
-        (write (project->sexp project) :stream stream)
-        (terpri stream))))
+  "Write PROJECT readably to PATHNAME, replacing an existing file.
+
+Atomic: writes a temporary file beside PATHNAME first, then renames it into
+place, so a write an autosave timer interrupts or a disk that fills mid-write
+never leaves a half-written project where the real one was."
+  (let ((pathname (pathname pathname))
+        (temporary nil))
+    (unwind-protect
+         (progn
+           (setf temporary
+                 (merge-pathnames
+                  (make-pathname
+                   :name (format nil ".~A-~36R-~36R"
+                                 (pathname-name (pathname pathname))
+                                 (get-internal-real-time)
+                                 (random most-positive-fixnum))
+                   :type "tmp")
+                  (uiop:pathname-directory-pathname pathname)))
+           (with-open-file (stream temporary
+                                   :direction :output
+                                   :if-exists nil
+                                   :if-does-not-exist :create)
+             (with-standard-io-syntax
+               (let ((*print-pretty* t)
+                     (*print-readably* nil)
+                     (*print-escape* t))
+                 (write (project->sexp project) :stream stream)
+                 (terpri stream)
+                 (finish-output stream))))
+           (sb-posix:rename (namestring temporary) (namestring pathname)))
+      (when (and temporary (probe-file temporary))
+        (ignore-errors (delete-file temporary)))))
   pathname)
+
+(defun project-autosave-pathname (project-path)
+  "The autosave sidecar for a project at PROJECT-PATH, or the one slot for a
+project with no path of its own yet.
+
+A pathed project's sidecar sits beside it, as a hidden dotfile, so it moves
+and is cleaned up with the project; an unsaved, never-named project has
+nowhere of its own, so it gets one fixed slot under Orfeus's data directory."
+  (if project-path
+      (let ((path (pathname project-path)))
+        (make-pathname :name (format nil ".~A" (pathname-name path))
+                       :type (format nil "~A.autosave"
+                                     (or (pathname-type path) "sexp"))
+                       :defaults path))
+      (merge-pathnames "untitled.sexp.autosave"
+                       (ensure-directories-exist
+                        (uiop:xdg-data-home "orfeus/autosave/")))))
+
+(defun project-autosave-recoverable-p (autosave-path project-path)
+  "True when AUTOSAVE-PATH holds changes worth offering to recover for
+PROJECT-PATH: it exists, and either PROJECT-PATH does not (an untitled
+project) or the autosave is newer than what was last saved."
+  (and autosave-path
+       (probe-file autosave-path)
+       (or (null project-path)
+           (not (probe-file project-path))
+           (let ((saved (ignore-errors (file-write-date project-path)))
+                 (auto (ignore-errors (file-write-date autosave-path))))
+             (and auto saved (> auto saved))))))
 
 (defun project-read (pathname)
   "Read and validate one project, resolving relative paths beside PATHNAME."
