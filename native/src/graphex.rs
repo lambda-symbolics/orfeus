@@ -1103,6 +1103,11 @@ fn sensor_noise_measurement_cache() -> &'static Mutex<Vec<NodeMeasurement<Option
     CACHE.get_or_init(|| Mutex::new(Vec::new()))
 }
 
+fn sharpen_prepared_cache() -> &'static Mutex<Vec<NodeMeasurement<Option<render::SharpenPrepared>>>> {
+    static CACHE: OnceLock<Mutex<Vec<NodeMeasurement<Option<render::SharpenPrepared>>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(Vec::new()))
+}
+
 fn default_snapshot_boundary(ops: &[GraphOp]) -> StagePoint {
     let index = ops
         .iter()
@@ -1907,13 +1912,28 @@ fn execute_graph_into(
                 // The radius is stated for the photograph, not for whichever
                 // reduction of it is on screen, so it shrinks with the render.
                 let ratio = render::scale_ratio(context.scaled_pixels, context.full_pixels);
-                render::apply_sharpen(
-                    &mut image,
-                    op.params[0],
-                    op.params[1] * ratio,
-                    op.params[2],
-                    sensors[slot].as_ref(),
-                );
+                let amount = op.params[0];
+                let radius = op.params[1] * ratio;
+                let threshold = op.params[2];
+                // Luma, the detail band, the noise read off it, and the
+                // per-row reach all depend on the pixels entering this node
+                // and RADIUS alone -- not on AMOUNT or THRESHOLD, which an
+                // amount or threshold drag re-executes this whole node to
+                // reflect on every tick regardless, paying for the whole
+                // preparation again for a picture that never moved.
+                if amount > 0.0 {
+                    let sensor = sensors[slot];
+                    let prepared = node_measurement_cached(
+                        sharpen_prepared_cache(),
+                        cache_key.as_ref(),
+                        index,
+                        ops,
+                        || render::prepare_sharpen(&image, radius, sensor.as_ref()),
+                    );
+                    if let Some(prepared) = prepared.as_ref() {
+                        render::apply_sharpen_prepared(&mut image, prepared, amount, threshold);
+                    }
+                }
             }
             NODE_TONE => {
                 let adjustments: [f32; 7] = op.params[..7]
@@ -3952,6 +3972,36 @@ mod tests {
         let fourth = node_measurement_cached(&cache, None, index, &ops, compute(33));
         assert_eq!(*fourth, 33);
         assert_eq!(calls.get(), 3);
+    }
+
+    #[test]
+    fn sharpen_preparation_is_reused_across_an_amount_drag_and_invalidated_by_a_crop_change() {
+        let program = |crop_width: f32, amount: f32| {
+            parse_graph(
+                &GraphBuilder::new()
+                    .node(NODE_CROP, 0, -1, &[0.05, 0.05, crop_width, 0.9, 0.0], None)
+                    .node(NODE_SHARPEN, 1, -1, &[amount, 1.5, 2.0], None)
+                    .build(),
+            )
+            .unwrap()
+        };
+        let graph_context = context(5);
+        let key = test_prefix_key("sharpen-prepared-test", &graph_context);
+        for (crop_width, amount) in [(0.9, 0.5), (0.9, 1.2), (0.6, 0.5), (0.6, 2.0)] {
+            let ops = program(crop_width, amount);
+            let cached = execute_graph_cached(
+                &ops,
+                Arc::new(noisy_scene(320, 240)),
+                &graph_context,
+                Some(key.clone()),
+            )
+            .unwrap();
+            let cold = execute_graph(&ops, noisy_scene(320, 240), &graph_context).unwrap();
+            assert!(
+                max_difference(&cached, &cold) == 0.0,
+                "crop {crop_width} amount {amount} differs from a cold render"
+            );
+        }
     }
 
     #[test]

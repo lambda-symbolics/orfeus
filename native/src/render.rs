@@ -4337,6 +4337,7 @@ pub(crate) fn measure_negative(image: &RgbImage, picked: [f32; 3]) -> NegativeMe
 /// which is nearly flat over the shadows and saturates in the highlights; every
 /// stop of scene the photographer meant to keep had then to be dragged back with
 /// per-channel gains that clipped whatever they reached first.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn apply_negative(image: &mut RgbImage, picked: [f32; 3], gamma: f32, balance: f32) {
     let measure = measure_negative(image, picked);
     apply_negative_measured(image, &measure, gamma, balance);
@@ -4951,45 +4952,35 @@ const SHARPEN_HALO_ALLOWANCE: f32 = 0.2;
 const SHARPEN_GATE_MARGIN: f32 = 1.25;
 
 
-/// Unsharp masking on brightness alone, with the noise floor kept out of it
-/// and the halos held in.
-///
-/// Four things make this a photographic sharpener rather than a filter that
-/// happens to raise contrast at edges.
-///
-/// It works on **brightness only**, and puts the result back as a gain on the
-/// three channels, so hue and saturation come out untouched. Sharpening the
-/// channels separately is what produces coloured fringes on every edge.
-///
-/// It works on the **square root of the signal**, not on linear light. A linear
-/// unsharp mask spends most of its correction on the brightest pixels, which is
-/// where a halo is most visible and least wanted.
-///
-/// The detail it adds back is **gated by how much of it is signal**, the way
-/// the denoiser judges a band: the local power of the detail against the
-/// noise power the flattest parts of the frame carry at that brightness — or
-/// against what the sensor put there before a denoiser cleaned it, when SENSOR
-/// says, since a denoiser's leavings are not texture however far they stand
-/// over what it left elsewhere. Where the detail is at that floor nothing is
-/// added; where it is texture, all of it is. THRESHOLD is how many times the floor to subtract, in halves:
-/// two is the Wiener answer with the floor's own spread allowed for, see
-/// `SHARPEN_GATE_MARGIN`. The floor is read between brightness bins rather than
-/// stepped from one to the next, so a gradient does not change grain where it
-/// crosses a bin.
-///
-/// And the result is **held to what its neighbourhood already spans**, plus
-/// `SHARPEN_HALO_ALLOWANCE` of it, so edges get steeper without growing the
-/// light and dark lines a camera's sharpening draws along them.
-pub(crate) fn apply_sharpen(
-    image: &mut RgbImage,
-    amount: f32,
+/// Everything APPLY_SHARPEN_PREPARED needs that depends on the pixels
+/// entering the node and RADIUS, never on AMOUNT or THRESHOLD -- which a
+/// drag moves on every tick while the pixels underneath do not.
+pub(crate) struct SharpenPrepared {
+    width: usize,
+    height: usize,
+    luma: Vec<f32>,
+    encoded: Vec<f32>,
+    detail: Vec<f32>,
+    activity: Vec<f32>,
+    lowest: Vec<f32>,
+    highest: Vec<f32>,
+    noise: BandNoise,
+    sensor: Option<SensorNoise>,
+    sensor_scale: Option<f32>,
+    reach: usize,
+}
+
+/// The preparation half of sharpening: everything APPLY_SHARPEN_PREPARED
+/// reads that depends on IMAGE and RADIUS, not on the amount or threshold a
+/// drag moves. None for an image too small to sharpen at all.
+pub(crate) fn prepare_sharpen(
+    image: &RgbImage,
     radius: f32,
-    threshold: f32,
     sensor: Option<&SensorNoise>,
-) {
+) -> Option<SharpenPrepared> {
     let (width, height) = (image.width, image.height);
-    if amount <= 0.0 || width < 3 || height < 3 {
-        return;
+    if width < 3 || height < 3 {
+        return None;
     }
     let radius = radius.max(MIN_SHARPEN_RADIUS);
     let luma: Vec<f32> = image
@@ -5022,36 +5013,9 @@ pub(crate) fn apply_sharpen(
         detail_band_noise_gain(&kernel)
             / detail_band_noise_gain(&gaussian_kernel(SENSOR_NOISE_REFERENCE_RADIUS))
     });
-    let floor_at = |luma: f32| {
-        let own = noise.power_at(luma);
-        match (sensor, sensor_scale) {
-            (Some(sensor), Some(scale)) => own.max(sensor.power_at(luma) * scale),
-            _ => own,
-        }
-    };
     let mut activity = Vec::new();
     let mut scratch = Vec::new();
     local_mean_square(&detail, &mut activity, &mut scratch, width, height);
-    let noise_share = 0.5 * threshold * SHARPEN_GATE_MARGIN;
-    if std::env::var_os("ORFEUS_PROFILE").is_some() {
-        let mut gated = 0_usize;
-        let mut total_gain = 0.0_f64;
-        for (index, (mean_square, luma)) in activity.iter().zip(&luma).enumerate() {
-            if index % 97 != 0 {
-                continue;
-            }
-            let gain = activity_gain(*mean_square, noise_share * floor_at(*luma));
-            total_gain += f64::from(gain);
-            gated += usize::from(gain == 0.0);
-        }
-        let sampled = activity.len() / 97 + 1;
-        eprintln!(
-            "orfeus-profile sharpen-gate mean-gain={:.3} fully-gated={:.1}% noise-power={:?}",
-            total_gain / sampled as f64,
-            100.0 * gated as f64 / sampled as f64,
-            noise.power
-        );
-    }
     // The darkest and brightest value along each row within the blur's reach;
     // the column direction is folded into the pass below, a few rows at a time.
     let reach = (radius.ceil() as usize).clamp(1, 3);
@@ -5068,6 +5032,96 @@ pub(crate) fn apply_sharpen(
                 highest[x] = window.iter().copied().fold(f32::NEG_INFINITY, f32::max);
             }
         });
+    Some(SharpenPrepared {
+        width,
+        height,
+        luma,
+        encoded,
+        detail,
+        activity,
+        lowest,
+        highest,
+        noise,
+        sensor: sensor.copied(),
+        sensor_scale,
+        reach,
+    })
+}
+
+/// Unsharp masking on brightness alone, with the noise floor kept out of it
+/// and the halos held in.
+///
+/// Four things make this a photographic sharpener rather than a filter that
+/// happens to raise contrast at edges.
+///
+/// It works on **brightness only**, and puts the result back as a gain on the
+/// three channels, so hue and saturation come out untouched. Sharpening the
+/// channels separately is what produces coloured fringes on every edge.
+///
+/// It works on the **square root of the signal**, not on linear light. A linear
+/// unsharp mask spends most of its correction on the brightest pixels, which is
+/// where a halo is most visible and least wanted.
+///
+/// The detail it adds back is **gated by how much of it is signal**, the way
+/// the denoiser judges a band: the local power of the detail against the
+/// noise power the flattest parts of the frame carry at that brightness — or
+/// against what the sensor put there before a denoiser cleaned it, when SENSOR
+/// says, since a denoiser's leavings are not texture however far they stand
+/// over what it left elsewhere. Where the detail is at that floor nothing is
+/// added; where it is texture, all of it is. THRESHOLD is how many times the floor to subtract, in halves:
+/// two is the Wiener answer with the floor's own spread allowed for, see
+/// `SHARPEN_GATE_MARGIN`. The floor is read between brightness bins rather than
+/// stepped from one to the next, so a gradient does not change grain where it
+/// crosses a bin.
+///
+/// And the result is **held to what its neighbourhood already spans**, plus
+/// `SHARPEN_HALO_ALLOWANCE` of it, so edges get steeper without growing the
+/// light and dark lines a camera's sharpening draws along them.
+///
+/// The application half of sharpening: AMOUNT and THRESHOLD against what
+/// PREPARE_SHARPEN already read off the image.
+pub(crate) fn apply_sharpen_prepared(
+    image: &mut RgbImage,
+    prepared: &SharpenPrepared,
+    amount: f32,
+    threshold: f32,
+) {
+    if amount <= 0.0 {
+        return;
+    }
+    debug_assert_eq!(
+        (image.width, image.height),
+        (prepared.width, prepared.height),
+        "a prepared sharpen was applied to a differently sized image"
+    );
+    let floor_at = |luma: f32| {
+        let own = prepared.noise.power_at(luma);
+        match (prepared.sensor, prepared.sensor_scale) {
+            (Some(sensor), Some(scale)) => own.max(sensor.power_at(luma) * scale),
+            _ => own,
+        }
+    };
+    let noise_share = 0.5 * threshold * SHARPEN_GATE_MARGIN;
+    if std::env::var_os("ORFEUS_PROFILE").is_some() {
+        let mut gated = 0_usize;
+        let mut total_gain = 0.0_f64;
+        for (index, (mean_square, luma)) in prepared.activity.iter().zip(&prepared.luma).enumerate() {
+            if index % 97 != 0 {
+                continue;
+            }
+            let gain = activity_gain(*mean_square, noise_share * floor_at(*luma));
+            total_gain += f64::from(gain);
+            gated += usize::from(gain == 0.0);
+        }
+        let sampled = prepared.activity.len() / 97 + 1;
+        eprintln!(
+            "orfeus-profile sharpen-gate mean-gain={:.3} fully-gated={:.1}% noise-power={:?}",
+            total_gain / sampled as f64,
+            100.0 * gated as f64 / sampled as f64,
+            prepared.noise.power
+        );
+    }
+    let (width, height, reach) = (prepared.width, prepared.height, prepared.reach);
     image
         .data
         .par_chunks_mut(3 * width)
@@ -5076,17 +5130,17 @@ pub(crate) fn apply_sharpen(
             let rows = y.saturating_sub(reach)..=(y + reach).min(height - 1);
             for (x, pixel) in pixels.as_chunks_mut::<3>().0.iter_mut().enumerate() {
                 let index = y * width + x;
-                let luma = luma[index];
+                let luma = prepared.luma[index];
                 if luma <= 1.0e-5 {
                     continue;
                 }
-                let encoded = encoded[index];
-                let detail = detail[index]
-                    * activity_gain(activity[index], noise_share * floor_at(luma));
+                let encoded = prepared.encoded[index];
+                let detail = prepared.detail[index]
+                    * activity_gain(prepared.activity[index], noise_share * floor_at(luma));
                 let (mut low, mut high) = (f32::INFINITY, f32::NEG_INFINITY);
                 for row in rows.clone() {
-                    low = low.min(lowest[row * width + x]);
-                    high = high.max(highest[row * width + x]);
+                    low = low.min(prepared.lowest[row * width + x]);
+                    high = high.max(prepared.highest[row * width + x]);
                 }
                 let slack = SHARPEN_HALO_ALLOWANCE * (high - low);
                 let sharpened = (encoded + amount * detail)
@@ -5098,6 +5152,24 @@ pub(crate) fn apply_sharpen(
                 }
             }
         });
+}
+
+/// Prepares then applies in one call, for a caller with nothing to cache the
+/// preparation against -- a cold render, or a test.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn apply_sharpen(
+    image: &mut RgbImage,
+    amount: f32,
+    radius: f32,
+    threshold: f32,
+    sensor: Option<&SensorNoise>,
+) {
+    if amount <= 0.0 || image.width < 3 || image.height < 3 {
+        return;
+    }
+    if let Some(prepared) = prepare_sharpen(image, radius, sensor) {
+        apply_sharpen_prepared(image, &prepared, amount, threshold);
+    }
 }
 
 fn exact_srgb_encode(value: f32) -> f32 {
@@ -9803,6 +9875,34 @@ mod sharpen_bench {
             let started = std::time::Instant::now();
             let _ = measure_sensor_noise(&image);
             eprintln!("measure_sensor_noise: {:.1} ms", started.elapsed().as_secs_f64() * 1000.0);
+        }
+    }
+}
+
+#[cfg(test)]
+mod sharpen_prepared_bench {
+    use super::*;
+    #[test]
+    #[ignore]
+    fn bench_apply_sharpen_prepared_20mp() {
+        let (width, height) = (5184, 3888);
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 40) as f32 / (1_u32 << 24) as f32
+        };
+        let data: Vec<f32> = (0..width * height * 3).map(|_| next()).collect();
+        let mut image = RgbImage { width, height, data };
+        let prepared = prepare_sharpen(&image, 1.5, None).unwrap();
+        for amount in [0.5, 0.6, 0.7] {
+            let started = std::time::Instant::now();
+            apply_sharpen_prepared(&mut image, &prepared, amount, 2.0);
+            eprintln!(
+                "apply_sharpen_prepared (amount {amount}): {:.1} ms",
+                started.elapsed().as_secs_f64() * 1000.0
+            );
         }
     }
 }
