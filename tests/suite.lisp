@@ -851,7 +851,7 @@ and then quietly relocated them would be lying about where a click puts things."
      ;; shape tone. Shaping tone after a look is the point of a look — without
      ;; it there is nowhere to lift a shadow the look buried.
      (let ((below '(:film :crop :rotate :flip :tone :curves :contrast :sharpen
-                    :saturation)))
+                    :saturation :luminance)))
        (and (null (set-difference (graph-insertable-kinds graph film) below))
             (null (set-difference below (graph-insertable-kinds graph film)))
             (null (set-difference (graph-insertable-kinds graph display-crop)
@@ -1973,6 +1973,54 @@ is just as valid after a film node as before one, the same as contrast."
            ;; A colour grade, not a scene-linear correction: valid after film.
            (not (rejected-p (saturation-default-params) :film))))))
 
+(defun luminance-node-validates-and-encodes-p ()
+  "A luminance node carries eight band adjustments, refuses one off its -1..1
+range, fills its defaults in, reaches the executor as kind 22 with eight
+parameters in band order, and -- the same colour grade as saturation, not a
+scene-linear correction -- is just as valid after a film node as before one."
+  (flet ((rejected-p (params &optional (input-kind :crop))
+           (handler-case
+               (progn
+                 (graph-validate
+                  (make-processing-graph
+                   :nodes (list (make-graph-node
+                                 :id 1 :kind input-kind
+                                 :params (if (eq input-kind :film)
+                                             '(:grain-amount 0.2)
+                                             '(:left 0.1 :top 0.1
+                                               :width 0.8 :height 0.8))
+                                 :inputs '(0))
+                                (make-graph-node
+                                 :id 2 :kind :luminance
+                                 :params params :inputs '(1)))
+                   :output 2))
+                 nil)
+             (invalid-project-data () t))))
+    (let* ((params '(:red -0.2 :orange -0.3 :yellow -0.1
+                     :green 0.1 :aqua 0.1 :blue 0.0 :purple 0.0 :magenta 0.0))
+           (graph (graph-validate
+                   (make-processing-graph
+                    :nodes (list (make-graph-node
+                                  :id 1 :kind :luminance
+                                  :params params :inputs '(0)))
+                    :output 1)))
+           (decoded (sexp->graph (graph->sexp graph)))
+           (bytes (orfeus::graph->program-bytes decoded)))
+      (and (equal params (graph-node-params (graph-find-node decoded 1)))
+           (= 22 (elt bytes 12))
+           (= 8 (elt bytes 24))
+           (member :luminance (graph-node-kinds))
+           (equal '(:red 0.0 :orange 0.0 :yellow 0.0 :green 0.0
+                    :aqua 0.0 :blue 0.0 :purple 0.0 :magenta 0.0)
+                  (luminance-default-params))
+           (not (rejected-p (luminance-default-params)))
+           (not (rejected-p '()))
+           (rejected-p '(:red -1.5))
+           (rejected-p '(:magenta 1.1))
+           (rejected-p '(:unknown-key 0.1))
+           ;; A colour grade, not a scene-linear correction: valid after film.
+           (not (rejected-p (luminance-default-params) :film))))))
+
 (defun dust-node-validates-and-encodes-p ()
   "A dust node carries a speck size, a contrast and which specks it looks for,
 refuses what cannot be dust, and reaches the executor as kind 17 with three
@@ -2681,6 +2729,8 @@ renderer is told about them."
              (dehaze-node-validates-and-encodes-p))
       (check "saturation node validates, encodes, defaults, and follows a look"
              (saturation-node-validates-and-encodes-p))
+      (check "luminance node validates, encodes, defaults, and follows a look"
+             (luminance-node-validates-and-encodes-p))
       (check "clarity node validates, encodes and defaults"
              (clarity-node-validates-and-encodes-p))
       (check "vignette node validates, encodes and defaults"

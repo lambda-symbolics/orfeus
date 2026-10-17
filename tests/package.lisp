@@ -21,6 +21,7 @@
                 #:clarity-default-params
                 #:dehaze-default-params
                 #:saturation-default-params
+                #:luminance-default-params
                 #:resolve-lens-profile-alias
                 #:make-export-settings
                 #:make-photo-job

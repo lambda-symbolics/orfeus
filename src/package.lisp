@@ -170,6 +170,8 @@
    #:dehaze-default-params
    #:*saturation-keys*
    #:saturation-default-params
+   #:*luminance-keys*
+   #:luminance-default-params
    #:*negative-default-gamma*
    #:*negative-default-balance*
    #:*rotate-keys*

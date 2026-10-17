@@ -136,7 +136,7 @@ them as a copyable node chain.")
 
 (defparameter *graph-only-node-kinds*
   '(:blend :color-subtract :negative :contrast :hdr :dust :vignette :clarity :dehaze
-    :saturation :crop :rotate :flip :curves)
+    :saturation :luminance :crop :rotate :flip :curves)
   "Node kinds that exist only in graphs, beyond the flat pipeline stages.
 
 :COLOR-SUBTRACT computes picked-color minus pixel per channel in scene-linear
@@ -258,6 +258,19 @@ only ever reaches the colours its name promises.")
 (defun saturation-default-params ()
   "A saturation node's parameters as the panel first shows them: untouched."
   (list :amount 0.0 :red 0.0 :orange 0.0 :yellow 0.0 :green 0.0 :aqua 0.0
+        :blue 0.0 :purple 0.0 :magenta 0.0))
+
+(defparameter *luminance-keys*
+  '(:red :orange :yellow :green :aqua :blue :purple :magenta)
+  "Parameters of a luminance node: how much lighter or darker each of
+Lightroom's eight hue bands reads, every one -1 to 1, a stop at the extremes.
+A sibling of a saturation node's own band keys, not folded into it: the two
+panels answer different questions about a colour, and one node asking both
+left no room to read.")
+
+(defun luminance-default-params ()
+  "A luminance node's parameters as the panel first shows them: untouched."
+  (list :red 0.0 :orange 0.0 :yellow 0.0 :green 0.0 :aqua 0.0
         :blue 0.0 :purple 0.0 :magenta 0.0))
 
 (defparameter *color-subtract-keys* '(:red :green :blue))

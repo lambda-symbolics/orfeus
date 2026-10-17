@@ -399,6 +399,7 @@ width, but a spinner cannot shrink below its digits.")
     (:clarity . "Clarity")
     (:dehaze . "Dehaze")
     (:saturation . "Satur")
+    (:luminance . "Lumin")
     (:sharpen . "Sharp")
     (:crop . "Crop")
     (:rotate . "Rotate")
@@ -425,6 +426,7 @@ width, but a spinner cannot shrink below its digits.")
     ("Clarity" . :clarity)
     ("Dehaze" . :dehaze)
     ("Saturation" . :saturation)
+    ("Luminance" . :luminance)
     ("Sharpen" . :sharpen)
     ("Crop" . :crop)
     ("Rotate" . :rotate)
@@ -621,6 +623,8 @@ sliders and nothing else has to be recomputed."
              (:rect 0 9 12 1) (:rect 0 11 12 1))
     (:saturation (:line 6 0 6 4) (:line 6 8 6 12) (:line 0 6 4 6) (:line 8 6 12 6)
                  (:rect 5 5 2 2))
+    (:luminance (:rect 1 2 4 8) (:line 7 2 11 2) (:line 11 2 11 9) (:line 11 9 7 9)
+                (:line 7 9 7 2))
     (:sharpen (:line 6 0 1 11) (:line 6 0 11 11) (:line 1 11 11 11))
     (:crop (:line 3 0 3 9) (:line 0 3 9 3) (:line 8 2 8 11) (:line 2 8 11 8))
     (:rotate (:line 1 10 1 2) (:line 1 2 9 2) (:line 6 0 9 2) (:line 6 4 9 2))
@@ -759,6 +763,9 @@ channel carries anywhere from its two endpoints to a full film-stock shape."
     (:saturation (let ((params (orfeus:graph-node-params node)))
                    (loop for key in orfeus:*saturation-keys*
                            thereis (/= 0.0 (getf params key 0.0)))))
+    (:luminance (let ((params (orfeus:graph-node-params node)))
+                  (loop for key in orfeus:*luminance-keys*
+                          thereis (/= 0.0 (getf params key 0.0)))))
     (:contrast (/= 1.0 (getf (orfeus:graph-node-params node) :contrast 1.0)))
     (:hdr (let ((params (orfeus:graph-node-params node)))
             (or (plusp (getf params :strength 0.4))
@@ -4013,7 +4020,7 @@ behind is memory. Best effort; returns how many directories went."
                                  (format nil "~,1F" megapixels)
                                  ""))))))
                (when (and node (member kind '(:contrast :negative :hdr :dust :vignette :clarity
-                                              :dehaze :saturation)))
+                                              :dehaze :saturation :luminance)))
                  (let ((params (orfeus:graph-node-params node)))
                    (dolist (entry node-param-controls)
                      (destructuring-bind (key widget default) entry
@@ -8884,6 +8891,23 @@ behind is memory. Best effort; returns how many directories went."
                      (make-node-number-field key label -1.0 1.0 0.05 0.0 y
                                              node-page swatch-rgb)
                      (format nil "Saturation for colours nearest ~A, on top of Amount"
+                             (string-downcase label))))))
+        (build-group
+         :luminance
+         (lambda ()
+           (loop for (key label y swatch-rgb)
+                   in '((:red "Red" 44 (237 28 36))
+                        (:orange "Orange" 76 (255 127 0))
+                        (:yellow "Yellow" 108 (255 242 0))
+                        (:green "Green" 140 (34 177 76))
+                        (:aqua "Aqua" 172 (0 255 255))
+                        (:blue "Blue" 204 (0 0 255))
+                        (:purple "Purple" 236 (163 73 164))
+                        (:magenta "Magenta" 268 (255 0 170)))
+                 do (lightfast:set-tooltip
+                     (make-node-number-field key label -1.0 1.0 0.05 0.0 y
+                                             node-page swatch-rgb)
+                     (format nil "How much lighter or darker colours nearest ~A read"
                              (string-downcase label))))))
         (build-group
          :sharpen

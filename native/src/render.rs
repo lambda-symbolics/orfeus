@@ -5400,6 +5400,35 @@ pub(crate) fn apply_saturation(image: &mut RgbImage, amount: f32, bands: &[f32])
     });
 }
 
+/// Lightens or darkens selectively by BANDS -- red, orange, yellow, green,
+/// aqua, blue, purple, magenta in that order, each -1..1 -- a stop darker or
+/// brighter at the extremes, the range Lightroom's own HSL Luminance panel
+/// covers. A sibling of `apply_saturation`, kept separate rather than folded
+/// into it: a colour's saturation and its brightness are independent things
+/// to want a knob for, and the one panel was already nine rows before this.
+pub(crate) fn apply_luminance(image: &mut RgbImage, bands: &[f32]) {
+    debug_assert_eq!(bands.len(), 8);
+    if bands.iter().all(|&value| value == 0.0) {
+        return;
+    }
+    image.data.par_chunks_mut(3).for_each(|pixel| {
+        let r = srgb_encode(pixel[0].max(0.0)).clamp(0.0, 1.0);
+        let g = srgb_encode(pixel[1].max(0.0)).clamp(0.0, 1.0);
+        let b = srgb_encode(pixel[2].max(0.0)).clamp(0.0, 1.0);
+        let (hue, saturation, value) = rgb_to_hsv(r, g, b);
+        if saturation <= 1.0e-6 {
+            return;
+        }
+        let weights = saturation_band_weights(hue);
+        let band_component: f32 = weights.iter().zip(bands.iter()).map(|(w, b)| w * b).sum();
+        let new_value = (value * band_component.exp2()).clamp(0.0, 1.0);
+        let (nr, ng, nb) = hsv_to_rgb(hue, saturation, new_value);
+        pixel[0] = srgb_decode(nr);
+        pixel[1] = srgb_decode(ng);
+        pixel[2] = srgb_decode(nb);
+    });
+}
+
 /// Width the frame is reduced to for estimating haze: coarse enough that the
 /// estimate costs nothing, fine enough that the transmission follows the scene.
 const DEHAZE_SMALL_WIDTH: usize = 256;
@@ -9927,6 +9956,62 @@ mod tests {
         assert!(
             (saturation_after(green, &bands) - green_saturation).abs() < 1.0e-4,
             "boosting red changed a green pixel"
+        );
+    }
+
+    #[test]
+    fn luminance_all_bands_zero_is_a_no_op() {
+        let mut image = RgbImage {
+            width: 4,
+            height: 4,
+            data: (0..48).map(|i| (i % 7) as f32 / 7.0).collect(),
+        };
+        let before = image.data.clone();
+        apply_luminance(&mut image, &[0.0; 8]);
+        assert_eq!(image.data, before);
+    }
+
+    #[test]
+    fn luminance_leaves_an_exact_neutral_pixel_untouched() {
+        let mut image = RgbImage {
+            width: 1,
+            height: 1,
+            data: vec![0.4, 0.4, 0.4],
+        };
+        apply_luminance(&mut image, &[1.0; 8]);
+        assert_eq!(image.data, vec![0.4, 0.4, 0.4]);
+    }
+
+    #[test]
+    fn luminance_band_only_darkens_or_lightens_its_own_hue() {
+        let brightness_after = |pixel: [f32; 3], bands: &[f32; 8]| {
+            let mut image = RgbImage { width: 1, height: 1, data: pixel.to_vec() };
+            apply_luminance(&mut image, bands);
+            let encoded: Vec<f32> = image.data.iter().map(|v| srgb_encode(v.max(0.0))).collect();
+            rgb_to_hsv(encoded[0], encoded[1], encoded[2]).2
+        };
+        let red = [0.8_f32, 0.3, 0.3];
+        let green = [0.3_f32, 0.8, 0.3];
+        let red_value = rgb_to_hsv(srgb_encode(red[0]), srgb_encode(red[1]), srgb_encode(red[2])).2;
+        let green_value =
+            rgb_to_hsv(srgb_encode(green[0]), srgb_encode(green[1]), srgb_encode(green[2])).2;
+
+        let mut darken_red = [0.0_f32; 8];
+        darken_red[0] = -1.0;
+        assert!(
+            brightness_after(red, &darken_red) < red_value,
+            "darkening red did not darken a red pixel"
+        );
+        assert!(
+            (brightness_after(green, &darken_red) - green_value).abs() < 1.0e-4,
+            "darkening red changed a green pixel"
+        );
+
+        let mut lighten_red = [0.0_f32; 8];
+        lighten_red[0] = 1.0;
+        assert!(
+            brightness_after(red, &lighten_red) > red_value,
+            "lightening red did not lighten a red pixel"
         );
     }
 
