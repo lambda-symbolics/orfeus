@@ -47,6 +47,8 @@ pub const NODE_CLARITY: u32 = 19;
 pub const NODE_DEHAZE: u32 = 20;
 pub const NODE_SATURATION: u32 = 21;
 pub const NODE_LUMINANCE: u32 = 22;
+pub const NODE_HUE: u32 = 23;
+pub const NODE_CAST: u32 = 24;
 
 /// Frame-level settings shared by every node of one graph render.
 #[repr(C)]
@@ -285,6 +287,8 @@ fn param_arity(kind: u32) -> Result<ParamArity, Error> {
         NODE_DEHAZE => ParamArity::Exact(1),        // amount
         NODE_SATURATION => ParamArity::Exact(9),    // amount, then 8 bands
         NODE_LUMINANCE => ParamArity::Exact(8),     // 8 bands, lighter or darker
+        NODE_HUE => ParamArity::Exact(8),           // 8 bands, turned toward a neighbour
+        NODE_CAST => ParamArity::Exact(8),          // 8 bands, pulled out of or pushed into others
         _ => return Err(Error::InvalidArgument("unknown graph node kind")),
     })
 }
@@ -528,6 +532,8 @@ fn validate_param(kind: u32, index: usize, value: f32) -> Result<(), Error> {
         (NODE_DEHAZE, 0) => (-1.0..=1.0).contains(&value),
         (NODE_SATURATION, _) => (-1.0..=1.0).contains(&value),
         (NODE_LUMINANCE, _) => (-1.0..=1.0).contains(&value),
+        (NODE_HUE, _) => (-1.0..=1.0).contains(&value),
+        (NODE_CAST, _) => (-1.0..=1.0).contains(&value),
         // The four leading parameters are point counts, not signal levels.
         (NODE_CURVES, index) if index < CURVE_CHANNELS => {
             (MIN_CURVE_POINTS as f32..=MAX_CURVE_POINTS as f32).contains(&value)
@@ -651,7 +657,7 @@ pub(crate) fn parse_graph(bytes: &[u8]) -> Result<Vec<GraphOp>, Error> {
             // everything a photographer could reach ran before the transform
             // that then crushed it again.
             NODE_TONE | NODE_CURVES | NODE_CONTRAST | NODE_SHARPEN | NODE_SATURATION
-            | NODE_LUMINANCE => {
+            | NODE_LUMINANCE | NODE_HUE | NODE_CAST => {
                 display[index] = display[input_a];
             }
             _ => {
@@ -1257,6 +1263,8 @@ fn node_stage_name(kind: u32) -> &'static str {
         NODE_DEHAZE => "removing haze\0",
         NODE_SATURATION => "saturation\0",
         NODE_LUMINANCE => "luminance\0",
+        NODE_HUE => "hue\0",
+        NODE_CAST => "cast\0",
         NODE_CONTRAST => "contrast\0",
         NODE_SHARPEN => "sharpening\0",
         _ => "developing\0",
@@ -1806,6 +1814,8 @@ fn execute_graph_into(
                     | NODE_DEHAZE
                     | NODE_SATURATION
                     | NODE_LUMINANCE
+                    | NODE_HUE
+                    | NODE_CAST
                     | NODE_CROP
                     | NODE_ROTATE
                     | NODE_FLIP
@@ -1931,6 +1941,12 @@ fn execute_graph_into(
             }
             NODE_LUMINANCE => {
                 render::apply_luminance(&mut image, &op.params[0..8]);
+            }
+            NODE_HUE => {
+                render::apply_hue(&mut image, &op.params[0..8]);
+            }
+            NODE_CAST => {
+                render::apply_cast(&mut image, &op.params[0..8]);
             }
             NODE_CLARITY => {
                 // The radius is stated for the photograph, like the sharpening
@@ -3210,6 +3226,8 @@ mod tests {
             NODE_SHARPEN,
             NODE_SATURATION,
             NODE_LUMINANCE,
+            NODE_HUE,
+            NODE_CAST,
         ] {
             let params: &[f32] = match kind {
                 NODE_TONE => &[0.0; 7],
@@ -3218,6 +3236,8 @@ mod tests {
                 NODE_CONTRAST => &[1.2, 0.435],
                 NODE_SATURATION => &[0.0; 9],
                 NODE_LUMINANCE => &[0.0; 8],
+                NODE_HUE => &[0.0; 8],
+                NODE_CAST => &[0.0; 8],
                 _ => &[0.5, 1.0, 2.0],
             };
             assert!(

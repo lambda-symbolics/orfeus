@@ -172,6 +172,10 @@
    #:saturation-default-params
    #:*luminance-keys*
    #:luminance-default-params
+   #:*hue-keys*
+   #:hue-default-params
+   #:*cast-keys*
+   #:cast-default-params
    #:*negative-default-gamma*
    #:*negative-default-balance*
    #:*rotate-keys*

@@ -5429,6 +5429,130 @@ pub(crate) fn apply_luminance(image: &mut RgbImage, bands: &[f32]) {
     });
 }
 
+/// Degrees band I moves at AMOUNT (-1..1): +1 puts it exactly on the next
+/// band's centre, -1 on the one before -- the same promise Lightroom's own
+/// Hue slider ramp makes at its ends, just expressed on -1..1 instead of
+/// -100..100. Ported from `scripts/lightroom-preset-lut.lisp`'s own
+/// `band-hue-shift`; keep the two in sync if either changes.
+fn band_hue_shift(index: usize, amount: f32) -> f32 {
+    let centre = SATURATION_BAND_CENTRES[index];
+    let next = if index == 7 { 360.0 } else { SATURATION_BAND_CENTRES[index + 1] };
+    let previous = if index == 0 {
+        SATURATION_BAND_CENTRES[7] - 360.0
+    } else {
+        SATURATION_BAND_CENTRES[index - 1]
+    };
+    if amount >= 0.0 {
+        amount * (next - centre)
+    } else {
+        amount * (centre - previous)
+    }
+}
+
+/// Rotates hue selectively by BANDS -- red, orange, yellow, green, aqua, blue,
+/// purple, magenta in that order, each -1..1 -- toward the neighbouring band
+/// the sign points at, the range Lightroom's own HSL Hue panel covers. A
+/// second sibling of `apply_saturation`: where that scales how vivid a band
+/// reads and `apply_luminance` how bright, this moves what a band reads AS.
+pub(crate) fn apply_hue(image: &mut RgbImage, bands: &[f32]) {
+    debug_assert_eq!(bands.len(), 8);
+    if bands.iter().all(|&value| value == 0.0) {
+        return;
+    }
+    image.data.par_chunks_mut(3).for_each(|pixel| {
+        let r = srgb_encode(pixel[0].max(0.0)).clamp(0.0, 1.0);
+        let g = srgb_encode(pixel[1].max(0.0)).clamp(0.0, 1.0);
+        let b = srgb_encode(pixel[2].max(0.0)).clamp(0.0, 1.0);
+        let (hue, saturation, value) = rgb_to_hsv(r, g, b);
+        if saturation <= 1.0e-6 {
+            return;
+        }
+        let weights = saturation_band_weights(hue);
+        let shift: f32 = weights
+            .iter()
+            .enumerate()
+            .map(|(index, &weight)| weight * band_hue_shift(index, bands[index]))
+            .sum();
+        let (nr, ng, nb) = hsv_to_rgb(hue + shift, saturation, value);
+        pixel[0] = srgb_decode(nr);
+        pixel[1] = srgb_decode(ng);
+        pixel[2] = srgb_decode(nb);
+    });
+}
+
+/// Each of the eight bands' own paint-mixing colour: the plain, saturated
+/// colour the band's name promises, each scaled so its largest component is
+/// 1.0. Red, orange, yellow, green, aqua, blue, purple, magenta in that order,
+/// matching `SATURATION_BAND_CENTRES`.
+const CAST_CANONICAL_COLOURS: [[f32; 3]; 8] = [
+    [1.0, 0.0, 0.0],
+    [1.0, 0.5, 0.0],
+    [1.0, 1.0, 0.0],
+    [0.0, 1.0, 0.0],
+    [0.0, 1.0, 1.0],
+    [0.0, 0.0, 1.0],
+    [0.5, 0.0, 1.0],
+    [1.0, 0.0, 1.0],
+];
+
+/// Pulls a band's own colour out of (positive) or pushes it into (negative)
+/// pixels that are NOT themselves that colour -- red, orange, yellow, green,
+/// aqua, blue, purple, magenta in that order, each -1..1. A third sibling of
+/// `apply_saturation`: where that scales how vivid a band reads, `apply_hue`
+/// what it reads as, and `apply_luminance` how bright, this moves how much of
+/// one band's colour shows up as a cast on a DIFFERENT one -- the knob for "a
+/// green that reads too warm because of a red cast it picked up," which is not
+/// something turning the green's own hue, saturation or brightness reaches,
+/// since the green is not wrong about being green.
+///
+/// Works directly in RGB rather than through hue and saturation: a band's
+/// "content" in a pixel is the smallest of the channels its own canonical
+/// colour calls for (so yellow's content is `min(r, g)`, the usual subtractive
+/// measure of how much of a shared primary or secondary a colour carries), and
+/// that much of the canonical colour is added or removed. A pixel sitting at a
+/// band's own centre has that band's own tent weight at 1.0, so its exemption
+/// (1 minus the weight) is 0 and the band's own knob leaves it alone
+/// regardless of amount -- a red is never dimmed by its own cast knob, however
+/// far it is turned.
+pub(crate) fn apply_cast(image: &mut RgbImage, bands: &[f32]) {
+    debug_assert_eq!(bands.len(), 8);
+    if bands.iter().all(|&value| value == 0.0) {
+        return;
+    }
+    image.data.par_chunks_mut(3).for_each(|pixel| {
+        let mut rgb = [
+            srgb_encode(pixel[0].max(0.0)).clamp(0.0, 1.0),
+            srgb_encode(pixel[1].max(0.0)).clamp(0.0, 1.0),
+            srgb_encode(pixel[2].max(0.0)).clamp(0.0, 1.0),
+        ];
+        let (hue, saturation, _value) = rgb_to_hsv(rgb[0], rgb[1], rgb[2]);
+        if saturation <= 1.0e-6 {
+            return;
+        }
+        let weights = saturation_band_weights(hue);
+        for (index, &amount) in bands.iter().enumerate() {
+            if amount == 0.0 {
+                continue;
+            }
+            let colour = CAST_CANONICAL_COLOURS[index];
+            let content = colour
+                .iter()
+                .zip(rgb.iter())
+                .filter(|&(&share, _)| share > 0.0)
+                .map(|(_, &value)| value)
+                .fold(f32::INFINITY, f32::min);
+            let exemption = 1.0 - weights[index];
+            let adjustment = amount * exemption * content;
+            for channel in 0..3 {
+                rgb[channel] -= adjustment * colour[channel];
+            }
+        }
+        pixel[0] = srgb_decode(rgb[0].clamp(0.0, 1.0));
+        pixel[1] = srgb_decode(rgb[1].clamp(0.0, 1.0));
+        pixel[2] = srgb_decode(rgb[2].clamp(0.0, 1.0));
+    });
+}
+
 /// Width the frame is reduced to for estimating haze: coarse enough that the
 /// estimate costs nothing, fine enough that the transmission follows the scene.
 const DEHAZE_SMALL_WIDTH: usize = 256;
@@ -10013,6 +10137,146 @@ mod tests {
             brightness_after(red, &lighten_red) > red_value,
             "lightening red did not lighten a red pixel"
         );
+    }
+
+    #[test]
+    fn hue_all_bands_zero_is_a_no_op() {
+        let mut image = RgbImage {
+            width: 4,
+            height: 4,
+            data: (0..48).map(|i| (i % 7) as f32 / 7.0).collect(),
+        };
+        let before = image.data.clone();
+        apply_hue(&mut image, &[0.0; 8]);
+        assert_eq!(image.data, before);
+    }
+
+    #[test]
+    fn hue_leaves_an_exact_neutral_pixel_untouched() {
+        let mut image = RgbImage {
+            width: 1,
+            height: 1,
+            data: vec![0.4, 0.4, 0.4],
+        };
+        apply_hue(&mut image, &[1.0; 8]);
+        assert_eq!(image.data, vec![0.4, 0.4, 0.4]);
+    }
+
+    #[test]
+    fn hue_band_turns_its_own_hue_toward_the_signed_neighbour_only() {
+        let hue_after = |pixel: [f32; 3], bands: &[f32; 8]| {
+            let mut image = RgbImage { width: 1, height: 1, data: pixel.to_vec() };
+            apply_hue(&mut image, bands);
+            let encoded: Vec<f32> = image.data.iter().map(|v| srgb_encode(v.max(0.0))).collect();
+            rgb_to_hsv(encoded[0], encoded[1], encoded[2]).0
+        };
+        // Pure green (band 3, centre 120 degrees), away from either boundary.
+        let green = [0.1_f32, 0.6, 0.15];
+        let red = [0.6_f32, 0.1, 0.1];
+        let green_hue = rgb_to_hsv(srgb_encode(green[0]), srgb_encode(green[1]), srgb_encode(green[2])).0;
+        let red_hue = rgb_to_hsv(srgb_encode(red[0]), srgb_encode(red[1]), srgb_encode(red[2])).0;
+
+        // Positive turns green toward aqua (its next band, 180 degrees): hue rises.
+        let mut toward_aqua = [0.0_f32; 8];
+        toward_aqua[3] = 1.0;
+        assert!(
+            hue_after(green, &toward_aqua) > green_hue,
+            "a positive green shift did not turn green toward aqua"
+        );
+        assert!(
+            (hue_after(red, &toward_aqua) - red_hue).abs() < 1.0e-4,
+            "turning green changed a red pixel"
+        );
+
+        // Negative turns green toward yellow (its previous band, 60 degrees): hue falls.
+        let mut toward_yellow = [0.0_f32; 8];
+        toward_yellow[3] = -1.0;
+        assert!(
+            hue_after(green, &toward_yellow) < green_hue,
+            "a negative green shift did not turn green toward yellow"
+        );
+    }
+
+    #[test]
+    fn cast_all_bands_zero_is_a_no_op() {
+        let mut image = RgbImage {
+            width: 4,
+            height: 4,
+            data: (0..48).map(|i| (i % 7) as f32 / 7.0).collect(),
+        };
+        let before = image.data.clone();
+        apply_cast(&mut image, &[0.0; 8]);
+        assert_eq!(image.data, before);
+    }
+
+    #[test]
+    fn cast_leaves_an_exact_neutral_pixel_untouched() {
+        let mut image = RgbImage {
+            width: 1,
+            height: 1,
+            data: vec![0.4, 0.4, 0.4],
+        };
+        apply_cast(&mut image, &[1.0; 8]);
+        assert_eq!(image.data, vec![0.4, 0.4, 0.4]);
+    }
+
+    #[test]
+    fn cast_never_dims_a_colour_sitting_at_its_own_band_centre() {
+        // Pure, fully saturated red: exactly at band 0's own centre, so its
+        // own knob's exemption is zero regardless of amount.
+        let mut image = RgbImage { width: 1, height: 1, data: vec![1.0, 0.0, 0.0] };
+        let mut bands = [0.0_f32; 8];
+        bands[0] = 1.0;
+        apply_cast(&mut image, &bands);
+        assert_eq!(image.data, vec![1.0, 0.0, 0.0], "red's own knob changed a pure red pixel");
+    }
+
+    #[test]
+    fn cast_pulls_a_bands_colour_out_of_a_pixel_that_carries_some() {
+        // A green leaning warm: real red content (0.3), not just a trace.
+        // `srgb_encode` interpolates a lookup table for its non-trivial range,
+        // so even an untouched channel's round trip is only close, not exact
+        // -- the same reason `apply_saturation`'s and `apply_hue`'s own tests
+        // compare derived quantities with a tolerance rather than the raw
+        // channel bytes.
+        let warm_green = [0.3_f32, 0.6, 0.1];
+        let mut image = RgbImage { width: 1, height: 1, data: warm_green.to_vec() };
+        let mut bands = [0.0_f32; 8];
+        bands[0] = 1.0; // pull red out
+        apply_cast(&mut image, &bands);
+        assert!(image.data[0] < warm_green[0] - 1.0e-3, "pulling red did not reduce the red channel");
+        assert!((image.data[1] - warm_green[1]).abs() < 1.0e-4, "pulling red touched the green channel");
+        assert!((image.data[2] - warm_green[2]).abs() < 1.0e-4, "pulling red touched the blue channel");
+    }
+
+    #[test]
+    fn cast_pushes_a_bands_colour_into_a_pixel_on_a_negative_amount() {
+        let warm_green = [0.3_f32, 0.6, 0.1];
+        let mut image = RgbImage { width: 1, height: 1, data: warm_green.to_vec() };
+        let mut bands = [0.0_f32; 8];
+        bands[0] = -1.0; // push red in
+        apply_cast(&mut image, &bands);
+        assert!(image.data[0] > warm_green[0] + 1.0e-3, "a negative amount did not add red");
+    }
+
+    #[test]
+    fn cast_leaves_a_pixel_with_none_of_a_bands_colour_untouched() {
+        // Pure blue has no red and no yellow (needs both red and green) to
+        // pull out or push in either direction.
+        let pure_blue = [0.0_f32, 0.0, 0.8];
+        let mut image = RgbImage { width: 1, height: 1, data: pure_blue.to_vec() };
+        let mut bands = [0.0_f32; 8];
+        bands[0] = 1.0; // red
+        bands[2] = 1.0; // yellow
+        apply_cast(&mut image, &bands);
+        for channel in 0..3 {
+            assert!(
+                (image.data[channel] - pure_blue[channel]).abs() < 1.0e-4,
+                "red/yellow knobs changed a pure blue pixel with neither, channel {channel}: {} vs {}",
+                image.data[channel],
+                pure_blue[channel]
+            );
+        }
     }
 
     #[test]

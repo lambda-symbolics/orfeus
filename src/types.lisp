@@ -136,7 +136,7 @@ them as a copyable node chain.")
 
 (defparameter *graph-only-node-kinds*
   '(:blend :color-subtract :negative :contrast :hdr :dust :vignette :clarity :dehaze
-    :saturation :luminance :crop :rotate :flip :curves)
+    :saturation :luminance :hue :cast :crop :rotate :flip :curves)
   "Node kinds that exist only in graphs, beyond the flat pipeline stages.
 
 :COLOR-SUBTRACT computes picked-color minus pixel per channel in scene-linear
@@ -270,6 +270,35 @@ left no room to read.")
 
 (defun luminance-default-params ()
   "A luminance node's parameters as the panel first shows them: untouched."
+  (list :red 0.0 :orange 0.0 :yellow 0.0 :green 0.0 :aqua 0.0
+        :blue 0.0 :purple 0.0 :magenta 0.0))
+
+(defparameter *hue-keys*
+  '(:red :orange :yellow :green :aqua :blue :purple :magenta)
+  "Parameters of a hue node: how far each of Lightroom's eight hue bands turns
+toward its signed neighbour, every one -1 to 1, landing exactly on the next
+band's centre at the extreme. The third sibling of the saturation and
+luminance band keys -- Lightroom's own HSL panel has exactly these three
+tabs, and this is the one that moves what a band reads AS rather than how
+vivid or bright it is.")
+
+(defun hue-default-params ()
+  "A hue node's parameters as the panel first shows them: untouched."
+  (list :red 0.0 :orange 0.0 :yellow 0.0 :green 0.0 :aqua 0.0
+        :blue 0.0 :purple 0.0 :magenta 0.0))
+
+(defparameter *cast-keys*
+  '(:red :orange :yellow :green :aqua :blue :purple :magenta)
+  "Parameters of a cast node: how much of each of Lightroom's eight named
+colours is pulled out of (positive) or pushed into (negative) pixels that are
+not themselves that colour, every one -1 to 1. Where saturation, luminance and
+hue each reshape a band's OWN pixels, this one reaches across bands -- the
+knob for a green that reads too warm from a red cast it picked up, which
+turning the green's own hue, saturation or brightness cannot fix, since the
+green is not wrong about being green.")
+
+(defun cast-default-params ()
+  "A cast node's parameters as the panel first shows them: untouched."
   (list :red 0.0 :orange 0.0 :yellow 0.0 :green 0.0 :aqua 0.0
         :blue 0.0 :purple 0.0 :magenta 0.0))
 
