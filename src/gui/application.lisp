@@ -6559,16 +6559,25 @@ behind is memory. Best effort; returns how many directories went."
            (start-dialog-export ()
              (when (apply-export-dialog)
                (lightfast:hide export-dialog)
-               (let ((scope (lightfast:value export-dialog-scope)))
-                 (when (string-equal scope "Current photograph")
+               (let* ((scope (lightfast:value export-dialog-scope))
+                      (selected (gui-model-selected-jobs model)))
+                 ;; The filename field names one photograph; it is honoured
+                 ;; whenever exactly one is about to be exported, not only
+                 ;; when the scope is spelled "Current photograph" -- the
+                 ;; thumbnail context menu's own "Export" opens this same
+                 ;; dialog with "Selected photographs" even for a single
+                 ;; right-clicked photo, and the field was visible and filled
+                 ;; in there just the same.
+                 (when (or (string-equal scope "Current photograph")
+                           (and (string-equal scope "Selected photographs")
+                                (= 1 (length selected))))
                    (apply-export-filename
                     (export-format-from-caption
                      (lightfast:value export-dialog-format))))
                  (cond
                    ((string-equal scope "All photographs") (render-all))
                    ((string-equal scope "Selected photographs")
-                    (render-jobs (gui-model-selected-jobs model)
-                                 "the selection"))
+                    (render-jobs selected "the selection"))
                    (t (render-selected))))))
            (browse-export-destination ()
              (let ((chosen (lightfast:choose-directory
