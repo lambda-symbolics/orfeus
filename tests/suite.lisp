@@ -590,6 +590,78 @@ start with the graph a fresh photograph gets, grade for grade."
                                                      :inputs '(1)))
                        :output 2))))))
 
+(defun optics-tier-ordering-p ()
+  "OPTICS must precede every other scene-linear node, not only a crop -- the
+OPTICS tier colour's own promise -- except the domain-propagating kinds
+already free to sit on either side of a film node, which get the same
+freedom here."
+  (flet ((rejected-p (graph)
+           (handler-case (progn (graph-validate graph) nil)
+             (invalid-project-data () t))))
+    (and
+     ;; Optics reading white balance's output: rejected.
+     (rejected-p (make-processing-graph
+                  :nodes (list (make-graph-node :id 1 :kind :white-balance
+                                                :params '(:white-balance-temperature 5000.0
+                                                          :white-balance-tint 0.0)
+                                                :inputs '(0))
+                               (make-graph-node :id 2 :kind :optics
+                                                :params '() :inputs '(1)))
+                  :output 2))
+     ;; Optics reading noise reduction's output: rejected.
+     (rejected-p (make-processing-graph
+                  :nodes (list (make-graph-node :id 1 :kind :noise-reduction
+                                                :params '(:noise-reduction 0.4
+                                                          :neural-noise-reduction 0.0)
+                                                :inputs '(0))
+                               (make-graph-node :id 2 :kind :optics
+                                                :params '() :inputs '(1)))
+                  :output 2))
+     ;; Optics reading a domain-propagating kind's output, which itself
+     ;; reads the raw source: legal, same freedom a film node grants it.
+     (not (rejected-p (make-processing-graph
+                       :nodes (list (make-graph-node :id 1 :kind :tone
+                                                     :params '(:tone-shadows 0.3)
+                                                     :inputs '(0))
+                                    (make-graph-node :id 2 :kind :optics
+                                                     :params '() :inputs '(1)))
+                       :output 2)))
+     ;; A domain-propagating kind does not launder a spent branch: optics
+     ;; behind tone behind white balance is still rejected.
+     (rejected-p (make-processing-graph
+                  :nodes (list (make-graph-node :id 1 :kind :white-balance
+                                                :params '(:white-balance-temperature 5000.0
+                                                          :white-balance-tint 0.0)
+                                                :inputs '(0))
+                               (make-graph-node :id 2 :kind :tone
+                                                :params '(:tone-shadows 0.3)
+                                                :inputs '(1))
+                               (make-graph-node :id 3 :kind :optics
+                                                :params '() :inputs '(2)))
+                  :output 3))
+     ;; GRAPH-OPTICS-TIER-SPENT-P agrees directly.
+     (let ((graph (make-processing-graph
+                   :nodes (list (make-graph-node :id 1 :kind :white-balance
+                                                 :params '(:white-balance-temperature 5000.0
+                                                           :white-balance-tint 0.0)
+                                                 :inputs '(0))
+                                (make-graph-node :id 2 :kind :tone
+                                                 :params '(:tone-shadows 0.3)
+                                                 :inputs '(1)))
+                   :output 2)))
+       (and (not (graph-optics-tier-spent-p graph 0))
+            (graph-optics-tier-spent-p graph 1)
+            (graph-optics-tier-spent-p graph 2)))
+     ;; GRAPH-INSERTION-POINT clamps an OPTICS request upstream of the noise
+     ;; reduction in the default graph, landing right after the existing
+     ;; optics node -- the furthest downstream position still legal -- rather
+     ;; than failing outright.
+     (let* ((graph (default-processing-graph))
+            (optics (first (processing-graph-nodes graph))))
+       (eql (graph-node-id optics)
+            (graph-insertion-point
+             graph (processing-graph-output graph) :optics))))))
+
 (defun settings-graph-conversion-p ()
   (let* ((settings (make-processing-settings :exposure 0.5
                                              :noise-reduction 0.4
@@ -598,13 +670,14 @@ start with the graph a fresh photograph gets, grade for grade."
                                              :lut-strength 0.0))
          (graph (settings->graph settings '(:noise-reduction)))
          (nodes (processing-graph-nodes graph)))
-    ;; Exposure, the bypassed noise reduction, and the sharpening every
-    ;; photograph gets by default, in pipeline order.
+    ;; The bypassed noise reduction, exposure, and the sharpening every
+    ;; photograph gets by default, in pipeline order -- noise reduction before
+    ;; exposure so dragging exposure live never recomputes it needlessly.
     (and (= 3 (length nodes))
-         (equal '(:exposure :noise-reduction :sharpen)
+         (equal '(:noise-reduction :exposure :sharpen)
                 (mapcar #'graph-node-kind nodes))
-         (graph-node-bypassed-p (second nodes))
-         (not (graph-node-bypassed-p (first nodes)))
+         (graph-node-bypassed-p (first nodes))
+         (not (graph-node-bypassed-p (second nodes)))
          ;; The bypassed node drops out of the effective plan.
          (= 2 (length (graph-effective-nodes graph))))))
 
@@ -844,8 +917,13 @@ and then quietly relocated them would be lying about where a click puts things."
                                                      :angle 0.0))))
          (all (graph-node-kinds)))
     (and
-     ;; A scene-linear, uncropped position accepts everything.
-     (null (set-difference all (graph-insertable-kinds graph linear)))
+     ;; A scene-linear, uncropped position accepts everything except optics,
+     ;; which already has noise reduction ahead of it here (the default
+     ;; graph's own second node) -- the OPTICS tier's promise that nothing
+     ;; scene-linear runs ahead of it, same rule the crop case below checks
+     ;; from a different angle.
+     (null (set-difference (remove :optics all) (graph-insertable-kinds graph linear)))
+     (not (member :optics (graph-insertable-kinds graph linear)))
      ;; Below the film transform: another film node, a crop and a rotation,
      ;; which are indifferent to which domain they reframe, plus the four that
      ;; shape tone. Shaping tone after a look is the point of a look — without
@@ -1009,14 +1087,16 @@ and then quietly relocated them would be lying about where a click puts things."
          ;; The output can move to any node.
          (graph-set-output graph (graph-node-id optics))
          (eql (graph-node-id optics) (processing-graph-output graph))
-         ;; Wiring a genuine cycle rolls back untouched.
-         (graph-set-primary-input graph (graph-node-id optics)
-                                  (graph-node-id nr))
+         ;; Wiring optics downstream of noise reduction rolls back untouched:
+         ;; the OPTICS tier's own promise is that nothing scene-linear runs
+         ;; ahead of it, not only that the graph stays acyclic (a genuine
+         ;; cycle, via a blend's second input, is covered by
+         ;; GRAPH-REWIRE-P).
          (let ((before (graph->sexp graph)))
            (and (handler-case
                     (progn (graph-set-primary-input
-                            graph (graph-node-id nr)
-                            (graph-node-id optics))
+                            graph (graph-node-id optics)
+                            (graph-node-id nr))
                            nil)
                   (invalid-project-data () t))
                 (equal before (graph->sexp graph)))))))
@@ -2814,6 +2894,8 @@ renderer is told about them."
              (graph-round-trip-p))
       (check "graph validation rejects malformed graphs"
              (graph-validation-rejects-p))
+      (check "optics precedes every scene-linear node, not only a crop"
+             (optics-tier-ordering-p))
       (check "settings convert to equivalent linear graphs"
              (settings-graph-conversion-p))
       (check "untouched settings sharpen like the camera, after noise reduction"

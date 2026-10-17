@@ -676,25 +676,32 @@ clarity has one radius, and this is the node's default.")
          (base *default-graph-nodes*))
     (append
      ;; Optics first: it is the one correction the node graph's own tiers put
-     ;; ahead of everything else (GRAPH-NODE-BODY-STYLE), and swapping it with
-     ;; a scalar white-balance re-gain changes nothing a viewer could see --
-     ;; confirmed by rendering both orders of this exact still and diffing the
-     ;; output (floating-point rounding noise only, RMSE far under one 8-bit
-     ;; level either way).
+     ;; ahead of everything else (GRAPH-NODE-BODY-STYLE), and the executor's
+     ;; own cache resumes from the first position two renders' parameters
+     ;; diverge, so the one expensive, rarely-touched stage goes first to stay
+     ;; out of the blast radius of every cheap slider after it.
      (list (first base))
+     ;; Dehaze measures the whole frame, so it goes right after the optics too.
+     (unless (zerop dehaze)
+       (list (list :dehaze (list :amount dehaze))))
+     ;; Noise reduction next, the next most expensive stage and, like optics,
+     ;; rarely touched once set -- reading sensor-referred data before white
+     ;; balance's per-channel gain unevenly shifts what it measures, matching
+     ;; how a real RAW pipeline denoises before grading.
+     (list (second base))
      ;; A film stock is rated for a light source -- a "D" or "T" film, say --
      ;; and its colour response in the LUT below assumes a photograph was
      ;; taken under it. This resets white balance to that rating regardless
-     ;; of what the photograph was actually lit by, right after optics and
-     ;; ahead of everything else.
+     ;; of what the photograph was actually lit by, right after the expensive
+     ;; stages and ahead of the cheap, frequently-tweaked ones -- swapping it
+     ;; with optics changes nothing a viewer could see, confirmed by rendering
+     ;; both orders of this exact still and diffing the output (floating-point
+     ;; rounding noise only, RMSE far under one 8-bit level either way).
      (unless (zerop rated-kelvin)
        (list (list :white-balance
                    (list :white-balance-temperature (coerce rated-kelvin 'single-float)
                          :white-balance-tint (coerce rated-tint 'single-float)))))
-     ;; Dehaze measures the whole frame, so it goes right after the optics too.
-     (unless (zerop dehaze)
-       (list (list :dehaze (list :amount dehaze))))
-     (rest base)
+     (cddr base)
      (unless (zerop clarity)
        (list (list :clarity (list :amount clarity :radius *clarity-radius*))))
      (unless (zerop vignette)

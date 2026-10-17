@@ -189,6 +189,7 @@
    #:graph-can-insert-p
    #:graph-insertable-kinds
    #:graph-display-domain-p
+   #:graph-optics-tier-spent-p
    #:graph-kind-accepts-display-p
    #:graph-delete-node
    #:graph-swap-with-upstream

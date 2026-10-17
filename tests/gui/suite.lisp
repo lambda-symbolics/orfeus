@@ -437,7 +437,10 @@ for light ones, and on any other photograph it joins the end of the chain."
         (check (equal '(:optics :noise-reduction :white-balance :film)
                       (mapcar #'first (funcall rows)))
                "Moving later did not restore the original order")
-        ;; Every kind the menu offers must actually insert.
+        ;; Every kind the menu offers must actually insert. :OPTICS clamps
+        ;; upstream of the white balance and noise reduction already in this
+        ;; chain (GRAPH-INSERTION-POINT), the same way a grade correction
+        ;; clamps upstream of a film tail.
         (dolist (kind (orfeus:graph-node-kinds))
           (check (orfeus/gui::gui-model-add-node model kind)
                  (format nil "Adding a ~S node returned nothing" kind)))))))

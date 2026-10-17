@@ -64,6 +64,7 @@
                 #:graph-insertable-kinds
                 #:graph-node-kinds
                 #:graph-display-domain-p
+                #:graph-optics-tier-spent-p
                 #:graph-kind-accepts-display-p
                 #:*graph-source-id*
                 #:graph-node-bypassed-p

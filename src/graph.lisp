@@ -380,17 +380,32 @@ whose frame has already moved, whichever of the two moved it."
                              "only saved blend state may carry blend fields"))))))
   states)
 
+(defparameter *domain-propagating-kinds*
+  '(:crop :rotate :flip :curves :contrast :sharpen :saturation :luminance
+    :hue :cast :tone :node)
+  "Kinds that carry their branch's domain through rather than requiring or
+fixing one of their own -- the same set that may already sit on either side
+of a film node (see the matching member-list cond clauses below; :TONE and
+:NODE each keep their own clause for other reasons and are not folded in, but
+belong to the same set here). They get the identical freedom relative to
+OPTICS: a plain brightness remap or a crop does not care whether the frame
+under it has had its lens distortion corrected yet, so it may sit on either
+side without spending the OPTICS tier's own promise.")
+
 (defun graph-validate (graph)
   "Signal INVALID-PROJECT-DATA unless GRAPH is well formed; return GRAPH.
 
 Checks topological id order, input arity and reference validity, per-stage
-parameter keys, blend opacities, compatible branch crop geometry, optics before
-crop, and the display-domain rule that only film nodes may consume film output
-while blends stay scene-linear."
+parameter keys, blend opacities, compatible branch crop geometry, optics
+before every other scene-linear correction (not just before a crop -- the
+OPTICS tier colour's own promise), and the display-domain rule that only film
+nodes may consume film output while blends stay scene-linear."
   (let ((seen (list *graph-source-id*))
         (display '())
-        (geometry (make-hash-table)))
+        (geometry (make-hash-table))
+        (optics-tier-spent (make-hash-table)))
     (setf (gethash *graph-source-id* geometry) '())
+    (setf (gethash *graph-source-id* optics-tier-spent) nil)
     (dolist (node (processing-graph-nodes graph))
       (let ((id (graph-node-id node))
             (kind (graph-node-kind node))
@@ -404,6 +419,16 @@ while blends stay scene-linear."
         (dolist (input inputs)
           (unless (member input seen)
             (graph-invalid node "node ~S input ~S is not upstream" id input)))
+        ;; The OPTICS tier's own promise: it runs before every other
+        ;; scene-linear node, not just before a crop -- except the kinds that
+        ;; are already domain-agnostic enough to sit on either side of a FILM
+        ;; node (*DOMAIN-PROPAGATING-KINDS*), which get the same freedom here.
+        ;; A register is "spent" the moment any other kind has touched it,
+        ;; whether directly or through an ancestor -- generic over every kind,
+        ;; so no branch below needs its own copy of this rule.
+        (setf (gethash id optics-tier-spent)
+              (or (not (member kind (cons :optics *domain-propagating-kinds*)))
+                  (some (lambda (input) (gethash input optics-tier-spent)) inputs)))
         (cond
           ((graph-node-blend-p node)
            (unless (= 2 (length inputs))
@@ -490,6 +515,12 @@ while blends stay scene-linear."
                       (gethash (first inputs) geometry))
              (graph-invalid node
                             "optics node ~S cannot process cropped output" id))
+           (when (and (eq kind :optics)
+                      (not (graph-node-bypassed-p node))
+                      (gethash (first inputs) optics-tier-spent))
+             (graph-invalid node
+                            "optics node ~S cannot follow a scene-linear correction"
+                            id))
            (cond ((eq kind :film) (pushnew id display))
                  ;; A tonal equalizer reads a brightness and rewrites it, which
                  ;; is as meaningful on a graded image as on a scene-linear one.
@@ -603,10 +634,26 @@ while blends stay scene-linear."
     :output (getf sexp :output *graph-source-id*))))
 
 (defparameter *flat-pipeline-stage-order*
-  '(:white-balance :exposure :optics :noise-reduction :sharpen :tone :film)
-  "The order the flat pipeline actually executes its stages in.
-Graph conversion must chain nodes this way — notably optics before noise
-reduction — so a converted photograph renders identically.")
+  '(:optics :noise-reduction :white-balance :exposure :sharpen :tone :film)
+  "The order a photograph's default graph chains its stages in.
+
+Optics first: the tier colours (GRAPH-NODE-BODY-STYLE) promise it runs before
+every other scene-linear node, not just before crops, and it is by far the
+most expensive one (hundreds of milliseconds to seconds at a large sensor's
+full resolution) — the graph executor's own cache (RESUME-LIMIT, native side)
+resumes from the first position two renders' parameters diverge, so putting
+the one expensive, rarely-touched stage first keeps it out of the blast radius
+of every cheap, constantly-dragged slider after it. Noise reduction follows
+right after optics for the same reason, the neural path especially: it is the
+next most expensive stage, and it reads sensor-referred data before white
+balance or exposure's per-channel gains would unevenly shift what the
+denoiser is measuring, matching how a real RAW pipeline denoises before
+grading. White balance and exposure are both pure per-pixel gains with no
+correctness dependency on optics' or each other's order (confirmed by
+rendering a real photo both ways and diffing: the difference is float32
+rounding noise, nothing a viewer could see) — they are last among the cheap,
+frequently-tweaked stages precisely because dragging them should cost as
+little recomputation as possible.")
 
 (defun settings->graph (settings &optional disabled-stages)
   "Chain the non-identity stages of SETTINGS as a linear graph.
@@ -1018,6 +1065,23 @@ and nothing else may consume display output at all. The source is scene-linear."
             (graph-display-domain-p graph (first (graph-node-inputs node))))
            (t nil)))))
 
+(defun graph-optics-tier-spent-p (graph id)
+  "True when the branch ending at ID has already had a non-flexible
+scene-linear correction applied to it, and so could not legally feed a new
+OPTICS node.
+
+Mirrors GRAPH-VALIDATE's own OPTICS-TIER-SPENT computation: kinds in
+*DOMAIN-PROPAGATING-KINDS* (plus OPTICS itself) carry their input's
+spent-ness through unchanged; every other kind spends it unconditionally. The
+source is never spent."
+  (let ((node (graph-find-node graph id)))
+    (and node
+         (if (member (graph-node-kind node)
+                     (cons :optics *domain-propagating-kinds*))
+             (some (lambda (input) (graph-optics-tier-spent-p graph input))
+                   (graph-node-inputs node))
+             t))))
+
 (defun graph-insertion-point (graph after-id kind)
   "The furthest downstream position at or above AFTER-ID that KIND may occupy.
 
@@ -1026,14 +1090,18 @@ after the film tail used to fail outright: the node did not appear and the
 reason went to the status bar, which read as the button doing nothing. Walking
 upstream to the last position where the kind is legal puts it where the user
 can only have meant, since a grade node placed after the film transform would
-have nothing sensible to do there anyway."
+have nothing sensible to do there anyway. OPTICS gets the same clamping
+against GRAPH-OPTICS-TIER-SPENT-P: asking for it after white balance or noise
+reduction walks upstream to where it is still legal, rather than failing."
   (cond ((graph-kind-accepts-display-p kind) after-id)
-        ((not (graph-display-domain-p graph after-id)) after-id)
-        (t (let ((node (graph-find-node graph after-id)))
-             (if node
-                 (graph-insertion-point graph (first (graph-node-inputs node))
-                                        kind)
-                 after-id)))))
+        ((or (graph-display-domain-p graph after-id)
+             (and (eq kind :optics) (graph-optics-tier-spent-p graph after-id)))
+         (let ((node (graph-find-node graph after-id)))
+           (if node
+               (graph-insertion-point graph (first (graph-node-inputs node))
+                                      kind)
+               after-id)))
+        (t after-id)))
 
 (defun graph-can-insert-p (graph after-id kind)
   "True when a KIND node inserted directly after AFTER-ID would be well formed.
