@@ -168,6 +168,15 @@
         (graph-invalid params "cast ~A must be within -1..1" key))))
   params)
 
+(defun calibration-params-validate (params)
+  (unless (and (listp params) (plist-known-keys-p params *calibration-keys*))
+    (graph-invalid params "expected three primaries' hue and saturation"))
+  (dolist (key *calibration-keys*)
+    (let ((value (getf params key 0)))
+      (unless (and (realp value) (<= -1 value 1))
+        (graph-invalid params "calibration ~A must be within -1..1" key))))
+  params)
+
 (defparameter *legacy-sharpen-keys*
   '((:amount . :sharpen-amount) (:radius . :sharpen-radius)
     (:threshold . :sharpen-threshold))
@@ -335,6 +344,7 @@ whose frame has already moved, whichever of the two moved it."
     ((eq kind :luminance) (luminance-params-validate params))
     ((eq kind :hue) (hue-params-validate params))
     ((eq kind :cast) (cast-params-validate params))
+    ((eq kind :calibration) (calibration-params-validate params))
     ((graph-filter-kind-p kind)
      (graph-node-params-validate
       (make-graph-node :kind kind :params params)))
@@ -407,7 +417,7 @@ while blends stay scene-linear."
                (graph-invalid node
                               "blend node ~S cannot consume film output" id))))
           ((member kind '(:color-subtract :negative :hdr :dust :vignette :clarity
-                          :dehaze))
+                          :dehaze :calibration))
            (unless (= 1 (length inputs))
              (graph-invalid node "filter node ~S needs exactly one input" id))
            (ecase kind
@@ -418,7 +428,9 @@ while blends stay scene-linear."
              (:clarity (clarity-params-validate (graph-node-params node)))
              (:dehaze (dehaze-params-validate (graph-node-params node)))
              (:color-subtract
-              (color-subtract-params-validate (graph-node-params node))))
+              (color-subtract-params-validate (graph-node-params node)))
+             (:calibration
+              (calibration-params-validate (graph-node-params node))))
            (when (member (first inputs) display)
              (graph-invalid node "node ~S cannot process film output" id)))
           ((eq kind :crop)

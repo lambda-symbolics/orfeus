@@ -49,6 +49,7 @@ pub const NODE_SATURATION: u32 = 21;
 pub const NODE_LUMINANCE: u32 = 22;
 pub const NODE_HUE: u32 = 23;
 pub const NODE_CAST: u32 = 24;
+pub const NODE_CALIBRATION: u32 = 25;
 
 /// Frame-level settings shared by every node of one graph render.
 #[repr(C)]
@@ -289,6 +290,7 @@ fn param_arity(kind: u32) -> Result<ParamArity, Error> {
         NODE_LUMINANCE => ParamArity::Exact(8),     // 8 bands, lighter or darker
         NODE_HUE => ParamArity::Exact(8),           // 8 bands, turned toward a neighbour
         NODE_CAST => ParamArity::Exact(8),          // 8 bands, pulled out of or pushed into others
+        NODE_CALIBRATION => ParamArity::Exact(6),   // R/G/B primary hue + saturation
         _ => return Err(Error::InvalidArgument("unknown graph node kind")),
     })
 }
@@ -534,6 +536,7 @@ fn validate_param(kind: u32, index: usize, value: f32) -> Result<(), Error> {
         (NODE_LUMINANCE, _) => (-1.0..=1.0).contains(&value),
         (NODE_HUE, _) => (-1.0..=1.0).contains(&value),
         (NODE_CAST, _) => (-1.0..=1.0).contains(&value),
+        (NODE_CALIBRATION, _) => (-1.0..=1.0).contains(&value),
         // The four leading parameters are point counts, not signal levels.
         (NODE_CURVES, index) if index < CURVE_CHANNELS => {
             (MIN_CURVE_POINTS as f32..=MAX_CURVE_POINTS as f32).contains(&value)
@@ -1265,6 +1268,7 @@ fn node_stage_name(kind: u32) -> &'static str {
         NODE_LUMINANCE => "luminance\0",
         NODE_HUE => "hue\0",
         NODE_CAST => "cast\0",
+        NODE_CALIBRATION => "calibrating\0",
         NODE_CONTRAST => "contrast\0",
         NODE_SHARPEN => "sharpening\0",
         _ => "developing\0",
@@ -1816,6 +1820,7 @@ fn execute_graph_into(
                     | NODE_LUMINANCE
                     | NODE_HUE
                     | NODE_CAST
+                    | NODE_CALIBRATION
                     | NODE_CROP
                     | NODE_ROTATE
                     | NODE_FLIP
@@ -1947,6 +1952,9 @@ fn execute_graph_into(
             }
             NODE_CAST => {
                 render::apply_cast(&mut image, &op.params[0..8]);
+            }
+            NODE_CALIBRATION => {
+                render::apply_calibration(&mut image, &op.params[0..6]);
             }
             NODE_CLARITY => {
                 // The radius is stated for the photograph, like the sharpening
@@ -3266,6 +3274,7 @@ mod tests {
             NODE_VIGNETTE,
             NODE_CLARITY,
             NODE_DEHAZE,
+            NODE_CALIBRATION,
         ] {
             let params: &[f32] = match kind {
                 NODE_WHITE_BALANCE => &[0.0, 0.0],
@@ -3277,6 +3286,7 @@ mod tests {
                 NODE_VIGNETTE => &[-0.3, 0.5, 0.5, 0.0],
                 NODE_CLARITY => &[0.3, 150.0],
                 NODE_DEHAZE => &[0.3],
+                NODE_CALIBRATION => &[0.2, 0.0, 0.0, 0.0, 0.0, 0.0],
                 _ => &[1.0, 1.0, 1.0],
             };
             assert!(

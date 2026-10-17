@@ -24,6 +24,7 @@
                 #:luminance-default-params
                 #:hue-default-params
                 #:cast-default-params
+                #:calibration-default-params
                 #:resolve-lens-profile-alias
                 #:make-export-settings
                 #:make-photo-job

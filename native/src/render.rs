@@ -5565,6 +5565,125 @@ pub(crate) fn apply_cast(image: &mut RgbImage, bands: &[f32]) {
     });
 }
 
+/// Linear sRGB to Oklab's cone responses (Björn Ottosson's M1). Ported from
+/// `scripts/lightroom-preset-lut.lisp`'s own `*oklab-m1*`; keep the four
+/// matrices here in sync with that file's four if any of them ever change.
+const OKLAB_M1: [[f32; 3]; 3] = [
+    [0.4122214708, 0.5363325363, 0.0514459929],
+    [0.2119034982, 0.6806995451, 0.1073969566],
+    [0.0883024619, 0.2817188376, 0.6299787005],
+];
+
+/// Cube-rooted cone responses to Oklab L a b (Björn Ottosson's M2).
+const OKLAB_M2: [[f32; 3]; 3] = [
+    [0.2104542553, 0.7936177850, -0.0040720468],
+    [1.9779984951, -2.4285922050, 0.4505937099],
+    [0.0259040371, 0.7827717662, -0.8086757660],
+];
+
+/// Inverse of `OKLAB_M1`, precomputed rather than inverted at load time since
+/// it never changes; verified against `OKLAB_M1` multiplying out to the
+/// identity to the last printed digit.
+const OKLAB_M1_INVERSE: [[f32; 3]; 3] = [
+    [4.0767416613, -3.3077115904, 0.2309699287],
+    [-1.2684380041, 2.6097574007, -0.3413193963],
+    [-0.0041960865, -0.7034186145, 1.7076147009],
+];
+
+/// Inverse of `OKLAB_M2`, precomputed the same way and for the same reason.
+const OKLAB_M2_INVERSE: [[f32; 3]; 3] = [
+    [0.9999999985, 0.3963377922, 0.2158037581],
+    [1.0000000089, -0.1055613423, -0.0638541748],
+    [1.0000000547, -0.0894841821, -1.2914855379],
+];
+
+fn mat3_vec3(matrix: &[[f32; 3]; 3], vector: [f32; 3]) -> [f32; 3] {
+    [
+        matrix[0][0] * vector[0] + matrix[0][1] * vector[1] + matrix[0][2] * vector[2],
+        matrix[1][0] * vector[0] + matrix[1][1] * vector[1] + matrix[1][2] * vector[2],
+        matrix[2][0] * vector[0] + matrix[2][1] * vector[1] + matrix[2][2] * vector[2],
+    ]
+}
+
+fn linear_srgb_to_oklab(rgb: [f32; 3]) -> [f32; 3] {
+    let lms = mat3_vec3(&OKLAB_M1, rgb);
+    mat3_vec3(&OKLAB_M2, [lms[0].cbrt(), lms[1].cbrt(), lms[2].cbrt()])
+}
+
+fn oklab_to_linear_srgb(lab: [f32; 3]) -> [f32; 3] {
+    let lms_cbrt = mat3_vec3(&OKLAB_M2_INVERSE, lab);
+    mat3_vec3(
+        &OKLAB_M1_INVERSE,
+        [lms_cbrt[0].powi(3), lms_cbrt[1].powi(3), lms_cbrt[2].powi(3)],
+    )
+}
+
+/// Linear-sRGB RGB with its Oklab hue turned by DEGREES and its chroma scaled
+/// by FACTOR, lightness kept. Positive goes the way round the wheel Lightroom's
+/// own calibration sliders' ramps do: red toward orange, green toward cyan,
+/// blue toward purple. Ported from `scripts/lightroom-preset-lut.lisp`'s own
+/// `turn-primary`, whose own history has a sign trap worth repeating: a
+/// flipped rotation direction here once turned blue toward purple on the
+/// WRONG sign and made skies purple instead of leaving them blue, so this is
+/// cross-checked against that Lisp function's own output, not re-derived.
+fn turn_primary(rgb: [f32; 3], degrees: f32, factor: f32) -> [f32; 3] {
+    let lab = linear_srgb_to_oklab(rgb);
+    let theta = degrees.to_radians();
+    let (sin, cos) = theta.sin_cos();
+    oklab_to_linear_srgb([
+        lab[0],
+        factor * (lab[1] * cos - lab[2] * sin),
+        factor * (lab[1] * sin + lab[2] * cos),
+    ])
+}
+
+/// The 3x3 matrix a camera calibration panel amounts to, on linear sRGB: each
+/// primary's hue turned by up to thirty degrees and its chroma scaled by up to
+/// a factor of two, rows normalised so white stays white. PARAMS are
+/// red-hue, red-saturation, green-hue, green-saturation, blue-hue,
+/// blue-saturation, each -1..1 (Lightroom's own panel runs -100..100; this
+/// drops the extra /100). Ported from `scripts/lightroom-preset-lut.lisp`'s
+/// own `calibration-matrix`.
+fn calibration_matrix(params: &[f32]) -> [[f32; 3]; 3] {
+    let primary = |rgb: [f32; 3], hue: f32, saturation: f32| {
+        turn_primary(rgb, 30.0 * hue, 2.0_f32.powf(saturation))
+    };
+    let red = primary([1.0, 0.0, 0.0], params[0], params[1]);
+    let green = primary([0.0, 1.0, 0.0], params[2], params[3]);
+    let blue = primary([0.0, 0.0, 1.0], params[4], params[5]);
+    let mut matrix = [[0.0_f32; 3]; 3];
+    for row in 0..3 {
+        let values = [red[row], green[row], blue[row]];
+        let sum: f32 = values.iter().sum();
+        for (col, &value) in values.iter().enumerate() {
+            matrix[row][col] = value / sum;
+        }
+    }
+    matrix
+}
+
+/// Applies a camera-calibration matrix (see `calibration_matrix`) directly to
+/// every pixel in the renderer's own linear register -- never gamma-encoded
+/// first, unlike `apply_saturation`/`apply_hue`/`apply_cast`, because this
+/// models the camera's actual sensor primaries, a property of the as-shot
+/// scene rather than something meaningful to read off an already-displayed
+/// colour. PARAMS: red-hue, red-saturation, green-hue, green-saturation,
+/// blue-hue, blue-saturation, each -1..1.
+pub(crate) fn apply_calibration(image: &mut RgbImage, params: &[f32]) {
+    debug_assert_eq!(params.len(), 6);
+    if params.iter().all(|&value| value == 0.0) {
+        return;
+    }
+    let matrix = calibration_matrix(params);
+    image.data.par_chunks_mut(3).for_each(|pixel| {
+        let input = [pixel[0].max(0.0), pixel[1].max(0.0), pixel[2].max(0.0)];
+        let output = mat3_vec3(&matrix, input);
+        pixel[0] = output[0].max(0.0);
+        pixel[1] = output[1].max(0.0);
+        pixel[2] = output[2].max(0.0);
+    });
+}
+
 /// Width the frame is reduced to for estimating haze: coarse enough that the
 /// estimate costs nothing, fine enough that the transmission follows the scene.
 const DEHAZE_SMALL_WIDTH: usize = 256;
@@ -10287,6 +10406,101 @@ mod tests {
                 "red/yellow knobs changed a pure blue pixel with neither, channel {channel}: {} vs {}",
                 image.data[channel],
                 pure_blue[channel]
+            );
+        }
+    }
+
+    // `turn_primary`/`calibration_matrix` cross-checked against
+    // `scripts/lightroom-preset-lut.lisp`'s own `turn-primary`/
+    // `calibration-matrix`, run directly (`sbcl --script`, pushing
+    // `:lightroom-preset-lut-library` first) rather than re-derived, because
+    // this exact Oklab rotation already has one documented sign trap (a
+    // flipped rotation direction once turned skies purple instead of leaving
+    // them blue -- see orfeus-lightroom-luts memory). Tolerance is 1.0e-3,
+    // generous for f32 vs the Lisp reference's f64 through two cube roots.
+    #[test]
+    fn turn_primary_matches_the_reference_lisp_implementation() {
+        let cases: &[([f32; 3], f32, f32, [f32; 3])] = &[
+            ([0.0, 0.0, 1.0], 30.0, 2.0, [0.3662478680524203, -0.38780166941263927, 2.6510616574075256]),
+            ([0.0, 0.0, 1.0], -30.0, 0.5, [-0.04837194032857977, 0.11349556371204886, 0.34166425418582114]),
+            ([1.0, 0.0, 0.0], 15.0, 1.0, [0.9603242616878894, 0.022794592738529545, -0.058192161445310156]),
+            ([0.0, 1.0, 0.0], 30.0, 1.0, [-0.44992801172893604, 1.1111792083518826, 0.5166525111167951]),
+        ];
+        for &(rgb, degrees, factor, expected) in cases {
+            let actual = turn_primary(rgb, degrees, factor);
+            for channel in 0..3 {
+                assert!(
+                    (actual[channel] - expected[channel]).abs() < 1.0e-3,
+                    "turn_primary({rgb:?}, {degrees}, {factor}) channel {channel}: {} vs reference {}",
+                    actual[channel],
+                    expected[channel]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn calibration_matrix_matches_the_reference_lisp_implementation() {
+        // crs:RedHue=20 RedSaturation=10 GreenHue=-15 GreenSaturation=25
+        // BlueHue=-40 BlueSaturation=-20, the same attributes probed directly
+        // against the Lisp `calibration-matrix` (which takes -100..100).
+        let params = [0.2_f32, 0.1, -0.15, 0.25, -0.4, -0.2];
+        let expected: [[f32; 3]; 3] = [
+            [1.051667774426404, -0.0021885832046539787, -0.04947919122174995],
+            [-0.01339242044443418, 0.9639499412386406, 0.04944247920579361],
+            [-0.06307171426628254, -0.22258405193918018, 1.2856557662054628],
+        ];
+        let actual = calibration_matrix(&params);
+        for row in 0..3 {
+            for col in 0..3 {
+                assert!(
+                    (actual[row][col] - expected[row][col]).abs() < 1.0e-3,
+                    "calibration_matrix row {row} col {col}: {} vs reference {}",
+                    actual[row][col],
+                    expected[row][col]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn calibration_all_params_zero_is_a_no_op() {
+        let mut image = RgbImage {
+            width: 4,
+            height: 4,
+            data: (0..48).map(|i| (i % 7) as f32 / 7.0).collect(),
+        };
+        let before = image.data.clone();
+        apply_calibration(&mut image, &[0.0; 6]);
+        assert_eq!(image.data, before);
+    }
+
+    #[test]
+    fn calibration_untwisted_matrix_is_the_identity() {
+        let matrix = calibration_matrix(&[0.0; 6]);
+        let identity = [[1.0_f32, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        for row in 0..3 {
+            for col in 0..3 {
+                assert!(
+                    (matrix[row][col] - identity[row][col]).abs() < 1.0e-5,
+                    "untwisted calibration matrix row {row} col {col}: {}",
+                    matrix[row][col]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn calibration_keeps_white_white() {
+        // The matrix's own row normalisation promises this regardless of the
+        // six parameters: every row sums to 1, so (1,1,1) maps to (1,1,1).
+        let mut image = RgbImage { width: 1, height: 1, data: vec![1.0, 1.0, 1.0] };
+        apply_calibration(&mut image, &[0.6, -0.3, 0.2, 0.4, -0.5, 0.1]);
+        for channel in 0..3 {
+            assert!(
+                (image.data[channel] - 1.0).abs() < 1.0e-4,
+                "channel {channel} moved white: {}",
+                image.data[channel]
             );
         }
     }

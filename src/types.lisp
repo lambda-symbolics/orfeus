@@ -136,7 +136,7 @@ them as a copyable node chain.")
 
 (defparameter *graph-only-node-kinds*
   '(:blend :color-subtract :negative :contrast :hdr :dust :vignette :clarity :dehaze
-    :saturation :luminance :hue :cast :crop :rotate :flip :curves)
+    :saturation :luminance :hue :cast :calibration :crop :rotate :flip :curves)
   "Node kinds that exist only in graphs, beyond the flat pipeline stages.
 
 :COLOR-SUBTRACT computes picked-color minus pixel per channel in scene-linear
@@ -301,6 +301,23 @@ green is not wrong about being green.")
   "A cast node's parameters as the panel first shows them: untouched."
   (list :red 0.0 :orange 0.0 :yellow 0.0 :green 0.0 :aqua 0.0
         :blue 0.0 :purple 0.0 :magenta 0.0))
+
+(defparameter *calibration-keys*
+  '(:red-hue :red-saturation :green-hue :green-saturation
+    :blue-hue :blue-saturation)
+  "Parameters of a calibration node: each camera primary's own hue, turned up
+to thirty degrees around the colour wheel, and its own chroma, scaled up to a
+factor of two, every one -1 to 1. Unlike saturation, luminance, hue and cast,
+which all read a pixel's displayed colour, this redefines what red, green and
+blue THEMSELVES mean before any of that -- a property of the sensor and the
+as-shot scene, not of how a colour ended up looking, so it belongs before a
+film look rather than after one.")
+
+(defun calibration-default-params ()
+  "A calibration node's parameters as the panel first shows them: untouched,
+same as an un-twisted camera profile."
+  (list :red-hue 0.0 :red-saturation 0.0 :green-hue 0.0 :green-saturation 0.0
+        :blue-hue 0.0 :blue-saturation 0.0))
 
 (defparameter *color-subtract-keys* '(:red :green :blue))
 

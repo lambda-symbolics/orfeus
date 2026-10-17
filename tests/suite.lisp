@@ -2117,6 +2117,55 @@ scene-linear correction -- is just as valid after a film node as before one."
            ;; A colour grade, not a scene-linear correction: valid after film.
            (not (rejected-p (cast-default-params) :film))))))
 
+(defun calibration-node-validates-and-encodes-p ()
+  "A calibration node carries three primaries' hue and saturation, refuses one
+off its -1..1 range, fills its defaults in, reaches the executor as kind 25
+with six parameters, and -- unlike saturation, luminance, hue and cast, a
+property of the as-shot scene rather than a look -- is rejected after a film
+node."
+  (flet ((rejected-p (params &optional (input-kind :crop))
+           (handler-case
+               (progn
+                 (graph-validate
+                  (make-processing-graph
+                   :nodes (list (make-graph-node
+                                 :id 1 :kind input-kind
+                                 :params (if (eq input-kind :film)
+                                             '(:grain-amount 0.2)
+                                             '(:left 0.1 :top 0.1
+                                               :width 0.8 :height 0.8))
+                                 :inputs '(0))
+                                (make-graph-node
+                                 :id 2 :kind :calibration
+                                 :params params :inputs '(1)))
+                   :output 2))
+                 nil)
+             (invalid-project-data () t))))
+    (let* ((params '(:red-hue 0.2 :red-saturation 0.1 :green-hue -0.15
+                     :green-saturation 0.25 :blue-hue -0.4 :blue-saturation -0.2))
+           (graph (graph-validate
+                   (make-processing-graph
+                    :nodes (list (make-graph-node
+                                  :id 1 :kind :calibration
+                                  :params params :inputs '(0)))
+                    :output 1)))
+           (decoded (sexp->graph (graph->sexp graph)))
+           (bytes (orfeus::graph->program-bytes decoded)))
+      (and (equal params (graph-node-params (graph-find-node decoded 1)))
+           (= 25 (elt bytes 12))
+           (= 6 (elt bytes 24))
+           (member :calibration (graph-node-kinds))
+           (equal '(:red-hue 0.0 :red-saturation 0.0 :green-hue 0.0
+                    :green-saturation 0.0 :blue-hue 0.0 :blue-saturation 0.0)
+                  (calibration-default-params))
+           (not (rejected-p (calibration-default-params)))
+           (not (rejected-p '()))
+           (rejected-p '(:red-hue -1.5))
+           (rejected-p '(:blue-saturation 1.1))
+           (rejected-p '(:unknown-key 0.1))
+           ;; A property of the as-shot scene, not a look: rejected after film.
+           (rejected-p (calibration-default-params) :film)))))
+
 (defun dust-node-validates-and-encodes-p ()
   "A dust node carries a speck size, a contrast and which specks it looks for,
 refuses what cannot be dust, and reaches the executor as kind 17 with three
@@ -2831,6 +2880,8 @@ renderer is told about them."
              (hue-node-validates-and-encodes-p))
       (check "cast node validates, encodes, defaults, and follows a look"
              (cast-node-validates-and-encodes-p))
+      (check "calibration node validates, encodes, defaults, and precedes a look"
+             (calibration-node-validates-and-encodes-p))
       (check "clarity node validates, encodes and defaults"
              (clarity-node-validates-and-encodes-p))
       (check "vignette node validates, encodes and defaults"

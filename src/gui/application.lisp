@@ -398,6 +398,7 @@ width, but a spinner cannot shrink below its digits.")
     (:vignette . "Vignette")
     (:clarity . "Clarity")
     (:dehaze . "Dehaze")
+    (:calibration . "Calib")
     (:saturation . "Satur")
     (:luminance . "Lumin")
     (:hue . "Hue")
@@ -427,6 +428,7 @@ width, but a spinner cannot shrink below its digits.")
     ("Vignette" . :vignette)
     ("Clarity" . :clarity)
     ("Dehaze" . :dehaze)
+    ("Calibration" . :calibration)
     ("Saturation" . :saturation)
     ("Luminance" . :luminance)
     ("Hue" . :hue)
@@ -625,6 +627,7 @@ sliders and nothing else has to be recomputed."
               (:rect 5 5 2 2))
     (:dehaze (:line 0 7 4 2) (:line 4 2 8 7) (:line 7 6 9 4) (:line 9 4 12 7)
              (:rect 0 9 12 1) (:rect 0 11 12 1))
+    (:calibration (:rect 1 5 2 2) (:rect 5 5 2 2) (:rect 9 5 2 2))
     (:saturation (:line 6 0 6 4) (:line 6 8 6 12) (:line 0 6 4 6) (:line 8 6 12 6)
                  (:rect 5 5 2 2))
     (:luminance (:rect 1 2 4 8) (:line 7 2 11 2) (:line 11 2 11 9) (:line 11 9 7 9)
@@ -766,6 +769,9 @@ channel carries anywhere from its two endpoints to a full film-stock shape."
     (:vignette (/= 0.0 (getf (orfeus:graph-node-params node) :amount -0.25)))
     (:clarity (/= 0.0 (getf (orfeus:graph-node-params node) :amount 0.25)))
     (:dehaze (/= 0.0 (getf (orfeus:graph-node-params node) :amount 0.3)))
+    (:calibration (let ((params (orfeus:graph-node-params node)))
+                    (loop for key in orfeus:*calibration-keys*
+                            thereis (/= 0.0 (getf params key 0.0)))))
     (:saturation (let ((params (orfeus:graph-node-params node)))
                    (loop for key in orfeus:*saturation-keys*
                            thereis (/= 0.0 (getf params key 0.0)))))
@@ -4032,7 +4038,8 @@ behind is memory. Best effort; returns how many directories went."
                                  (format nil "~,1F" megapixels)
                                  ""))))))
                (when (and node (member kind '(:contrast :negative :hdr :dust :vignette :clarity
-                                              :dehaze :saturation :luminance :hue :cast)))
+                                              :dehaze :saturation :luminance :hue :cast
+                                              :calibration)))
                  (let ((params (orfeus:graph-node-params node)))
                    (dolist (entry node-param-controls)
                      (destructuring-bind (key widget default) entry
@@ -8883,6 +8890,26 @@ behind is memory. Best effort; returns how many directories went."
             (make-node-number-field :amount "Amount" -1.0 1.0 0.05 0.3 44
                                     node-page)
             "How much of the haze to take out; negative lays it on")))
+        (build-group
+         :calibration
+         (lambda ()
+           (loop for (key label y swatch-rgb tooltip)
+                   in '((:red-hue "Red Hue" 44 (237 28 36)
+                         "Turns the camera's own red primary toward orange (positive) or magenta (negative)")
+                        (:red-saturation "Red Saturation" 76 (237 28 36)
+                         "Scales how vivid the camera's own red primary reads")
+                        (:green-hue "Green Hue" 108 (34 177 76)
+                         "Turns the camera's own green primary toward cyan (positive) or yellow (negative)")
+                        (:green-saturation "Green Saturation" 140 (34 177 76)
+                         "Scales how vivid the camera's own green primary reads")
+                        (:blue-hue "Blue Hue" 172 (0 0 255)
+                         "Turns the camera's own blue primary toward purple (positive) or cyan (negative)")
+                        (:blue-saturation "Blue Saturation" 204 (0 0 255)
+                         "Scales how vivid the camera's own blue primary reads"))
+                 do (lightfast:set-tooltip
+                     (make-node-number-field key label -1.0 1.0 0.05 0.0 y
+                                             node-page swatch-rgb)
+                     tooltip))))
         (build-group
          :saturation
          (lambda ()

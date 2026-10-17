@@ -176,6 +176,8 @@
    #:hue-default-params
    #:*cast-keys*
    #:cast-default-params
+   #:*calibration-keys*
+   #:calibration-default-params
    #:*negative-default-gamma*
    #:*negative-default-balance*
    #:*rotate-keys*
