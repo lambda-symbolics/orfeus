@@ -629,9 +629,10 @@ nodes may consume film output while blends stay scene-linear."
                (plist-known-keys-p sexp '(:nodes :output)))
     (graph-invalid sexp "expected a graph property list"))
   (graph-validate
-   (make-processing-graph
-    :nodes (mapcar #'sexp->graph-node (getf sexp :nodes '()))
-    :output (getf sexp :output *graph-source-id*))))
+   (migrate-optics-before-scene-linear
+    (make-processing-graph
+     :nodes (mapcar #'sexp->graph-node (getf sexp :nodes '()))
+     :output (getf sexp :output *graph-source-id*)))))
 
 (defparameter *flat-pipeline-stage-order*
   '(:optics :noise-reduction :white-balance :exposure :sharpen :tone :film)
@@ -731,11 +732,16 @@ a fresh topologically ordered node list whose references remain valid."
             (setf (second tail) (if present-p mapped *graph-source-id*)))))))
   node)
 
-(defun graph-normalize (graph)
-  "Topologically order GRAPH's nodes and renumber them 1..N.
+(defun graph-topological-renumber (graph)
+  "Topologically order GRAPH's nodes and renumber them 1..N, without
+validating anything else about the result.
 
 Relative order between independent nodes follows their current listing, so
-edits stay visually stable. Signals INVALID-PROJECT-DATA on cycles."
+edits stay visually stable. Signals INVALID-PROJECT-DATA on a cycle; every
+other rule is the caller's job -- GRAPH-NORMALIZE adds the full
+GRAPH-VALIDATE pass this lacks, and MIGRATE-OPTICS-BEFORE-SCENE-LINEAR needs
+exactly this much: a safe, bounded way to walk a not-yet-validated graph's
+:INPUTS without either call's own recursion risking a cycle."
   (let ((remaining (copy-list (processing-graph-nodes graph)))
         (placed (list *graph-source-id*))
         (ordered '()))
@@ -764,8 +770,17 @@ edits stay visually stable. Signals INVALID-PROJECT-DATA on cycles."
                     (graph-node-inputs node)))
       (graph-remap-kind-state-inputs node mapping))
     (setf (processing-graph-output graph)
-          (gethash (processing-graph-output graph) mapping))
-    (graph-validate graph)))
+          (gethash (processing-graph-output graph) mapping)))
+  graph)
+
+(defun graph-normalize (graph)
+  "Topologically order GRAPH's nodes and renumber them 1..N.
+
+Relative order between independent nodes follows their current listing, so
+edits stay visually stable. Signals INVALID-PROJECT-DATA on cycles, or on any
+other rule GRAPH-VALIDATE enforces."
+  (graph-topological-renumber graph)
+  (graph-validate graph))
 
 (defun graph-consumers (graph id)
   "Return the nodes of GRAPH that read node ID directly."
@@ -1081,6 +1096,50 @@ source is never spent."
              (some (lambda (input) (graph-optics-tier-spent-p graph input))
                    (graph-node-inputs node))
              t))))
+
+(defun migrate-optics-before-scene-linear (graph)
+  "Repair GRAPH in place so every non-bypassed OPTICS node precedes every
+scene-linear node that already spent the tier against it, then renumber.
+
+A project, preset or still saved before GRAPH-VALIDATE enforced this (it used
+to check only that optics preceded a crop) can have a scene-linear node --
+white balance, most often, from the flat pipeline's own former order -- ahead
+of optics. Rejecting that graph outright on load would make an old,
+previously-fine project unopenable over a rule it was never checked against;
+splicing optics upstream of whatever already spent the tier, the same
+destination GRAPH-INSERTION-POINT would clamp a fresh insertion to, is silent
+and keeps every other node's relative order. A no-op on a graph that already
+satisfies the rule.
+
+Renumbers first with GRAPH-TOPOLOGICAL-RENUMBER, not the validating
+GRAPH-NORMALIZE: this runs on freshly deserialized data nothing has yet
+confirmed is even a DAG, and GRAPH-OPTICS-TIER-SPENT-P's own recursion has no
+cycle guard of its own -- safe once the bounded topological sort has already
+either proven the graph acyclic or signalled INVALID-PROJECT-DATA on a cycle.
+Whether the RESULT satisfies every other rule is SEXP->GRAPH's own following
+GRAPH-VALIDATE call to decide, same as always."
+  (graph-topological-renumber graph)
+  (dolist (node (processing-graph-nodes graph))
+    (when (and (eq :optics (graph-node-kind node))
+               (not (graph-node-bypassed-p node))
+               (= 1 (length (graph-node-inputs node)))
+               (graph-optics-tier-spent-p graph (first (graph-node-inputs node))))
+      (let* ((optics-id (graph-node-id node))
+             (old-input (first (graph-node-inputs node)))
+             (chain (loop for id = old-input
+                            then (first (graph-node-inputs (graph-find-node graph id)))
+                          while (graph-optics-tier-spent-p graph id)
+                          collect id))
+             (nearest-spent-id (car (last chain)))
+             (clean-id (first (graph-node-inputs
+                               (graph-find-node graph nearest-spent-id)))))
+        (dolist (consumer (graph-consumers graph optics-id))
+          (setf (graph-node-inputs consumer)
+                (substitute old-input optics-id (graph-node-inputs consumer))))
+        (setf (graph-node-inputs (graph-find-node graph nearest-spent-id))
+              (list optics-id))
+        (setf (graph-node-inputs node) (list clean-id)))))
+  (graph-topological-renumber graph))
 
 (defun graph-insertion-point (graph after-id kind)
   "The furthest downstream position at or above AFTER-ID that KIND may occupy.

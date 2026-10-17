@@ -662,6 +662,50 @@ freedom here."
             (graph-insertion-point
              graph (processing-graph-output graph) :optics))))))
 
+(defun optics-tier-migration-p ()
+  "SEXP->GRAPH repairs a project saved before optics-before-everything was
+enforced instead of rejecting it outright -- it used to check only that
+optics preceded a crop, so a project built under that looser rule can have
+white balance (or anything else scene-linear) ahead of optics on disk."
+  (let* ((old-sexp
+           '(:nodes
+             ((:id 1 :kind :white-balance
+               :params (:white-balance-temperature 5200.0 :white-balance-tint 0.0)
+               :inputs (0))
+              (:id 2 :kind :optics :params () :inputs (1))
+              (:id 3 :kind :sharpen
+               :params (:sharpen-amount 0.5 :sharpen-radius 1.5 :sharpen-threshold 2.0)
+               :inputs (2)))
+             :output 3))
+         (graph (sexp->graph old-sexp)))
+    (and
+     ;; Optics moved to the front; white balance and sharpen keep their own
+     ;; relative order and every parameter, just renumbered around the move.
+     (equal '(:optics :white-balance :sharpen)
+            (mapcar #'graph-node-kind (processing-graph-nodes graph)))
+     (equal '(:white-balance-temperature 5200.0 :white-balance-tint 0.0)
+            (graph-node-params (graph-find-node graph 2)))
+     (equal '(:sharpen-amount 0.5 :sharpen-radius 1.5 :sharpen-threshold 2.0)
+            (graph-node-params (graph-find-node graph 3)))
+     ;; A longer spent chain (white balance, then a flexible tone node that
+     ;; does not launder it) still lands optics right at the front.
+     (equal '(:optics :white-balance :tone)
+            (mapcar #'graph-node-kind
+                    (processing-graph-nodes
+                     (sexp->graph
+                      '(:nodes
+                        ((:id 1 :kind :white-balance
+                          :params (:white-balance-temperature 5200.0 :white-balance-tint 0.0)
+                          :inputs (0))
+                         (:id 2 :kind :tone :params (:tone-shadows 0.3) :inputs (1))
+                         (:id 3 :kind :optics :params () :inputs (2)))
+                        :output 3)))))
+     ;; Already-legal graphs are not touched beyond the usual round trip.
+     (equal '(:optics :noise-reduction)
+            (mapcar #'graph-node-kind
+                    (processing-graph-nodes
+                     (sexp->graph (graph->sexp (default-processing-graph)))))))))
+
 (defun settings-graph-conversion-p ()
   (let* ((settings (make-processing-settings :exposure 0.5
                                              :noise-reduction 0.4
@@ -2896,6 +2940,8 @@ renderer is told about them."
              (graph-validation-rejects-p))
       (check "optics precedes every scene-linear node, not only a crop"
              (optics-tier-ordering-p))
+      (check "a project saved under the looser optics rule still opens"
+             (optics-tier-migration-p))
       (check "settings convert to equivalent linear graphs"
              (settings-graph-conversion-p))
       (check "untouched settings sharpen like the camera, after noise reduction"
