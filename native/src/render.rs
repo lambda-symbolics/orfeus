@@ -2506,12 +2506,6 @@ pub(crate) fn cpu_noise_reduction(image: &mut RgbImage, luma: f32, chroma: f32) 
     let _ = step_started;
 }
 
-/// Whether a sample coordinate lies inside the image.
-#[inline]
-pub(crate) fn inside(image: &RgbImage, x: f32, y: f32) -> bool {
-    inside_frame(x, y, image.width, image.height)
-}
-
 #[inline]
 fn inside_frame(x: f32, y: f32, width: usize, height: usize) -> bool {
     x >= 0.0 && y >= 0.0 && x <= (width - 1) as f32 && y <= (height - 1) as f32
@@ -2522,11 +2516,19 @@ fn inside_frame(x: f32, y: f32, width: usize, height: usize) -> bool {
 /// The weights and the four addresses are computed once for the pixel instead
 /// of once per channel, and the three channels of a corner are adjacent in
 /// memory, so each corner is one cache line rather than three lookups.
+///
+/// X and Y are clamped into the frame first rather than returning black for a
+/// point outside it: a correction's own safety margin (`auto_crop_scale`) is
+/// an approximation, and when it falls short -- it did, for a real lens's
+/// chromatic aberration, right at the edge of the frame -- the fallback used
+/// to paint a border of pure black into the image's own red or blue channel,
+/// a cyan or orange fringe worse than whatever the margin missed. Repeating
+/// the nearest real pixel is what every other edge in this renderer already
+/// does, and never invents a colour that was not in the photograph.
 #[inline]
 pub(crate) fn bilinear_rgb(image: &RgbImage, x: f32, y: f32) -> [f32; 3] {
-    if !inside(image, x, y) {
-        return [0.0; 3];
-    }
+    let x = x.clamp(0.0, (image.width - 1) as f32);
+    let y = y.clamp(0.0, (image.height - 1) as f32);
     let (x0, y0) = (x.floor() as usize, y.floor() as usize);
     let (x1, y1) = (
         (x0 + 1).min(image.width - 1),
@@ -2546,10 +2548,11 @@ pub(crate) fn bilinear_rgb(image: &RgbImage, x: f32, y: f32) -> [f32; 3] {
     })
 }
 
+/// As `bilinear_rgb`, for one channel; clamped into the frame for the same
+/// reason -- see that function's doc comment.
 pub(crate) fn bilinear(image: &RgbImage, x: f32, y: f32, channel: usize) -> f32 {
-    if x < 0.0 || y < 0.0 || x > (image.width - 1) as f32 || y > (image.height - 1) as f32 {
-        return 0.0;
-    }
+    let x = x.clamp(0.0, (image.width - 1) as f32);
+    let y = y.clamp(0.0, (image.height - 1) as f32);
     let (x0, y0) = (x.floor() as usize, y.floor() as usize);
     let (x1, y1) = (
         (x0 + 1).min(image.width - 1),
@@ -9237,6 +9240,55 @@ mod tests {
         assert_eq!(copy.data, clean.data);
         let flat = RgbImage { width: 400, height: 300, data: vec![0.4; 400 * 300 * 3] };
         assert!(measure_lateral_colour(&flat).is_none());
+    }
+
+    #[test]
+    fn sampling_past_the_frame_repeats_its_nearest_edge_not_black() {
+        // A real lens's own measured lateral colour once sampled past the
+        // frame right at its border despite the auto-crop margin meant to
+        // keep every channel's shifted sample inside it -- the margin is an
+        // approximation, not an exact bound, and the real photo that caught
+        // this needed no extreme correction to cross it. `bilinear` and
+        // `bilinear_rgb` used to answer any such sample with pure black,
+        // which painted a visible cyan or orange fringe into whichever
+        // channel went missing, right at the one edge of the frame a crop
+        // margin cannot also crop away. Repeating the nearest real pixel,
+        // the standard way any renderer handles a sample past its own
+        // border, cannot invent a colour that was not in the photograph.
+        let image = RgbImage {
+            width: 4,
+            height: 3,
+            data: vec![
+                0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.11, 0.22, 0.33, //
+                0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.11, 0.22, 0.33, 0.44, //
+                0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.11, 0.22, 0.33, 0.44, 0.55,
+            ],
+        };
+        // Well past every edge, each direction and each corner.
+        for (x, y) in [
+            (-3.0_f32, -3.0_f32),
+            (-3.0, 1.0),
+            (-3.0, 5.0),
+            (1.0, -3.0),
+            (1.0, 5.0),
+            (6.0, -3.0),
+            (6.0, 1.0),
+            (6.0, 5.0),
+        ] {
+            let clamped_x = x.clamp(0.0, (image.width - 1) as f32);
+            let clamped_y = y.clamp(0.0, (image.height - 1) as f32);
+            let expected = bilinear_rgb(&image, clamped_x, clamped_y);
+            let got = bilinear_rgb(&image, x, y);
+            assert_eq!(got, expected, "({x}, {y}) did not repeat its clamped edge pixel");
+            assert!(got.iter().all(|v| *v > 0.0), "({x}, {y}) went to black");
+            for channel in 0..3 {
+                assert_eq!(
+                    bilinear(&image, x, y, channel),
+                    expected[channel],
+                    "channel {channel} at ({x}, {y}) did not match bilinear_rgb"
+                );
+            }
+        }
     }
 
     #[test]
