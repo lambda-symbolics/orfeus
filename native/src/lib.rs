@@ -496,8 +496,11 @@ where
 /// processing node graph. Version 4 adds `orfeus_raw_decode_v1`, which fills
 /// the decode cache without rendering. Version 10 adds
 /// `orfeus_lens_profile_match_v1` and `orfeus_lens_profiles_v1`, which answer
-/// about lens profiles without rendering. Every earlier entry point is
-/// unchanged.
+/// about lens profiles without rendering. `orfeus_raw_render_v1` and
+/// `orfeus_raw_render_v2` are since removed: the graph path (`v3` on) took
+/// over rendering for both frontends and nothing called the flat,
+/// settings-struct entry points any more. Every remaining earlier entry
+/// point is unchanged.
 #[unsafe(no_mangle)]
 pub extern "C" fn orfeus_bridge_abi_version() -> u32 {
     10
@@ -869,46 +872,18 @@ pub extern "C" fn orfeus_raw_render_capabilities_v1() -> u32 {
     1 | 2 | 4 | 16 | 32
 }
 
-/// Decode, process, and export one Olympus ORF using version 1 render settings.
-///
-/// Export applies source orientation physically and embeds an sRGB ICC profile,
-/// but does not preserve source EXIF/XMP metadata. Output is created through a
-/// same-directory temporary file, synced, then atomically renamed.
-///
-/// # Safety
-///
-/// Path pointers and a non-null `settings.lut_path` must be readable
-/// NUL-terminated strings for the duration of this call. `settings` must point
-/// to a readable `OrfeusRenderSettingsV1`. The error buffer, when non-null, must
-/// be writable for its stated capacity.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn orfeus_raw_render_v1(
-    input_path: *const c_char,
-    output_path: *const c_char,
-    settings: *const render::RenderSettingsV1,
-    error_buffer: *mut c_char,
-    error_capacity: usize,
-) -> i32 {
-    // SAFETY: The v2 entry point upholds the identical contract.
-    unsafe {
-        orfeus_raw_render_v2(
-            input_path,
-            output_path,
-            settings,
-            render::CACHE_NONE,
-            error_buffer,
-            error_capacity,
-        )
-    }
-}
-
 /// Render INPUT through a serialized processing node graph.
 ///
 /// `frame` carries the output and lens-alias parameters shared by the whole
 /// graph; `graph`/`graph_length` reference the little-endian node program
-/// produced by the Orfeus core (magic "ORFG"). Cache semantics match
-/// `orfeus_raw_render_v2`. Export behavior (orientation, ICC, atomic
-/// publish) matches `orfeus_raw_render_v1`.
+/// produced by the Orfeus core (magic "ORFG"). `cache_mode` 0 always decodes
+/// the input fresh; mode 1 serves repeated renders of an unchanged input file
+/// from a small in-process cache of decoded scene-linear images, which
+/// interactive frontends use to re-render quickly while adjusting settings —
+/// the cache key covers path, size, and modification time. Export applies
+/// source orientation physically and embeds an sRGB ICC profile, but does not
+/// preserve source EXIF/XMP metadata; output is created through a
+/// same-directory temporary file, synced, then atomically renamed.
 ///
 /// # Safety
 ///
@@ -1003,7 +978,7 @@ pub unsafe extern "C" fn orfeus_raw_render_rgb_v1(
 /// oriented normalized coordinates, the scene-linear base color (red, green,
 /// blue) sampled from the border ring, and the straightening angle in
 /// degrees. A full-frame rectangle with angle zero is reported when no
-/// plausible tile exists. Cache semantics match `orfeus_raw_render_v2`.
+/// plausible tile exists. Cache semantics match `orfeus_raw_render_v3`.
 ///
 /// # Safety
 ///
@@ -1088,7 +1063,7 @@ pub unsafe extern "C" fn orfeus_embedded_preview_v1(
 /// upright, and a confidence — how many times the winning angle's strongest
 /// line outweighs the run of angles'. Under about two there was no straight
 /// edge worth trusting; zero says the tilt lies beyond the ten degrees
-/// searched. Cache semantics match `orfeus_raw_render_v2`.
+/// searched. Cache semantics match `orfeus_raw_render_v3`.
 ///
 /// # Safety
 ///
@@ -1121,7 +1096,7 @@ pub unsafe extern "C" fn orfeus_analyze_level_v1(
 /// Average the scene-linear color around an oriented normalized point.
 ///
 /// Writes three floats. The radius is normalized against the shorter image
-/// edge and limited to 0.25. Cache semantics match `orfeus_raw_render_v2`.
+/// edge and limited to 0.25. Cache semantics match `orfeus_raw_render_v3`.
 ///
 /// # Safety
 ///
@@ -1153,38 +1128,6 @@ pub unsafe extern "C" fn orfeus_sample_linear_v1(
     }
 }
 
-/// Render like `orfeus_raw_render_v1`, optionally reusing decoded scene data.
-///
-/// `cache_mode` 0 always decodes the input fresh. Mode 1 serves repeated
-/// renders of an unchanged input file from a small in-process cache of decoded
-/// scene-linear images, which interactive frontends use to re-render quickly
-/// while adjusting settings. The cache key covers path, size, and modification
-/// time.
-///
-/// # Safety
-///
-/// Identical to `orfeus_raw_render_v1`.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn orfeus_raw_render_v2(
-    input_path: *const c_char,
-    output_path: *const c_char,
-    settings: *const render::RenderSettingsV1,
-    cache_mode: u32,
-    error_buffer: *mut c_char,
-    error_capacity: usize,
-) -> i32 {
-    // SAFETY: Pointer validation and dereferences remain inside the panic boundary.
-    unsafe {
-        ffi_result(error_buffer, error_capacity, || {
-            if settings.is_null() {
-                return Err(Error::InvalidArgument("render settings pointer is null"));
-            }
-            let input = path_from_c(input_path)?;
-            let output = path_from_c(output_path)?;
-            render::render(input, output, &*settings, cache_mode)
-        })
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -1340,16 +1283,36 @@ mod tests {
             std::env::temp_dir().join(format!("orfeus-abi-same-input-{}", std::process::id()));
         fs::write(&path, b"not a raw, but must survive").unwrap();
         let c_path = CString::new(path.as_os_str().as_bytes()).unwrap();
-        let settings = render::RenderSettingsV1 {
+        let frame = graphex::RenderFrameV1 {
+            struct_size: std::mem::size_of::<graphex::RenderFrameV1>() as u32,
+            version: 1,
+            output_format: render::OUTPUT_JPEG,
+            max_width: 0,
+            max_height: 0,
+            jpeg_quality: 90,
+            grain_seed: 0,
+            focal_reducer: 1.0,
+            lens_crop_factor: 2.0,
+            lens_profile_model: std::ptr::null(),
             flags: 0,
-            ..render::RenderSettingsV1::default()
+            lens_name: std::ptr::null(),
+            progress: None,
+            progress_context: std::ptr::null_mut(),
+            viewport: [0.0; 4],
+            focal_length: 0.0,
         };
+        // A non-null graph pointer: this must be rejected for being the same
+        // file as its output, not for a null graph pointer reached first.
+        let graph_bytes = [0_u8; 1];
         let mut error = [0_i8; 256];
         let status = unsafe {
-            orfeus_raw_render_v1(
+            orfeus_raw_render_v3(
                 c_path.as_ptr(),
                 c_path.as_ptr(),
-                &settings,
+                &frame,
+                graph_bytes.as_ptr(),
+                0,
+                render::CACHE_NONE,
                 error.as_mut_ptr(),
                 error.len(),
             )
