@@ -188,6 +188,23 @@
         (graph-invalid params "calibration ~A must be within -1..1" key))))
   params)
 
+(defun grading-params-validate (params)
+  (unless (and (listp params) (plist-known-keys-p params *grading-keys*))
+    (graph-invalid params "expected three zones' hue, saturation and luminance, and a balance"))
+  (dolist (key '(:shadow-hue :midtone-hue :highlight-hue))
+    (let ((value (getf params key 0)))
+      (unless (and (realp value) (<= 0 value 360))
+        (graph-invalid params "grading ~A must be within 0..360 degrees" key))))
+  (dolist (key '(:shadow-saturation :midtone-saturation :highlight-saturation))
+    (let ((value (getf params key 0)))
+      (unless (and (realp value) (<= 0 value 1))
+        (graph-invalid params "grading ~A must be within 0..1" key))))
+  (dolist (key '(:shadow-luminance :midtone-luminance :highlight-luminance :balance))
+    (let ((value (getf params key 0)))
+      (unless (and (realp value) (<= -1 value 1))
+        (graph-invalid params "grading ~A must be within -1..1" key))))
+  params)
+
 (defparameter *legacy-sharpen-keys*
   '((:amount . :sharpen-amount) (:radius . :sharpen-radius)
     (:threshold . :sharpen-threshold))
@@ -357,6 +374,7 @@ whose frame has already moved, whichever of the two moved it."
     ((eq kind :cast) (cast-params-validate params))
     ((eq kind :calibration) (calibration-params-validate params))
     ((eq kind :softness) (softness-params-validate params))
+    ((eq kind :grading) (grading-params-validate params))
     ((graph-filter-kind-p kind)
      (graph-node-params-validate
       (make-graph-node :kind kind :params params)))
@@ -394,7 +412,7 @@ whose frame has already moved, whichever of the two moved it."
 
 (defparameter *domain-propagating-kinds*
   '(:crop :rotate :flip :curves :contrast :sharpen :saturation :luminance
-    :hue :cast :tone :node)
+    :hue :cast :grading :tone :node)
   "Kinds that carry their branch's domain through rather than requiring or
 fixing one of their own -- the same set that may already sit on either side
 of a film node (see the matching member-list cond clauses below; :TONE and
@@ -488,15 +506,16 @@ nodes may consume film output while blends stay scene-linear."
            ;; like a crop.
            (when (member (first inputs) display)
              (push id display)))
-          ((member kind '(:curves :contrast :sharpen :saturation :luminance :hue :cast))
+          ((member kind '(:curves :contrast :sharpen :saturation :luminance :hue :cast
+                          :grading))
            ;; Tone shaping carries its branch's domain rather than refusing it.
            ;; Shaping tone after a look is the point of having a look: without
            ;; this there was nowhere to lift a shadow a film LUT had buried,
            ;; because everything a photographer could reach ran before the
            ;; transform that then crushed it again. :TONE takes the same route
            ;; through GRAPH-FILTER-KIND-P below. :SATURATION, :LUMINANCE,
-           ;; :HUE and :CAST are colour grades in the same sense -- as
-           ;; meaningful to refine a film look with as to apply before one.
+           ;; :HUE, :CAST and :GRADING are colour grades in the same sense --
+           ;; as meaningful to refine a film look with as to apply before one.
            (unless (= 1 (length inputs))
              (graph-invalid node "filter node ~S needs exactly one input" id))
            (ecase kind
@@ -506,7 +525,8 @@ nodes may consume film output while blends stay scene-linear."
              (:saturation (saturation-params-validate (graph-node-params node)))
              (:luminance (luminance-params-validate (graph-node-params node)))
              (:hue (hue-params-validate (graph-node-params node)))
-             (:cast (cast-params-validate (graph-node-params node))))
+             (:cast (cast-params-validate (graph-node-params node)))
+             (:grading (grading-params-validate (graph-node-params node))))
            (when (member (first inputs) display)
              (push id display)))
           ((eq kind :node)

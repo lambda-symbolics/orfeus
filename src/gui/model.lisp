@@ -1039,6 +1039,7 @@ when the roll is past *AUTO-LEVEL-LIMIT*."
     (:clarity (orfeus:clarity-default-params))
     (:dehaze (orfeus:dehaze-default-params))
     (:softness (orfeus:softness-default-params))
+    (:grading (orfeus:grading-default-params))
     ;; No kind-specific params fell through to an empty plist here, which left
     ;; LUT strength reading the stage's zero identity value instead of full
     ;; strength -- a LUT picked right after looked like it was doing nothing

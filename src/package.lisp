@@ -180,6 +180,8 @@
    #:calibration-default-params
    #:*softness-keys*
    #:softness-default-params
+   #:*grading-keys*
+   #:grading-default-params
    #:*negative-default-gamma*
    #:*negative-default-balance*
    #:*rotate-keys*

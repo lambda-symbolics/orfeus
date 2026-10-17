@@ -973,7 +973,7 @@ and then quietly relocated them would be lying about where a click puts things."
      ;; shape tone. Shaping tone after a look is the point of a look — without
      ;; it there is nowhere to lift a shadow the look buried.
      (let ((below '(:film :crop :rotate :flip :tone :curves :contrast :sharpen
-                    :saturation :luminance :hue :cast)))
+                    :saturation :luminance :hue :cast :grading)))
        (and (null (set-difference (graph-insertable-kinds graph film) below))
             (null (set-difference below (graph-insertable-kinds graph film)))
             (null (set-difference (graph-insertable-kinds graph display-crop)
@@ -2241,6 +2241,65 @@ scene-linear correction -- is just as valid after a film node as before one."
            ;; A colour grade, not a scene-linear correction: valid after film.
            (not (rejected-p (cast-default-params) :film))))))
 
+(defun grading-node-validates-and-encodes-p ()
+  "A grading node carries an independent hue, saturation and luminance for
+shadows, midtones and highlights, plus a balance, refuses a value off its own
+range -- hue 0..360, saturation 0..1, luminance and balance -1..1 -- fills
+its defaults in, reaches the executor as kind 27 with ten parameters in
+order, and -- the same colour grade as saturation, luminance, hue and cast,
+reading brightness instead of hue band -- is just as valid after a film node
+as before one."
+  (flet ((rejected-p (params &optional (input-kind :crop))
+           (handler-case
+               (progn
+                 (graph-validate
+                  (make-processing-graph
+                   :nodes (list (make-graph-node
+                                 :id 1 :kind input-kind
+                                 :params (if (eq input-kind :film)
+                                             '(:grain-amount 0.2)
+                                             '(:left 0.1 :top 0.1
+                                               :width 0.8 :height 0.8))
+                                 :inputs '(0))
+                                (make-graph-node
+                                 :id 2 :kind :grading
+                                 :params params :inputs '(1)))
+                   :output 2))
+                 nil)
+             (invalid-project-data () t))))
+    (let* ((params '(:shadow-hue 210.0 :shadow-saturation 0.2 :shadow-luminance -0.1
+                     :midtone-hue 0.0 :midtone-saturation 0.0 :midtone-luminance 0.0
+                     :highlight-hue 45.0 :highlight-saturation 0.15 :highlight-luminance 0.1
+                     :balance 0.0))
+           (graph (graph-validate
+                   (make-processing-graph
+                    :nodes (list (make-graph-node
+                                  :id 1 :kind :grading
+                                  :params params :inputs '(0)))
+                    :output 1)))
+           (decoded (sexp->graph (graph->sexp graph)))
+           (bytes (orfeus::graph->program-bytes decoded)))
+      (and (equal params (graph-node-params (graph-find-node decoded 1)))
+           (= 27 (elt bytes 12))
+           (= 10 (elt bytes 24))
+           (member :grading (graph-node-kinds))
+           (equal '(:shadow-hue 0.0 :shadow-saturation 0.0 :shadow-luminance 0.0
+                    :midtone-hue 0.0 :midtone-saturation 0.0 :midtone-luminance 0.0
+                    :highlight-hue 0.0 :highlight-saturation 0.0 :highlight-luminance 0.0
+                    :balance 0.0)
+                  (grading-default-params))
+           (not (rejected-p (grading-default-params)))
+           (not (rejected-p '()))
+           (rejected-p '(:shadow-hue -1.0))
+           (rejected-p '(:shadow-hue 361.0))
+           (rejected-p '(:midtone-saturation -0.1))
+           (rejected-p '(:midtone-saturation 1.1))
+           (rejected-p '(:highlight-luminance -1.1))
+           (rejected-p '(:balance 1.1))
+           (rejected-p '(:unknown-key 0.1))
+           ;; A colour grade, not a scene-linear correction: valid after film.
+           (not (rejected-p (grading-default-params) :film))))))
+
 (defun calibration-node-validates-and-encodes-p ()
   "A calibration node carries three primaries' hue and saturation, refuses one
 off its -1..1 range, fills its defaults in, reaches the executor as kind 25
@@ -3054,6 +3113,8 @@ renderer is told about them."
              (hue-node-validates-and-encodes-p))
       (check "cast node validates, encodes, defaults, and follows a look"
              (cast-node-validates-and-encodes-p))
+      (check "grading node validates, encodes, defaults, and follows a look"
+             (grading-node-validates-and-encodes-p))
       (check "calibration node validates, encodes, defaults, and precedes a look"
              (calibration-node-validates-and-encodes-p))
       (check "clarity node validates, encodes and defaults"

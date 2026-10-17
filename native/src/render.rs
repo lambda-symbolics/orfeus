@@ -5602,6 +5602,85 @@ pub(crate) fn apply_calibration(image: &mut RgbImage, params: &[f32]) {
     });
 }
 
+/// Where the three luminance zones meet, as two `smooth_step` pivots around
+/// the BALANCE-shifted thirds: pure shadows below the first, pure highlights
+/// above the second, the middle third's own feathered overlap with each
+/// neighbour in between. The three weights always sum to one.
+fn grading_zone_weights(l: f32, balance: f32) -> (f32, f32, f32) {
+    let low = (1.0 / 3.0 + 0.12 * balance).clamp(0.08, 0.6);
+    let high = (2.0 / 3.0 + 0.12 * balance).clamp(0.4, 0.92);
+    let shadow = 1.0 - smooth_step(0.0, low + 0.18, l);
+    let highlight = smooth_step(high - 0.18, 1.0, l);
+    let midtone = (1.0 - shadow - highlight).max(0.0);
+    (shadow, midtone, highlight)
+}
+
+/// The RGB offset a zone's own HUE and SATURATION contribute at WEIGHT: the
+/// same paint-mixing idea `apply_cast` and `scripts/lightroom-preset-lut.lisp`'s
+/// own split toning use, pulling the pixel toward the zone's canonical colour
+/// by an amount scaled by how saturated that colour is asked to be and how
+/// much of this zone the pixel's own brightness carries.
+fn grading_tint(hue: f32, saturation: f32, weight: f32) -> [f32; 3] {
+    if saturation <= 0.0 || weight <= 0.0 {
+        return [0.0; 3];
+    }
+    let (tr, tg, tb) = hsv_to_rgb(hue, 1.0, 1.0);
+    let grey = 0.2126 * tr + 0.7152 * tg + 0.0722 * tb;
+    let k = 0.3 * saturation * weight;
+    [k * (tr - grey), k * (tg - grey), k * (tb - grey)]
+}
+
+/// Lightroom's Color Grading panel: an independent hue and saturation tint
+/// for shadows, midtones and highlights, plus a brightness move for each, so
+/// a look can read differently in its shadows than in its highlights --
+/// cooler shadows and warmer highlights, say -- rather than one colour
+/// correction applied the same way at every brightness. A sensor does not
+/// distinguish a deep blue sea from a bright blue sky by anything but
+/// brightness, yet accounts of some of the film stocks this was built to
+/// emulate describe exactly that distinction; nothing else in this pipeline
+/// reaches for brightness and hue at once to make it.
+///
+/// PARAMS, ten in order: shadow hue in degrees, shadow saturation 0..1,
+/// shadow luminance -1..1 stops; the same three for midtones; the same three
+/// for highlights; then balance -1..1, shifting where shadows and highlights
+/// give way to midtones.
+///
+/// Works on whatever the register already holds, scene-linear or already
+/// past a film look's display transform, the way `apply_contrast` and
+/// `apply_saturation` do: a finished look's own shadows and highlights are
+/// exactly where a photographer would still want to reach this from.
+pub(crate) fn apply_grading(image: &mut RgbImage, params: &[f32]) {
+    debug_assert_eq!(params.len(), 10);
+    let (shadow_hue, shadow_sat, shadow_lum) = (params[0], params[1], params[2]);
+    let (mid_hue, mid_sat, mid_lum) = (params[3], params[4], params[5]);
+    let (high_hue, high_sat, high_lum) = (params[6], params[7], params[8]);
+    let balance = params[9];
+    if shadow_sat == 0.0
+        && mid_sat == 0.0
+        && high_sat == 0.0
+        && shadow_lum == 0.0
+        && mid_lum == 0.0
+        && high_lum == 0.0
+    {
+        return;
+    }
+    image.data.par_chunks_mut(3).for_each(|pixel| {
+        let r = pixel[0].max(0.0);
+        let g = pixel[1].max(0.0);
+        let b = pixel[2].max(0.0);
+        let l = (0.2126 * r + 0.7152 * g + 0.0722 * b).clamp(0.0, 1.0);
+        let (shadow_w, mid_w, high_w) = grading_zone_weights(l, balance);
+        let sh = grading_tint(shadow_hue, shadow_sat, shadow_w);
+        let mi = grading_tint(mid_hue, mid_sat, mid_w);
+        let hi = grading_tint(high_hue, high_sat, high_w);
+        let lum_stops = shadow_w * shadow_lum + mid_w * mid_lum + high_w * high_lum;
+        let gain = lum_stops.exp2();
+        pixel[0] = ((r + sh[0] + mi[0] + hi[0]) * gain).max(0.0);
+        pixel[1] = ((g + sh[1] + mi[1] + hi[1]) * gain).max(0.0);
+        pixel[2] = ((b + sh[2] + mi[2] + hi[2]) * gain).max(0.0);
+    });
+}
+
 /// Width the frame is reduced to for estimating haze: coarse enough that the
 /// estimate costs nothing, fine enough that the transmission follows the scene.
 const DEHAZE_SMALL_WIDTH: usize = 256;
@@ -10383,6 +10462,38 @@ mod tests {
                 image.data[channel]
             );
         }
+    }
+
+    #[test]
+    fn grading_tints_shadows_and_highlights_independently() {
+        // Shadows tinted toward blue (240 degrees), highlights toward orange
+        // (30 degrees), midtones left alone. A dark pixel must lean toward
+        // the shadow tint and a bright one toward the highlight tint, not
+        // the other way around or blended together.
+        let (width, height) = (4, 4);
+        let params = [240.0, 0.8, 0.0, 0.0, 0.0, 0.0, 30.0, 0.8, 0.0, 0.0];
+        let mut dark = RgbImage { width, height, data: vec![0.05; width * height * 3] };
+        let mut bright = RgbImage { width, height, data: vec![0.95; width * height * 3] };
+        apply_grading(&mut dark, &params);
+        apply_grading(&mut bright, &params);
+        assert!(
+            dark.data[2] > dark.data[0],
+            "shadow tint did not lean toward blue: {:?}",
+            &dark.data[0..3]
+        );
+        assert!(
+            bright.data[0] > bright.data[2],
+            "highlight tint did not lean toward orange: {:?}",
+            &bright.data[0..3]
+        );
+    }
+
+    #[test]
+    fn grading_all_zero_is_a_no_op() {
+        let mut image = RgbImage { width: 4, height: 4, data: vec![0.4; 4 * 4 * 3] };
+        let before = image.data.clone();
+        apply_grading(&mut image, &[0.0; 10]);
+        assert_eq!(image.data, before);
     }
 
     #[test]

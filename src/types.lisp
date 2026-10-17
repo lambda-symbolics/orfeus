@@ -136,7 +136,8 @@ them as a copyable node chain.")
 
 (defparameter *graph-only-node-kinds*
   '(:blend :color-subtract :negative :contrast :hdr :dust :vignette :clarity :dehaze
-    :saturation :luminance :hue :cast :calibration :softness :crop :rotate :flip :curves)
+    :saturation :luminance :hue :cast :calibration :softness :grading
+    :crop :rotate :flip :curves)
   "Node kinds that exist only in graphs, beyond the flat pipeline stages.
 
 :COLOR-SUBTRACT computes picked-color minus pixel per channel in scene-linear
@@ -170,7 +171,12 @@ on. :SOFTNESS gives back some of a pixel's finest, highest-frequency detail
 to a small local blur, in the midtones, luminance only — clarity's opposite
 in direction but not its mirror: a much smaller radius, reading fine texture
 rather than broad tonal structure, and with no amplifying direction of its
-own since that already belongs to :SHARPEN.")
+own since that already belongs to :SHARPEN. :GRADING is Lightroom's Color
+Grading panel: an independent hue, saturation and brightness move for
+shadows, midtones and highlights, so a look can read differently at
+different brightnesses the way :SATURATION, :LUMINANCE, :HUE and :CAST read
+differently by hue band — tone shaping, so it may follow a film look the
+same way :SATURATION and the rest do.")
 
 (defparameter *flip-keys* '(:horizontal :vertical)
   "Parameters of a flip node: which axes to mirror across.")
@@ -336,6 +342,27 @@ detail, not opposite directions of the same one.")
 over a few pixels, closer to film's own modestly soft spatial response than
 to a soft-focus effect."
   (list :amount 0.25 :radius 3.0))
+
+(defparameter *grading-keys*
+  '(:shadow-hue :shadow-saturation :shadow-luminance
+    :midtone-hue :midtone-saturation :midtone-luminance
+    :highlight-hue :highlight-saturation :highlight-luminance
+    :balance)
+  "Parameters of a grading node: an independent hue (0 to 360 degrees),
+saturation (0 to 1) and luminance (-1 to 1 stops) for the shadows, the
+midtones and the highlights, then a balance (-1 to 1) shifting where shadows
+and highlights give way to midtones. Unlike saturation, luminance, hue and
+cast, which read which HUE BAND a colour belongs to, this reads how BRIGHT
+it is -- a deep blue sea and a bright blue sky are the same hue to those
+nodes and to a sensor, which is not how some film stocks this was built to
+emulate were described behaving.")
+
+(defun grading-default-params ()
+  "A grading node's parameters as the panel first shows them: untouched."
+  (list :shadow-hue 0.0 :shadow-saturation 0.0 :shadow-luminance 0.0
+        :midtone-hue 0.0 :midtone-saturation 0.0 :midtone-luminance 0.0
+        :highlight-hue 0.0 :highlight-saturation 0.0 :highlight-luminance 0.0
+        :balance 0.0))
 
 (defparameter *color-subtract-keys* '(:red :green :blue))
 

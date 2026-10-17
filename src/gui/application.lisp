@@ -404,6 +404,7 @@ width, but a spinner cannot shrink below its digits.")
     (:luminance . "Lumin")
     (:hue . "Hue")
     (:cast . "Cast")
+    (:grading . "Grading")
     (:sharpen . "Sharp")
     (:crop . "Crop")
     (:rotate . "Rotate")
@@ -435,6 +436,7 @@ width, but a spinner cannot shrink below its digits.")
     ("Luminance" . :luminance)
     ("Hue" . :hue)
     ("Cast" . :cast)
+    ("Grading" . :grading)
     ("Sharpen" . :sharpen)
     ("Crop" . :crop)
     ("Rotate" . :rotate)
@@ -640,6 +642,9 @@ sliders and nothing else has to be recomputed."
                 (:line 7 9 7 2))
     (:hue (:line 6 0 11 6) (:line 11 6 6 12) (:line 6 12 1 6) (:line 1 6 6 0))
     (:cast (:rect 0 5 3 2) (:line 3 6 9 6) (:line 7 3 10 6) (:line 7 9 10 6))
+    ;; Three swatches on a baseline: shadows, midtones and highlights each
+    ;; with their own colour, the way the node's own panel lays them out.
+    (:grading (:rect 1 2 3 8) (:rect 5 2 3 8) (:rect 9 2 3 8))
     (:sharpen (:line 6 0 1 11) (:line 6 0 11 11) (:line 1 11 11 11))
     (:crop (:line 3 0 3 9) (:line 0 3 9 3) (:line 8 2 8 11) (:line 2 8 11 8))
     (:rotate (:line 1 10 1 2) (:line 1 2 9 2) (:line 6 0 9 2) (:line 6 4 9 2))
@@ -776,6 +781,15 @@ channel carries anywhere from its two endpoints to a full film-stock shape."
     (:clarity (/= 0.0 (getf (orfeus:graph-node-params node) :amount 0.25)))
     (:dehaze (/= 0.0 (getf (orfeus:graph-node-params node) :amount 0.3)))
     (:softness (/= 0.0 (getf (orfeus:graph-node-params node) :amount 0.25)))
+    (:grading (let ((params (orfeus:graph-node-params node)))
+                ;; Hue alone does nothing at zero saturation, and balance
+                ;; alone does nothing without some zone's own saturation or
+                ;; luminance to shift -- only these six say the node moves
+                ;; anything.
+                (loop for key in '(:shadow-saturation :shadow-luminance
+                                    :midtone-saturation :midtone-luminance
+                                    :highlight-saturation :highlight-luminance)
+                        thereis (/= 0.0 (getf params key 0.0)))))
     (:calibration (let ((params (orfeus:graph-node-params node)))
                     (loop for key in orfeus:*calibration-keys*
                             thereis (/= 0.0 (getf params key 0.0)))))
@@ -4046,7 +4060,7 @@ behind is memory. Best effort; returns how many directories went."
                                  ""))))))
                (when (and node (member kind '(:contrast :negative :hdr :dust :vignette :clarity
                                               :dehaze :saturation :luminance :hue :cast
-                                              :calibration :softness)))
+                                              :calibration :softness :grading)))
                  (let ((params (orfeus:graph-node-params node)))
                    (dolist (entry node-param-controls)
                      (destructuring-bind (key widget default) entry
@@ -9000,6 +9014,34 @@ behind is memory. Best effort; returns how many directories went."
                                              node-page swatch-rgb)
                      (format nil "Pulls ~A out of other colours (negative pushes it in)"
                              (string-downcase label))))))
+        (build-group
+         :grading
+         (lambda ()
+           (loop for (key label y min max step default tooltip)
+                   in '((:shadow-hue "Shadow Hue" 44 0.0 360.0 5.0 0.0
+                         "Hue the shadows are tinted toward")
+                        (:shadow-saturation "Shadow Saturation" 76 0.0 1.0 0.05 0.0
+                         "How strong the shadow tint is")
+                        (:shadow-luminance "Shadow Luminance" 108 -1.0 1.0 0.05 0.0
+                         "How much darker or lighter the shadows read")
+                        (:midtone-hue "Midtone Hue" 140 0.0 360.0 5.0 0.0
+                         "Hue the midtones are tinted toward")
+                        (:midtone-saturation "Midtone Saturation" 172 0.0 1.0 0.05 0.0
+                         "How strong the midtone tint is")
+                        (:midtone-luminance "Midtone Luminance" 204 -1.0 1.0 0.05 0.0
+                         "How much darker or lighter the midtones read")
+                        (:highlight-hue "Highlight Hue" 236 0.0 360.0 5.0 0.0
+                         "Hue the highlights are tinted toward")
+                        (:highlight-saturation "Highlight Saturation" 268 0.0 1.0 0.05 0.0
+                         "How strong the highlight tint is")
+                        (:highlight-luminance "Highlight Luminance" 300 -1.0 1.0 0.05 0.0
+                         "How much darker or lighter the highlights read")
+                        (:balance "Balance" 332 -1.0 1.0 0.05 0.0
+                         "Shifts where shadows and highlights give way to midtones"))
+                 do (lightfast:set-tooltip
+                     (make-node-number-field key label min max step default y
+                                             node-page)
+                     tooltip))))
         (build-group
          :sharpen
          (lambda ()

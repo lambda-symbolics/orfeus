@@ -51,6 +51,7 @@ pub const NODE_HUE: u32 = 23;
 pub const NODE_CAST: u32 = 24;
 pub const NODE_CALIBRATION: u32 = 25;
 pub const NODE_SOFTNESS: u32 = 26;
+pub const NODE_GRADING: u32 = 27;
 
 /// Frame-level settings shared by every node of one graph render.
 #[repr(C)]
@@ -293,6 +294,7 @@ fn param_arity(kind: u32) -> Result<ParamArity, Error> {
         NODE_CAST => ParamArity::Exact(8),          // 8 bands, pulled out of or pushed into others
         NODE_CALIBRATION => ParamArity::Exact(6),   // R/G/B primary hue + saturation
         NODE_SOFTNESS => ParamArity::Exact(2),      // amount, radius px
+        NODE_GRADING => ParamArity::Exact(10),      // 3 zones x (hue, sat, lum), balance
         _ => return Err(Error::InvalidArgument("unknown graph node kind")),
     })
 }
@@ -541,6 +543,9 @@ fn validate_param(kind: u32, index: usize, value: f32) -> Result<(), Error> {
         (NODE_CALIBRATION, _) => (-1.0..=1.0).contains(&value),
         (NODE_SOFTNESS, 0) => (0.0..=1.0).contains(&value),
         (NODE_SOFTNESS, 1) => (0.5..=20.0).contains(&value),
+        (NODE_GRADING, 0 | 3 | 6) => (0.0..=360.0).contains(&value),
+        (NODE_GRADING, 1 | 4 | 7) => (0.0..=1.0).contains(&value),
+        (NODE_GRADING, 2 | 5 | 8 | 9) => (-1.0..=1.0).contains(&value),
         // The four leading parameters are point counts, not signal levels.
         (NODE_CURVES, index) if index < CURVE_CHANNELS => {
             (MIN_CURVE_POINTS as f32..=MAX_CURVE_POINTS as f32).contains(&value)
@@ -664,7 +669,7 @@ pub(crate) fn parse_graph(bytes: &[u8]) -> Result<Vec<GraphOp>, Error> {
             // everything a photographer could reach ran before the transform
             // that then crushed it again.
             NODE_TONE | NODE_CURVES | NODE_CONTRAST | NODE_SHARPEN | NODE_SATURATION
-            | NODE_LUMINANCE | NODE_HUE | NODE_CAST => {
+            | NODE_LUMINANCE | NODE_HUE | NODE_CAST | NODE_GRADING => {
                 display[index] = display[input_a];
             }
             _ => {
@@ -1276,6 +1281,7 @@ fn node_stage_name(kind: u32) -> &'static str {
         NODE_CONTRAST => "contrast\0",
         NODE_SHARPEN => "sharpening\0",
         NODE_SOFTNESS => "softening\0",
+        NODE_GRADING => "grading\0",
         _ => "developing\0",
     }
 }
@@ -1828,6 +1834,7 @@ fn execute_graph_into(
                     | NODE_CAST
                     | NODE_CALIBRATION
                     | NODE_SOFTNESS
+                    | NODE_GRADING
                     | NODE_CROP
                     | NODE_ROTATE
                     | NODE_FLIP
@@ -1962,6 +1969,9 @@ fn execute_graph_into(
             }
             NODE_CALIBRATION => {
                 render::apply_calibration(&mut image, &op.params[0..6]);
+            }
+            NODE_GRADING => {
+                render::apply_grading(&mut image, &op.params[0..10]);
             }
             NODE_CLARITY => {
                 // The radius is stated for the photograph, like the sharpening
@@ -3247,6 +3257,7 @@ mod tests {
             NODE_LUMINANCE,
             NODE_HUE,
             NODE_CAST,
+            NODE_GRADING,
         ] {
             let params: &[f32] = match kind {
                 NODE_TONE => &[0.0; 7],
@@ -3257,6 +3268,7 @@ mod tests {
                 NODE_LUMINANCE => &[0.0; 8],
                 NODE_HUE => &[0.0; 8],
                 NODE_CAST => &[0.0; 8],
+                NODE_GRADING => &[0.0; 10],
                 _ => &[0.5, 1.0, 2.0],
             };
             assert!(

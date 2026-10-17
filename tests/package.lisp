@@ -26,6 +26,7 @@
                 #:cast-default-params
                 #:calibration-default-params
                 #:softness-default-params
+                #:grading-default-params
                 #:resolve-lens-profile-alias
                 #:make-export-settings
                 #:make-photo-job
