@@ -152,6 +152,16 @@ pulled or a folder that is not ours to read is an answer, not a crash."
         ((< bytes 1000000000) (format nil "~D MB" (round bytes 1000000)))
         (t (format nil "~,2F GB" (/ bytes 1000000000.0)))))
 
+(defun picker-entry-capture-seconds (picker entry)
+  "ENTRY's real capture time in UNIX seconds if ExifTool has read it, else
+its file's own modification time -- a bulk extraction or a card copy writes
+the file this week with a photograph taken long before, so the real date is
+preferred the moment it is known and the caption does not wait for it."
+  (let ((known (gethash (picker-entry-pathname entry) (photo-picker-capture-times picker))))
+    (if (and known (not (eq known :none)))
+        known
+        (picker-entry-mtime entry))))
+
 (defun picker-time-text (unix-seconds)
   "UNIX-SECONDS as a local date and time, or nothing when unknown."
   (if (and (integerp unix-seconds) (plusp unix-seconds))
@@ -592,6 +602,14 @@ Returns the new vector and how many were new."
   ;; and the pathnames already asked for.
   (thumbnails (make-hash-table :test #'equal))
   (requested (make-hash-table :test #'equal))
+  ;; Pathname -> capture time as a universal time, or :NONE once ExifTool has
+  ;; been asked and had nothing to say. A directory's own stat-based MTIME
+  ;; (what the grid shows at once) is when a file last changed on disk, not
+  ;; when the photograph was taken -- the same file a batch DNG extraction or
+  ;; a card copy wrote this week can hold a photograph years old. This is
+  ;; filled in behind it, a batch of ExifTool calls at a time so one Perl
+  ;; startup is not paid per file, and the caption prefers it once it lands.
+  (capture-times (make-hash-table :test #'equal))
   (history '()) (forward '())
   (on-pick nil) (accept-label "Add"))
 
@@ -679,15 +697,82 @@ is on screen fills before what was scrolled past."
              :front-p t))))))
 
 (defun picker-forget-pending-requests (picker)
-  "Drop the previews still waiting to be lifted — the folder they were for is
-gone from view — so they can be asked for again if it comes back."
+  "Drop the work still waiting on a folder that is no longer in view: previews
+not yet lifted, and capture dates not yet read, so either is asked for again
+if the folder comes back."
   (discard-gui-tasks (photo-picker-workers picker) :picker-thumbnail)
+  (discard-gui-tasks (photo-picker-workers picker) :picker-dates)
   (let ((requested (photo-picker-requested picker))
         (done (photo-picker-thumbnails picker)))
     (loop for key being the hash-keys of requested
           unless (gethash key done)
             collect key into stale
           finally (dolist (key stale) (remhash key requested)))))
+
+;;; Capture dates
+
+(defparameter *picker-date-batch-size* 400
+  "Files asked of ExifTool per call when filling in real capture dates: far
+fewer subprocess starts than one file at a time, but small enough that a
+result lands on screen well before a big folder's whole batch is read.")
+
+(defun picker-capture-unix-seconds (raw)
+  "RAW, an ExifTool date like \"2026:08:02 18:35:12\", as UNIX seconds, or NIL.
+
+Shares ORFEUS::CAPTURE-UNIVERSAL-TIME's parsing rather than re-deriving it,
+then steps back from Lisp's 1900 epoch to UNIX's 1970 one, the convention
+PICKER-ENTRY-MTIME and PICKER-TIME-TEXT already use."
+  (let ((universal (orfeus::capture-universal-time raw)))
+    (and universal (- universal (encode-universal-time 0 0 0 1 1 1970 0)))))
+
+(defun picker-fetch-capture-times (paths)
+  "Ask ExifTool for DateTimeOriginal of every one of PATHS, one subprocess for
+the whole batch, and return a UNIX-seconds integer or NIL per path, in order."
+  (handler-case
+      (multiple-value-bind (output error-output status)
+          (uiop:run-program
+           (append (list "exiftool" "-q" "-f" "-s3" "-DateTimeOriginal")
+                   (mapcar #'namestring paths))
+           :output :string :error-output :string :ignore-error-status t)
+        (declare (ignore error-output status))
+        (let ((lines (uiop:split-string (string-right-trim '(#\Newline) output)
+                                        :separator '(#\Newline))))
+          (loop for path in paths
+                for line = (pop lines)
+                collect (and line (picker-capture-unix-seconds line)))))
+    (error () (mapcar (constantly nil) paths))))
+
+(defun picker-request-capture-time-batch (picker batch)
+  (let ((queue (photo-picker-queue picker))
+        (paths (mapcar #'picker-entry-pathname batch)))
+    (enqueue-gui-task
+     (photo-picker-workers picker) :picker-dates
+     (lambda ()
+       (let ((times (picker-fetch-capture-times paths)))
+         (queue-event
+          queue
+          (list :call
+                (lambda ()
+                  (let ((known (photo-picker-capture-times picker)))
+                    (loop for path in paths
+                          for time in times
+                          do (setf (gethash path known) (or time :none))))
+                  (picker-redraw picker)))))))))
+
+(defun picker-request-capture-times (picker files)
+  "See to it that every FILES entry's real capture date is known: already
+cached ones are left alone, the rest asked of ExifTool a batch at a time on a
+worker thread, in file order so the top of a freshly opened folder fills in
+first."
+  (let* ((known (photo-picker-capture-times picker))
+         (pending (remove-if (lambda (entry)
+                               (gethash (picker-entry-pathname entry) known))
+                             files)))
+    (loop for start from 0 below (length pending) by *picker-date-batch-size*
+          for batch = (subseq pending start
+                              (min (length pending)
+                                   (+ start *picker-date-batch-size*)))
+          do (picker-request-capture-time-batch picker batch))))
 
 ;;; Drawing
 
@@ -758,7 +843,8 @@ amber, a band or a drag badge over the top."
                        (lightfast:draw-text (format nil "~A~@[ · ~A~]"
                                                     (picker-size-text (picker-entry-size entry))
                                                     (let ((time (picker-time-text
-                                                                 (picker-entry-mtime entry))))
+                                                                 (picker-entry-capture-seconds
+                                                                  picker entry))))
                                                       (and (plusp (length time)) time)))
                                             picture-x (+ picture-y picture-h 18)
                                             :width picture-w :height 14))))))
@@ -818,6 +904,7 @@ and note where we came from for Back. The stash is untouched."
                 (photo-picker-folders picker) folders)
           (picker-forget-pending-requests picker)
           (picker-grid-set-entries (photo-picker-browse picker) files)
+          (picker-request-capture-times picker files)
           (setf (lightfast:value (photo-picker-path-input picker)) (namestring directory))
           (picker-fill-folder-browser picker)
           (picker-update-status picker)
