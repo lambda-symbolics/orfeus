@@ -5121,23 +5121,48 @@ pub(crate) fn apply_clarity(image: &mut RgbImage, amount: f32, radius: f32) {
         });
 }
 
-/// Where Lightroom's eight colour bands sit on the hue circle: red, orange,
-/// yellow, green, aqua, blue, purple, magenta. Matches the centres
-/// `scripts/lightroom-preset-lut.lisp`'s own HSL panel conversion uses, so a
-/// hand-authored preset and this node agree on what "orange" means.
-const SATURATION_BAND_CENTRES: [f32; 8] = [0.0, 30.0, 60.0, 120.0, 180.0, 240.0, 280.0, 320.0];
+/// Where the eight colour bands sit on the hue circle: red, orange, yellow,
+/// green, aqua, blue, purple, magenta. Red through yellow, and aqua through
+/// magenta, match the centres `scripts/lightroom-preset-lut.lisp`'s own HSL
+/// panel conversion uses, so a hand-authored preset and this node still agree
+/// on what "orange" or "purple" means. Green does not: Lightroom's textbook
+/// 120 degrees is a saturated, largely synthetic green that real foliage
+/// rarely reaches. A saturation-weighted hue histogram over a few hundred
+/// real photographs' green-dominant pixels peaked at 70-75 degrees with a
+/// weighted median of 100, and 120 sat in the low tail -- a green slider
+/// centred there barely touches an actual tree. 95 was chosen to sit inside
+/// that real cluster while still leaving a clear, intentional gap from
+/// yellow's 60. Keep `band_hue_shift` in sync with this array (it reads the
+/// centres directly, not a copy), but there is no longer one array shared
+/// with the authoring script -- that script's job is matching what Lightroom
+/// itself would have rendered from an imported XMP preset, which this does
+/// not try to do.
+const SATURATION_BAND_CENTRES: [f32; 8] = [0.0, 30.0, 60.0, 95.0, 180.0, 240.0, 280.0, 320.0];
+
+/// How much of the reach between two neighbouring bands' centres is actually
+/// spent blending between them, centred on the midpoint. 1.0 is a plain
+/// straight-line crossfade across the whole gap, so a band only reaches its
+/// own full weight exactly at its own centre and is already half given away
+/// one quarter of the way toward its neighbour. 0.5 instead holds a band at
+/// its own full weight across the middle half of its reach on each side
+/// before giving way, so real, off-centre instances of a colour (an olive
+/// leaf a little short of green's own 95, say) still land solidly in the
+/// band they look like rather than being split down the middle.
+const SATURATION_BAND_FEATHER: f32 = 0.5;
 
 /// Tent weights of the eight bands at HUE (degrees), summing to one.
 fn saturation_band_weights(hue: f32) -> [f32; 8] {
     let mut weights = [0.0_f32; 8];
     let h = hue.rem_euclid(360.0);
+    let half_feather = SATURATION_BAND_FEATHER / 2.0;
     for i in 0..8 {
         let centre = SATURATION_BAND_CENTRES[i];
         let next = if i == 7 { 360.0 } else { SATURATION_BAND_CENTRES[i + 1] };
         if centre <= h && h < next {
             let u = (h - centre) / (next - centre);
-            weights[i] += 1.0 - u;
-            weights[(i + 1) % 8] += u;
+            let eased = ((u - (0.5 - half_feather)) / SATURATION_BAND_FEATHER).clamp(0.0, 1.0);
+            weights[i] += 1.0 - eased;
+            weights[(i + 1) % 8] += eased;
         }
     }
     weights
@@ -5246,8 +5271,10 @@ pub(crate) fn apply_luminance(image: &mut RgbImage, bands: &[f32]) {
 /// Degrees band I moves at AMOUNT (-1..1): +1 puts it exactly on the next
 /// band's centre, -1 on the one before -- the same promise Lightroom's own
 /// Hue slider ramp makes at its ends, just expressed on -1..1 instead of
-/// -100..100. Ported from `scripts/lightroom-preset-lut.lisp`'s own
-/// `band-hue-shift`; keep the two in sync if either changes.
+/// -100..100. The formula is ported from `scripts/lightroom-preset-lut.lisp`'s
+/// own `band-hue-shift` and the two should stay in step, but it now reads a
+/// different `SATURATION_BAND_CENTRES` than that script's `*hsl-centres*` --
+/// see that array's own comment.
 fn band_hue_shift(index: usize, amount: f32) -> f32 {
     let centre = SATURATION_BAND_CENTRES[index];
     let next = if index == 7 { 360.0 } else { SATURATION_BAND_CENTRES[index + 1] };
