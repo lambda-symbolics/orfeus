@@ -292,6 +292,22 @@ for light ones, and on any other photograph it joins the end of the chain."
                 (orfeus:graph-tail-linear-node-id (orfeus:photo-job-graph plain)))
            "Dust on a plain photograph did not join the end of the chain")))
 
+(defun test-a-fresh-film-node-starts-at-full-lut-strength ()
+  "A film node added fresh starts ready for a LUT at once: picking a look
+right after must not look like it did nothing because the strength sat at
+the stage's zero identity value, there only to keep an absent LUT inert."
+  (let* ((job (orfeus:make-photo-job :input-path #P"film.orf"))
+         (model (orfeus/gui:make-gui-model
+                 :project (orfeus:make-project :output-directory #P"exports/"
+                                               :photos (list job))))
+         (film (orfeus/gui:gui-model-add-node model :film)))
+    (check (eql 1.0 (getf (orfeus:graph-node-params film) :lut-strength))
+           "A fresh film node's strength is ~S"
+           (getf (orfeus:graph-node-params film) :lut-strength))
+    (check (eql 0.0 (getf (orfeus:graph-node-params film) :grain-amount))
+           "A fresh film node's grain amount is ~S"
+           (getf (orfeus:graph-node-params film) :grain-amount))))
+
 (defun test-undo-history ()
   (let* ((job (orfeus:make-photo-job :input-path #P"one.orf"
                                      :overrides '(:exposure 1.0)))
@@ -2492,6 +2508,7 @@ would silently ignore whatever the Destination field said."
   (test-undo-history)
   (test-undo-after-a-removal-keeps-the-project-and-its-survivors)
   (test-dust-goes-in-front-of-the-negative)
+  (test-a-fresh-film-node-starts-at-full-lut-strength)
   (test-a-node-resets-to-its-defaults)
   (test-brackets-fold-unfold-and-undo)
   (test-one-to-one-waits-for-the-native-frame)

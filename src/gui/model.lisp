@@ -1038,6 +1038,11 @@ when the roll is past *AUTO-LEVEL-LIMIT*."
     (:vignette (orfeus:vignette-default-params))
     (:clarity (orfeus:clarity-default-params))
     (:dehaze (orfeus:dehaze-default-params))
+    ;; No kind-specific params fell through to an empty plist here, which left
+    ;; LUT strength reading the stage's zero identity value instead of full
+    ;; strength -- a LUT picked right after looked like it was doing nothing
+    ;; until the slider was noticed sitting at 0%.
+    (:film (list :lut-path nil :lut-strength 1.0 :grain-amount 0.0 :grain-size 1.0))
     ;; Light specks once a negative has been inverted, dark before it and
     ;; anywhere else.
     (:dust (orfeus:dust-default-params
