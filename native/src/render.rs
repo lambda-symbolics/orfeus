@@ -5337,7 +5337,16 @@ pub(crate) fn apply_luminance(image: &mut RgbImage, bands: &[f32]) {
         }
         let weights = saturation_band_weights(hue);
         let band_component: f32 = weights.iter().zip(bands.iter()).map(|(w, b)| w * b).sum();
-        let new_value = (value * band_component.exp2()).clamp(0.0, 1.0);
+        // A near-neutral pixel's hue is numerically present but visually
+        // meaningless, and the shift above does not know that -- it would
+        // otherwise apply a full stop the instant saturation ticks past the
+        // zero check, while an exactly neutral neighbour gets none. That is
+        // what turns a smooth saturation gradient (a sky fading into haze, a
+        // highlight rolling off toward white) into a visible hard edge.
+        // Scaling the shift by the pixel's own saturation tapers it away the
+        // same way the gradient itself does, instead of switching it on at
+        // full strength the moment saturation is merely nonzero.
+        let new_value = (value * (band_component * saturation).exp2()).clamp(0.0, 1.0);
         let (nr, ng, nb) = hsv_to_rgb(hue, saturation, new_value);
         pixel[0] = srgb_decode(nr);
         pixel[1] = srgb_decode(ng);
@@ -10235,6 +10244,43 @@ mod tests {
         assert!(
             brightness_after(red, &lighten_red) > red_value,
             "lightening red did not lighten a red pixel"
+        );
+    }
+
+    #[test]
+    fn luminance_tapers_off_near_neutral_instead_of_snapping_full_strength() {
+        // A real sky's blue fades gradually to near-neutral haze near the
+        // horizon; pushing the blue band hard should fade out across that
+        // gradient too, not hold full strength right up to the exact-neutral
+        // pixel and then cut to nothing. A pixel one saturation step above
+        // neutral getting the SAME multi-stop shift as a saturated sky blue
+        // is what turns that smooth fade into a visible hard edge.
+        let mut bands = [0.0_f32; 8];
+        bands[5] = -1.0; // blue, pushed a full stop darker
+        let shifted = |pixel: [f32; 3]| {
+            let mut image = RgbImage { width: 1, height: 1, data: pixel.to_vec() };
+            apply_luminance(&mut image, &bands);
+            image.data
+        };
+        let near_neutral = [0.4995_f32, 0.4995, 0.5005];
+        let saturated_sky = [0.3_f32, 0.5, 0.9];
+        let near_neutral_shift: f32 = shifted(near_neutral)
+            .iter()
+            .zip(near_neutral.iter())
+            .map(|(after, before)| (after - before).abs())
+            .sum();
+        let sky_shift: f32 = shifted(saturated_sky)
+            .iter()
+            .zip(saturated_sky.iter())
+            .map(|(after, before)| (after - before).abs())
+            .sum();
+        assert!(
+            near_neutral_shift < 0.02,
+            "a near-neutral pixel moved by {near_neutral_shift}, not a tapered amount"
+        );
+        assert!(
+            sky_shift > 0.1,
+            "a genuinely saturated blue barely moved ({sky_shift}); the taper over-corrected"
         );
     }
 
