@@ -5668,7 +5668,16 @@ pub(crate) fn apply_grading(image: &mut RgbImage, params: &[f32]) {
         let r = pixel[0].max(0.0);
         let g = pixel[1].max(0.0);
         let b = pixel[2].max(0.0);
-        let l = (0.2126 * r + 0.7152 * g + 0.0722 * b).clamp(0.0, 1.0);
+        // A pixel's OWN encoded value is not a usable shadow/midtone/highlight
+        // measure when this sits ahead of a film look: scene-linear light
+        // packs almost everything into a sliver near zero and leaves the
+        // zone pivots meaningless, the same problem `apply_clarity` already
+        // solved for its midtone weighting. Predicting the displayed
+        // brightness instead of reading the raw register, via the same
+        // helper, is what lets this run on either side of a look the way the
+        // doc comment above promises, rather than only truly working after
+        // one.
+        let (_, l) = log_luma_and_displayed(pixel);
         let (shadow_w, mid_w, high_w) = grading_zone_weights(l, balance);
         let sh = grading_tint(shadow_hue, shadow_sat, shadow_w);
         let mi = grading_tint(mid_hue, mid_sat, mid_w);
@@ -10485,6 +10494,28 @@ mod tests {
             bright.data[0] > bright.data[2],
             "highlight tint did not lean toward orange: {:?}",
             &bright.data[0..3]
+        );
+    }
+
+    #[test]
+    fn grading_zones_use_displayed_brightness_not_the_raw_register_value() {
+        // A real photograph exposed this: scene-linear 0.18 (18% grey, a
+        // normal mid-exposure reference, not a shadow) was read straight as
+        // the zone brightness by an earlier version of this, which crushed
+        // almost the whole frame into "shadow" and left "midtone" reachable
+        // only by near-overexposed highlights -- a midtone-only tint had to
+        // read as a no-op on ordinary content, and shadow's tint showed up
+        // everywhere instead. Tone-mapping the brightness first (the same
+        // helper `apply_clarity` already uses) is what lets a midtone tint
+        // reach a normally exposed pixel at all.
+        let (width, height) = (4, 4);
+        let params = [0.0, 0.0, 0.0, 200.0, 0.8, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let mut image = RgbImage { width, height, data: vec![0.18; width * height * 3] };
+        let before = image.data.clone();
+        apply_grading(&mut image, &params);
+        assert_ne!(
+            image.data, before,
+            "a midtone-only tint never reached ordinary scene-linear 18% grey"
         );
     }
 
