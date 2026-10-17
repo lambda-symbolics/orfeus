@@ -4012,7 +4012,7 @@ behind is memory. Best effort; returns how many directories went."
                                  (format nil "~,1F" megapixels)
                                  ""))))))
                (when (and node (member kind '(:contrast :negative :hdr :dust :vignette :clarity
-                                              :dehaze)))
+                                              :dehaze :saturation)))
                  (let ((params (orfeus:graph-node-params node)))
                    (dolist (entry node-param-controls)
                      (destructuring-bind (key widget default) entry
@@ -7169,11 +7169,19 @@ behind is memory. Best effort; returns how many directories went."
                 parent 12 y 26 :page)
                spinner))
            (make-node-number-field (key label minimum maximum step default y
-                                    parent)
+                                    parent &optional swatch-rgb)
              ;; Like MAKE-NUMBER-FIELD, but for a node kind that carries its own
              ;; parameters rather than one of the flat pipeline's settings: the
              ;; value belongs to this node, so it is written straight to it.
-             (let* ((label-widget
+             ;; SWATCH-RGB, given as a (RED GREEN BLUE) list of 0..255 bytes,
+             ;; draws a small fixed reference colour before the caption, a
+             ;; static hint rather than a live readout, so a band name like
+             ;; "Aqua" does not have to be imagined.
+             (let* ((swatch (and swatch-rgb
+                                 (lightfast:make-box :parent parent :x 12 :y y
+                                                     :width 16 :height 16
+                                                     :label "")))
+                    (label-widget
                       (lightfast:make-label :parent parent :x 12 :y y
                                             :width 88 :height 26 :label label))
                     (callback
@@ -7201,13 +7209,35 @@ behind is memory. Best effort; returns how many directories went."
                     (slider (lightfast:make-slider
                              :parent parent :x 110 :y y
                              :width 84 :height 26 :callback callback)))
+               (when swatch
+                 (lightfast:set-box swatch lightfast:+box-flat-box+)
+                 (destructuring-bind (red green blue) swatch-rgb
+                   (lightfast:set-color-rgb swatch :red red :green green
+                                            :blue blue)))
                (dolist (widget (list slider spinner))
                  (lightfast:set-range widget minimum maximum)
                  (lightfast:set-step widget step)
                  (push (list key widget default) node-param-controls))
                (register-inspector-row
-                (number-field-layout label-widget slider spinner)
-                (list label-widget slider spinner)
+                (if swatch
+                    (lightfast:make-layout-row
+                     :gap 8
+                     :children
+                     (list (lightfast:make-layout-item swatch :basis 16
+                                                       :shrink 0)
+                           (lightfast:make-layout-item
+                            label-widget
+                            :basis (- *number-field-label-width* 24)
+                            :shrink 0)
+                           (lightfast:make-layout-item slider :basis 0
+                                                       :grow 1 :min-width 64)
+                           (lightfast:make-layout-item
+                            spinner :basis *number-field-value-width*
+                            :shrink 0)))
+                    (number-field-layout label-widget slider spinner))
+                (if swatch
+                    (list swatch label-widget slider spinner)
+                    (list label-widget slider spinner))
                 parent 12 y 26 :page)
                spinner))
            (make-tone-band (key short-label full-label)
@@ -8815,14 +8845,18 @@ behind is memory. Best effort; returns how many directories went."
             (make-node-number-field :amount "Amount" -1.0 1.0 0.05 0.0 44
                                     node-page)
             "Saturation overall, before any one colour's own adjustment")
-           (loop for (key label y)
-                   in '((:red "Red" 76) (:orange "Orange" 108)
-                        (:yellow "Yellow" 140) (:green "Green" 172)
-                        (:aqua "Aqua" 204) (:blue "Blue" 236)
-                        (:purple "Purple" 268) (:magenta "Magenta" 300))
+           (loop for (key label y swatch-rgb)
+                   in '((:red "Red" 76 (237 28 36))
+                        (:orange "Orange" 108 (255 127 0))
+                        (:yellow "Yellow" 140 (255 242 0))
+                        (:green "Green" 172 (34 177 76))
+                        (:aqua "Aqua" 204 (0 255 255))
+                        (:blue "Blue" 236 (0 0 255))
+                        (:purple "Purple" 268 (163 73 164))
+                        (:magenta "Magenta" 300 (255 0 170)))
                  do (lightfast:set-tooltip
                      (make-node-number-field key label -1.0 1.0 0.05 0.0 y
-                                             node-page)
+                                             node-page swatch-rgb)
                      (format nil "Saturation for colours nearest ~A, on top of Amount"
                              (string-downcase label))))))
         (build-group
