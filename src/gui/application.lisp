@@ -1722,6 +1722,7 @@ behind is memory. Best effort; returns how many directories went."
            export-quality export-max-width export-max-height export-metadata
            export-timestamp
            export-dialog export-dialog-destination export-dialog-filename
+           export-dialog-filename-label
            export-dialog-scope
            export-dialog-format export-dialog-quality
            export-dialog-width export-dialog-height
@@ -6521,6 +6522,21 @@ behind is memory. Best effort; returns how many directories went."
                (when job
                  (let ((output (ignore-errors (gui-photo-output-path model job))))
                    (and output (file-namestring output))))))
+           (export-dialog-scope-singular-p ()
+             ;; True when the dialog's current scope names exactly one
+             ;; photograph -- the only case a single typed name can mean
+             ;; anything, so the only case the field is offered at all.
+             (let ((scope (lightfast:value export-dialog-scope)))
+               (or (string-equal scope "Current photograph")
+                   (and (string-equal scope "Selected photographs")
+                        (= 1 (length (gui-model-selected-jobs model)))))))
+           (sync-export-filename-visibility ()
+             (when (and export-dialog-filename export-dialog-filename-label)
+               (if (export-dialog-scope-singular-p)
+                   (progn (lightfast:show export-dialog-filename-label)
+                          (lightfast:show export-dialog-filename))
+                   (progn (lightfast:hide export-dialog-filename-label)
+                          (lightfast:hide export-dialog-filename)))))
            (apply-export-filename (format)
              ;; A name only, never a path: the folder has a field of its own,
              ;; and a relative output path is merged with it by the core. An
@@ -6562,15 +6578,9 @@ behind is memory. Best effort; returns how many directories went."
                (let* ((scope (lightfast:value export-dialog-scope))
                       (selected (gui-model-selected-jobs model)))
                  ;; The filename field names one photograph; it is honoured
-                 ;; whenever exactly one is about to be exported, not only
-                 ;; when the scope is spelled "Current photograph" -- the
-                 ;; thumbnail context menu's own "Export" opens this same
-                 ;; dialog with "Selected photographs" even for a single
-                 ;; right-clicked photo, and the field was visible and filled
-                 ;; in there just the same.
-                 (when (or (string-equal scope "Current photograph")
-                           (and (string-equal scope "Selected photographs")
-                                (= 1 (length selected))))
+                 ;; whenever exactly one is about to be exported, the same
+                 ;; test that decides whether the field is even offered.
+                 (when (export-dialog-scope-singular-p)
                    (apply-export-filename
                     (export-format-from-caption
                      (lightfast:value export-dialog-format))))
@@ -6639,11 +6649,13 @@ behind is memory. Best effort; returns how many directories went."
                                        #'browse-export-destination 88)
                                :folder-open)))
                  ;; Only the single-photograph scope can honour a name; a batch
-                 ;; has as many names as it has photographs. Left visible and
-                 ;; labelled rather than hidden, so its scope is stated instead
-                 ;; of discovered.
+                 ;; has as many names as it has photographs. Hidden rather than
+                 ;; merely stated, since stating it was not enough -- offering
+                 ;; a field a batch export silently ignores is what looked like
+                 ;; a bug.
+                 (setf export-dialog-filename-label (text "File name"))
                  (setf export-dialog-filename
-                       (field (text "File name")
+                       (field export-dialog-filename-label
                               (lightfast:make-input :parent dialog :x 0 :y 0
                                                     :width 200
                                                     :height row-height)))
@@ -6654,7 +6666,11 @@ behind is memory. Best effort; returns how many directories went."
                                :width 200 :height row-height
                                :items '("Current photograph"
                                         "Selected photographs"
-                                        "All photographs"))))
+                                        "All photographs")
+                               :callback
+                               (lambda (widget event value)
+                                 (declare (ignore widget event value))
+                                 (sync-export-filename-visibility)))))
                  (setf export-dialog-format
                        (field (text "Format")
                               (lightfast:make-choice
@@ -6735,6 +6751,7 @@ behind is memory. Best effort; returns how many directories went."
                          (if (selected-job)
                              "Current photograph"
                              "All photographs"))))
+             (sync-export-filename-visibility)
              (place-dialog-over export-dialog window)
              (lightfast:show export-dialog))
            (selected-lens-profile-status ()
