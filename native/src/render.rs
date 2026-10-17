@@ -5889,6 +5889,51 @@ fn grain_fade(t: f32) -> f32 {
     t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
 }
 
+/// One grain value-noise field, scanline-cached: four lattice corners are
+/// only re-hashed when X crosses into a new integer grain cell, the same
+/// amortization a single field used before a second one joined it for the
+/// grain's colour layers.
+struct GrainLattice {
+    seed: u64,
+    cached_gx0: Option<i64>,
+    corners: [f32; 4],
+}
+
+impl GrainLattice {
+    fn new(seed: u64) -> Self {
+        Self { seed, cached_gx0: None, corners: [0.0; 4] }
+    }
+
+    fn value_at(&mut self, gx0: i64, gy0: i64, gy1: i64, tx: f32, ty: f32) -> f32 {
+        if self.cached_gx0 != Some(gx0) {
+            self.corners = [
+                grain_lattice_value(self.seed, gx0, gy0),
+                grain_lattice_value(self.seed, gx0 + 1, gy0),
+                grain_lattice_value(self.seed, gx0, gy1),
+                grain_lattice_value(self.seed, gx0 + 1, gy1),
+            ];
+            self.cached_gx0 = Some(gx0);
+        }
+        let [n00, n10, n01, n11] = self.corners;
+        let nx0 = n00 + (n10 - n00) * tx;
+        let nx1 = n01 + (n11 - n01) * tx;
+        nx0 + (nx1 - nx0) * ty
+    }
+}
+
+/// How much of the grain's amplitude rides on an independent colour-layer
+/// field rather than the shared luminance one, tilting red and blue in
+/// opposite directions while green stays on the luminance noise alone. Real
+/// grain is not monochrome -- each colour layer's own crystals are a
+/// separate, imperfectly registered population -- but the brightness
+/// variation is what a viewer actually reads as "grain," so this stays a
+/// minority share: present, not a colour-noise effect in its own right.
+const GRAIN_CHROMA_FRACTION: f32 = 0.3;
+
+/// Chroma tilt's own, larger salt: a different seed from the luminance
+/// field's so the two are independent fields, not the same noise reread.
+const GRAIN_CHROMA_SALT: u64 = 0x9E37_79B9_7F4A_7C15;
+
 /// Lays film grain down, seeded from where each pixel sits in the whole frame.
 ///
 /// Real grain is an irregular, continuously varying texture, not a mosaic: a
@@ -5899,6 +5944,12 @@ fn grain_fade(t: f32) -> f32 {
 /// point the way a first, simpler version here once did -- that read as a
 /// flat-shaded square grid the moment SIZE grew past a pixel or two, worst
 /// zoomed in on a photograph with any of the chunkier grain sizes.
+///
+/// A second, independent field tilts red and blue oppositely around the
+/// shared luminance noise, at `GRAIN_CHROMA_FRACTION` of its amplitude: real
+/// film grain is not perfectly monochrome the way a single shared noise value
+/// per pixel is, though the brightness variation still carries most of what
+/// reads as "grain."
 ///
 /// ORIGIN is the image's top-left corner within the frame it is part of, which
 /// is zero for a whole-frame render and the window's corner for a render of
@@ -5928,23 +5979,14 @@ pub(crate) fn apply_grain(
             let ty = grain_fade(fy - gy0);
             let gy0 = gy0 as i64;
             let gy1 = gy0 + 1;
-            let mut cached_gx0: Option<i64> = None;
-            let (mut n00, mut n10, mut n01, mut n11) = (0.0_f32, 0.0_f32, 0.0_f32, 0.0_f32);
+            let mut luma_field = GrainLattice::new(seed);
+            let mut chroma_field = GrainLattice::new(seed ^ GRAIN_CHROMA_SALT);
             for (x, pixel) in row.as_chunks_mut::<3>().0.iter_mut().enumerate() {
                 let fx = (x + origin.0) as f32 / size;
                 let gx0f = fx.floor();
                 let tx = grain_fade(fx - gx0f);
                 let gx0 = gx0f as i64;
-                if cached_gx0 != Some(gx0) {
-                    n00 = grain_lattice_value(seed, gx0, gy0);
-                    n10 = grain_lattice_value(seed, gx0 + 1, gy0);
-                    n01 = grain_lattice_value(seed, gx0, gy1);
-                    n11 = grain_lattice_value(seed, gx0 + 1, gy1);
-                    cached_gx0 = Some(gx0);
-                }
-                let nx0 = n00 + (n10 - n00) * tx;
-                let nx1 = n01 + (n11 - n01) * tx;
-                let noise = (nx0 + (nx1 - nx0) * ty) * amount * 0.16;
+                let noise = luma_field.value_at(gx0, gy0, gy1, tx, ty) * amount * 0.16;
                 let luminance = 0.2126 * pixel[0] + 0.7152 * pixel[1] + 0.0722 * pixel[2];
                 // Shadows read grainiest, the one point every account of real
                 // film agrees on, but highlights keep most of their share too:
@@ -5955,10 +5997,16 @@ pub(crate) fn apply_grain(
                 // sensor's photon noise does. An earlier, much steeper falloff
                 // here (highlights at a third of a shadow's amplitude) modelled
                 // the wrong kind of noise.
-                let shaped = noise * (0.6 + 0.4 * (1.0 - luminance));
-                for value in pixel.iter_mut() {
-                    *value = (*value + shaped).clamp(0.0, 1.0);
-                }
+                let shape = 0.6 + 0.4 * (1.0 - luminance);
+                let shaped = noise * shape;
+                let tilt = chroma_field.value_at(gx0, gy0, gy1, tx, ty)
+                    * amount
+                    * 0.16
+                    * GRAIN_CHROMA_FRACTION
+                    * shape;
+                pixel[0] = (pixel[0] + shaped + tilt).clamp(0.0, 1.0);
+                pixel[1] = (pixel[1] + shaped).clamp(0.0, 1.0);
+                pixel[2] = (pixel[2] + shaped - tilt).clamp(0.0, 1.0);
             }
         });
 }
@@ -10362,7 +10410,8 @@ mod tests {
     fn grain_does_not_jump_at_a_cell_boundary() {
         // The old quantized version could swing by its full amplitude between
         // one cell and the very next pixel; blended lattice noise must not,
-        // wherever a cell boundary happens to fall.
+        // wherever a cell boundary happens to fall. The threshold allows for
+        // the chroma field's own amplitude riding alongside the luminance one.
         let (width, height) = (40, 4);
         let mut image = RgbImage { width, height, data: vec![0.5; width * height * 3] };
         apply_grain(&mut image, 1.0, 10.0, 0xC0FF_EE12_3456_789A, (0, 0));
@@ -10371,7 +10420,7 @@ mod tests {
             let before = image.data[(row * width + x - 1) * 3];
             let after = image.data[(row * width + x + 1) * 3];
             assert!(
-                (after - before).abs() < 0.05,
+                (after - before).abs() < 0.07,
                 "grain jumped from {before} to {after} around x={x}"
             );
         }
@@ -10392,6 +10441,39 @@ mod tests {
         let before = image.data.clone();
         apply_grain(&mut image, 0.0, 4.0, 1, (0, 0));
         assert_eq!(image.data, before);
+    }
+
+    #[test]
+    fn grain_tilts_red_and_blue_oppositely_around_a_shared_luminance() {
+        // Real grain is not perfectly monochrome: each colour layer is its own
+        // population of crystals. Green rides the shared luminance noise
+        // alone; red and blue pick up an independent, opposite tilt, so a
+        // grain clump that reads warm in red reads cool in blue at the same
+        // spot, not just uniformly brighter or darker across all three.
+        let (width, height) = (24, 24);
+        let mut image = RgbImage { width, height, data: vec![0.5; width * height * 3] };
+        apply_grain(&mut image, 1.0, 4.0, 0x1234_5678_9ABC_DEF0, (0, 0));
+        let mut saw_divergence = false;
+        for pixel in 0..width * height {
+            let i = pixel * 3;
+            let (r, g, b) = (image.data[i], image.data[i + 1], image.data[i + 2]);
+            // Green already tells us the shared luminance noise at this pixel;
+            // red and blue must not just copy it in lockstep.
+            if (r - g).abs() > 1.0e-4 || (b - g).abs() > 1.0e-4 {
+                saw_divergence = true;
+            }
+            // And where they do diverge from green, they lean opposite ways
+            // (one above, the other below) rather than together.
+            if (r - g).abs() > 1.0e-4 && (b - g).abs() > 1.0e-4 {
+                assert!(
+                    (r - g).signum() != (b - g).signum(),
+                    "pixel {pixel}: r-g={} and b-g={} moved the same way",
+                    r - g,
+                    b - g
+                );
+            }
+        }
+        assert!(saw_divergence, "red and blue never diverged from green -- grain is still monochrome");
     }
 
     #[test]
