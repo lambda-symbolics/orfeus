@@ -16,6 +16,6 @@
     (:id 4 :kind :sharpen :inputs (3) :params
      (:sharpen-amount 0.5 :sharpen-radius 1.5 :sharpen-threshold 2.0))
     (:id 5 :kind :film :inputs (4) :params
-     (:lut-path "luts/Reala 500D.cube" :lut-strength 1.0 :grain-amount 0.0
-      :grain-size 1.0)))
+     (:lut-path "luts/Reala 500D.cube" :lut-strength 1.0 :grain-amount 0.3
+      :grain-size 1.3)))
    :output 5)))
