@@ -5869,7 +5869,16 @@ pub(crate) fn apply_grain(
                 let nx1 = n01 + (n11 - n01) * tx;
                 let noise = (nx0 + (nx1 - nx0) * ty) * amount * 0.16;
                 let luminance = 0.2126 * pixel[0] + 0.7152 * pixel[1] + 0.0722 * pixel[2];
-                let shaped = noise * (0.35 + 0.65 * (1.0 - luminance));
+                // Shadows read grainiest, the one point every account of real
+                // film agrees on, but highlights keep most of their share too:
+                // cinematographers who shot Reala 500D while it was current
+                // described whites as "conspicuously grainy... even with a
+                // well-exposed negative" (Ellen Kuras, Eternal Sunshine, 2004)
+                // -- film grain does not fade toward white the way a digital
+                // sensor's photon noise does. An earlier, much steeper falloff
+                // here (highlights at a third of a shadow's amplitude) modelled
+                // the wrong kind of noise.
+                let shaped = noise * (0.6 + 0.4 * (1.0 - luminance));
                 for value in pixel.iter_mut() {
                     *value = (*value + shaped).clamp(0.0, 1.0);
                 }
