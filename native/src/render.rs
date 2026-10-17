@@ -5791,7 +5791,37 @@ pub(crate) fn splitmix64(mut value: u64) -> u64 {
     value ^ (value >> 31)
 }
 
+/// A pseudo-random value in -0.5..0.5 at integer grain-lattice coordinates,
+/// the same for every caller so neighbouring pixels -- and, since it depends
+/// on nothing but SEED and the coordinates, neighbouring windows of a frame
+/// rendered in pieces -- agree on the corners they share.
+fn grain_lattice_value(seed: u64, gx: i64, gy: i64) -> f32 {
+    let bits = splitmix64(
+        seed ^ (gx as u64).wrapping_mul(0x517c_c1b7_2722_0a95)
+            ^ (gy as u64).wrapping_mul(0x6eed_0e9d_a4d9_4a4f),
+    );
+    (bits >> 40) as f32 / 16_777_215.0 - 0.5
+}
+
+/// Perlin's fade curve: smooths an interpolation parameter so the grain's own
+/// slope is continuous across a lattice line too, not just its value -- a
+/// plain linear blend still shows faint creases at the cell boundaries once
+/// the grain is enlarged enough to see.
+#[inline]
+fn grain_fade(t: f32) -> f32 {
+    t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
+}
+
 /// Lays film grain down, seeded from where each pixel sits in the whole frame.
+///
+/// Real grain is an irregular, continuously varying texture, not a mosaic: a
+/// silver halide crystal does not know where some other crystal's edge is.
+/// This lays down one pseudo-random value per lattice point SIZE pixels
+/// apart and blends between the four around each pixel (Perlin's classic
+/// value noise), rather than quantizing each pixel to its nearest lattice
+/// point the way a first, simpler version here once did -- that read as a
+/// flat-shaded square grid the moment SIZE grew past a pixel or two, worst
+/// zoomed in on a photograph with any of the chunkier grain sizes.
 ///
 /// ORIGIN is the image's top-left corner within the frame it is part of, which
 /// is zero for a whole-frame render and the window's corner for a render of
@@ -5810,18 +5840,34 @@ pub(crate) fn apply_grain(
         return;
     }
     let width = image.width;
+    let size = size.max(1.0e-3);
     image
         .data
         .par_chunks_mut(width * 3)
         .enumerate()
         .for_each(|(y, row)| {
-            let y = y + origin.1;
-            let gy = (y as f32 / size).floor() as u64;
-            let row_seed = seed ^ gy.wrapping_mul(0x6eed_0e9d_a4d9_4a4f);
+            let fy = (y + origin.1) as f32 / size;
+            let gy0 = fy.floor();
+            let ty = grain_fade(fy - gy0);
+            let gy0 = gy0 as i64;
+            let gy1 = gy0 + 1;
+            let mut cached_gx0: Option<i64> = None;
+            let (mut n00, mut n10, mut n01, mut n11) = (0.0_f32, 0.0_f32, 0.0_f32, 0.0_f32);
             for (x, pixel) in row.as_chunks_mut::<3>().0.iter_mut().enumerate() {
-                let gx = ((x + origin.0) as f32 / size).floor() as u64;
-                let bits = splitmix64(row_seed ^ gx.wrapping_mul(0x517c_c1b7_2722_0a95));
-                let noise = ((bits >> 40) as f32 / 16_777_215.0 - 0.5) * amount * 0.16;
+                let fx = (x + origin.0) as f32 / size;
+                let gx0f = fx.floor();
+                let tx = grain_fade(fx - gx0f);
+                let gx0 = gx0f as i64;
+                if cached_gx0 != Some(gx0) {
+                    n00 = grain_lattice_value(seed, gx0, gy0);
+                    n10 = grain_lattice_value(seed, gx0 + 1, gy0);
+                    n01 = grain_lattice_value(seed, gx0, gy1);
+                    n11 = grain_lattice_value(seed, gx0 + 1, gy1);
+                    cached_gx0 = Some(gx0);
+                }
+                let nx0 = n00 + (n10 - n00) * tx;
+                let nx1 = n01 + (n11 - n01) * tx;
+                let noise = (nx0 + (nx1 - nx0) * ty) * amount * 0.16;
                 let luminance = 0.2126 * pixel[0] + 0.7152 * pixel[1] + 0.0722 * pixel[2];
                 let shaped = noise * (0.35 + 0.65 * (1.0 - luminance));
                 for value in pixel.iter_mut() {
@@ -10131,6 +10177,63 @@ mod tests {
                 image.data[channel]
             );
         }
+    }
+
+    #[test]
+    fn grain_varies_smoothly_within_a_cell_instead_of_in_flat_blocks() {
+        // A first, simpler version of this quantized every pixel to its
+        // nearest SIZE-wide cell, so a whole cell read as one flat shade: a
+        // literal square grid laid over the photograph once SIZE grew past a
+        // pixel or two. Ten pixels inside one cell must now show real
+        // variation, not an identical value repeated ten times.
+        let (width, height) = (40, 4);
+        let mut image = RgbImage { width, height, data: vec![0.5; width * height * 3] };
+        apply_grain(&mut image, 1.0, 10.0, 0xC0FF_EE12_3456_789A, (0, 0));
+        let row = 1;
+        let values: Vec<f32> = (0..10).map(|x| image.data[(row * width + x) * 3]).collect();
+        let min = values.iter().cloned().fold(f32::INFINITY, f32::min);
+        let max = values.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        assert!(
+            max - min > 1.0e-3,
+            "ten pixels inside one grain cell varied by only {} -- still a flat block",
+            max - min
+        );
+    }
+
+    #[test]
+    fn grain_does_not_jump_at_a_cell_boundary() {
+        // The old quantized version could swing by its full amplitude between
+        // one cell and the very next pixel; blended lattice noise must not,
+        // wherever a cell boundary happens to fall.
+        let (width, height) = (40, 4);
+        let mut image = RgbImage { width, height, data: vec![0.5; width * height * 3] };
+        apply_grain(&mut image, 1.0, 10.0, 0xC0FF_EE12_3456_789A, (0, 0));
+        let row = 1;
+        for x in 1..width - 1 {
+            let before = image.data[(row * width + x - 1) * 3];
+            let after = image.data[(row * width + x + 1) * 3];
+            assert!(
+                (after - before).abs() < 0.05,
+                "grain jumped from {before} to {after} around x={x}"
+            );
+        }
+    }
+
+    #[test]
+    fn grain_is_deterministic_for_the_same_seed() {
+        let mut a = RgbImage { width: 16, height: 16, data: vec![0.5; 16 * 16 * 3] };
+        let mut b = a.clone();
+        apply_grain(&mut a, 0.6, 3.0, 42, (0, 0));
+        apply_grain(&mut b, 0.6, 3.0, 42, (0, 0));
+        assert_eq!(a.data, b.data);
+    }
+
+    #[test]
+    fn grain_amount_zero_is_a_no_op() {
+        let mut image = RgbImage { width: 8, height: 8, data: vec![0.4; 8 * 8 * 3] };
+        let before = image.data.clone();
+        apply_grain(&mut image, 0.0, 4.0, 1, (0, 0));
+        assert_eq!(image.data, before);
     }
 
     #[test]
