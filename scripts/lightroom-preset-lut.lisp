@@ -675,17 +675,23 @@ clarity has one radius, and this is the node's default.")
          (grain (hundredth text "GrainAmount"))
          (base *default-graph-nodes*))
     (append
+     ;; Optics first: it is the one correction the node graph's own tiers put
+     ;; ahead of everything else (GRAPH-NODE-BODY-STYLE), and swapping it with
+     ;; a scalar white-balance re-gain changes nothing a viewer could see --
+     ;; confirmed by rendering both orders of this exact still and diffing the
+     ;; output (floating-point rounding noise only, RMSE far under one 8-bit
+     ;; level either way).
+     (list (first base))
      ;; A film stock is rated for a light source -- a "D" or "T" film, say --
      ;; and its colour response in the LUT below assumes a photograph was
      ;; taken under it. This resets white balance to that rating regardless
-     ;; of what the photograph was actually lit by, ahead of everything else,
-     ;; the same place Orfeus's own flat pipeline puts a white balance node.
+     ;; of what the photograph was actually lit by, right after optics and
+     ;; ahead of everything else.
      (unless (zerop rated-kelvin)
        (list (list :white-balance
                    (list :white-balance-temperature (coerce rated-kelvin 'single-float)
                          :white-balance-tint (coerce rated-tint 'single-float)))))
-     ;; Dehaze measures the whole frame, so it goes right after the optics.
-     (list (first base))
+     ;; Dehaze measures the whole frame, so it goes right after the optics too.
      (unless (zerop dehaze)
        (list (list :dehaze (list :amount dehaze))))
      (rest base)
