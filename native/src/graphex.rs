@@ -50,6 +50,7 @@ pub const NODE_LUMINANCE: u32 = 22;
 pub const NODE_HUE: u32 = 23;
 pub const NODE_CAST: u32 = 24;
 pub const NODE_CALIBRATION: u32 = 25;
+pub const NODE_SOFTNESS: u32 = 26;
 
 /// Frame-level settings shared by every node of one graph render.
 #[repr(C)]
@@ -291,6 +292,7 @@ fn param_arity(kind: u32) -> Result<ParamArity, Error> {
         NODE_HUE => ParamArity::Exact(8),           // 8 bands, turned toward a neighbour
         NODE_CAST => ParamArity::Exact(8),          // 8 bands, pulled out of or pushed into others
         NODE_CALIBRATION => ParamArity::Exact(6),   // R/G/B primary hue + saturation
+        NODE_SOFTNESS => ParamArity::Exact(2),      // amount, radius px
         _ => return Err(Error::InvalidArgument("unknown graph node kind")),
     })
 }
@@ -537,6 +539,8 @@ fn validate_param(kind: u32, index: usize, value: f32) -> Result<(), Error> {
         (NODE_HUE, _) => (-1.0..=1.0).contains(&value),
         (NODE_CAST, _) => (-1.0..=1.0).contains(&value),
         (NODE_CALIBRATION, _) => (-1.0..=1.0).contains(&value),
+        (NODE_SOFTNESS, 0) => (0.0..=1.0).contains(&value),
+        (NODE_SOFTNESS, 1) => (0.5..=20.0).contains(&value),
         // The four leading parameters are point counts, not signal levels.
         (NODE_CURVES, index) if index < CURVE_CHANNELS => {
             (MIN_CURVE_POINTS as f32..=MAX_CURVE_POINTS as f32).contains(&value)
@@ -1271,6 +1275,7 @@ fn node_stage_name(kind: u32) -> &'static str {
         NODE_CALIBRATION => "calibrating\0",
         NODE_CONTRAST => "contrast\0",
         NODE_SHARPEN => "sharpening\0",
+        NODE_SOFTNESS => "softening\0",
         _ => "developing\0",
     }
 }
@@ -1342,6 +1347,7 @@ pub(crate) fn plan_viewport(ops: &[GraphOp]) -> Option<ViewportPlan> {
             // Stated for the photograph, so an upper bound for any reduction.
             NODE_DUST => render::dust_reach(op.params[0]),
             NODE_CLARITY => render::clarity_reach(op.params[1]),
+            NODE_SOFTNESS => render::softness_reach(op.params[1]),
             _ => 0,
         };
     }
@@ -1821,6 +1827,7 @@ fn execute_graph_into(
                     | NODE_HUE
                     | NODE_CAST
                     | NODE_CALIBRATION
+                    | NODE_SOFTNESS
                     | NODE_CROP
                     | NODE_ROTATE
                     | NODE_FLIP
@@ -1961,6 +1968,10 @@ fn execute_graph_into(
                 // radius, and shrinks with the render.
                 let ratio = render::scale_ratio(context.scaled_pixels, context.full_pixels);
                 render::apply_clarity(&mut image, op.params[0], op.params[1] * ratio);
+            }
+            NODE_SOFTNESS => {
+                let ratio = render::scale_ratio(context.scaled_pixels, context.full_pixels);
+                render::apply_softness(&mut image, op.params[0], op.params[1] * ratio);
             }
             NODE_VIGNETTE => {
                 // Placed within the whole frame, which is the image itself
@@ -3275,6 +3286,7 @@ mod tests {
             NODE_CLARITY,
             NODE_DEHAZE,
             NODE_CALIBRATION,
+            NODE_SOFTNESS,
         ] {
             let params: &[f32] = match kind {
                 NODE_WHITE_BALANCE => &[0.0, 0.0],
@@ -3287,6 +3299,7 @@ mod tests {
                 NODE_CLARITY => &[0.3, 150.0],
                 NODE_DEHAZE => &[0.3],
                 NODE_CALIBRATION => &[0.2, 0.0, 0.0, 0.0, 0.0, 0.0],
+                NODE_SOFTNESS => &[0.3, 3.0],
                 _ => &[1.0, 1.0, 1.0],
             };
             assert!(

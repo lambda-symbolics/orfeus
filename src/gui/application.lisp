@@ -398,6 +398,7 @@ width, but a spinner cannot shrink below its digits.")
     (:vignette . "Vignette")
     (:clarity . "Clarity")
     (:dehaze . "Dehaze")
+    (:softness . "Softness")
     (:calibration . "Calib")
     (:saturation . "Satur")
     (:luminance . "Lumin")
@@ -428,6 +429,7 @@ width, but a spinner cannot shrink below its digits.")
     ("Vignette" . :vignette)
     ("Clarity" . :clarity)
     ("Dehaze" . :dehaze)
+    ("Softness" . :softness)
     ("Calibration" . :calibration)
     ("Saturation" . :saturation)
     ("Luminance" . :luminance)
@@ -627,6 +629,10 @@ sliders and nothing else has to be recomputed."
               (:rect 5 5 2 2))
     (:dehaze (:line 0 7 4 2) (:line 4 2 8 7) (:line 7 6 9 4) (:line 9 4 12 7)
              (:rect 0 9 12 1) (:rect 0 11 12 1))
+    ;; Clarity's diamond outline, broken into short, separated ticks: the
+    ;; same contrast-at-a-distance idea, diffuse rather than crisp.
+    (:softness (:rect 5 5 2 2) (:line 5 1 7 1) (:line 1 5 1 7)
+               (:line 5 10 7 10) (:line 10 5 10 7))
     (:calibration (:rect 1 5 2 2) (:rect 5 5 2 2) (:rect 9 5 2 2))
     (:saturation (:line 6 0 6 4) (:line 6 8 6 12) (:line 0 6 4 6) (:line 8 6 12 6)
                  (:rect 5 5 2 2))
@@ -769,6 +775,7 @@ channel carries anywhere from its two endpoints to a full film-stock shape."
     (:vignette (/= 0.0 (getf (orfeus:graph-node-params node) :amount -0.25)))
     (:clarity (/= 0.0 (getf (orfeus:graph-node-params node) :amount 0.25)))
     (:dehaze (/= 0.0 (getf (orfeus:graph-node-params node) :amount 0.3)))
+    (:softness (/= 0.0 (getf (orfeus:graph-node-params node) :amount 0.25)))
     (:calibration (let ((params (orfeus:graph-node-params node)))
                     (loop for key in orfeus:*calibration-keys*
                             thereis (/= 0.0 (getf params key 0.0)))))
@@ -4039,7 +4046,7 @@ behind is memory. Best effort; returns how many directories went."
                                  ""))))))
                (when (and node (member kind '(:contrast :negative :hdr :dust :vignette :clarity
                                               :dehaze :saturation :luminance :hue :cast
-                                              :calibration)))
+                                              :calibration :softness)))
                  (let ((params (orfeus:graph-node-params node)))
                    (dolist (entry node-param-controls)
                      (destructuring-bind (key widget default) entry
@@ -8890,6 +8897,17 @@ behind is memory. Best effort; returns how many directories went."
             (make-node-number-field :amount "Amount" -1.0 1.0 0.05 0.3 44
                                     node-page)
             "How much of the haze to take out; negative lays it on")))
+        (build-group
+         :softness
+         (lambda ()
+           (lightfast:set-tooltip
+            (make-node-number-field :amount "Amount" 0.0 1.0 0.05 0.25 44
+                                    node-page)
+            "How much of the finest detail to give back to a local blur, in the midtones")
+           (lightfast:set-tooltip
+            (make-node-number-field :radius "Radius (px)" 0.5 20.0 0.5 3.0 76
+                                    node-page)
+            "How wide the local blur is, in pixels of the photograph -- fine texture, not broad structure")))
         (build-group
          :calibration
          (lambda ()

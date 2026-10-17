@@ -136,7 +136,7 @@ them as a copyable node chain.")
 
 (defparameter *graph-only-node-kinds*
   '(:blend :color-subtract :negative :contrast :hdr :dust :vignette :clarity :dehaze
-    :saturation :luminance :hue :cast :calibration :crop :rotate :flip :curves)
+    :saturation :luminance :hue :cast :calibration :softness :crop :rotate :flip :curves)
   "Node kinds that exist only in graphs, beyond the flat pipeline stages.
 
 :COLOR-SUBTRACT computes picked-color minus pixel per channel in scene-linear
@@ -166,7 +166,11 @@ corner stays a highlight. :CLARITY is Lightroom's clarity: the contrast
 between each pixel and its wide surroundings, raised or lowered in the
 midtones, colour kept. :DEHAZE takes the veiling light of haze out by the
 dark channel prior, measured from the whole frame; negative amounts lay it
-on.")
+on. :SOFTNESS gives back some of a pixel's finest, highest-frequency detail
+to a small local blur, in the midtones, luminance only — clarity's opposite
+in direction but not its mirror: a much smaller radius, reading fine texture
+rather than broad tonal structure, and with no amplifying direction of its
+own since that already belongs to :SHARPEN.")
 
 (defparameter *flip-keys* '(:horizontal :vertical)
   "Parameters of a flip node: which axes to mirror across.")
@@ -318,6 +322,20 @@ film look rather than after one.")
 same as an un-twisted camera profile."
   (list :red-hue 0.0 :red-saturation 0.0 :green-hue 0.0 :green-saturation 0.0
         :blue-hue 0.0 :blue-saturation 0.0))
+
+(defparameter *softness-keys* '(:amount :radius)
+  "Parameters of a softness node: how much of the finest, highest-frequency
+detail to give back to a local blur, 0 to 1, and how wide that local blur is,
+in pixels of the photograph. Unlike clarity's radius, stated in tens to
+hundreds of pixels (the scale of a face), softness's is a handful of pixels
+(the scale of fine texture and grain) -- the two read very different bands of
+detail, not opposite directions of the same one.")
+
+(defun softness-default-params ()
+  "A softness node's parameters as the panel first shows them: a mild amount
+over a few pixels, closer to film's own modestly soft spatial response than
+to a soft-focus effect."
+  (list :amount 0.25 :radius 3.0))
 
 (defparameter *color-subtract-keys* '(:red :green :blue))
 

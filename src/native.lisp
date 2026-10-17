@@ -383,7 +383,7 @@ photographer."
     (:contrast . 12) (:sharpen . 13) (:flip . 14) (:negative . 15)
     (:hdr . 16) (:dust . 17) (:vignette . 18)
     (:clarity . 19) (:dehaze . 20) (:saturation . 21) (:luminance . 22)
-    (:hue . 23) (:cast . 24) (:calibration . 25))
+    (:hue . 23) (:cast . 24) (:calibration . 25) (:softness . 26))
   "Wire codes of graph node kinds in the native program format.")
 
 (defconstant +graph-program-magic+ #x4746524F
@@ -548,6 +548,13 @@ reaches it and there is nothing to keep alive across threads.")
          (values (mapcar (lambda (key)
                            (float (getf params key (getf defaults key)) 1.0))
                          *calibration-keys*)
+                 nil)))
+      (:softness
+       (let ((params (graph-node-params node))
+             (defaults (softness-default-params)))
+         (values (mapcar (lambda (key)
+                           (float (getf params key (getf defaults key)) 1.0))
+                         *softness-keys*)
                  nil)))
       (:crop
        (let ((params (graph-node-params node)))

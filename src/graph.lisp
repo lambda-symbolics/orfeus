@@ -124,6 +124,17 @@
       (graph-invalid params "clarity radius must be within 10..1000 pixels")))
   params)
 
+(defun softness-params-validate (params)
+  (unless (and (listp params) (plist-known-keys-p params *softness-keys*))
+    (graph-invalid params "expected :amount :radius parameters"))
+  (let ((amount (getf params :amount 0))
+        (radius (getf params :radius 3)))
+    (unless (and (realp amount) (<= 0 amount 1))
+      (graph-invalid params "softness amount must be within 0..1"))
+    (unless (and (realp radius) (<= 0.5 radius 20))
+      (graph-invalid params "softness radius must be within 0.5..20 pixels")))
+  params)
+
 (defun dehaze-params-validate (params)
   (unless (and (listp params) (plist-known-keys-p params *dehaze-keys*))
     (graph-invalid params "expected an :amount parameter"))
@@ -345,6 +356,7 @@ whose frame has already moved, whichever of the two moved it."
     ((eq kind :hue) (hue-params-validate params))
     ((eq kind :cast) (cast-params-validate params))
     ((eq kind :calibration) (calibration-params-validate params))
+    ((eq kind :softness) (softness-params-validate params))
     ((graph-filter-kind-p kind)
      (graph-node-params-validate
       (make-graph-node :kind kind :params params)))
@@ -442,7 +454,7 @@ nodes may consume film output while blends stay scene-linear."
                (graph-invalid node
                               "blend node ~S cannot consume film output" id))))
           ((member kind '(:color-subtract :negative :hdr :dust :vignette :clarity
-                          :dehaze :calibration))
+                          :dehaze :calibration :softness))
            (unless (= 1 (length inputs))
              (graph-invalid node "filter node ~S needs exactly one input" id))
            (ecase kind
@@ -452,6 +464,7 @@ nodes may consume film output while blends stay scene-linear."
              (:vignette (vignette-params-validate (graph-node-params node)))
              (:clarity (clarity-params-validate (graph-node-params node)))
              (:dehaze (dehaze-params-validate (graph-node-params node)))
+             (:softness (softness-params-validate (graph-node-params node)))
              (:color-subtract
               (color-subtract-params-validate (graph-node-params node)))
              (:calibration

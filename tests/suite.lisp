@@ -2290,6 +2290,52 @@ node."
            ;; A property of the as-shot scene, not a look: rejected after film.
            (rejected-p (calibration-default-params) :film)))))
 
+(defun softness-node-validates-and-encodes-p ()
+  "A softness node carries an amount and a radius, refuses values off their
+ranges -- amount 0..1, unlike clarity's -1..1, since there is no sharpening
+direction here -- fills its defaults in, and reaches the executor as kind 26,
+rejected after a film node like clarity and dehaze."
+  (flet ((rejected-p (params &optional (input-kind :crop))
+           (handler-case
+               (progn
+                 (graph-validate
+                  (make-processing-graph
+                   :nodes (list (make-graph-node
+                                 :id 1 :kind input-kind
+                                 :params (if (eq input-kind :film)
+                                             '(:grain-amount 0.2)
+                                             '(:left 0.1 :top 0.1
+                                               :width 0.8 :height 0.8))
+                                 :inputs '(0))
+                                (make-graph-node
+                                 :id 2 :kind :softness
+                                 :params params :inputs '(1)))
+                   :output 2))
+                 nil)
+             (invalid-project-data () t))))
+    (let* ((params '(:amount 0.5 :radius 5.0))
+           (graph (graph-validate
+                   (make-processing-graph
+                    :nodes (list (make-graph-node
+                                  :id 1 :kind :softness
+                                  :params params :inputs '(0)))
+                    :output 1)))
+           (decoded (sexp->graph (graph->sexp graph)))
+           (bytes (orfeus::graph->program-bytes decoded)))
+      (and (equal params (graph-node-params (graph-find-node decoded 1)))
+           (= 26 (elt bytes 12))
+           (= 2 (elt bytes 24))
+           (member :softness (graph-node-kinds))
+           (equal '(:amount 0.25 :radius 3.0) (softness-default-params))
+           (not (rejected-p (softness-default-params)))
+           (not (rejected-p '()))
+           (rejected-p '(:amount -0.1))
+           (rejected-p '(:amount 1.1))
+           (rejected-p '(:radius 0.3))
+           (rejected-p '(:radius 25))
+           (rejected-p '(:unknown-key 0.1))
+           (rejected-p (softness-default-params) :film)))))
+
 (defun dust-node-validates-and-encodes-p ()
   "A dust node carries a speck size, a contrast and which specks it looks for,
 refuses what cannot be dust, and reaches the executor as kind 17 with three
@@ -3012,6 +3058,8 @@ renderer is told about them."
              (calibration-node-validates-and-encodes-p))
       (check "clarity node validates, encodes and defaults"
              (clarity-node-validates-and-encodes-p))
+      (check "softness node validates, encodes and defaults"
+             (softness-node-validates-and-encodes-p))
       (check "vignette node validates, encodes and defaults"
              (vignette-node-validates-and-encodes-p))
       (check "dust node validates, encodes and defaults"

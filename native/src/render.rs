@@ -5075,27 +5075,41 @@ const CLARITY_DETAIL_LIMIT: f32 = 1.5;
 /// colour is multiplied by the result so its hue and saturation stay. Negative
 /// amounts soften instead. Two O(1) box passes per axis, so the radius costs
 /// nothing.
+/// How much of a presence effect a pixel of this DISPLAYED brightness takes:
+/// all of it in the midtones, tapering to none at black or white. Shared by
+/// `apply_clarity` and `apply_softness`, the two effects that measure detail
+/// against a local blur and are not meant to crush an already-clipped
+/// highlight or an already-black shadow in the process.
+fn midtone_weight(displayed: f32) -> f32 {
+    1.0 - (2.0 * displayed - 1.0).powi(4)
+}
+
+/// A pixel's log2 luminance plus a small floor, and the DISPLAYED (encoded,
+/// tone-mapped) brightness a reader would see it as -- the pair `apply_clarity`
+/// and `apply_softness` both need per pixel, computed the same careful way:
+/// a pixel the camera matrix pushed below zero, or one a stage left
+/// non-finite, counts as black, since the log of anything else is NaN and the
+/// tent blur's prefix sums would carry one NaN to every pixel below and to
+/// the right of it.
+fn log_luma_and_displayed(pixel: &[f32]) -> (f32, f32) {
+    const FLOOR: f32 = 1.0e-4;
+    let luminance = 0.2126 * pixel[0] + 0.7152 * pixel[1] + 0.0722 * pixel[2];
+    let luminance = if luminance.is_finite() { luminance.max(0.0) } else { 0.0 };
+    let log_luma = (luminance + FLOOR).log2();
+    let displayed =
+        srgb_encode(super::tone::default_display_tone(luminance)).clamp(0.0, 1.0);
+    (log_luma, displayed)
+}
+
 pub(crate) fn apply_clarity(image: &mut RgbImage, amount: f32, radius: f32) {
     if amount == 0.0 || image.width == 0 || image.height == 0 {
         return;
     }
     let (width, height) = (image.width, image.height);
     let radius = (radius.round() as usize).max(1);
-    const FLOOR: f32 = 1.0e-4;
-    let log_luma: Vec<f32> = image
-        .data
-        .par_chunks(3)
-        .map(|pixel| {
-            let luminance = 0.2126 * pixel[0] + 0.7152 * pixel[1] + 0.0722 * pixel[2];
-            // A pixel the camera matrix pushed below zero, or one a stage left
-            // non-finite, counts as black here. The log of anything else is
-            // NaN, and the tent blur's prefix sums carry one NaN to every
-            // pixel below and to the right of it: a single saturated pixel
-            // used to paint the rest of the frame black.
-            let luminance = if luminance.is_finite() { luminance.max(0.0) } else { 0.0 };
-            (luminance + FLOOR).log2()
-        })
-        .collect();
+    let samples: Vec<(f32, f32)> =
+        image.data.par_chunks(3).map(log_luma_and_displayed).collect();
+    let log_luma: Vec<f32> = samples.par_iter().map(|&(luma, _)| luma).collect();
     let blurred = tent_blur(&log_luma, width, height, radius);
     let strength = 0.8 * amount;
     image
@@ -5109,11 +5123,74 @@ pub(crate) fn apply_clarity(image: &mut RgbImage, amount: f32, radius: f32) {
                 let detail = log_luma[index] - blurred[index];
                 let limited = CLARITY_DETAIL_LIMIT * (detail / CLARITY_DETAIL_LIMIT).tanh();
                 // Midtones take the whole effect; black and white none of it.
-                let luminance = log_luma[index].exp2() - FLOOR;
-                let displayed = srgb_encode(super::tone::default_display_tone(luminance.max(0.0)))
-                    .clamp(0.0, 1.0);
-                let midtone = 1.0 - (2.0 * displayed - 1.0).powi(4);
+                let midtone = midtone_weight(samples[index].1);
                 let gain = (strength * limited * midtone).exp2();
+                for value in pixel.iter_mut() {
+                    *value *= gain;
+                }
+            }
+        });
+}
+
+/// How far the softness's blur reads around a pixel it writes: the same two
+/// box passes of RADIUS `clarity_reach` uses, since both are `tent_blur`.
+pub(crate) fn softness_reach(radius: f32) -> usize {
+    2 * (radius.max(1.0).ceil() as usize) + 2
+}
+
+/// A modestly soft spatial response, the way several cinematographers who
+/// shot real film described it, Ellen Kuras and Hoyte van Hoytema among them:
+/// not a dreamy blur, but a measurable, specifically *fine-detail* softening
+/// that still leaves the picture "reasonably clean and modern-looking."
+///
+/// Three choices follow directly from that brief, not from blurring the
+/// frame and calling it done:
+///
+/// - **Luma only.** Film's colour layers are not where the resolution loss
+///   reads; blurring chroma along with luminance is what makes a soft-focus
+///   filter look hazy rather than filmic. Detail is measured and reduced in
+///   log luminance exactly as `apply_clarity` measures it, and reapplied as a
+///   gain on all three channels, which moves brightness but leaves each
+///   pixel's hue and saturation exactly where they were -- chroma detail is
+///   never touched.
+/// - **A small RADIUS.** Clarity's is stated in tens to hundreds of pixels,
+///   the scale of a face; softness's is a handful of pixels, the scale of
+///   film grain and fine texture. Only that band of detail is reduced, so a
+///   photograph's overall shapes and tonal structure -- its "clarity" in the
+///   everyday sense -- survive untouched, which is what keeps this from
+///   reading as a soft-focus blur.
+/// - **Selective, like Clarity.** The same `midtone_weight` that keeps
+///   Clarity from crushing a clipped highlight or an already-black shadow
+///   keeps this from smearing a specular highlight or deepening a shadow's
+///   own noise floor -- "selective reduction of microcontrast," not a
+///   blanket one.
+///
+/// AMOUNT is 0..1, how much of the measured fine detail is given up; there is
+/// no sharpening direction here, since that is the Sharpen node's job.
+pub(crate) fn apply_softness(image: &mut RgbImage, amount: f32, radius: f32) {
+    if amount <= 0.0 || image.width == 0 || image.height == 0 {
+        return;
+    }
+    let (width, height) = (image.width, image.height);
+    let radius = (radius.round() as usize).max(1);
+    let samples: Vec<(f32, f32)> =
+        image.data.par_chunks(3).map(log_luma_and_displayed).collect();
+    let log_luma: Vec<f32> = samples.par_iter().map(|&(luma, _)| luma).collect();
+    let blurred = tent_blur(&log_luma, width, height, radius);
+    image
+        .data
+        .par_chunks_mut(3 * 8192)
+        .enumerate()
+        .for_each(|(chunk_index, chunk)| {
+            let first = chunk_index * 8192;
+            for (offset, pixel) in chunk.as_chunks_mut::<3>().0.iter_mut().enumerate() {
+                let index = first + offset;
+                let detail = log_luma[index] - blurred[index];
+                let reduction = amount * midtone_weight(samples[index].1);
+                // How much of the measured fine detail is given back to the
+                // local blur, as a gain on all three channels -- chroma rides
+                // along unchanged since R, G and B are scaled the same.
+                let gain = (-detail * reduction).exp2();
                 for value in pixel.iter_mut() {
                     *value *= gain;
                 }
@@ -9727,6 +9804,78 @@ mod tests {
             }
             assert_eq!(seeded, black, "pixel {} differs", index / 3);
         }
+    }
+
+    #[test]
+    fn softness_reduces_fine_detail_and_leaves_flat_ground() {
+        let (width, height) = (64, 8);
+        let mut image = RgbImage { width, height, data: vec![0.0; width * height * 3] };
+        for row in 0..height {
+            for column in 0..width {
+                // A one-pixel-period texture band around a midtone level,
+                // flat well away from it.
+                let value = if (12..52).contains(&column) {
+                    0.4 + 0.08 * if column % 2 == 0 { 1.0 } else { -1.0 }
+                } else {
+                    0.4
+                };
+                for channel in 0..3 {
+                    image.data[(row * width + column) * 3 + channel] = value;
+                }
+            }
+        }
+        let before = image.clone();
+        apply_softness(&mut image, 1.0, 2.0);
+        let at = |image: &RgbImage, x: usize| image.data[((height / 2) * width + x) * 3];
+        // Flat ground far from the texture, outside the small radius's reach,
+        // is untouched.
+        assert!((at(&image, 2) - at(&before, 2)).abs() < 1.0e-5, "flat ground moved");
+        let swing = |image: &RgbImage| {
+            let values: Vec<f32> = (28..32).map(|x| at(image, x)).collect();
+            values.iter().cloned().fold(f32::NEG_INFINITY, f32::max)
+                - values.iter().cloned().fold(f32::INFINITY, f32::min)
+        };
+        let (before_swing, after_swing) = (swing(&before), swing(&image));
+        assert!(
+            after_swing < before_swing * 0.7,
+            "fine texture barely softened: {before_swing} to {after_swing}"
+        );
+    }
+
+    #[test]
+    fn softness_changes_luminance_only_never_chroma() {
+        // A deliberately colourful, textured field: softness must move every
+        // pixel's brightness without ever turning its hue or saturation,
+        // since it is a gain on log luminance reapplied to all three
+        // channels alike, not a blur of each channel independently.
+        let (width, height) = (32, 4);
+        let mut image = RgbImage { width, height, data: vec![0.0; width * height * 3] };
+        for row in 0..height {
+            for column in 0..width {
+                let t = column as f32 / width as f32;
+                let index = (row * width + column) * 3;
+                image.data[index] = 0.3 + 0.2 * (column as f32 * 0.7).sin();
+                image.data[index + 1] = 0.25 + 0.15 * (column as f32 * 0.5 + 1.0).cos();
+                image.data[index + 2] = 0.2 + 0.1 * t;
+            }
+        }
+        let before = image.clone();
+        apply_softness(&mut image, 0.8, 3.0);
+        for pixel in 0..width * height {
+            let i = pixel * 3;
+            let (br, bg, bb) = (before.data[i], before.data[i + 1], before.data[i + 2]);
+            let (ar, ag, ab) = (image.data[i], image.data[i + 1], image.data[i + 2]);
+            assert!((ar * bg - ag * br).abs() < 1.0e-5, "pixel {pixel} hue shifted (r,g)");
+            assert!((ag * bb - ab * bg).abs() < 1.0e-5, "pixel {pixel} hue shifted (g,b)");
+        }
+    }
+
+    #[test]
+    fn softness_amount_zero_is_a_no_op() {
+        let mut image = RgbImage { width: 8, height: 8, data: vec![0.4; 8 * 8 * 3] };
+        let before = image.data.clone();
+        apply_softness(&mut image, 0.0, 3.0);
+        assert_eq!(image.data, before);
     }
 
     #[test]
