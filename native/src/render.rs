@@ -5508,9 +5508,14 @@ const CAST_CANONICAL_COLOURS: [[f32; 3]; 8] = [
 /// Works directly in RGB rather than through hue and saturation: a band's
 /// "content" in a pixel is the smallest of the channels its own canonical
 /// colour calls for (so yellow's content is `min(r, g)`, the usual subtractive
-/// measure of how much of a shared primary or secondary a colour carries), and
-/// that much of the canonical colour is added or removed. A pixel sitting at a
-/// band's own centre has that band's own tent weight at 1.0, so its exemption
+/// measure of how much of a shared primary or secondary a colour carries),
+/// scaled again by the pixel's own saturation, and that much of the canonical
+/// colour is added or removed. The saturation scaling matters: without it a
+/// bright, barely-coloured surface (a pale wall, a cloud) reads as full of red
+/// simply from being bright, not from leaning red, and turning the knob up
+/// paints the whole frame a colour instead of pulling one out of what already
+/// carries it. A pixel sitting at a band's own centre has that band's own tent
+/// weight at 1.0, so its exemption
 /// (1 minus the weight) is 0 and the band's own knob leaves it alone
 /// regardless of amount -- a red is never dimmed by its own cast knob, however
 /// far it is turned.
@@ -5535,12 +5540,19 @@ pub(crate) fn apply_cast(image: &mut RgbImage, bands: &[f32]) {
                 continue;
             }
             let colour = CAST_CANONICAL_COLOURS[index];
-            let content = colour
-                .iter()
-                .zip(rgb.iter())
-                .filter(|&(&share, _)| share > 0.0)
-                .map(|(_, &value)| value)
-                .fold(f32::INFINITY, f32::min);
+            // The smallest of the canonical colour's own channels is the usual
+            // subtractive measure of how much of it a colour carries, but a
+            // bright, barely-coloured pixel (a pale wall, a white cloud) has a
+            // large R or G or B just from being bright, not from leaning
+            // toward any one hue -- scaling by the pixel's own saturation is
+            // what keeps a near-grey surface from reading as "full of red."
+            let content = saturation
+                * colour
+                    .iter()
+                    .zip(rgb.iter())
+                    .filter(|&(&share, _)| share > 0.0)
+                    .map(|(_, &value)| value)
+                    .fold(f32::INFINITY, f32::min);
             let exemption = 1.0 - weights[index];
             let adjustment = amount * exemption * content;
             for channel in 0..3 {
