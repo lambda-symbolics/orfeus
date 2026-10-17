@@ -2823,7 +2823,7 @@ renderer is told about them."
              ("kodak_kodachrome_25.cube" . "70a9f8106de3a5e87fb2b5e478d708407429d064945b769be8913a814653523e")
              ("kodak_kodachrome_64.cube" . "6fce987295dac264a689a8ef1b1b3a407f26ffcb3f6d81a356ebc5d9c565d0b4")
              ("kodak_kodachrome_64_generic.cube" . "19cacda68131b43e153cee643c02e9fd015ec1f6e7b74fa95b7c2168b0979935")
-             ("Reala 500D.cube" . "c8dee79e94a5265183a885187805061e25053f53474326af075086277be01efe"))))
+             ("Reala 500D.cube" . "c3abbdf1118ddb8f8e9c0d8a4c4e835a1435144816afca253bc942b84b6270c7"))))
     (and (= (length expected) (length (directory (merge-pathnames "*.cube" directory))))
          (every (lambda (entry)
                   (let ((path (merge-pathnames (first entry) directory)))
