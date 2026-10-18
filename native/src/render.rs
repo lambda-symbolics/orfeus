@@ -764,6 +764,93 @@ pub(crate) fn measure_sensor_noise(image: &RgbImage) -> Option<SensorNoise> {
     Some(SensorNoise { power: noise.power })
 }
 
+/// Builds the per-position noise WEIGHT the neural denoiser's own input
+/// domain needs, each in 0..1 relative to the noisiest brightness this frame
+/// measures anywhere -- one value per 2x2 block of real pixels, matching the
+/// single shared noise-level plane its pixel-unshuffled input already carries
+/// across all four of a block's channels.
+///
+/// Relative, not an absolute sigma, on purpose: an earlier version of this
+/// returned the measured sigma directly, and feeding that straight in (scaled
+/// only by the user's own strength) made the network *weaker* almost
+/// everywhere than the single flat sigma it replaced, including in the
+/// noisiest real corner of a 2026-10-19 PEN-F test photo shot through tinted
+/// glass -- confirmed by rendering that exact frame both ways and measuring a
+/// sky patch and a shaded, textured patch before and after. The reason: this
+/// measurement deliberately reads the noise *floor*, the same envelope fit
+/// `SensorNoise` uses for the sharpener, which explicitly excludes real
+/// texture from counting as noise (a textured patch's own detail inflates a
+/// naive reading of it, which is exactly what the fit is built to resist).
+/// That is correct for what it measures, but it is a smaller number than the
+/// flat sigma a user turning the strength slider to maximum expects to reach
+/// in the worst part of their photograph, and strength had no way to ask for
+/// more. Normalizing every position against this frame's own noisiest bin
+/// restores that: at strength 1.0 the noisiest measured brightness reaches
+/// exactly the old flat ceiling, same as before, while a cleaner position
+/// scales down from there instead of being forced to match it -- spatially
+/// adaptive without taking away the headroom the slider used to offer.
+///
+/// Measured directly in sRGB-encoded units -- the domain
+/// `apply_neural_noise_reduction` already encodes every pixel into before
+/// handing them to the network -- rather than by reusing `SensorNoise`'s own
+/// fit. That fit is tied throughout to the square root of linear brightness
+/// (its bin placement in `noise_bin`/`interpolate_bins`, and its `scaled`
+/// exposure-gain formula, both assume it); converting a sigma out of that
+/// domain into this one would need an unverified derivative conversion, and
+/// measuring fresh here in the domain this is actually for avoids that risk
+/// entirely. None when the frame is too small to measure -- the caller falls
+/// back to a flat weight of 1.0 everywhere, reproducing the old flat sigma
+/// exactly.
+pub(crate) fn measure_neural_noise_weight(
+    data: &[f32],
+    width: usize,
+    height: usize,
+    half_width: usize,
+    half_height: usize,
+) -> Option<Vec<f32>> {
+    if width < 8 || height < 8 {
+        return None;
+    }
+    let luma: Vec<f32> = data
+        .as_chunks::<3>()
+        .0
+        .par_iter()
+        .map(|pixel| 0.2126 * pixel[0] + 0.7152 * pixel[1] + 0.0722 * pixel[2])
+        .collect();
+    let encoded: Vec<f32> = luma.par_iter().map(|value| srgb_encode(value.max(0.0))).collect();
+    let kernel = gaussian_kernel(SENSOR_NOISE_REFERENCE_RADIUS);
+    let mut blurred = vec![0.0_f32; width * height];
+    gaussian_blur(&encoded, &mut blurred, width, height, &kernel);
+    let mut detail = blurred;
+    detail
+        .par_chunks_mut(8192)
+        .zip(encoded.par_chunks(8192))
+        .for_each(|(detail, encoded)| {
+            for (d, e) in detail.iter_mut().zip(encoded) {
+                *d = e - *d;
+            }
+        });
+    let noise = fine_band_noise_by_bin(&detail, &luma, width, height);
+    let loudest = noise.power.iter().cloned().fold(0.0_f32, f32::max);
+    if !(loudest > 0.0) {
+        return None;
+    }
+    let reference = loudest.sqrt();
+    let mut weight = vec![0.0_f32; half_width * half_height];
+    weight.par_iter_mut().enumerate().for_each(|(index, value)| {
+        let (half_y, half_x) = (index / half_width, index % half_width);
+        let (y0, y1) = ((2 * half_y).min(height - 1), (2 * half_y + 1).min(height - 1));
+        let (x0, x1) = ((2 * half_x).min(width - 1), (2 * half_x + 1).min(width - 1));
+        let block_luma = 0.25
+            * (luma[y0 * width + x0]
+                + luma[y0 * width + x1]
+                + luma[y1 * width + x0]
+                + luma[y1 * width + x1]);
+        *value = (noise.power_at(block_luma).max(0.0).sqrt() / reference).clamp(0.0, 1.0);
+    });
+    Some(weight)
+}
+
 /// One brightness bin's reading of a band's noise: the power measured there,
 /// the mean brightness of the pixels it was read from, and how many there were.
 #[derive(Clone, Copy, Debug, Default)]
@@ -8746,6 +8833,40 @@ mod tests {
             let ratio = predicted.power_at(brightness) / after.power_at(brightness);
             assert!((0.8..1.25).contains(&ratio), "at {brightness}: predicted/measured {ratio}");
         }
+    }
+
+    /// The neural denoiser needs the same spatial sensitivity the sharpener
+    /// already gets from `measure_sensor_noise`: the same photograph can
+    /// carry a clean sky and a noisy shadow at once, and a single number
+    /// cannot describe both. A real PEN-F frame shot through tinted glass
+    /// (2026-10-19) measured more raw noise in its shaded foreground than in
+    /// its sky; a map that did not vary with brightness at all could never
+    /// ask the network to clean one without wrecking the other. And the
+    /// weight has to be normalized against the frame's own loudest position,
+    /// not an absolute sigma -- an absolute reading made the network weaker
+    /// almost everywhere once strength was applied on top of it, including in
+    /// that same noisy foreground, since this measurement is a noise floor
+    /// that reads low wherever real texture sits.
+    #[test]
+    fn neural_noise_weight_rises_toward_the_dark_end_and_peaks_at_one() {
+        let (width, height) = (384, 128);
+        let noisy = noisy_gradient(width, height, 0x1234_5678_9abc_def0);
+        let half_width = width.div_ceil(2);
+        let half_height = height.div_ceil(2);
+        let weight = measure_neural_noise_weight(&noisy.data, width, height, half_width, half_height)
+            .expect("a frame this size is readable");
+        let row = half_height / 2;
+        let dark = weight[row * half_width + 4];
+        let bright = weight[row * half_width + half_width - 5];
+        assert!(
+            dark > bright,
+            "dark end weight {dark} was not higher than the bright end's {bright}"
+        );
+        let loudest = weight.iter().cloned().fold(0.0_f32, f32::max);
+        assert!(
+            loudest > 0.999,
+            "the frame's own loudest position did not reach the full weight of 1.0: {loudest}"
+        );
     }
 
     /// A plane of nothing but noise, at one brightness.

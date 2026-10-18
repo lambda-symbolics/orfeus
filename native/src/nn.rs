@@ -393,14 +393,20 @@ fn convolve_valid(
 
 /// Copies one input patch (with zero padding beyond the image, matching the
 /// network's zero-padded convolutions at real borders) into `patch` planes.
+///
+/// `sigma_plane` is one value per half-resolution position, not a single
+/// scalar -- a spatially uniform image (every entry equal) reproduces the
+/// network's old fixed-noise-level behaviour exactly; a real one is how a
+/// dark, noisy corner gets asked for more correction than a clean sky in the
+/// same frame, which a single shared sigma could never express.
 #[allow(clippy::too_many_arguments)]
 fn gather_patch(
     planes: &[f32],
+    sigma_plane: &[f32],
     half_width: usize,
     half_height: usize,
     tile_x: usize,
     tile_y: usize,
-    sigma: f32,
     patch: &mut [f32],
     patch_size: usize,
 ) {
@@ -427,7 +433,7 @@ fn gather_patch(
                 .copy_from_slice(&planes[source..source + clipped_end - clipped_start]);
         }
     }
-    let sigma_plane = OUTPUT_CHANNELS * patch_plane;
+    let sigma_offset = OUTPUT_CHANNELS * patch_plane;
     for row in 0..patch_size {
         let source_y = tile_y as isize + row as isize - HALO as isize;
         if source_y < 0 || source_y >= half_height as isize {
@@ -441,8 +447,10 @@ fn gather_patch(
             continue;
         }
         let target_offset = (clipped_start as isize - source_x_start) as usize;
-        let target = sigma_plane + row * patch_size + target_offset;
-        patch[target..target + clipped_end - clipped_start].fill(sigma);
+        let source = source_y as usize * half_width + clipped_start;
+        let target = sigma_offset + row * patch_size + target_offset;
+        patch[target..target + clipped_end - clipped_start]
+            .copy_from_slice(&sigma_plane[source..source + clipped_end - clipped_start]);
     }
 }
 
@@ -581,9 +589,9 @@ fn parallel_tiles(tile_size: usize) -> usize {
 fn infer_tiled_on_gpu(
     gpu: &GpuNetwork,
     planes: &[f32],
+    sigma_plane: &[f32],
     half_width: usize,
     half_height: usize,
-    sigma: f32,
     tile_size: usize,
 ) -> Result<Vec<f32>, String> {
     let half_plane = half_width * half_height;
@@ -597,11 +605,11 @@ fn infer_tiled_on_gpu(
             let origin_y = tile_y * tile_size;
             gather_patch(
                 planes,
+                sigma_plane,
                 half_width,
                 half_height,
                 origin_x,
                 origin_y,
-                sigma,
                 &mut patch,
                 patch_size,
             );
@@ -634,15 +642,15 @@ fn infer_tiled_on_gpu(
 fn infer_tiled_with_tile_size(
     net: &FfdNet,
     planes: &[f32],
+    sigma_plane: &[f32],
     half_width: usize,
     half_height: usize,
-    sigma: f32,
     tile_size: usize,
 ) -> Vec<f32> {
     if gpu_requested()
         && let Ok(gpu) = gpu_network()
     {
-        match infer_tiled_on_gpu(gpu, planes, half_width, half_height, sigma, tile_size) {
+        match infer_tiled_on_gpu(gpu, planes, sigma_plane, half_width, half_height, tile_size) {
             Ok(denoised) => return denoised,
             Err(error) => report_gpu_neural_fallback(&error),
         }
@@ -665,11 +673,11 @@ fn infer_tiled_with_tile_size(
                     let origin_y = tile_y * tile_size;
                     gather_patch(
                         planes,
+                        sigma_plane,
                         half_width,
                         half_height,
                         origin_x,
                         origin_y,
-                        sigma,
                         &mut scratch.ping,
                         patch_size,
                     );
@@ -771,10 +779,29 @@ fn best_tile_size(half_width: usize, half_height: usize) -> usize {
 
 /// Applies FFDNet color denoising in place.
 ///
-/// `strength` in (0, 1] maps linearly to the network's training-domain noise
-/// level, up to sigma 50/255 at full strength. Pixels are processed in the
-/// sRGB-encoded [0, 1] range the network was trained on; energy outside that
-/// range (unclipped highlights, gamut excursions) passes through unchanged.
+/// `strength` in (0, 1] still means what it always did: 1.0 asks the network
+/// for the most it was trained against, sigma 30/255 (`MAX_NETWORK_SIGMA`),
+/// in whichever part of the frame measures as the noisiest. What changed is
+/// that the sigma asked for elsewhere now scales down from that ceiling with
+/// how clean `measure_neural_noise_weight` finds that position relative to
+/// the frame's own worst one, instead of asking for the same ceiling
+/// everywhere. A single flat sigma used to stand in for this: it could only
+/// be picked large enough to help the noisiest corner of a frame, which asked
+/// the network to smooth a clean sky by exactly as much as a noisy shadow, or
+/// picked small enough to spare the sky and leave the shadow's real noise
+/// untouched -- one slider position could not do both at once. A real
+/// photograph (a PEN-F snow scene shot through tinted glass, 2026-10-19)
+/// measured sky noise cleaning well under either choice while its shaded,
+/// textured foreground stayed close to untouched. Scaling the measured
+/// *sigma* directly by strength was the first attempt and made the network
+/// weaker almost everywhere, including that exact foreground, because the
+/// measurement is a noise *floor* that deliberately reads low wherever real
+/// texture sits -- normalizing against the frame's own loudest measured
+/// position instead is what keeps the old ceiling reachable while still
+/// varying where the noise is worse; see `measure_neural_noise_weight`'s own
+/// doc comment for the full account. Pixels are processed in the sRGB-encoded
+/// [0, 1] range the network was trained on; energy outside that range
+/// (unclipped highlights, gamut excursions) passes through unchanged.
 pub(crate) fn apply_neural_noise_reduction(
     data: &mut [f32],
     width: usize,
@@ -785,7 +812,6 @@ pub(crate) fn apply_neural_noise_reduction(
         return Ok(());
     }
     let net = network()?;
-    let sigma = strength.min(1.0) * MAX_NETWORK_SIGMA;
 
     // Replication-pad to even dimensions, then pixel-unshuffle into twelve
     // half-resolution planes of sRGB-encoded values, exactly as in training.
@@ -810,9 +836,18 @@ pub(crate) fn apply_neural_noise_reduction(
             }
         });
 
+    let strength = strength.min(1.0);
+    let ceiling = strength * MAX_NETWORK_SIGMA;
+    let sigma_plane: Vec<f32> =
+        match super::render::measure_neural_noise_weight(data, width, height, half_width, half_height) {
+            Some(weight) => weight.into_iter().map(|weight| weight * ceiling).collect(),
+            None => vec![ceiling; half_plane],
+        };
+
     let started = std::time::Instant::now();
     let tile = best_tile_size(half_width, half_height);
-    let denoised = infer_tiled_with_tile_size(net, &planes, half_width, half_height, sigma, tile);
+    let denoised =
+        infer_tiled_with_tile_size(net, &planes, &sigma_plane, half_width, half_height, tile);
     if std::env::var_os("ORFEUS_PROFILE").is_some() {
         eprintln!(
             "orfeus-profile stage=neural-network half={half_width}x{half_height} \
@@ -855,13 +890,14 @@ mod tests {
         let patch_size = TILE + 2 * HALO;
         let mut patch = vec![1.0; INPUT_CHANNELS * patch_size * patch_size];
         let planes = vec![0.0; OUTPUT_CHANNELS * half_width * half_height];
+        let sigma_plane = vec![0.25; half_width * half_height];
         gather_patch(
             &planes,
+            &sigma_plane,
             half_width,
             half_height,
             0,
             0,
-            0.25,
             &mut patch,
             patch_size,
         );
@@ -934,6 +970,7 @@ mod tests {
             .map(|index| (index % 17) as f32 / 19.0)
             .collect();
         let sigma = 0.07;
+        let sigma_plane = vec![sigma; plane];
         let net = network().unwrap();
         let reference = infer_same_padded_reference(net, &planes, size, sigma);
         //
@@ -943,7 +980,8 @@ mod tests {
         // seam — which shows up as a whole edge of visibly wrong pixels — cannot
         // hide underneath it.
         for tile_size in [1, 2, 3, 4, 6, 7, 9, 32] {
-            let tiled = infer_tiled_with_tile_size(net, &planes, size, size, sigma, tile_size);
+            let tiled =
+                infer_tiled_with_tile_size(net, &planes, &sigma_plane, size, size, tile_size);
             let max_error = tiled
                 .iter()
                 .zip(&reference)
@@ -1071,6 +1109,7 @@ mod tests {
         let planes: Vec<f32> = (0..OUTPUT_CHANNELS * plane)
             .map(|index| (index % 251) as f32 / 251.0)
             .collect();
+        let sigma_plane = vec![0.07; plane];
         let net = network().unwrap();
         eprintln!("threads={}", rayon::current_num_threads());
         eprintln!("chosen tile={}", best_tile_size(width, height));
@@ -1078,7 +1117,7 @@ mod tests {
             let tiles = width.div_ceil(tile) * height.div_ceil(tile);
             let patch = tile + 2 * HALO;
             let started = std::time::Instant::now();
-            let _ = infer_tiled_with_tile_size(net, &planes, width, height, 0.07, tile);
+            let _ = infer_tiled_with_tile_size(net, &planes, &sigma_plane, width, height, tile);
             eprintln!(
                 "tile={tile:4} tiles={tiles:4} patchpx={:9} {:8.1} ms",
                 tiles * patch * patch,
@@ -1189,6 +1228,68 @@ mod tests {
         assert!(
             bright - dark > 0.4,
             "edge contrast collapsed: {dark} vs {bright}"
+        );
+    }
+
+    #[test]
+    fn denoising_removes_more_from_a_noisy_dark_region_than_a_clean_bright_one() {
+        // The sigma fed to the network used to be one flat number for the
+        // whole frame, picked large enough to help the noisiest part -- which
+        // asked it to smooth a clean, bright region by exactly as much as a
+        // noisy, dark one. A real PEN-F photograph (2026-10-19, shot through
+        // tinted glass) showed exactly this: its sky cleaned up fine while its
+        // shaded foreground stayed close to untouched, because one sigma
+        // could not describe both at once. A spatially varying sigma should
+        // treat each region on its own merits instead.
+        let width = 128;
+        let height = 64;
+        let dark_base = 0.08_f32;
+        let bright_base = 0.6_f32;
+        let mut image = Vec::with_capacity(width * height * 3);
+        for y in 0..height {
+            for x in 0..width {
+                let dark = x < width / 2;
+                let base = if dark { dark_base } else { bright_base };
+                let amplitude = if dark { 0.8 } else { 0.05 };
+                for channel in 0..3 {
+                    image.push(base + hash_noise(x, y, channel) * amplitude);
+                }
+            }
+        }
+        let rms_against_base = |data: &[f32], dark: bool| -> f32 {
+            let base = if dark { dark_base } else { bright_base };
+            let mut sum = 0.0_f32;
+            let mut count = 0_usize;
+            for y in 0..height {
+                for x in 0..width {
+                    if (x < width / 2) != dark {
+                        continue;
+                    }
+                    let error = data[(y * width + x) * 3] - base;
+                    sum += error * error;
+                    count += 1;
+                }
+            }
+            (sum / count as f32).sqrt()
+        };
+        let before_dark = rms_against_base(&image, true);
+        let before_bright = rms_against_base(&image, false);
+        apply_neural_noise_reduction(&mut image, width, height, 0.8).unwrap();
+        let after_dark = rms_against_base(&image, true);
+        let after_bright = rms_against_base(&image, false);
+        let dark_ratio = after_dark / before_dark;
+        let bright_ratio = after_bright / before_bright;
+        eprintln!(
+            "dark: {before_dark} -> {after_dark} (ratio {dark_ratio}); \
+             bright: {before_bright} -> {after_bright} (ratio {bright_ratio})"
+        );
+        assert!(
+            dark_ratio < 0.6,
+            "the noisy dark region was not meaningfully cleaned: {before_dark} -> {after_dark}"
+        );
+        assert!(
+            bright_ratio > 0.7,
+            "the already-clean bright region was oversmoothed: {before_bright} -> {after_bright}"
         );
     }
 
