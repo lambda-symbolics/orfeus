@@ -1859,11 +1859,11 @@ fn execute_graph_into(
             }
             NODE_NOISE_REDUCTION => {
 
-                // One denoiser or the other, and the edge-aware one asks the
-                // same of brightness as of colour. It used to get a fifth of
-                // the slider for brightness, which is the noise that shows:
-                // at the default setting that left grain untouched — a
-                // measured drop of a tenth against a half for colour.
+                // The edge-aware one asks the same of brightness as of
+                // colour. It used to get a fifth of the slider for
+                // brightness, which is the noise that shows: at the default
+                // setting that left grain untouched — a measured drop of a
+                // tenth against a half for colour.
                 let edge = render::strength_for_scale(
                     op.params[0],
                     context.scaled_pixels,
@@ -1889,6 +1889,18 @@ fn execute_graph_into(
                         || render::measure_sensor_noise(&image),
                     );
                 }
+                // Both stack rather than one replacing the other: two
+                // independent sliders that silently disabled each other was
+                // the single most confusing thing about this node (a real
+                // project turned both up, at which point the edge-aware one
+                // simply never ran, with nothing in the GUI saying so). The
+                // edge-aware pass runs first -- cheap, and it means whatever
+                // noise is left by the time the network measures its own
+                // input is already smaller, so turning both up does not
+                // double-apply a full correction twice.
+                if edge > 0.0 {
+                    render::apply_noise_reduction(&mut image, edge, edge);
+                }
                 if neural > 0.0 {
                     super::nn::apply_neural_noise_reduction(
                         &mut image.data,
@@ -1896,8 +1908,6 @@ fn execute_graph_into(
                         image.height,
                         neural,
                     )?;
-                } else {
-                    render::apply_noise_reduction(&mut image, edge, edge);
                 }
             }
             NODE_CONTRAST => {
@@ -3128,6 +3138,41 @@ mod tests {
         assert_eq!(via_graph.width, reference.width);
         assert_eq!(via_graph.height, reference.height);
         assert!(max_difference(&via_graph, &reference) < 1.0e-6);
+    }
+
+    #[test]
+    fn noise_reduction_stacks_edge_aware_and_neural_instead_of_picking_one() {
+        // A real project turned both sliders up (edge-aware 1.0, neural
+        // 0.35); under the dispatch this replaces, neural being nonzero
+        // silently skipped the edge-aware pass entirely, with nothing in the
+        // GUI saying so -- "edge-aware does literally nothing" was literally
+        // true, by design. Both must now run, edge-aware first.
+        let ops = parse_graph(
+            &GraphBuilder::new()
+                .node(NODE_NOISE_REDUCTION, 0, -1, &[1.0, 0.35], None)
+                .build(),
+        )
+        .unwrap();
+        let via_graph = execute_graph(&ops, gradient_image(), &context(5)).unwrap();
+
+        let mut reference = gradient_image();
+        render::apply_noise_reduction(&mut reference, 1.0, 1.0);
+        super::super::nn::apply_neural_noise_reduction(
+            &mut reference.data,
+            reference.width,
+            reference.height,
+            0.35,
+        )
+        .unwrap();
+        to_display(&mut reference);
+
+        assert_eq!(via_graph.width, reference.width);
+        assert_eq!(via_graph.height, reference.height);
+        assert!(max_difference(&via_graph, &reference) < 1.0e-6);
+        // And confirm this is not trivially satisfied by both being no-ops:
+        // the stacked result has to differ from a fresh, undenoised render.
+        let untouched = gradient_image();
+        assert!(max_difference(&via_graph, &untouched) > 1.0e-3);
     }
 
     #[test]
