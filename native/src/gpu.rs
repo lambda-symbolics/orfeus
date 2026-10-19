@@ -1465,7 +1465,7 @@ mod tests {
                 height,
                 data: data.clone(),
             };
-            crate::render::cpu_noise_reduction(&mut expected, luma, chroma);
+            crate::render::cpu_noise_reduction(&mut expected, luma, chroma, 1.0);
             let mut actual = data.clone();
             noise_reduction(&mut actual, width, height, luma, chroma)
                 .expect("Vulkan noise reduction dispatch");

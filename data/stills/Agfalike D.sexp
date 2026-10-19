@@ -10,7 +10,7 @@
       :demosaic :rcd))
     (:id 2 :kind :dehaze :inputs (1) :params (:amount 0.21))
     (:id 3 :kind :noise-reduction :inputs (2) :params
-     (:noise-reduction 0.45 :neural-noise-reduction 0.0))
+     (:noise-reduction 0.45 :neural-noise-reduction 0.0 :detail 1.0))
     (:id 4 :kind :sharpen :inputs (3) :params
      (:sharpen-amount 0.5 :sharpen-radius 1.5 :sharpen-threshold 2.0))
     (:id 5 :kind :clarity :inputs (4) :params (:amount 0.33 :radius 150.0))

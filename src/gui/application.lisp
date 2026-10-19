@@ -1598,16 +1598,21 @@ behind is memory. Best effort; returns how many directories went."
               (neural (gui-model-setting model :neural-noise-reduction))
               (lut (gui-model-setting model :lut-path))
               (strength (gui-model-setting model :lut-strength)))
-          ;; One denoiser runs, not both, so name the one that did rather
-          ;; than listing a strength that was never applied.
+          ;; Both denoisers can run at once, so name whichever are actually
+          ;; active rather than picking one as if the other were silently
+          ;; disabled by it.
           (format nil "RAW preview  |  WB: ~A  |  NR: ~A  |  LUT: ~A"
                   (if temperature "Custom" "As shot")
-                  (cond ((plusp neural)
-                         (format nil "neural ~D%" (round (* 100 neural))))
-                        ((plusp noise-reduction)
-                         (format nil "edge-aware ~D%"
-                                 (round (* 100 noise-reduction))))
-                        (t "off"))
+                  (let ((active
+                          (append
+                           (when (plusp noise-reduction)
+                             (list (format nil "edge-aware ~D%"
+                                           (round (* 100 noise-reduction)))))
+                           (when (plusp neural)
+                             (list (format nil "neural ~D%" (round (* 100 neural))))))))
+                    (if active
+                        (format nil "~{~A~^ + ~}" active)
+                        "off"))
                   (if (and lut (plusp strength))
                       (format nil "~A (~D%)" (file-namestring lut)
                               (round (* 100 strength)))
@@ -8593,6 +8598,8 @@ behind is memory. Best effort; returns how many directories went."
            (make-number-field :noise-reduction "Edge-aware" 0 1 0.05 44
                               node-page)
            (make-number-field :neural-noise-reduction "Neural" 0 1 0.05 76
+                              node-page)
+           (make-number-field :detail "Detail" 0 1 0.05 108
                               node-page)))
         (build-group
          :tone

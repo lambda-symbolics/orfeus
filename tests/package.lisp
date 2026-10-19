@@ -103,6 +103,7 @@
                 #:processing-settings-lut-strength
                 #:processing-settings-neural-noise-reduction
                 #:processing-settings-noise-reduction
+                #:processing-settings-detail
                 #:processing-settings-tone-shadows
                 #:processing-settings-with-overrides
                 #:settings-grade-plist

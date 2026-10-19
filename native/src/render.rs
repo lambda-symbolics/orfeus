@@ -504,6 +504,23 @@ const ACTIVITY_RADIUS: usize = 3;
 /// being faithful.
 const ACTIVITY_STRENGTH: f32 = 2.9;
 
+/// The steepest `activity_gain` bias the Detail control reaches, at its most
+/// aggressive setting (0.0). 1.0 (Detail at its default, 1.0) reproduces the
+/// plain linear Wiener share exactly; this is how far asking for less detail
+/// is allowed to push borderline local activity toward being treated as noise
+/// instead. Not derived from a measurement -- there is no "correct" amount of
+/// real texture to sacrifice, only a photographer's own call -- chosen so the
+/// low end visibly cuts into texture a default-detail render would have kept,
+/// without being so steep that an unambiguous edge (RATIO near zero) softens
+/// along with it.
+const MAX_DETAIL_BIAS: f32 = 16.0;
+
+/// Converts the Detail control (0..1, 1.0 default and gentlest) to the
+/// exponent `activity_gain` raises its Wiener share to.
+fn detail_bias(detail: f32) -> f32 {
+    1.0 + (1.0 - detail.clamp(0.0, 1.0)) * (MAX_DETAIL_BIAS - 1.0)
+}
+
 /// Grows PLANE to LEN elements, zeroing the new ones on every thread at once.
 ///
 /// `resize` zero-fills serially, and with the allocator told to keep large
@@ -626,12 +643,26 @@ fn local_mean_square(
 /// is a small part of what is there and almost all of it does. One expression,
 /// no threshold to place, and it is the same estimator the noise profile is
 /// already measuring for.
+///
+/// BIAS raises the linear Wiener share to a power, 1.0 reproducing it exactly
+/// -- every caller but the noise-reduction node's own shrink passes 1.0, since
+/// this is the one place a user asks, independently of how much noise there
+/// is overall, how willing the gate should be to call borderline local
+/// activity texture rather than noise. A real PEN-F photograph (2026-10-19,
+/// high ISO, shot through tinted glass) measured its sky cleaning to about
+/// half its noise while a busy, textured shadow barely moved -- not because
+/// either denoiser's sigma was wrong (both were, separately, fixed by then),
+/// but because this gate is deliberately reluctant to treat real texture as
+/// noise, and a shadow full of branches reads as mostly texture. A higher
+/// bias leaves an unambiguous edge (RATIO near zero) and an unambiguous flat
+/// noise patch (RATIO near one) exactly where they already were -- only the
+/// borderline middle, where this is actually a judgement call, moves.
 #[inline]
-fn activity_gain(mean_square: f32, noise_power: f32) -> f32 {
+fn activity_gain(mean_square: f32, noise_power: f32, bias: f32) -> f32 {
     if !(mean_square > 0.0) {
         return 0.0;
     }
-    (1.0 - noise_power / mean_square).clamp(0.0, 1.0)
+    (1.0 - noise_power / mean_square).clamp(0.0, 1.0).powf(bias)
 }
 
 /// The brightness plane is split at these steps, finest first. Each blur
@@ -1412,6 +1443,7 @@ fn shrink_luma_bands(
     coarse: &[f32],
     noise: [BandNoise; 3],
     strength: f32,
+    bias: f32,
     width: usize,
     height: usize,
 ) {
@@ -1499,7 +1531,7 @@ fn shrink_luma_bands(
                         // says nothing about how bright anything is.
                         let bin = noise_bin(line[x]);
                         let shrink = |band: usize, total: f32, value: f32| {
-                            value * activity_gain(total / count, strength * noise[band].power[bin])
+                            value * activity_gain(total / count, strength * noise[band].power[bin], bias)
                         };
                         line[x] += shrink(0, totals_fine[x], fine[x])
                             + shrink(1, totals_middle[x], middle[x])
@@ -1514,13 +1546,16 @@ fn shrink_luma_bands(
 /// detail bands, each against the noise power measured in that band.
 ///
 /// RESIDUAL is left holding the finest band afterwards, which the caller may
-/// reuse as scratch. STRENGTH is the slider, nought to one.
+/// reuse as scratch. STRENGTH is the slider, nought to one. DETAIL is the
+/// separate Detail control, also nought to one and 1.0 by default -- see
+/// `detail_bias`.
 fn denoise_luma(
     plane: &mut Vec<f32>,
     residual: &mut Vec<f32>,
     width: usize,
     height: usize,
     strength: f32,
+    detail: f32,
 ) {
     let profiling = std::env::var_os("ORFEUS_PROFILE").is_some();
     let mut step_started = Instant::now();
@@ -1549,6 +1584,7 @@ fn denoise_luma(
         &coarse,
         [fine_noise, middle_noise, coarse_noise],
         strength,
+        detail_bias(detail),
         width,
         height,
     );
@@ -2148,14 +2184,14 @@ pub(crate) fn strength_for_scale(strength: f32, pixels: usize, full_pixels: usiz
     strength * (2.0 * scale - 1.0).clamp(0.0, 1.0)
 }
 
-pub(crate) fn apply_noise_reduction(image: &mut RgbImage, luma: f32, chroma: f32) {
+pub(crate) fn apply_noise_reduction(image: &mut RgbImage, luma: f32, chroma: f32, detail: f32) {
     if (luma == 0.0 && chroma == 0.0) || image.width < 3 || image.height < 3 {
         return;
     }
     if gpu_noise_reduction(image, luma, chroma) {
         return;
     }
-    cpu_noise_reduction(image, luma, chroma)
+    cpu_noise_reduction(image, luma, chroma, detail)
 }
 
 fn gpu_noise_reduction(image: &mut RgbImage, luma: f32, chroma: f32) -> bool {
@@ -2215,7 +2251,7 @@ fn gpu_noise_reduction_requested() -> bool {
     false
 }
 
-pub(crate) fn cpu_noise_reduction(image: &mut RgbImage, luma: f32, chroma: f32) {
+pub(crate) fn cpu_noise_reduction(image: &mut RgbImage, luma: f32, chroma: f32, detail: f32) {
     if (luma == 0.0 && chroma == 0.0) || image.width < 3 || image.height < 3 {
         return;
     }
@@ -2284,7 +2320,7 @@ pub(crate) fn cpu_noise_reduction(image: &mut RgbImage, luma: f32, chroma: f32) 
     let mut filtered = Vec::new();
     let luma_strength = luma.clamp(0.0, 1.0);
     if luma_strength > 0.0 {
-        denoise_luma(&mut yy, &mut filtered, width, height, luma_strength);
+        denoise_luma(&mut yy, &mut filtered, width, height, luma_strength, detail);
     }
 
     profile_step!("luma");
@@ -5013,7 +5049,7 @@ pub(crate) fn apply_sharpen_prepared(
             if index % 97 != 0 {
                 continue;
             }
-            let gain = activity_gain(*mean_square, noise_share * floor_at(*luma));
+            let gain = activity_gain(*mean_square, noise_share * floor_at(*luma), 1.0);
             total_gain += f64::from(gain);
             gated += usize::from(gain == 0.0);
         }
@@ -5040,7 +5076,7 @@ pub(crate) fn apply_sharpen_prepared(
                 }
                 let encoded = prepared.encoded[index];
                 let detail = prepared.detail[index]
-                    * activity_gain(prepared.activity[index], noise_share * floor_at(luma));
+                    * activity_gain(prepared.activity[index], noise_share * floor_at(luma), 1.0);
                 let (mut low, mut high) = (f32::INFINITY, f32::NEG_INFINITY);
                 for row in rows.clone() {
                     low = low.min(prepared.lowest[row * width + x]);
@@ -7882,7 +7918,7 @@ mod tests {
                     data: noisy.clone(),
                 };
                 let started = std::time::Instant::now();
-                cpu_noise_reduction(&mut image, luma, chroma);
+                cpu_noise_reduction(&mut image, luma, chroma, 1.0);
                 let milliseconds = started.elapsed().as_secs_f64() * 1000.0;
                 let (luma_sigma, chroma_sigma) = flat_field_noise(&image.data, width, height);
                 eprintln!(
@@ -7945,7 +7981,7 @@ mod tests {
                     data: source.clone(),
                 };
                 let started = std::time::Instant::now();
-                cpu_noise_reduction(&mut image, luma, chroma);
+                cpu_noise_reduction(&mut image, luma, chroma, 1.0);
                 times.push(started.elapsed().as_secs_f64() * 1000.0);
                 assert!(image.data.iter().all(|value| value.is_finite()));
             }
@@ -8807,7 +8843,7 @@ mod tests {
         let noisy = noisy_gradient(384, 128, 0x9E37_79B9_7F4A_7C15);
         let sensor = measure_sensor_noise(&noisy).expect("a frame this size is readable");
         let mut denoised = noisy.clone();
-        cpu_noise_reduction(&mut denoised, 0.45, 0.45);
+        cpu_noise_reduction(&mut denoised, 0.45, 0.45, 1.0);
         let residue = grain_against_gradient(&denoised);
         let mut blind = denoised.clone();
         apply_sharpen(&mut blind, 0.5, 1.5, 2.0, None);
@@ -8973,15 +9009,100 @@ mod tests {
         let zeros = vec![0.0_f32; width * height];
         let noise = BandNoise { power: [0.05 * 0.05; NOISE_BINS] };
         let mut fused = vec![0.4_f32; width * height];
-        shrink_luma_bands(&mut fused, &band, &zeros, &zeros, [noise; 3], 1.0, width, height);
+        shrink_luma_bands(&mut fused, &band, &zeros, &zeros, [noise; 3], 1.0, 1.0, width, height);
         for index in 0..width * height {
-            let expected = 0.4 + band[index] * activity_gain(activity[index], noise.power[noise_bin(0.4)]);
+            let expected =
+                0.4 + band[index] * activity_gain(activity[index], noise.power[noise_bin(0.4)], 1.0);
             assert!(
                 (fused[index] - expected).abs() < 1e-5,
                 "pixel {index}: fused {} against {expected}",
                 fused[index]
             );
         }
+    }
+
+    /// The Detail control only moves the borderline middle: an unambiguous
+    /// edge and an unambiguous flat noise patch read the same at either end
+    /// of the slider, by construction (BIAS cannot move a gain already at its
+    /// 0 or 1 endpoint). Only a local activity genuinely between the two --
+    /// where it is a judgement call whether that is texture or noise -- moves
+    /// when Detail does.
+    #[test]
+    fn detail_bias_only_moves_the_borderline_middle() {
+        let gentle = detail_bias(1.0);
+        let aggressive = detail_bias(0.0);
+        assert!(
+            (gentle - 1.0).abs() < 1e-6,
+            "Detail at its default must reproduce the plain linear gate exactly: {gentle}"
+        );
+        assert!(
+            aggressive > gentle,
+            "a lower Detail setting must raise the bias exponent: {aggressive} vs {gentle}"
+        );
+
+        let noise_power = 0.01_f32;
+        let unambiguous_edge = activity_gain(10_000.0 * noise_power, noise_power, aggressive);
+        assert!(
+            unambiguous_edge > 0.99,
+            "an unambiguous edge was softened by a stricter Detail setting: {unambiguous_edge}"
+        );
+        let unambiguous_noise = activity_gain(noise_power, noise_power * 1.5, aggressive);
+        assert_eq!(unambiguous_noise, 0.0, "unambiguous noise should stay fully gone either way");
+
+        let borderline_mean_square = 2.0 * noise_power;
+        let gentle_gain = activity_gain(borderline_mean_square, noise_power, gentle);
+        let aggressive_gain = activity_gain(borderline_mean_square, noise_power, aggressive);
+        assert!(
+            aggressive_gain < gentle_gain * 0.5,
+            "a borderline activity was not treated more like noise at a stricter Detail setting: \
+             {aggressive_gain} vs {gentle_gain}"
+        );
+    }
+
+    /// End to end: on a scene with real, busy texture at a noisy brightness --
+    /// the exact shape of the real complaint this exists for (a PEN-F shadow
+    /// full of branches, 2026-10-19) -- a stricter Detail setting must leave
+    /// that band smoother (lower local variance) than the default does, on
+    /// the same noise-reduction entry point the graph actually calls. Not a
+    /// PSNR-against-the-clean-scene check: the whole point of asking for less
+    /// Detail is to accept moving further from the original texture in
+    /// exchange for a flatter result, so a fidelity metric would not
+    /// distinguish "removed more noise" from "destroyed more real detail" --
+    /// here either one reads as smoother, which is what was asked for.
+    #[test]
+    fn lower_detail_leaves_a_busy_textured_scene_smoother() {
+        let scene = denoise_test_scene(256, 128);
+        let (width, height) = (256, 128);
+        // Gentle noise on purpose: a swept check across scales from 0.05 to
+        // 1.5 found the gap between Detail settings real and large (30%) only
+        // where the texture and the noise are genuinely close in size --
+        // scale 0.2 and up already saturates both settings to the same
+        // near-total removal, because at that point there is no longer a real
+        // ambiguity between texture and noise for Detail to arbitrate, and
+        // nothing *should* distinguish them there.
+        let noisy = add_sensor_noise(&scene, 0.05);
+        // The fine-texture band, y in [96, 128): see DENOISE_TEST_SCENE.
+        let band_stddev = |data: &[f32]| {
+            let rows = &data[96 * width * 3..128 * width * 3];
+            let mean = rows.iter().step_by(3).sum::<f32>() / (rows.len() / 3) as f32;
+            let variance = rows.iter().step_by(3).map(|v| (v - mean).powi(2)).sum::<f32>()
+                / (rows.len() / 3) as f32;
+            variance.sqrt()
+        };
+
+        let mut gentle = RgbImage { width, height, data: noisy.clone() };
+        cpu_noise_reduction(&mut gentle, 1.0, 0.0, 1.0);
+        let gentle_stddev = band_stddev(&gentle.data);
+
+        let mut aggressive = RgbImage { width, height, data: noisy };
+        cpu_noise_reduction(&mut aggressive, 1.0, 0.0, 0.0);
+        let aggressive_stddev = band_stddev(&aggressive.data);
+
+        assert!(
+            aggressive_stddev < gentle_stddev * 0.85,
+            "a stricter Detail setting did not leave the textured band meaningfully \
+             smoother: aggressive {aggressive_stddev} vs gentle {gentle_stddev}"
+        );
     }
 
     /// A frame with no noise has nothing to lose, whatever the slider says.
@@ -8999,7 +9120,7 @@ mod tests {
                 height,
                 data: clean.clone(),
             };
-            cpu_noise_reduction(&mut image, strength, strength);
+            cpu_noise_reduction(&mut image, strength, strength, 1.0);
             let kept = texture_amplitude(&image.data, width, height)
                 / texture_amplitude(&clean, width, height);
             assert!(kept > 0.98, "slider {strength} kept only {kept} of a clean frame's texture");
@@ -9030,8 +9151,8 @@ mod tests {
         let initial_rms = flat_patch_luma_rms(&original, 0.5);
         let mut moderate = original.clone();
         let mut maximum = original;
-        apply_noise_reduction(&mut moderate, 0.35, 0.35);
-        apply_noise_reduction(&mut maximum, 1.0, 1.0);
+        apply_noise_reduction(&mut moderate, 0.35, 0.35, 1.0);
+        apply_noise_reduction(&mut maximum, 1.0, 1.0, 1.0);
         let moderate_rms = flat_patch_luma_rms(&moderate, 0.5);
         let maximum_rms = flat_patch_luma_rms(&maximum, 0.5);
         assert!(
@@ -9083,7 +9204,7 @@ mod tests {
             }
         }
         let before = flat_patch_chroma_rms(&image);
-        apply_noise_reduction(&mut image, 0.0, 0.6);
+        apply_noise_reduction(&mut image, 0.0, 0.6, 1.0);
         let after = flat_patch_chroma_rms(&image);
         assert!(
             after < before * 0.35,
@@ -9112,7 +9233,7 @@ mod tests {
             }
         }
         let before = image.clone();
-        apply_noise_reduction(&mut image, 0.5, 1.0);
+        apply_noise_reduction(&mut image, 0.5, 1.0, 1.0);
         let dark_edge = image.data[(2 * image.width + 2) * 3];
         let bright_edge = image.data[(2 * image.width + 3) * 3];
         assert!(bright_edge - dark_edge > 0.5, "edge was smeared");

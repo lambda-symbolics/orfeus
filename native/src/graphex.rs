@@ -270,7 +270,7 @@ fn param_arity(kind: u32) -> Result<ParamArity, Error> {
     Ok(match kind {
         NODE_WHITE_BALANCE => ParamArity::Exact(2), // kelvin (0 = as shot), tint
         NODE_EXPOSURE => ParamArity::Exact(1),      // ev
-        NODE_NOISE_REDUCTION => ParamArity::Exact(2), // edge-aware, neural
+        NODE_NOISE_REDUCTION => ParamArity::Exact(3), // edge-aware, neural, detail
         NODE_TONE => ParamArity::Exact(7),          // blacks..whites
         NODE_OPTICS => ParamArity::Exact(4),        // distortion?, strength, fringing source, manual
         NODE_FILM => ParamArity::Exact(3),          // lut strength, grain amount, size
@@ -1870,6 +1870,7 @@ fn execute_graph_into(
                     context.full_pixels,
                 );
                 let neural = op.params[1];
+                let detail = op.params[2];
                 // A sharpener is the measurement's only consumer (the match
                 // above already drops it at anything that reshapes tone), so
                 // there is nothing to read it for an edit that lacks one.
@@ -1899,7 +1900,7 @@ fn execute_graph_into(
                 // input is already smaller, so turning both up does not
                 // double-apply a full correction twice.
                 if edge > 0.0 {
-                    render::apply_noise_reduction(&mut image, edge, edge);
+                    render::apply_noise_reduction(&mut image, edge, edge, detail);
                 }
                 if neural > 0.0 {
                     super::nn::apply_neural_noise_reduction(
@@ -2895,7 +2896,7 @@ mod tests {
         let denoised = parse_graph(
             &GraphBuilder::new()
                 .node(NODE_EXPOSURE, 0, -1, &[0.4], None)
-                .node(NODE_NOISE_REDUCTION, 1, -1, &[0.6, 0.0], None)
+                .node(NODE_NOISE_REDUCTION, 1, -1, &[0.6, 0.0, 1.0], None)
                 .node(NODE_TONE, 2, -1, &[0.2, 0.1, 0.0, -0.1, 0.0, 0.1, 0.0], None)
                 .node(NODE_FILM, 3, -1, &[0.0, 0.4, 2.0], None)
                 .build(),
@@ -3026,7 +3027,7 @@ mod tests {
                 let params: &[f32] = match *kind {
                     NODE_TONE => &[0.0; 7],
                     NODE_FILM => &[0.0, 0.0, 1.0],
-                    NODE_NOISE_REDUCTION => &[0.5, 0.0],
+                    NODE_NOISE_REDUCTION => &[0.5, 0.0, 1.0],
                     NODE_CROP => &[0.1, 0.1, 0.8, 0.8, 0.0],
                     NODE_OPTICS => &[1.0, 1.0, 0.0, 0.0],
                     _ => &[0.0],
@@ -3103,7 +3104,7 @@ mod tests {
             &GraphBuilder::new()
                 .node(NODE_WHITE_BALANCE, 0, -1, &[6500.0, 3.0], None)
                 .node(NODE_EXPOSURE, 1, -1, &[0.5], None)
-                .node(NODE_NOISE_REDUCTION, 2, -1, &[0.0, 0.0], None)
+                .node(NODE_NOISE_REDUCTION, 2, -1, &[0.0, 0.0, 1.0], None)
                 .node(
                     NODE_TONE,
                     3,
@@ -3123,7 +3124,7 @@ mod tests {
         render::apply_white_adaptation(&mut reference, 6500.0, 3.0, None);
         render::apply_exposure(&mut reference, 0.5);
         reference = render::orient(reference, 6);
-        render::apply_noise_reduction(&mut reference, 0.0, 0.0);
+        render::apply_noise_reduction(&mut reference, 0.0, 0.0, 1.0);
         super::super::nn::apply_neural_noise_reduction(
             &mut reference.data,
             reference.width,
@@ -3149,14 +3150,14 @@ mod tests {
         // true, by design. Both must now run, edge-aware first.
         let ops = parse_graph(
             &GraphBuilder::new()
-                .node(NODE_NOISE_REDUCTION, 0, -1, &[1.0, 0.35], None)
+                .node(NODE_NOISE_REDUCTION, 0, -1, &[1.0, 0.35, 1.0], None)
                 .build(),
         )
         .unwrap();
         let via_graph = execute_graph(&ops, gradient_image(), &context(5)).unwrap();
 
         let mut reference = gradient_image();
-        render::apply_noise_reduction(&mut reference, 1.0, 1.0);
+        render::apply_noise_reduction(&mut reference, 1.0, 1.0, 1.0);
         super::super::nn::apply_neural_noise_reduction(
             &mut reference.data,
             reference.width,
@@ -3348,7 +3349,7 @@ mod tests {
             let params: &[f32] = match kind {
                 NODE_WHITE_BALANCE => &[0.0, 0.0],
                 NODE_EXPOSURE => &[0.5],
-                NODE_NOISE_REDUCTION => &[0.5, 0.0],
+                NODE_NOISE_REDUCTION => &[0.5, 0.0, 1.0],
                 NODE_NEGATIVE => &[0.5, 0.3, 0.2, 2.2, 1.0],
                 NODE_HDR => &[0.0, 0.5, 0.49, 1.0],
                 NODE_DUST => &[12.0, 0.5, 0.0],
@@ -3913,7 +3914,7 @@ mod tests {
                 &GraphBuilder::new()
                     .node(NODE_CROP, 0, -1, &[0.05, 0.05, 0.9, 0.9, 0.0], None)
                     .node(NODE_EXPOSURE, 1, -1, &[0.4], None)
-                    .node(NODE_NOISE_REDUCTION, 2, -1, &[0.6, 0.0], None)
+                    .node(NODE_NOISE_REDUCTION, 2, -1, &[0.6, 0.0, 1.0], None)
                     .node(NODE_TONE, 3, -1, &[shadows, 0.1, 0.0, -0.1, 0.0, 0.1, 0.0], None)
                     .build(),
             )
@@ -3970,7 +3971,7 @@ mod tests {
 
     #[test]
     fn graph_reaches_a_sharpener_only_through_carrying_nodes() {
-        let denoise_params = [0.6_f32, 0.0];
+        let denoise_params = [0.6_f32, 0.0, 1.0];
         let sharpen_params = [0.5_f32, 1.5, 2.0];
         let identity_curve = curves_params(&IDENTITY_CURVE, &IDENTITY_CURVE, &IDENTITY_CURVE);
 
@@ -4037,7 +4038,7 @@ mod tests {
         let ops = parse_graph(
             &GraphBuilder::new()
                 .node(NODE_CROP, 0, -1, &[0.1, 0.1, 0.8, 0.8, 0.0], None)
-                .node(NODE_NOISE_REDUCTION, 1, -1, &[0.6, 0.0], None)
+                .node(NODE_NOISE_REDUCTION, 1, -1, &[0.6, 0.0, 1.0], None)
                 .node(NODE_TONE, 2, -1, &[0.1, 0.1, 0.0, -0.1, 0.0, 0.1, 0.0], None)
                 .build(),
         )
@@ -4194,7 +4195,7 @@ mod tests {
             parse_graph(
                 &GraphBuilder::new()
                     .node(NODE_CROP, 0, -1, &[0.05, 0.05, crop_width, 0.9, 0.0], None)
-                    .node(NODE_NOISE_REDUCTION, 1, -1, &[denoise, 0.0], None)
+                    .node(NODE_NOISE_REDUCTION, 1, -1, &[denoise, 0.0, 1.0], None)
                     .node(NODE_SHARPEN, 2, -1, &[0.5, 1.5, 2.0], None)
                     .build(),
             )
@@ -4259,7 +4260,7 @@ mod tests {
                 &GraphBuilder::new()
                     .node(NODE_CROP, 0, -1, &[0.05, 0.05, crop_width, 0.9, 0.0], None)
                     .node(NODE_EXPOSURE, 1, -1, &[0.4], None)
-                    .node(NODE_NOISE_REDUCTION, 2, -1, &[0.6, 0.0], None)
+                    .node(NODE_NOISE_REDUCTION, 2, -1, &[0.6, 0.0, 1.0], None)
                     .node(NODE_TONE, 3, -1, &[shadows, 0.1, 0.0, -0.1, 0.0, 0.1, 0.0], None)
                     .build(),
             )
@@ -4301,7 +4302,7 @@ mod tests {
                 &GraphBuilder::new()
                     .node(NODE_CROP, 0, -1, &[0.05, 0.05, 0.9, 0.9, 0.0], None)
                     .node(NODE_EXPOSURE, 1, -1, &[exposure], None)
-                    .node(NODE_NOISE_REDUCTION, 2, -1, &[0.6, 0.0], None)
+                    .node(NODE_NOISE_REDUCTION, 2, -1, &[0.6, 0.0, 1.0], None)
                     .node(NODE_TONE, 3, -1, &[0.1, 0.1, 0.0, -0.1, 0.0, 0.1, 0.0], None)
                     .build(),
             )
@@ -4346,7 +4347,7 @@ mod tests {
                 &GraphBuilder::new()
                     .node(NODE_CROP, 0, -1, &[0.05, 0.05, 0.9, 0.9, 0.0], None)
                     .node(NODE_EXPOSURE, 1, -1, &[exposure], None)
-                    .node(NODE_NOISE_REDUCTION, 2, -1, &[0.6, 0.0], None)
+                    .node(NODE_NOISE_REDUCTION, 2, -1, &[0.6, 0.0, 1.0], None)
                     .node(NODE_TONE, 3, -1, &[shadows, 0.1, 0.0, -0.1, 0.0, 0.1, 0.0], None)
                     .build(),
             )

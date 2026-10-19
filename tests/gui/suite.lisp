@@ -1658,11 +1658,22 @@ would silently ignore whatever the Destination field said."
                                           settings))))
                    text)
            "Preview status does not name the denoiser that ran")
-    ;; The two denoisers are exclusive, so the status names one of them.
+    ;; The two denoisers stack rather than one disabling the other, so the
+    ;; status names both when both are actually active (the default
+    ;; edge-aware amount, 0.45, is still in effect here alongside neural).
     (let* ((neural (orfeus:make-processing-settings
                     :neural-noise-reduction 0.5))
            (project (orfeus:make-project :output-directory #P"exports/"
                                          :defaults neural))
+           (text (orfeus/gui::preview-status-text
+                  (orfeus/gui:make-gui-model :project project))))
+      (check (search "NR: edge-aware 45% + neural 50%" text)
+             "Preview status does not report both active denoisers"))
+    ;; With edge-aware explicitly off, only neural shows.
+    (let* ((neural-only (orfeus:make-processing-settings
+                         :noise-reduction 0.0 :neural-noise-reduction 0.5))
+           (project (orfeus:make-project :output-directory #P"exports/"
+                                         :defaults neural-only))
            (text (orfeus/gui::preview-status-text
                   (orfeus/gui:make-gui-model :project project))))
       (check (search "NR: neural 50%" text)

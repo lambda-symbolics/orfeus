@@ -9,7 +9,7 @@
       :measured :lens-distortion 0.0 :lens-profile nil :lens-focal-length nil
       :demosaic :rcd))
     (:id 2 :kind :noise-reduction :inputs (1) :params
-     (:noise-reduction 0.45 :neural-noise-reduction 0.0))
+     (:noise-reduction 0.45 :neural-noise-reduction 0.0 :detail 1.0))
     (:id 3 :kind :sharpen :inputs (2) :params
      (:sharpen-amount 0.5 :sharpen-radius 1.5 :sharpen-threshold 2.0))
     (:id 4 :kind :clarity :inputs (3) :params (:amount 0.3 :radius 150.0))

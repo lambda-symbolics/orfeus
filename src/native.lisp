@@ -431,7 +431,8 @@ reaches it and there is nothing to keep alive across threads.")
        (values (list (parameter :exposure)) nil))
       (:noise-reduction
        (values (list (parameter :noise-reduction)
-                     (parameter :neural-noise-reduction))
+                     (parameter :neural-noise-reduction)
+                     (parameter :detail))
                nil))
       (:tone
        (values (list (parameter :tone-blacks) (parameter :tone-shadows)

@@ -10,7 +10,7 @@
 
 (defparameter *processing-setting-keys*
   '(:exposure :white-balance-temperature :white-balance-tint
-    :noise-reduction :neural-noise-reduction
+    :noise-reduction :neural-noise-reduction :detail
     :sharpen-amount :sharpen-radius :sharpen-threshold
     :tone-blacks :tone-shadows :tone-dark-mids
     :tone-midtones :tone-light-mids :tone-highlights :tone-whites
@@ -37,6 +37,19 @@ the optics node, the front of the pipeline; the source itself has no panel.")
   ;; parts of the frame keep all but a quarter of a percent of their detail.
   (noise-reduction 0.45)
   (neural-noise-reduction 0.0)
+  ;; How willing the edge-aware denoiser's own gate is to call a borderline
+  ;; local activity texture rather than noise, 0..1, gentlest (today's
+  ;; original behaviour) at the default 1.0. Separate from NOISE-REDUCTION's
+  ;; own amount: raising that scales the same gate's threshold, which a lower
+  ;; Detail could already mimic by raising Amount instead, so Detail needs its
+  ;; own axis -- steepening how sharply the gate responds to a given
+  ;; threshold -- to do anything Amount could not already do alone. A real
+  ;; PEN-F photograph (2026-10-19, high ISO, shot through tinted glass) needed
+  ;; this: its sky cleaned to about half its noise at the default on either
+  ;; axis, while a busy, textured shadow barely moved, because that gate is
+  ;; deliberately reluctant to call real texture noise and a shadow full of
+  ;; branches reads as mostly texture.
+  (detail 1.0)
   ;; Sharpening by default, by as much as the camera does. Calibrated against
   ;; the OM-1's own JPEG (Sharpness at Soft, which is how these frames were
   ;; shot): the spectral gain the camera adds over an unsharpened render, read
@@ -81,7 +94,7 @@ the optics node, the front of the pipeline; the source itself has no panel.")
 (defparameter *grade-stages*
   '((:white-balance (:white-balance-temperature :white-balance-tint))
     (:exposure (:exposure))
-    (:noise-reduction (:noise-reduction :neural-noise-reduction))
+    (:noise-reduction (:noise-reduction :neural-noise-reduction :detail))
     (:sharpen (:sharpen-amount :sharpen-radius :sharpen-threshold))
     (:tone (:tone-blacks :tone-shadows :tone-dark-mids :tone-midtones
             :tone-light-mids :tone-highlights :tone-whites))
@@ -96,7 +109,7 @@ them as a copyable node chain.")
 (defparameter *stage-identity-plist*
   '(:white-balance-temperature nil :white-balance-tint 0.0
     :exposure 0.0
-    :noise-reduction 0.0 :neural-noise-reduction 0.0
+    :noise-reduction 0.0 :neural-noise-reduction 0.0 :detail 1.0
     :sharpen-amount 0.0 :sharpen-radius 1.5 :sharpen-threshold 2.0
     :tone-blacks 0.0 :tone-shadows 0.0 :tone-dark-mids 0.0 :tone-midtones 0.0
     :tone-light-mids 0.0 :tone-highlights 0.0 :tone-whites 0.0

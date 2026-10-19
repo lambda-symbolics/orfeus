@@ -122,7 +122,7 @@ frontend keep undo snapshots."
     ((:exposure :white-balance-tint :noise-reduction :lut-strength
       :grain-amount :grain-size)
      (realp value))
-    (:neural-noise-reduction
+    ((:neural-noise-reduction :detail)
      (and (realp value) (<= 0 value 1)))
     (:sharpen-amount
      (and (realp value) (<= 0 value 3)))
@@ -171,6 +171,7 @@ frontend keep undo snapshots."
         :noise-reduction (processing-settings-noise-reduction settings)
         :neural-noise-reduction
         (processing-settings-neural-noise-reduction settings)
+        :detail (processing-settings-detail settings)
         :sharpen-amount (processing-settings-sharpen-amount settings)
         :sharpen-radius (processing-settings-sharpen-radius settings)
         :sharpen-threshold (processing-settings-sharpen-threshold settings)
@@ -358,6 +359,8 @@ frontend keep undo snapshots."
                 (setf (processing-settings-noise-reduction result) value))
                (:neural-noise-reduction
                 (setf (processing-settings-neural-noise-reduction result) value))
+               (:detail
+                (setf (processing-settings-detail result) value))
                (:sharpen-amount
                 (setf (processing-settings-sharpen-amount result) value))
                (:sharpen-radius

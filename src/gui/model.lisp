@@ -529,6 +529,7 @@ override semantics."
     (:white-balance-tint #'orfeus:processing-settings-white-balance-tint)
     (:noise-reduction #'orfeus:processing-settings-noise-reduction)
     (:neural-noise-reduction #'orfeus:processing-settings-neural-noise-reduction)
+    (:detail #'orfeus:processing-settings-detail)
     (:sharpen-amount #'orfeus:processing-settings-sharpen-amount)
     (:sharpen-radius #'orfeus:processing-settings-sharpen-radius)
     (:sharpen-threshold #'orfeus:processing-settings-sharpen-threshold)
@@ -585,6 +586,7 @@ downstream node of that stage, otherwise the stage's identity value."
     (:noise-reduction (setf (orfeus:processing-settings-noise-reduction settings) value))
     (:neural-noise-reduction
      (setf (orfeus:processing-settings-neural-noise-reduction settings) value))
+    (:detail (setf (orfeus:processing-settings-detail settings) value))
     (:sharpen-amount (setf (orfeus:processing-settings-sharpen-amount settings) value))
     (:sharpen-radius (setf (orfeus:processing-settings-sharpen-radius settings) value))
     (:sharpen-threshold
