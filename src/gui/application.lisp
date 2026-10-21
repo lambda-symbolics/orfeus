@@ -5797,6 +5797,7 @@ behind is memory. Best effort; returns how many directories went."
              (setf (gui-model-selected-node model) nil)
              (sync-window-title)
              (refresh-gallery)
+             (redraw-thumbnails)
              (sync-node-tools)
              (when graph-canvas (lightfast:redraw graph-canvas))
              (sync-controls)
