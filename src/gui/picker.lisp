@@ -157,6 +157,11 @@ pulled or a folder that is not ours to read is an answer, not a crash."
 its file's own modification time -- a bulk extraction or a card copy writes
 the file this week with a photograph taken long before, so the real date is
 preferred the moment it is known and the caption does not wait for it."
+  ;; PHOTO-PICKER is defined later in this file (it embeds a PICKER-GRID,
+  ;; defined later still, as a default slot value); this call is compiled
+  ;; before SBCL has seen that DEFSTRUCT, hence the explicit NOTINLINE rather
+  ;; than reordering a chain of structs each other's slot defaults depend on.
+  (declare (notinline photo-picker-capture-times))
   (let ((known (gethash (picker-entry-pathname entry) (photo-picker-capture-times picker))))
     (if (and known (not (eq known :none)))
         known

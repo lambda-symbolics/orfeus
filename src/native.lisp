@@ -407,6 +407,7 @@ the sharpen node's own parameters; 9 the negative node.")
 Bound around the native call rather than passed as a context pointer: the
 bridge invokes the callback on the thread that called in, so a dynamic binding
 reaches it and there is nothing to keep alive across threads.")
+(declaim (type (or null function) *render-progress-hook*))
 
 (cffi:defcallback render-progress-trampoline :void
     ((context :pointer) (name :string) (fraction :float))
@@ -414,8 +415,9 @@ reaches it and there is nothing to keep alive across threads.")
   ;; Nothing may escape from here. An unwinding condition would tear through
   ;; Rust's stack, and a status line is not worth that.
   (ignore-errors
-    (when *render-progress-hook*
-      (funcall *render-progress-hook* name fraction))))
+    (let ((hook *render-progress-hook*))
+      (when hook
+        (funcall (the function hook) name fraction)))))
 
 (defun graph-node-program-parameters (node)
   "Return NODE's packed parameter list and its optional string payload."
