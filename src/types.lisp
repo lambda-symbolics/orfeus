@@ -17,7 +17,8 @@
     :lens-correction-p :lens-correction-strength
     :chromatic-aberration-correction-p :chromatic-aberration-source
     :lens-distortion :lens-profile :lens-focal-length :demosaic
-    :lut-path :lut-strength :grain-amount :grain-size)
+    :lut-path :lut-strength :grain-amount :grain-size
+    :grain-highlight-retention)
   "Keys accepted in processing setting S-expressions.")
 
 (defparameter *demosaic-methods* '(:rcd :ppg)
@@ -89,7 +90,16 @@ the optics node, the front of the pipeline; the source itself has no panel.")
   (lut-path nil)
   (lut-strength 1.0)
   (grain-amount 0.0)
-  (grain-size 1.0))
+  (grain-size 1.0)
+  ;; How much grain's amplitude-vs-luminance shape keeps the shipped default
+  ;; (1.0, whites stay grainy, sized from a cinematographer's account of
+  ;; Reala 500D's own negative) versus the measured hump real colour-negative
+  ;; granularity curves show instead (0.0, peaking in the lower-midtones and
+  ;; falling toward both black and white) -- see GRAIN-SHAPE in
+  ;; native/src/render.rs. An experimentation knob, not a verdict: which end
+  ;; (or what in between) actually matches a given stock is for real film
+  ;; scans to settle.
+  (grain-highlight-retention 1.0))
 
 (defparameter *grade-stages*
   '((:white-balance (:white-balance-temperature :white-balance-tint))
@@ -101,7 +111,8 @@ the optics node, the front of the pipeline; the source itself has no panel.")
     (:optics (:lens-correction-p :lens-correction-strength
               :chromatic-aberration-correction-p :chromatic-aberration-source
               :lens-distortion :lens-profile :lens-focal-length :demosaic))
-    (:film (:lut-path :lut-strength :grain-amount :grain-size)))
+    (:film (:lut-path :lut-strength :grain-amount :grain-size
+            :grain-highlight-retention)))
   "The fixed processing pipeline as named stages over setting keys.
 Together the stages partition *PROCESSING-SETTING-KEYS*; frontends present
 them as a copyable node chain.")
@@ -117,7 +128,8 @@ them as a copyable node chain.")
     :chromatic-aberration-correction-p nil :chromatic-aberration-source :measured
     :lens-distortion 0.0 :lens-profile nil :lens-focal-length nil
     :demosaic :rcd
-    :lut-path nil :lut-strength 0.0 :grain-amount 0.0 :grain-size 1.0)
+    :lut-path nil :lut-strength 0.0 :grain-amount 0.0 :grain-size 1.0
+    :grain-highlight-retention 1.0)
   "Setting values under which every stage passes pixels through unchanged.")
 
 (defun grade-stage-keys (stage)

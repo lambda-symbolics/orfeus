@@ -18,5 +18,5 @@
      (:amount -0.1 :midpoint 0.0 :feather 1.0 :roundness 0.07))
     (:id 7 :kind :film :inputs (6) :params
      (:lut-path "luts/Agfalike D.cube" :lut-strength 1.0 :grain-amount 0.12
-      :grain-size 1.32)))
+      :grain-size 1.32 :grain-highlight-retention 1.0)))
    :output 7)))

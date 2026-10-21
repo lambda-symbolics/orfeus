@@ -122,7 +122,7 @@ frontend keep undo snapshots."
     ((:exposure :white-balance-tint :noise-reduction :lut-strength
       :grain-amount :grain-size)
      (realp value))
-    ((:neural-noise-reduction :detail)
+    ((:neural-noise-reduction :detail :grain-highlight-retention)
      (and (realp value) (<= 0 value 1)))
     (:sharpen-amount
      (and (realp value) (<= 0 value 3)))
@@ -196,7 +196,9 @@ frontend keep undo snapshots."
         :lut-path (processing-settings-lut-path settings)
         :lut-strength (processing-settings-lut-strength settings)
         :grain-amount (processing-settings-grain-amount settings)
-        :grain-size (processing-settings-grain-size settings)))
+        :grain-size (processing-settings-grain-size settings)
+        :grain-highlight-retention
+        (processing-settings-grain-highlight-retention settings)))
 
 (defun sexp->processing-settings (sexp)
   (processing-plist-validate sexp)
@@ -408,7 +410,10 @@ frontend keep undo snapshots."
                (:grain-amount
                 (setf (processing-settings-grain-amount result) value))
                (:grain-size
-                (setf (processing-settings-grain-size result) value))))
+                (setf (processing-settings-grain-size result) value))
+               (:grain-highlight-retention
+                (setf (processing-settings-grain-highlight-retention result)
+                      value))))
     result))
 
 (defun settings-apply-stage-bypass (settings disabled-stages)
@@ -434,8 +439,9 @@ frontend keep undo snapshots."
   "True when KEY cannot affect rendering given the other values in PLIST."
   (case key
     (:lut-strength (null (getf plist :lut-path)))
-    (:grain-size (let ((amount (getf plist :grain-amount)))
-                   (or (null amount) (not (plusp amount)))))
+    ((:grain-size :grain-highlight-retention)
+     (let ((amount (getf plist :grain-amount)))
+       (or (null amount) (not (plusp amount)))))
     (:lens-correction-strength (not (getf plist :lens-correction-p)))
     ((:sharpen-radius :sharpen-threshold)
      (let ((amount (getf plist :sharpen-amount)))

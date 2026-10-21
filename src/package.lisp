@@ -242,6 +242,7 @@
    #:processing-settings-exposure
    #:processing-settings-grain-amount
    #:processing-settings-grain-size
+   #:processing-settings-grain-highlight-retention
    #:processing-settings-lens-correction-p
    #:processing-settings-lens-correction-strength
    #:processing-settings-lut-path

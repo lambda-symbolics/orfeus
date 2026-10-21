@@ -8768,7 +8768,13 @@ behind is memory. Best effort; returns how many directories went."
            (make-number-field :grain-amount "Grain amount" 0 1 0.05 108
                               node-page)
            (make-number-field :grain-size "Grain size" 0.25 16 0.25 140
-                              node-page)))
+                              node-page)
+           (let ((field (make-number-field :grain-highlight-retention
+                                            "Grain in whites" 0 1 0.05 172
+                                            node-page)))
+             (lightfast:set-tooltip
+              field
+              "1 keeps grain visible in whites, like the shipped default; 0 fades grain toward white the way a negative's own measured granularity does"))))
         (build-group
          :blend
          (lambda ()

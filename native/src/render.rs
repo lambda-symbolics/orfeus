@@ -6154,6 +6154,50 @@ const GRAIN_CHROMA_FRACTION: f32 = 0.3;
 /// field's so the two are independent fields, not the same noise reread.
 const GRAIN_CHROMA_SALT: u64 = 0x9E37_79B9_7F4A_7C15;
 
+/// Where, on a 0 (black) .. 1 (white) luminance axis, measured colour-negative
+/// granularity curves peak -- read off Kodak VISION3 50D and 500T datasheets
+/// (two independent stocks, same shape), not fit to Reala 500D itself. See
+/// orfeus-kodak-sensitometry-research in project memory.
+const GRAIN_HUMP_PEAK_POSITION: f32 = 0.25;
+/// Granularity at black relative to the peak, same source.
+const GRAIN_HUMP_SHADOW_FLOOR: f32 = 0.5;
+/// Granularity at white relative to the peak, same source -- the measured
+/// curves fall harder toward white than toward black.
+const GRAIN_HUMP_HIGHLIGHT_FLOOR: f32 = 0.25;
+
+/// Grain's amplitude shape against a pixel's own displayed luminance, as
+/// measured colour-negative granularity curves actually read: rising from a
+/// floor near black, peaking in the lower-midtones, and falling away toward
+/// white, more steeply than toward black. `grain_fade` (Perlin's quintic
+/// smootherstep) gives each half of the hump a zero derivative at its own
+/// end, so the two halves meet at the peak with no crease.
+fn grain_shape_measured_hump(luminance: f32) -> f32 {
+    if luminance <= GRAIN_HUMP_PEAK_POSITION {
+        let t = (luminance / GRAIN_HUMP_PEAK_POSITION).clamp(0.0, 1.0);
+        GRAIN_HUMP_SHADOW_FLOOR + (1.0 - GRAIN_HUMP_SHADOW_FLOOR) * grain_fade(t)
+    } else {
+        let t = ((luminance - GRAIN_HUMP_PEAK_POSITION) / (1.0 - GRAIN_HUMP_PEAK_POSITION))
+            .clamp(0.0, 1.0);
+        1.0 + (GRAIN_HUMP_HIGHLIGHT_FLOOR - 1.0) * grain_fade(t)
+    }
+}
+
+/// Grain's amplitude shape against luminance, blended between two sources by
+/// RETENTION (0..1): at 1 (the long-shipped default) whites keep most of
+/// their grain, sized from Ellen Kuras's account of Reala 500D's own whites
+/// staying "conspicuously grainy... even with a well-exposed negative"; at 0,
+/// the measured negative-curve hump of `grain_shape_measured_hump`. These
+/// describe two different things -- a negative's own density-granularity
+/// curve is not necessarily what survives printing or projection -- so
+/// neither end is simply "more correct"; which one (or what in between)
+/// matches a given stock's actual look is for the real Reala scans to
+/// settle, not this blend's default of 1.
+fn grain_shape(luminance: f32, retention: f32) -> f32 {
+    let retained = 0.6 + 0.4 * (1.0 - luminance);
+    let measured = grain_shape_measured_hump(luminance);
+    measured + (retained - measured) * retention
+}
+
 /// Lays film grain down, seeded from where each pixel sits in the whole frame.
 ///
 /// Real grain is an irregular, continuously varying texture, not a mosaic: a
@@ -6183,6 +6227,7 @@ pub(crate) fn apply_grain(
     size: f32,
     seed: u64,
     origin: (usize, usize),
+    highlight_retention: f32,
 ) {
     if amount == 0.0 {
         return;
@@ -6208,16 +6253,7 @@ pub(crate) fn apply_grain(
                 let gx0 = gx0f as i64;
                 let noise = luma_field.value_at(gx0, gy0, gy1, tx, ty) * amount * 0.16;
                 let luminance = 0.2126 * pixel[0] + 0.7152 * pixel[1] + 0.0722 * pixel[2];
-                // Shadows read grainiest, the one point every account of real
-                // film agrees on, but highlights keep most of their share too:
-                // cinematographers who shot Reala 500D while it was current
-                // described whites as "conspicuously grainy... even with a
-                // well-exposed negative" (Ellen Kuras, Eternal Sunshine, 2004)
-                // -- film grain does not fade toward white the way a digital
-                // sensor's photon noise does. An earlier, much steeper falloff
-                // here (highlights at a third of a shadow's amplitude) modelled
-                // the wrong kind of noise.
-                let shape = 0.6 + 0.4 * (1.0 - luminance);
+                let shape = grain_shape(luminance, highlight_retention);
                 let shaped = noise * shape;
                 let tilt = chroma_field.value_at(gx0, gy0, gy1, tx, ty)
                     * amount
@@ -10824,7 +10860,7 @@ mod tests {
         // variation, not an identical value repeated ten times.
         let (width, height) = (40, 4);
         let mut image = RgbImage { width, height, data: vec![0.5; width * height * 3] };
-        apply_grain(&mut image, 1.0, 10.0, 0xC0FF_EE12_3456_789A, (0, 0));
+        apply_grain(&mut image, 1.0, 10.0, 0xC0FF_EE12_3456_789A, (0, 0), 1.0);
         let row = 1;
         let values: Vec<f32> = (0..10).map(|x| image.data[(row * width + x) * 3]).collect();
         let min = values.iter().cloned().fold(f32::INFINITY, f32::min);
@@ -10844,7 +10880,7 @@ mod tests {
         // the chroma field's own amplitude riding alongside the luminance one.
         let (width, height) = (40, 4);
         let mut image = RgbImage { width, height, data: vec![0.5; width * height * 3] };
-        apply_grain(&mut image, 1.0, 10.0, 0xC0FF_EE12_3456_789A, (0, 0));
+        apply_grain(&mut image, 1.0, 10.0, 0xC0FF_EE12_3456_789A, (0, 0), 1.0);
         let row = 1;
         for x in 1..width - 1 {
             let before = image.data[(row * width + x - 1) * 3];
@@ -10860,8 +10896,8 @@ mod tests {
     fn grain_is_deterministic_for_the_same_seed() {
         let mut a = RgbImage { width: 16, height: 16, data: vec![0.5; 16 * 16 * 3] };
         let mut b = a.clone();
-        apply_grain(&mut a, 0.6, 3.0, 42, (0, 0));
-        apply_grain(&mut b, 0.6, 3.0, 42, (0, 0));
+        apply_grain(&mut a, 0.6, 3.0, 42, (0, 0), 1.0);
+        apply_grain(&mut b, 0.6, 3.0, 42, (0, 0), 1.0);
         assert_eq!(a.data, b.data);
     }
 
@@ -10869,7 +10905,7 @@ mod tests {
     fn grain_amount_zero_is_a_no_op() {
         let mut image = RgbImage { width: 8, height: 8, data: vec![0.4; 8 * 8 * 3] };
         let before = image.data.clone();
-        apply_grain(&mut image, 0.0, 4.0, 1, (0, 0));
+        apply_grain(&mut image, 0.0, 4.0, 1, (0, 0), 1.0);
         assert_eq!(image.data, before);
     }
 
@@ -10882,7 +10918,7 @@ mod tests {
         // spot, not just uniformly brighter or darker across all three.
         let (width, height) = (24, 24);
         let mut image = RgbImage { width, height, data: vec![0.5; width * height * 3] };
-        apply_grain(&mut image, 1.0, 4.0, 0x1234_5678_9ABC_DEF0, (0, 0));
+        apply_grain(&mut image, 1.0, 4.0, 0x1234_5678_9ABC_DEF0, (0, 0), 1.0);
         let mut saw_divergence = false;
         for pixel in 0..width * height {
             let i = pixel * 3;
@@ -10904,6 +10940,69 @@ mod tests {
             }
         }
         assert!(saw_divergence, "red and blue never diverged from green -- grain is still monochrome");
+    }
+
+    #[test]
+    fn grain_hump_shape_peaks_in_the_lower_midtones_and_falls_at_both_ends() {
+        let black = grain_shape_measured_hump(0.0);
+        let peak = grain_shape_measured_hump(GRAIN_HUMP_PEAK_POSITION);
+        let white = grain_shape_measured_hump(1.0);
+        assert!(peak > black, "hump {peak} did not rise above black {black}");
+        assert!(peak > white, "hump {peak} did not rise above white {white}");
+        assert!(
+            white < black,
+            "measured curves fall harder toward white than black: white {white} was not below black {black}"
+        );
+    }
+
+    #[test]
+    fn grain_highlight_retention_at_one_reproduces_the_original_shape() {
+        for luminance in [0.0_f32, 0.1, 0.25, 0.5, 0.75, 1.0] {
+            let blended = grain_shape(luminance, 1.0);
+            let original = 0.6 + 0.4 * (1.0 - luminance);
+            assert!(
+                (blended - original).abs() < 1.0e-6,
+                "retention 1.0 at luminance {luminance} gave {blended}, expected the original {original}"
+            );
+        }
+    }
+
+    #[test]
+    fn grain_highlight_retention_at_zero_uses_the_measured_hump() {
+        for luminance in [0.0_f32, 0.1, 0.25, 0.5, 0.75, 1.0] {
+            let blended = grain_shape(luminance, 0.0);
+            let measured = grain_shape_measured_hump(luminance);
+            assert!(
+                (blended - measured).abs() < 1.0e-6,
+                "retention 0.0 at luminance {luminance} gave {blended}, expected the measured hump {measured}"
+            );
+        }
+    }
+
+    #[test]
+    fn grain_retention_changes_how_much_grain_survives_in_a_bright_image() {
+        // A flat near-white field: the shipped default (retention 1.0) should
+        // leave noticeably more grain here than the measured-hump alternative
+        // (retention 0.0) -- exactly the comparison this knob exists to let
+        // someone make instead of guessing from a chart.
+        let (width, height) = (64, 64);
+        let bright = || RgbImage { width, height, data: vec![0.95; width * height * 3] };
+        let stddev = |image: &RgbImage| -> f32 {
+            let n = image.data.len() as f32;
+            let mean = image.data.iter().sum::<f32>() / n;
+            (image.data.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / n).sqrt()
+        };
+
+        let mut retained = bright();
+        apply_grain(&mut retained, 1.0, 4.0, 99, (0, 0), 1.0);
+        let mut measured = bright();
+        apply_grain(&mut measured, 1.0, 4.0, 99, (0, 0), 0.0);
+
+        let (retained_stddev, measured_stddev) = (stddev(&retained), stddev(&measured));
+        assert!(
+            retained_stddev > measured_stddev * 1.3,
+            "retention 1.0 stddev {retained_stddev} was not clearly above retention 0.0's {measured_stddev}"
+        );
     }
 
     #[test]

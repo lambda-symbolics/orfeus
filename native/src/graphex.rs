@@ -273,7 +273,7 @@ fn param_arity(kind: u32) -> Result<ParamArity, Error> {
         NODE_NOISE_REDUCTION => ParamArity::Exact(3), // edge-aware, neural, detail
         NODE_TONE => ParamArity::Exact(7),          // blacks..whites
         NODE_OPTICS => ParamArity::Exact(4),        // distortion?, strength, fringing source, manual
-        NODE_FILM => ParamArity::Exact(3),          // lut strength, grain amount, size
+        NODE_FILM => ParamArity::Exact(4), // lut strength, grain amount, size, highlight retention
         NODE_BLEND => ParamArity::Exact(1),         // opacity toward input B
         NODE_COLOR_SUBTRACT => ParamArity::Exact(3), // picked colour, per channel
         NODE_CROP => ParamArity::Exact(5),          // left, top, width, height, angle
@@ -506,6 +506,7 @@ fn validate_param(kind: u32, index: usize, value: f32) -> Result<(), Error> {
         (NODE_FILM, 0) => (0.0..=1.0).contains(&value),
         (NODE_FILM, 1) => (0.0..=1.0).contains(&value),
         (NODE_FILM, 2) => (0.25..=16.0).contains(&value),
+        (NODE_FILM, 3) => (0.0..=1.0).contains(&value),
         (NODE_BLEND, 0) => (0.0..=1.0).contains(&value),
         (NODE_COLOR_SUBTRACT, _) => (0.0..=4.0).contains(&value),
         (NODE_CROP, 0) | (NODE_CROP, 1) => (0.0..=1.0).contains(&value),
@@ -2120,6 +2121,7 @@ fn execute_graph_into(
                         op.params[2],
                         context.grain_seed ^ film_ordinal.wrapping_mul(0x9e37_79b9),
                         window_origin,
+                        op.params[3],
                     );
                     film_ordinal += 1;
                 }
@@ -2821,7 +2823,7 @@ mod tests {
         let path_text = path.to_string_lossy().into_owned();
         let ops = parse_graph(
             &GraphBuilder::new()
-                .node(NODE_FILM, 0, -1, &[1.0, 0.0, 1.0], Some(&path_text))
+                .node(NODE_FILM, 0, -1, &[1.0, 0.0, 1.0, 1.0], Some(&path_text))
                 .build(),
         )
         .unwrap();
@@ -2889,7 +2891,7 @@ mod tests {
             &GraphBuilder::new()
                 .node(NODE_EXPOSURE, 0, -1, &[0.4], None)
                 .node(NODE_TONE, 1, -1, &[0.2, 0.1, 0.0, -0.1, 0.0, 0.1, 0.0], None)
-                .node(NODE_FILM, 2, -1, &[0.0, 0.4, 2.0], None)
+                .node(NODE_FILM, 2, -1, &[0.0, 0.4, 2.0, 1.0], None)
                 .build(),
         )
         .unwrap();
@@ -2898,7 +2900,7 @@ mod tests {
                 .node(NODE_EXPOSURE, 0, -1, &[0.4], None)
                 .node(NODE_NOISE_REDUCTION, 1, -1, &[0.6, 0.0, 1.0], None)
                 .node(NODE_TONE, 2, -1, &[0.2, 0.1, 0.0, -0.1, 0.0, 0.1, 0.0], None)
-                .node(NODE_FILM, 3, -1, &[0.0, 0.4, 2.0], None)
+                .node(NODE_FILM, 3, -1, &[0.0, 0.4, 2.0, 1.0], None)
                 .build(),
         )
         .unwrap();
@@ -2910,7 +2912,7 @@ mod tests {
                 .node(NODE_EXPOSURE, 0, -1, &[0.4], None)
                 .node(NODE_CLARITY, 1, -1, &[0.5, 12.0], None)
                 .node(NODE_TONE, 2, -1, &[0.2, 0.1, 0.0, -0.1, 0.0, 0.1, 0.0], None)
-                .node(NODE_FILM, 3, -1, &[0.0, 0.4, 2.0], None)
+                .node(NODE_FILM, 3, -1, &[0.0, 0.4, 2.0, 1.0], None)
                 .build(),
         )
         .unwrap();
@@ -2919,7 +2921,7 @@ mod tests {
                 .node(NODE_EXPOSURE, 0, -1, &[0.4], None)
                 .node(NODE_VIGNETTE, 1, -1, &[-0.6, 0.4, 0.6, 0.2], None)
                 .node(NODE_TONE, 2, -1, &[0.2, 0.1, 0.0, -0.1, 0.0, 0.1, 0.0], None)
-                .node(NODE_FILM, 3, -1, &[0.0, 0.4, 2.0], None)
+                .node(NODE_FILM, 3, -1, &[0.0, 0.4, 2.0, 1.0], None)
                 .build(),
         )
         .unwrap();
@@ -3026,7 +3028,7 @@ mod tests {
             for (index, kind) in ops.iter().enumerate() {
                 let params: &[f32] = match *kind {
                     NODE_TONE => &[0.0; 7],
-                    NODE_FILM => &[0.0, 0.0, 1.0],
+                    NODE_FILM => &[0.0, 0.0, 1.0, 1.0],
                     NODE_NOISE_REDUCTION => &[0.5, 0.0, 1.0],
                     NODE_CROP => &[0.1, 0.1, 0.8, 0.8, 0.0],
                     NODE_OPTICS => &[1.0, 1.0, 0.0, 0.0],
@@ -3112,7 +3114,7 @@ mod tests {
                     &[0.3, 0.0, 0.0, -0.2, 0.0, 0.0, 0.1],
                     None,
                 )
-                .node(NODE_FILM, 4, -1, &[0.0, 0.25, 1.0], None)
+                .node(NODE_FILM, 4, -1, &[0.0, 0.25, 1.0, 1.0], None)
                 .build(),
         )
         .unwrap();
@@ -3134,7 +3136,7 @@ mod tests {
         .unwrap();
         render::apply_tonal_equalizer(&mut reference, [0.3, 0.0, 0.0, -0.2, 0.0, 0.0, 0.1], false);
         to_display(&mut reference);
-        render::apply_grain(&mut reference, 0.25, 1.0, 17, (0, 0));
+        render::apply_grain(&mut reference, 0.25, 1.0, 17, (0, 0), 1.0);
 
         assert_eq!(via_graph.width, reference.width);
         assert_eq!(via_graph.height, reference.height);
@@ -3180,14 +3182,14 @@ mod tests {
     fn first_film_seed_does_not_depend_on_node_slot() {
         let direct = parse_graph(
             &GraphBuilder::new()
-                .node(NODE_FILM, 0, -1, &[0.0, 0.25, 1.0], None)
+                .node(NODE_FILM, 0, -1, &[0.0, 0.25, 1.0, 1.0], None)
                 .build(),
         )
         .unwrap();
         let preceded = parse_graph(
             &GraphBuilder::new()
                 .node(NODE_EXPOSURE, 0, -1, &[0.0], None)
-                .node(NODE_FILM, 1, -1, &[0.0, 0.25, 1.0], None)
+                .node(NODE_FILM, 1, -1, &[0.0, 0.25, 1.0, 1.0], None)
                 .build(),
         )
         .unwrap();
@@ -3200,14 +3202,14 @@ mod tests {
     fn inert_film_does_not_advance_the_grain_seed() {
         let direct = parse_graph(
             &GraphBuilder::new()
-                .node(NODE_FILM, 0, -1, &[0.0, 0.25, 1.0], None)
+                .node(NODE_FILM, 0, -1, &[0.0, 0.25, 1.0, 1.0], None)
                 .build(),
         )
         .unwrap();
         let preceded = parse_graph(
             &GraphBuilder::new()
-                .node(NODE_FILM, 0, -1, &[0.0, 0.0, 1.0], None)
-                .node(NODE_FILM, 1, -1, &[0.0, 0.25, 1.0], None)
+                .node(NODE_FILM, 0, -1, &[0.0, 0.0, 1.0, 1.0], None)
+                .node(NODE_FILM, 1, -1, &[0.0, 0.25, 1.0, 1.0], None)
                 .build(),
         )
         .unwrap();
@@ -3284,8 +3286,8 @@ mod tests {
         assert!(
             parse_graph(
                 &GraphBuilder::new()
-                    .node(NODE_FILM, 0, -1, &[0.0, 0.3, 1.0], None)
-                    .node(NODE_FILM, 1, -1, &[0.0, 0.1, 2.0], None)
+                    .node(NODE_FILM, 0, -1, &[0.0, 0.3, 1.0, 1.0], None)
+                    .node(NODE_FILM, 1, -1, &[0.0, 0.1, 2.0, 1.0], None)
                     .build(),
             )
             .is_ok()
@@ -3320,7 +3322,7 @@ mod tests {
             assert!(
                 parse_graph(
                     &GraphBuilder::new()
-                        .node(NODE_FILM, 0, -1, &[0.0, 0.3, 1.0], None)
+                        .node(NODE_FILM, 0, -1, &[0.0, 0.3, 1.0, 1.0], None)
                         .node(kind, 1, -1, params, None)
                         .build(),
                 )
@@ -3364,7 +3366,7 @@ mod tests {
                 matches!(
                     parse_graph(
                         &GraphBuilder::new()
-                            .node(NODE_FILM, 0, -1, &[0.0, 0.3, 1.0], None)
+                            .node(NODE_FILM, 0, -1, &[0.0, 0.3, 1.0, 1.0], None)
                             .node(kind, 1, -1, params, None)
                             .build(),
                     ),
@@ -3376,7 +3378,7 @@ mod tests {
         assert!(matches!(
             parse_graph(
                 &GraphBuilder::new()
-                    .node(NODE_FILM, 0, -1, &[0.0, 0.3, 1.0], None)
+                    .node(NODE_FILM, 0, -1, &[0.0, 0.3, 1.0, 1.0], None)
                     .node(NODE_BLEND, 0, 1, &[0.5], None)
                     .build(),
             ),
@@ -3687,7 +3689,7 @@ mod tests {
         // Rotation reframes, so it counts as geometry: optics maps against the
         // frame it was measured on. It is domain-agnostic like a crop.
         let program = GraphBuilder::new()
-            .node(NODE_FILM, 0, -1, &[0.0, 0.0, 1.0], None)
+            .node(NODE_FILM, 0, -1, &[0.0, 0.0, 1.0, 1.0], None)
             .node(NODE_ROTATE, 1, -1, &[1.0], None)
             .build();
         assert!(parse_graph(&program).is_ok(), "rotate may follow film");
@@ -3807,7 +3809,7 @@ mod tests {
     fn grain_program(grain: f32) -> Vec<u8> {
         GraphBuilder::new()
             .node(NODE_EXPOSURE, 0, -1, &[0.4], None)
-            .node(NODE_FILM, 1, -1, &[0.0, grain, 1.0], None)
+            .node(NODE_FILM, 1, -1, &[0.0, grain, 1.0, 1.0], None)
             .build()
     }
 
@@ -3848,7 +3850,7 @@ mod tests {
         let strengthened = parse_graph(
             &GraphBuilder::new()
                 .node(NODE_EXPOSURE, 0, -1, &[0.4], None)
-                .node(NODE_FILM, 1, -1, &[0.5, 0.7, 1.0], None)
+                .node(NODE_FILM, 1, -1, &[0.5, 0.7, 1.0, 1.0], None)
                 .build(),
         )
         .unwrap();
@@ -4428,9 +4430,9 @@ mod tests {
         assert!(
             parse_graph(
                 &GraphBuilder::new()
-                    .node(NODE_FILM, 0, -1, &[0.0, 0.2, 1.0], None)
+                    .node(NODE_FILM, 0, -1, &[0.0, 0.2, 1.0, 1.0], None)
                     .node(NODE_CROP, 1, -1, &[0.0, 0.0, 0.5, 0.5, 0.0], None)
-                    .node(NODE_FILM, 2, -1, &[0.0, 0.1, 1.0], None)
+                    .node(NODE_FILM, 2, -1, &[0.0, 0.1, 1.0, 1.0], None)
                     .build(),
             )
             .is_ok()
@@ -4440,7 +4442,7 @@ mod tests {
         assert!(
             parse_graph(
                 &GraphBuilder::new()
-                    .node(NODE_FILM, 0, -1, &[0.0, 0.2, 1.0], None)
+                    .node(NODE_FILM, 0, -1, &[0.0, 0.2, 1.0, 1.0], None)
                     .node(NODE_CROP, 1, -1, &[0.0, 0.0, 0.5, 0.5, 0.0], None)
                     .node(NODE_TONE, 2, -1, &[0.0; 7], None)
                     .build(),
@@ -4452,7 +4454,7 @@ mod tests {
         assert!(
             parse_graph(
                 &GraphBuilder::new()
-                    .node(NODE_FILM, 0, -1, &[0.0, 0.2, 1.0], None)
+                    .node(NODE_FILM, 0, -1, &[0.0, 0.2, 1.0, 1.0], None)
                     .node(NODE_CROP, 1, -1, &[0.0, 0.0, 0.5, 0.5, 0.0], None)
                     .node(NODE_EXPOSURE, 2, -1, &[0.5], None)
                     .build(),
@@ -4486,8 +4488,8 @@ mod tests {
     fn film_grain_lands_in_display_space_with_per_node_seeds() {
         let ops = parse_graph(
             &GraphBuilder::new()
-                .node(NODE_FILM, 0, -1, &[0.0, 0.5, 1.0], None)
-                .node(NODE_FILM, 1, -1, &[0.0, 0.25, 2.0], None)
+                .node(NODE_FILM, 0, -1, &[0.0, 0.5, 1.0, 1.0], None)
+                .node(NODE_FILM, 1, -1, &[0.0, 0.25, 2.0, 1.0], None)
                 .build(),
         )
         .unwrap();
@@ -4498,8 +4500,8 @@ mod tests {
 
         let mut reference = gradient_image();
         to_display(&mut reference);
-        render::apply_grain(&mut reference, 0.5, 1.0, 11, (0, 0));
-        render::apply_grain(&mut reference, 0.25, 2.0, 11 ^ 0x9e37_79b9, (0, 0));
+        render::apply_grain(&mut reference, 0.5, 1.0, 11, (0, 0), 1.0);
+        render::apply_grain(&mut reference, 0.25, 2.0, 11 ^ 0x9e37_79b9, (0, 0), 1.0);
         assert_eq!(grained.data, reference.data);
 
         let repeat = execute_graph(&ops, gradient_image(), &context(11)).unwrap();

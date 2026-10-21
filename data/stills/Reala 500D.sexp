@@ -19,5 +19,5 @@
      (:amount 0.15 :radius 2.5))
     (:id 6 :kind :film :inputs (5) :params
      (:lut-path "luts/Reala 500D.cube" :lut-strength 1.0 :grain-amount 0.3
-      :grain-size 1.3)))
+      :grain-size 1.3 :grain-highlight-retention 1.0)))
    :output 6)))

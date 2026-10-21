@@ -15,5 +15,5 @@
     (:id 4 :kind :clarity :inputs (3) :params (:amount 0.2 :radius 150.0))
     (:id 5 :kind :film :inputs (4) :params
      (:lut-path "luts/Agfalike E.cube" :lut-strength 1.0 :grain-amount 0.0
-      :grain-size 1.0)))
+      :grain-size 1.0 :grain-highlight-retention 1.0)))
    :output 5)))

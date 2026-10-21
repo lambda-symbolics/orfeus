@@ -553,7 +553,9 @@ override semantics."
     (:lut-path #'orfeus:processing-settings-lut-path)
     (:lut-strength #'orfeus:processing-settings-lut-strength)
     (:grain-amount #'orfeus:processing-settings-grain-amount)
-    (:grain-size #'orfeus:processing-settings-grain-size)))
+    (:grain-size #'orfeus:processing-settings-grain-size)
+    (:grain-highlight-retention
+     #'orfeus:processing-settings-grain-highlight-retention)))
 
 (defun gui-model-setting (model key)
   "Read one effective setting from MODEL.
@@ -612,7 +614,9 @@ downstream node of that stage, otherwise the stage's identity value."
     (:lut-path (setf (orfeus:processing-settings-lut-path settings) value))
     (:lut-strength (setf (orfeus:processing-settings-lut-strength settings) value))
     (:grain-amount (setf (orfeus:processing-settings-grain-amount settings) value))
-    (:grain-size (setf (orfeus:processing-settings-grain-size settings) value)))
+    (:grain-size (setf (orfeus:processing-settings-grain-size settings) value))
+    (:grain-highlight-retention
+     (setf (orfeus:processing-settings-grain-highlight-retention settings) value)))
   value)
 
 (defun gui-boolean-value (value)
@@ -706,8 +710,9 @@ Returns :BYPASSED, :ENABLED, or :NONE without a photograph."
   "True when KEY cannot affect rendering given the other GRADE values."
   (case key
     (:lut-strength (null (getf grade :lut-path)))
-    (:grain-size (let ((amount (getf grade :grain-amount)))
-                   (or (null amount) (not (plusp amount)))))
+    ((:grain-size :grain-highlight-retention)
+     (let ((amount (getf grade :grain-amount)))
+       (or (null amount) (not (plusp amount)))))
     (:lens-correction-strength (not (getf grade :lens-correction-p)))
     (t nil)))
 
@@ -1046,7 +1051,8 @@ when the roll is past *AUTO-LEVEL-LIMIT*."
     ;; LUT strength reading the stage's zero identity value instead of full
     ;; strength -- a LUT picked right after looked like it was doing nothing
     ;; until the slider was noticed sitting at 0%.
-    (:film (list :lut-path nil :lut-strength 1.0 :grain-amount 0.0 :grain-size 1.0))
+    (:film (list :lut-path nil :lut-strength 1.0 :grain-amount 0.0 :grain-size 1.0
+                 :grain-highlight-retention 1.0))
     ;; Light specks once a negative has been inverted, dark before it and
     ;; anywhere else.
     (:dust (orfeus:dust-default-params
