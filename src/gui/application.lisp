@@ -512,7 +512,8 @@ than turned by noise.")
     value))
 
 (defparameter *export-format-captions*
-  '(("JPEG" . :jpeg) ("16-bit TIFF" . :tiff) ("AVIF" . :avif))
+  '(("JPEG" . :jpeg) ("16-bit TIFF" . :tiff) ("AVIF" . :avif)
+    ("WebP (lossless)" . :webp))
   "Export encoders offered in the dialog, in menu order.")
 
 (defun export-format-from-caption (caption)

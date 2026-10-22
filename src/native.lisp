@@ -711,7 +711,8 @@ by definition."
                  (setting 'output-format (ecase output-format
                                            (:jpeg 1)
                                            (:tiff 2)
-                                           (:avif 3)))
+                                           (:avif 3)
+                                           (:webp 4)))
                  (setting 'max-width max-width)
                  (setting 'max-height max-height)
                  (setting 'jpeg-quality jpeg-quality)

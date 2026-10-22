@@ -172,7 +172,7 @@ impl RenderFrameV1 {
         }
         if !matches!(
             self.output_format,
-            render::OUTPUT_JPEG | render::OUTPUT_TIFF | render::OUTPUT_AVIF
+            render::OUTPUT_JPEG | render::OUTPUT_TIFF | render::OUTPUT_AVIF | render::OUTPUT_WEBP
         ) {
             return Err(Error::InvalidArgument("unsupported output format"));
         }

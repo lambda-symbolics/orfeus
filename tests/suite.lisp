@@ -185,8 +185,17 @@ the failure list, and both ON-ERROR modes without needing real RAW files."
          (string= "avif" (export-format-extension :avif))
          (eq :avif (orfeus::render-output-format #P"/tmp/frame.avif"))
          (handler-case
-             (progn (orfeus::sexp->export-settings '(:format :webp)) nil)
+             (progn (orfeus::sexp->export-settings '(:format :tga)) nil)
            (invalid-project-data () t)))))
+
+(defun webp-export-format-round-trips-p ()
+  (let* ((project (make-project
+                   :output-directory #P"exports/"
+                   :export-settings (make-export-settings :format :webp)))
+         (decoded (sexp->project (project->sexp project))))
+    (and (eq :webp (export-settings-format (project-export-settings decoded)))
+         (string= "webp" (export-format-extension :webp))
+         (eq :webp (orfeus::render-output-format #P"/tmp/frame.webp")))))
 
 (defun demosaic-choice-round-trips-p ()
   (let* ((settings (make-processing-settings
@@ -3019,6 +3028,7 @@ renderer is told about them."
              (project-autosave-recovery-decisions-p))
       (check "export settings round trip" (export-settings-round-trip-p))
       (check "AVIF export format round trips" (avif-export-format-round-trips-p))
+      (check "WebP export format round trips" (webp-export-format-round-trips-p))
       (check "demosaic choice round trips" (demosaic-choice-round-trips-p))
       (check "processing presets round trip" (processing-presets-round-trip-p))
       (check "neural noise reduction round trips and validates"

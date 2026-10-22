@@ -10,6 +10,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use image::codecs::avif::{AvifEncoder, ColorSpace as AvifColorSpace};
 use image::codecs::tiff::TiffEncoder;
+use image::codecs::webp::WebPEncoder;
 use image::{ColorType, ExtendedColorType, ImageEncoder};
 use lensfun::{Camera, Database, Lens, Modifier};
 use rawler::decoders::{RawDecodeParams, RawLoader};
@@ -27,6 +28,7 @@ use super::color::intermediate_to_linear_srgb;
 pub const OUTPUT_JPEG: u32 = 1;
 pub const OUTPUT_TIFF: u32 = 2;
 pub const OUTPUT_AVIF: u32 = 3;
+pub const OUTPUT_WEBP: u32 = 4;
 /// rav1e's speed preset for AVIF exports, 1 slowest to 10 fastest. Slower
 /// presets buy a smaller file, not a better picture: on a 20 MP frame at
 /// quality 92, speed 10 took 1.2 s over the JPEG's export time for a 790 KB
@@ -6342,6 +6344,26 @@ fn encode_to<W: Write + Seek>(
                     ExtendedColorType::Rgb8,
                 )
         }
+        OUTPUT_WEBP => {
+            // Lossless only: the underlying image-webp crate has no lossy
+            // mode, so quality is unused here exactly as it already is for
+            // TIFF above.
+            let bytes: Vec<u8> = image
+                .data
+                .par_iter()
+                .map(|v| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8)
+                .collect();
+            let mut encoder = WebPEncoder::new_lossless(writer);
+            encoder
+                .set_icc_profile(SRGB_ICC.to_vec())
+                .map_err(|e| Error::Render(format!("WebP ICC profile: {e}")))?;
+            encoder.write_image(
+                &bytes,
+                image.width as u32,
+                image.height as u32,
+                ExtendedColorType::Rgb8,
+            )
+        }
         _ => unreachable!(),
     }
     .map_err(|e| Error::Render(format!("image encoding failed: {e}")))
@@ -11073,6 +11095,25 @@ mod tests {
         assert_eq!(&bytes[4..8], b"ftyp");
         assert_eq!(&bytes[8..12], b"avif");
         assert!(bytes.windows(4).any(|window| window == b"av1C"));
+    }
+
+    #[test]
+    fn exported_webp_round_trips_losslessly_with_icc() {
+        let mut bytes = Cursor::new(Vec::new());
+        encode_to(&image(), &mut bytes, OUTPUT_WEBP, 90).unwrap();
+        let bytes = bytes.into_inner();
+        assert_eq!(&bytes[0..4], b"RIFF");
+        assert_eq!(&bytes[8..12], b"WEBP");
+        let mut decoder = image::codecs::webp::WebPDecoder::new(Cursor::new(bytes)).unwrap();
+        assert!(decoder.icc_profile().unwrap().is_some());
+        let mut decoded = vec![0_u8; decoder.total_bytes() as usize];
+        decoder.read_image(&mut decoded).unwrap();
+        let expected: Vec<u8> = image()
+            .data
+            .iter()
+            .map(|v| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8)
+            .collect();
+        assert_eq!(decoded, expected, "lossless WebP must round-trip exactly");
     }
 
     #[test]
