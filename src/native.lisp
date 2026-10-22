@@ -91,6 +91,7 @@ form by hand for each of them buried the call it guards."
   (graph :pointer)
   (graph-length :size)
   (cache-mode :uint32)
+  (out-narrowed :pointer)
   (error-buffer :pointer)
   (error-capacity :size))
 
@@ -103,6 +104,7 @@ form by hand for each of them buried the call it guards."
   (capacity :size)
   (out-width :pointer)
   (out-height :pointer)
+  (out-narrowed :pointer)
   (cache-mode :uint32)
   (error-buffer :pointer)
   (error-capacity :size))
@@ -692,7 +694,13 @@ VIEWPORT, when given, is a list of four fractions of the oriented frame — left
 top, width, height — and asks for only that part of it. A zoomed preview shows a
 fraction of the frame, and developing the rest is the largest waste left in the
 interactive path. Never given for an export: an export is the whole photograph
-by definition."
+by definition.
+
+Returns OUTPUT-PATHNAME and a second value: whether the delivered file is
+actually a window of a larger frame rather than the whole of it. A caller
+cannot reliably recover this from the file's own pixel dimensions, since a
+genuine window that keeps one whole dimension of the frame is the same size
+as that frame on that axis."
   (native-library-load)
   (native-render-require-compatible)
   (unless (>= (native-bridge-version) 3)
@@ -741,38 +749,41 @@ by definition."
                  (loop for octet across program
                        for index from 0
                        do (setf (mem-aref buffer :uint8 index) octet))
-                 (with-foreign-pointer (error-buffer
-                                        *native-error-buffer-size*)
-                   (let ((status
-                           #+sbcl
-                           (sb-int:with-float-traps-masked
-                               (:invalid :divide-by-zero :overflow
-                                :underflow :inexact)
+                 (with-foreign-object (out-narrowed :uint32)
+                   (setf (cffi:mem-ref out-narrowed :uint32) 0)
+                   (with-foreign-pointer (error-buffer
+                                          *native-error-buffer-size*)
+                     (let ((status
+                             #+sbcl
+                             (sb-int:with-float-traps-masked
+                                 (:invalid :divide-by-zero :overflow
+                                  :underflow :inexact)
+                               (%raw-render-v3
+                                (render-source-namestring input-pathname)
+                                (namestring output-pathname)
+                                frame buffer (length program)
+                                (if cache-p 1 0) out-narrowed error-buffer
+                                *native-error-buffer-size*))
+                             #-sbcl
                              (%raw-render-v3
                               (render-source-namestring input-pathname)
                               (namestring output-pathname)
                               frame buffer (length program)
-                              (if cache-p 1 0) error-buffer
-                              *native-error-buffer-size*))
-                           #-sbcl
-                           (%raw-render-v3
-                            (render-source-namestring input-pathname)
-                            (namestring output-pathname)
-                            frame buffer (length program)
-                            (if cache-p 1 0) error-buffer
-                            *native-error-buffer-size*)))
-                     (unless (zerop status)
-                       (error 'raw-render-error
-                              :input-pathname input-pathname
-                              :output-pathname output-pathname
-                              :status status
-                              :message (native-error-message
-                                        error-buffer)))))))))
+                              (if cache-p 1 0) out-narrowed error-buffer
+                              *native-error-buffer-size*)))
+                       (unless (zerop status)
+                         (error 'raw-render-error
+                                :input-pathname input-pathname
+                                :output-pathname output-pathname
+                                :status status
+                                :message (native-error-message
+                                          error-buffer)))
+                       (plusp (cffi:mem-ref out-narrowed :uint32)))))))))
       (let ((*render-progress-hook* progress))
         (with-optional-foreign-string (lens-pointer lens-profile-model)
           (with-optional-foreign-string (name-pointer lens-name)
-            (invoke lens-pointer name-pointer))))))
-  output-pathname)
+            (values output-pathname
+                    (invoke lens-pointer name-pointer))))))))
 
 (defun native-raw-render-graph-rgb (input-pathname graph rgb-buffer capacity
                                     &key lens-profile-model lens-name
@@ -785,7 +796,11 @@ by definition."
   "Render INPUT-PATHNAME through GRAPH into the foreign RGB-BUFFER.
 
 The live-preview hot path: no JPEG encode and no file. Returns the oriented
-image width and height as two values."
+image width and height, and whether the delivered image is actually a
+window of a larger frame rather than the whole of it, as three values. A
+caller cannot reliably recover the third from the first two alone, since a
+genuine window that keeps one whole dimension of the frame is the same
+size as that frame on that axis."
   (native-library-load)
   (native-render-require-compatible)
   (unless (>= (native-bridge-version) 3)
@@ -832,38 +847,41 @@ image width and height as two values."
                        do (setf (mem-aref program-buffer :uint8 index) octet))
                  (with-foreign-object (out-width :uint32)
                    (with-foreign-object (out-height :uint32)
-                     (with-foreign-pointer (error-buffer
-                                            *native-error-buffer-size*)
-                       (let ((status
-                               #+sbcl
-                               (sb-int:with-float-traps-masked
-                                   (:invalid :divide-by-zero :overflow
-                                    :underflow :inexact)
+                     (with-foreign-object (out-narrowed :uint32)
+                       (setf (cffi:mem-ref out-narrowed :uint32) 0)
+                       (with-foreign-pointer (error-buffer
+                                              *native-error-buffer-size*)
+                         (let ((status
+                                 #+sbcl
+                                 (sb-int:with-float-traps-masked
+                                     (:invalid :divide-by-zero :overflow
+                                      :underflow :inexact)
+                                   (%raw-render-rgb-v1
+                                    (render-source-namestring input-pathname)
+                                    frame program-buffer (length program)
+                                    rgb-buffer capacity
+                                    out-width out-height out-narrowed
+                                    (if cache-p 1 0) error-buffer
+                                    *native-error-buffer-size*))
+                                 #-sbcl
                                  (%raw-render-rgb-v1
                                   (render-source-namestring input-pathname)
                                   frame program-buffer (length program)
                                   rgb-buffer capacity
-                                  out-width out-height
+                                  out-width out-height out-narrowed
                                   (if cache-p 1 0) error-buffer
-                                  *native-error-buffer-size*))
-                               #-sbcl
-                               (%raw-render-rgb-v1
-                                (render-source-namestring input-pathname)
-                                frame program-buffer (length program)
-                                rgb-buffer capacity
-                                out-width out-height
-                                (if cache-p 1 0) error-buffer
-                                *native-error-buffer-size*)))
-                         (unless (zerop status)
-                           (error 'raw-render-error
-                                  :input-pathname input-pathname
-                                  :output-pathname nil
-                                  :status status
-                                  :message (native-error-message
-                                            error-buffer)))
-                         (values
-                          (cffi:mem-ref out-width :uint32)
-                          (cffi:mem-ref out-height :uint32))))))))))
+                                  *native-error-buffer-size*)))
+                           (unless (zerop status)
+                             (error 'raw-render-error
+                                    :input-pathname input-pathname
+                                    :output-pathname nil
+                                    :status status
+                                    :message (native-error-message
+                                              error-buffer)))
+                           (values
+                            (cffi:mem-ref out-width :uint32)
+                            (cffi:mem-ref out-height :uint32)
+                            (plusp (cffi:mem-ref out-narrowed :uint32))))))))))))
       (with-optional-foreign-string (lens-pointer lens-profile-model)
         (with-optional-foreign-string (name-pointer lens-name)
           (invoke lens-pointer name-pointer))))))

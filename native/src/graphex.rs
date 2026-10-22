@@ -1419,7 +1419,7 @@ pub(crate) fn execute_graph_windowed(
         None,
         None,
     )
-    .map(|(_, _, image)| image.expect("no byte buffer was asked for"))
+    .map(|(_, _, _, image)| image.expect("no byte buffer was asked for"))
 }
 
 #[cfg(test)]
@@ -1439,7 +1439,7 @@ pub(crate) fn execute_graph_windowed_cached(
         Some(cache_key),
         None,
     )
-    .map(|(_, _, image)| image.expect("no byte buffer was asked for"))
+    .map(|(_, _, _, image)| image.expect("no byte buffer was asked for"))
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -1457,7 +1457,7 @@ pub(crate) fn execute_graph_cached(
     context: &GraphContext<'_>,
     cache_key: Option<PrefixKey>,
 ) -> Result<RgbImage, Error> {
-    let (width, height, image) =
+    let (width, height, narrowed, image) =
         execute_graph_into(
             ops,
             move || render::own_source(source),
@@ -1467,7 +1467,7 @@ pub(crate) fn execute_graph_cached(
             cache_key,
             None,
         )?;
-    let _ = (width, height);
+    let _ = (width, height, narrowed);
     Ok(image.expect("a graph run without a byte buffer returns its image"))
 }
 
@@ -1719,7 +1719,7 @@ fn execute_graph_into(
     reporter: Reporter,
     cache_key: Option<PrefixKey>,
     bytes: Option<&mut [u8]>,
-) -> Result<(usize, usize, Option<RgbImage>), Error> {
+) -> Result<(usize, usize, bool, Option<RgbImage>), Error> {
     let count = ops.len();
     if count == 0 {
         let image = render::orient(source(), context.orientation);
@@ -1727,7 +1727,7 @@ fn execute_graph_into(
             Some(rect) => crop_to_viewport(image, rect, 0, context.orientation, true).0,
             None => image,
         };
-        return finish(image, Domain::Linear, None, bytes);
+        return finish(image, Domain::Linear, None, viewport.is_some(), bytes);
     }
     // Where the window may narrow, if it may at all.
     let plan = viewport.and_then(|rect| plan_viewport(ops).map(|plan| (rect, plan)));
@@ -2549,9 +2549,10 @@ fn execute_graph_into(
             crop_to_viewport(image, *rect, plan.halo, context.orientation, true);
         image = window;
         window_inner = Some(inner);
+        narrowed = true;
     }
     reporter.report("writing\0", 0.95);
-    let result = finish(image, domains[count], window_inner, bytes)?;
+    let result = finish(image, domains[count], window_inner, narrowed, bytes)?;
     reporter.report("done\0", 1.0);
     if let Some(started) = tail_started {
         eprintln!(
@@ -2570,13 +2571,21 @@ fn finish(
     image: RgbImage,
     domain: Domain,
     window: Option<(usize, usize, usize, usize)>,
+    narrowed: bool,
     bytes: Option<&mut [u8]>,
-) -> Result<(usize, usize, Option<RgbImage>), Error> {
+) -> Result<(usize, usize, bool, Option<RgbImage>), Error> {
     // A window still holding its halo, worth trimming before anything else
     // sees it. Only the direct-to-bytes path below can skip actually copying
     // it out: the owned-image path hands the result back to more Lisp code,
     // which needs it contiguous as its own image.
     let window = window.filter(|&(_, _, width, height)| width < image.width || height < image.height);
+    // NARROWED is the caller's own authoritative answer to "did this
+    // request actually use less than the full frame" -- not re-derived
+    // from WINDOW's pixel dimensions here, which answer a different
+    // question (whether the crop below is a no-op) and can coincide with
+    // the full frame's own size on one axis without the render actually
+    // being of the whole frame: a caller cannot recover the true answer
+    // from delivered pixel dimensions alone. See F12.
     match (window, bytes) {
         (Some((left, top, width, height)), Some(bytes)) => {
             let needed = width * height * 3;
@@ -2596,7 +2605,7 @@ fn finish(
                 &mut bytes[..needed],
                 domain == Domain::Linear,
             );
-            Ok((width, height, None))
+            Ok((width, height, narrowed, None))
         }
         (window, bytes) => {
             let mut image = match window {
@@ -2609,7 +2618,7 @@ fn finish(
                     if domain == Domain::Linear {
                         to_display(&mut image);
                     }
-                    Ok((width, height, Some(image)))
+                    Ok((width, height, narrowed, Some(image)))
                 }
                 Some(bytes) => {
                     let needed = width * height * 3;
@@ -2617,7 +2626,7 @@ fn finish(
                         return Err(Error::InvalidArgument("preview buffer is too small"));
                     }
                     render::write_display_bytes(&image, &mut bytes[..needed], domain == Domain::Linear);
-                    Ok((width, height, None))
+                    Ok((width, height, narrowed, None))
                 }
             }
         }
@@ -2682,7 +2691,7 @@ pub fn render_graph(
     frame: &RenderFrameV1,
     graph_bytes: &[u8],
     cache_mode: u32,
-) -> Result<(), Error> {
+) -> Result<bool, Error> {
     // A bracket's reference stands for it wherever a file is wanted.
     let reference = render::bracket_members(input)
         .and_then(|members| members.into_iter().next())
@@ -2692,7 +2701,7 @@ pub fn render_graph(
             "input and output refer to the same file",
         ));
     }
-    let image = render_graph_image(input, frame, graph_bytes, cache_mode)?;
+    let (narrowed, image) = render_graph_image(input, frame, graph_bytes, cache_mode)?;
     render::atomic_encode(
         &reference,
         output,
@@ -2700,21 +2709,25 @@ pub fn render_graph(
         frame.output_format,
         frame.jpeg_quality,
         frame.flags & FRAME_FLAG_DURABLE != 0,
-    )
+    )?;
+    Ok(narrowed)
 }
 
 /// Renders straight into a caller-provided RGB8 buffer: the zero-copy hot
 /// path for live previews, with no JPEG or file round trip.
+///
+/// Returns the delivered width and height, and whether this is a genuine
+/// window of a larger frame rather than the whole of it -- see F12.
 pub fn render_graph_rgb(
     input: &Path,
     frame: &RenderFrameV1,
     graph_bytes: &[u8],
     buffer: &mut [u8],
     cache_mode: u32,
-) -> Result<(usize, usize), Error> {
+) -> Result<(usize, usize, bool), Error> {
     let profiling = std::env::var_os("ORFEUS_PROFILE").is_some();
     let started = Instant::now();
-    let (width, height, _) =
+    let (width, height, narrowed, _) =
         render_graph_frame(input, frame, graph_bytes, cache_mode, Some(buffer))?;
     if profiling {
         eprintln!(
@@ -2722,7 +2735,7 @@ pub fn render_graph_rgb(
             started.elapsed().as_secs_f64() * 1000.0
         );
     }
-    Ok((width, height))
+    Ok((width, height, narrowed))
 }
 
 /// Whether a render develops a draft: only when the caller asked for one, and
@@ -2764,9 +2777,12 @@ fn render_graph_image(
     frame: &RenderFrameV1,
     graph_bytes: &[u8],
     cache_mode: u32,
-) -> Result<RgbImage, Error> {
-    let (_, _, image) = render_graph_frame(input, frame, graph_bytes, cache_mode, None)?;
-    Ok(image.expect("a frame rendered without a byte buffer returns its image"))
+) -> Result<(bool, RgbImage), Error> {
+    let (_, _, narrowed, image) = render_graph_frame(input, frame, graph_bytes, cache_mode, None)?;
+    Ok((
+        narrowed,
+        image.expect("a frame rendered without a byte buffer returns its image"),
+    ))
 }
 
 fn render_graph_frame(
@@ -2775,7 +2791,7 @@ fn render_graph_frame(
     graph_bytes: &[u8],
     cache_mode: u32,
     bytes: Option<&mut [u8]>,
-) -> Result<(usize, usize, Option<RgbImage>), Error> {
+) -> Result<(usize, usize, bool, Option<RgbImage>), Error> {
     frame.validate()?;
     let ops = parse_graph(graph_bytes)?;
     if !matches!(cache_mode, render::CACHE_NONE | render::CACHE_USE) {
@@ -3221,6 +3237,66 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_full_height_window_still_reports_itself_as_narrowed() {
+        // The audit's own reproduction: a window that happens to keep one
+        // whole dimension of the frame is the same size as the frame on
+        // that axis, which used to be the GUI's only signal for "this is
+        // secretly the whole frame" -- discarding the real viewport and
+        // mis-placing/mis-zooming a perfectly ordinary narrow crop.
+        let ops = parse_graph(
+            &GraphBuilder::new()
+                .node(NODE_EXPOSURE, 0, -1, &[0.2], None)
+                .build(),
+        )
+        .unwrap();
+        let graph_context = context(5);
+        let scene = noisy_scene(200, 300);
+        // Full height, 40% of the width: the delivered height equals the
+        // whole frame's own height exactly.
+        let rect = [0.3_f32, 0.0, 0.4, 1.0];
+        let (width, height, narrowed, image) = execute_graph_into(
+            &ops,
+            move || scene,
+            &graph_context,
+            Some(rect),
+            Reporter::none(),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(height, 300, "the window's height should equal the whole frame's");
+        assert!(width < 200, "the window's width should be narrower than the whole frame's");
+        assert!(
+            narrowed,
+            "a genuine window must report itself as narrowed even when one dimension matches the frame"
+        );
+        assert!(image.is_some());
+    }
+
+    #[test]
+    fn a_whole_frame_render_does_not_report_itself_as_narrowed() {
+        let ops = parse_graph(
+            &GraphBuilder::new()
+                .node(NODE_EXPOSURE, 0, -1, &[0.2], None)
+                .build(),
+        )
+        .unwrap();
+        let graph_context = context(5);
+        let scene = noisy_scene(200, 300);
+        let (_, _, narrowed, _) = execute_graph_into(
+            &ops,
+            move || scene,
+            &graph_context,
+            None,
+            Reporter::none(),
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(!narrowed, "an unrequested viewport must not report itself as narrowed");
     }
 
     /// Straightening is the same picture whether the frame is cut before or
@@ -4485,7 +4561,7 @@ mod tests {
             .collect();
 
         let mut bytes = vec![0_u8; owned.width * owned.height * 3];
-        let (width, height, image) = execute_graph_into(
+        let (width, height, narrowed, image) = execute_graph_into(
             &ops,
             move || scene,
             &graph_context,
@@ -4498,6 +4574,7 @@ mod tests {
         assert!(image.is_none(), "a byte buffer was supplied but an image came back too");
         assert_eq!((width, height), (owned.width, owned.height));
         assert_eq!(&bytes[..expected.len()], &expected[..], "direct and copied writes differ");
+        assert!(narrowed, "a genuine viewport rect must report itself as narrowed");
     }
 
     #[test]

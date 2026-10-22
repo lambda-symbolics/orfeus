@@ -499,11 +499,17 @@ where
 /// about lens profiles without rendering. `orfeus_raw_render_v1` and
 /// `orfeus_raw_render_v2` are since removed: the graph path (`v3` on) took
 /// over rendering for both frontends and nothing called the flat,
-/// settings-struct entry points any more. Every remaining earlier entry
+/// settings-struct entry points any more. Version 11 adds an `out_narrowed`
+/// parameter to `orfeus_raw_render_v3` and `orfeus_raw_render_rgb_v1`,
+/// reporting whether the render actually narrowed to a window of a larger
+/// frame rather than delivering the whole of it -- a caller cannot
+/// reliably recover this from the delivered pixel dimensions alone, since
+/// a genuine window that keeps one whole dimension of the frame is the
+/// same size as that frame on that axis. Every remaining earlier entry
 /// point is unchanged.
 #[unsafe(no_mangle)]
 pub extern "C" fn orfeus_bridge_abi_version() -> u32 {
-    10
+    11
 }
 
 /// Write a 64-bit perceptual signature of the image at PATH.
@@ -889,9 +895,10 @@ pub extern "C" fn orfeus_raw_render_capabilities_v1() -> u32 {
 ///
 /// Path pointers and a non-null `frame.lens_profile_model` must be readable
 /// NUL-terminated strings, `frame` must point to a readable
-/// `orfeus_render_frame_v1`, and `graph` must be readable for
-/// `graph_length` bytes, all for the duration of this call. The error
-/// buffer, when non-null, must be writable for its stated capacity.
+/// `orfeus_render_frame_v1`, `graph` must be readable for `graph_length`
+/// bytes, and `out_narrowed`, when non-null, must be writable, all for the
+/// duration of this call. The error buffer, when non-null, must be
+/// writable for its stated capacity.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn orfeus_raw_render_v3(
     input_path: *const c_char,
@@ -900,6 +907,7 @@ pub unsafe extern "C" fn orfeus_raw_render_v3(
     graph: *const u8,
     graph_length: usize,
     cache_mode: u32,
+    out_narrowed: *mut u32,
     error_buffer: *mut c_char,
     error_capacity: usize,
 ) -> i32 {
@@ -915,7 +923,11 @@ pub unsafe extern "C" fn orfeus_raw_render_v3(
             let bytes = std::slice::from_raw_parts(graph, graph_length);
             let input = path_from_c(input_path)?;
             let output = path_from_c(output_path)?;
-            graphex::render_graph(input, output, &*frame, bytes, cache_mode)
+            let narrowed = graphex::render_graph(input, output, &*frame, bytes, cache_mode)?;
+            if !out_narrowed.is_null() {
+                *out_narrowed = narrowed as u32;
+            }
+            Ok(())
         })
     }
 }
@@ -925,15 +937,21 @@ pub unsafe extern "C" fn orfeus_raw_render_v3(
 /// The live-preview hot path: identical processing to
 /// `orfeus_raw_render_v3`, but the oriented display image lands directly in
 /// `buffer` (row-major RGB, one byte per channel) with no JPEG encode or
-/// file write. Writes the image dimensions to `out_width`/`out_height`.
-/// The frame's output format and JPEG quality fields are ignored.
+/// file write. Writes the image dimensions to `out_width`/`out_height`,
+/// and whether this is a genuine window of a larger frame rather than the
+/// whole of it to `out_narrowed` (0 or 1) when it is non-null -- a caller
+/// cannot reliably tell the two apart from the delivered pixel dimensions
+/// alone, since a window that keeps one whole dimension of the frame looks
+/// identical in size to that frame on that axis. The frame's output format
+/// and JPEG quality fields are ignored.
 ///
 /// # Safety
 ///
 /// `input_path` must be a readable NUL-terminated path, `frame` and `graph`
 /// valid for their stated sizes, `buffer` writable for `capacity` bytes,
-/// `out_width`/`out_height` writable, and the error buffer, when non-null,
-/// writable for its stated capacity.
+/// `out_width`/`out_height` writable, `out_narrowed` writable when
+/// non-null, and the error buffer, when non-null, writable for its stated
+/// capacity.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn orfeus_raw_render_rgb_v1(
     input_path: *const c_char,
@@ -944,6 +962,7 @@ pub unsafe extern "C" fn orfeus_raw_render_rgb_v1(
     capacity: usize,
     out_width: *mut u32,
     out_height: *mut u32,
+    out_narrowed: *mut u32,
     cache_mode: u32,
     error_buffer: *mut c_char,
     error_capacity: usize,
@@ -963,10 +982,13 @@ pub unsafe extern "C" fn orfeus_raw_render_rgb_v1(
             let bytes = std::slice::from_raw_parts(graph, graph_length);
             let destination = std::slice::from_raw_parts_mut(buffer, capacity);
             let input = path_from_c(input_path)?;
-            let (width, height) =
+            let (width, height, narrowed) =
                 graphex::render_graph_rgb(input, &*frame, bytes, destination, cache_mode)?;
             *out_width = width as u32;
             *out_height = height as u32;
+            if !out_narrowed.is_null() {
+                *out_narrowed = narrowed as u32;
+            }
             Ok(())
         })
     }
@@ -1263,7 +1285,7 @@ mod tests {
 
     #[test]
     fn reports_current_abi_version() {
-        assert_eq!(orfeus_bridge_abi_version(), 10);
+        assert_eq!(orfeus_bridge_abi_version(), 11);
         assert_eq!(orfeus_raw_render_capabilities_v1(), 1 | 2 | 4 | 16 | 32);
     }
 
@@ -1313,6 +1335,7 @@ mod tests {
                 graph_bytes.as_ptr(),
                 0,
                 render::CACHE_NONE,
+                std::ptr::null_mut(),
                 error.as_mut_ptr(),
                 error.len(),
             )

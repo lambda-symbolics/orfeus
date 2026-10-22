@@ -3919,22 +3919,6 @@ behind is memory. Best effort; returns how many directories went."
                    requested-viewport-region nil)
              (when before-canvas (lightfast:redraw before-canvas))
              (when after-canvas (lightfast:redraw after-canvas)))
-           (published-region (path region bound)
-             ;; Trust the file over the request. A renderer that quietly ignored
-             ;; the viewport would hand back a whole frame while the interface
-             ;; believed it held a window, and the frame would then be drawn at
-             ;; the scale the window would have needed — which is how a zoomed
-             ;; view was seen shrinking by two and a half times. A file as wide
-             ;; as the whole bound is not a window, whatever was asked for.
-             (multiple-value-bind (file-width file-height) (preview-file-size path)
-               (cond ((null region) nil)
-                     ;; A render with no bound — the one-to-one view asks the
-                     ;; bridge for sensor resolution — leaves nothing to check
-                     ;; the file against.
-                     ((or (null bound) (zerop bound)) region)
-                     ((null file-width) nil)
-                     ((< (max file-width file-height) (* 0.98 bound)) region)
-                     (t nil))))
            (publish-preview (role path generation region geometry bound)
              (let ((old-path (ecase role
                                (:before before-preview-file)
@@ -6103,6 +6087,15 @@ behind is memory. Best effort; returns how many directories went."
                 (lambda ()
                   (when (or (not publish-p) (= generation preview-generation))
                     (let ((render-started (get-internal-real-time))
+                          ;; Trusted as asked for by default -- a cache hit
+                          ;; serves a file a past render already answered
+                          ;; for, so there is nothing fresh to recheck -- and
+                          ;; overwritten with the native renderer's own
+                          ;; answer whenever a fresh render actually runs,
+                          ;; since a renderer that silently ignored the
+                          ;; viewport must not be trusted to have narrowed to
+                          ;; it. See F12 in the 2026-10-22 image-quality audit.
+                          (trusted-region viewport)
                           (reporter
                             (and publish-p (eq role :after)
                                  (lambda (stage fraction)
@@ -6138,22 +6131,26 @@ behind is memory. Best effort; returns how many directories went."
                                    (call-with-preview-cache-fill
                                     output
                                     (lambda (temporary)
-                                      (if (typep settings 'orfeus:processing-graph)
-                                          (render-preview input temporary nil
-                                                          :graph settings
-                                                          :max-width max-width
-                                                          :max-height max-height
-                                                          :cache-p cache-p
-                                                          :viewport viewport
-                                                          :progress reporter
-                                                          :if-exists :supersede)
-                                          (render-preview input temporary settings
-                                                          :max-width max-width
-                                                          :max-height max-height
-                                                          :cache-p cache-p
-                                                          :viewport viewport
-                                                          :progress reporter
-                                                          :if-exists :supersede))
+                                      (let ((narrowed
+                                              (nth-value
+                                               1
+                                               (if (typep settings 'orfeus:processing-graph)
+                                                   (render-preview input temporary nil
+                                                                   :graph settings
+                                                                   :max-width max-width
+                                                                   :max-height max-height
+                                                                   :cache-p cache-p
+                                                                   :viewport viewport
+                                                                   :progress reporter
+                                                                   :if-exists :supersede)
+                                                   (render-preview input temporary settings
+                                                                   :max-width max-width
+                                                                   :max-height max-height
+                                                                   :cache-p cache-p
+                                                                   :viewport viewport
+                                                                   :progress reporter
+                                                                   :if-exists :supersede)))))
+                                        (setf trusted-region (and viewport narrowed viewport)))
                                       (unless (string= digest (photo-content-key input))
                                         (error "RAW source changed during preview render")))
                                     :validation-function dependencies-current-p)
@@ -6175,7 +6172,7 @@ behind is memory. Best effort; returns how many directories went."
                                              ((= generation preview-generation)
                                               (queue-event queue
                                                            (list :preview generation index
-                                                                 job role display viewport
+                                                                 job role display trusted-region
                                                                  bound geometry)))
                                              ;; Superseded while it rendered:
                                              ;; nobody will look at this copy.
@@ -6415,13 +6412,13 @@ behind is memory. Best effort; returns how many directories went."
                 queue :live
                 (lambda ()
                   (let ((started (get-internal-real-time))
-                        width height)
+                        width height narrowed)
                     ;; Whatever happens, the interface hears that the
                     ;; render is over, or no live render would start again.
                     (unwind-protect
                          (handler-case
                              (progn
-                               (multiple-value-setq (width height)
+                               (multiple-value-setq (width height narrowed)
                                  (orfeus:render-preview-rgb
                                   input snapshot buffer capacity
                                   :max-width bound
@@ -6439,7 +6436,9 @@ behind is memory. Best effort; returns how many directories went."
                                                 (princ-to-string condition)))))
                       (queue-event queue
                                    (list :live-preview epoch sequence job
-                                         width height since region bound)))))
+                                         width height since
+                                         (and region narrowed region)
+                                         bound)))))
                 :replace-kind :live :front-p t))))
            (schedule-live-settle ()
              ;; Once the drag quiets down, one file render persists the
@@ -7681,9 +7680,7 @@ behind is memory. Best effort; returns how many directories went."
                   (if (gui-preview-event-current-p model event preview-generation)
                       (progn
                         (publish-preview (fifth event) (sixth event) (second event)
-                                         (published-region (sixth event)
-                                                           (seventh event)
-                                                           (eighth event))
+                                         (seventh event)
                                          (ninth event)
                                          (eighth event))
                         (setf render-stage nil
@@ -7695,11 +7692,9 @@ behind is memory. Best effort; returns how many directories went."
                   (destructuring-bind (epoch sequence job width height since
                                        region bound)
                       (rest event)
-                    ;; As for files: an answer as big as the whole bound is
-                    ;; the whole frame, whatever window was asked for.
-                    (when (and region width (plusp bound)
-                               (>= (max width height) (* 0.98 bound)))
-                      (setf region nil))
+                    ;; REGION already carries the native renderer's own
+                    ;; narrowed-or-not answer (see F12): nothing left to
+                    ;; second-guess from WIDTH/HEIGHT/BOUND here.
                     (setf live-busy-p nil)
                     ;; Newer than what is on screen and for the photograph
                     ;; still shown: worth showing, even with another edit

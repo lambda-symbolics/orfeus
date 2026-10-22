@@ -409,7 +409,13 @@ publishing the file — as a function of no arguments, and decides when to run
 it. The default runs it at once, so OUTPUT-PATHNAME exists on return. A batch
 passes one that runs it while the next photograph renders: the metadata copy is
 an ExifTool process that takes most of a second on one core while the render
-has every other core busy, and the two have nothing to say to each other."
+has every other core busy, and the two have nothing to say to each other.
+
+Returns OUTPUT-PATHNAME and a second value: whether the delivered file is
+actually a window of a larger frame rather than the whole of it (always NIL
+without VIEWPORT). A caller cannot reliably recover this from the file's own
+pixel dimensions, since a genuine window that keeps one whole dimension of
+the frame is the same size as that frame on that axis."
   (check-type settings (or null processing-settings))
   ;; Every render goes through the graph. Flat settings used to take an older
   ;; native path of their own that rendered the same picture — measured, byte
@@ -445,7 +451,8 @@ has every other core busy, and the two have nothing to say to each other."
         (:supersede nil)))
     (ensure-directories-exist output-pathname)
     (let ((temporary (render-temporary-pathname output-pathname))
-          (rendered nil))
+          (rendered nil)
+          (narrowed nil))
       (flet ((finish ()
                ;; The temporary is removed however this ends: published, it
                ;; has been renamed away; failed, it must not be left behind.
@@ -462,18 +469,21 @@ has every other core busy, and the two have nothing to say to each other."
                (call-with-render-source
                 input-pathname
                 (lambda (render-input-pathname)
-                  (render-native-photo-graph
-                   render-input-pathname temporary graph
-                   :report-input-pathname input-pathname
-                   :grain-seed grain-seed
-                   :max-width (or max-width 0)
-                   :max-height (or max-height 0)
-                   :jpeg-quality jpeg-quality
-                   :cache-p cache-p
-                   :draft-p draft-p
-                   :durable-p durable-p
-                   :viewport viewport
-                   :progress progress)))
+                  (setf narrowed
+                        (nth-value
+                         1
+                         (render-native-photo-graph
+                          render-input-pathname temporary graph
+                          :report-input-pathname input-pathname
+                          :grain-seed grain-seed
+                          :max-width (or max-width 0)
+                          :max-height (or max-height 0)
+                          :jpeg-quality jpeg-quality
+                          :cache-p cache-p
+                          :draft-p draft-p
+                          :durable-p durable-p
+                          :viewport viewport
+                          :progress progress)))))
                (setf rendered t))
           ;; A render that did not finish leaves nothing behind; one that did
           ;; hands its temporary to FINISH, which cleans up after itself.
@@ -481,7 +491,7 @@ has every other core busy, and the two have nothing to say to each other."
             (when (probe-file temporary)
               (delete-file temporary))))
         (funcall finisher #'finish)
-        output-pathname))))
+        (values output-pathname narrowed)))))
 
 (defun render-preview (input-pathname output-pathname settings
                        &key (if-exists :error)
@@ -495,7 +505,10 @@ delivers, and the bridge ignores the request when the bound is large enough that
 binning would drop detail the downscale would have kept.
 
 Not durable: a preview is the cache's own disposable entry, not a photograph
-to lose, and skipping the write's fsyncs is most of what a cache fill costs."
+to lose, and skipping the write's fsyncs is most of what a cache fill costs.
+
+Returns OUTPUT-PATHNAME and whether it is actually a window of a larger
+frame, as RENDER-PHOTO does."
   (render-photo input-pathname output-pathname settings
                 :draft-p draft-p
                 :max-width max-width
@@ -537,7 +550,9 @@ reported, because that render will fail again and say so properly."
 
 The interactive hot path: no JPEG encode, no file, no metadata copy. VIEWPORT,
 as for RENDER-PREVIEW, develops only that part of the frame.
-Returns the oriented image width and height as two values."
+Returns the oriented image width and height, and whether the delivered
+image is actually a window of a larger frame rather than the whole of it,
+as three values."
   (check-type graph processing-graph)
   (multiple-value-bind (chosen-profile chosen-focal demosaic)
       (graph-optics-overrides graph)
