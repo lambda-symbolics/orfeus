@@ -1570,7 +1570,25 @@ pub(crate) fn plan_viewport(ops: &[GraphOp]) -> Option<ViewportPlan> {
         // filters in a row each want their own reach.
         halo += match op.kind {
             NODE_NOISE_REDUCTION => {
-                render::NOISE_REDUCTION_REACH.max(super::nn::NETWORK_REACH)
+                // The edge-aware filter and the network are two filters in a
+                // row within this one node, not an either/or: both run in
+                // sequence whenever both amounts are positive (the
+                // edge-aware pass first), so their reaches add here too,
+                // the same as this loop already adds reach across nodes.
+                // Checking the raw amount rather than the scaled strength a
+                // preview might use keeps this independent of render size,
+                // at most reserving a border neither pass ends up needing.
+                let edge_reach = if op.params[0] > 0.0 {
+                    render::NOISE_REDUCTION_REACH
+                } else {
+                    0
+                };
+                let neural_reach = if op.params[1] > 0.0 {
+                    super::nn::NETWORK_REACH
+                } else {
+                    0
+                };
+                edge_reach + neural_reach
             }
             NODE_SHARPEN => render::SHARPEN_MAX_REACH,
             // Stated for the photograph, so an upper bound for any reduction.
@@ -3307,6 +3325,21 @@ mod tests {
         let one = plan(&[NODE_NOISE_REDUCTION]).unwrap().halo;
         assert!(one >= render::NOISE_REDUCTION_REACH);
         assert_eq!(plan(&[NODE_NOISE_REDUCTION, NODE_NOISE_REDUCTION]).unwrap().halo, 2 * one);
+
+        // The edge-aware filter and the network run in sequence within one
+        // node when both amounts are positive, not either/or, so the window
+        // has to overlap by both their reaches together, not the larger
+        // alone -- otherwise its interior would not match a whole-frame
+        // render wherever the network's own extra reach was shorted.
+        let both_bytes = GraphBuilder::new()
+            .node(NODE_NOISE_REDUCTION, 0, -1, &[0.5, 0.5, 1.0], None)
+            .build();
+        let both = plan_viewport(&parse_graph(&both_bytes).unwrap()).unwrap();
+        assert_eq!(
+            both.halo,
+            render::NOISE_REDUCTION_REACH + super::super::nn::NETWORK_REACH,
+            "edge-aware and neural reaches must add when both amounts are positive"
+        );
     }
 
     fn max_difference(first: &RgbImage, second: &RgbImage) -> f32 {
