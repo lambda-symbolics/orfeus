@@ -2,15 +2,15 @@
 #+date: 2026-10-22
 
 Astra audited commit =5a3feb4= and found 14 findings (F01-F14), full text at
-=root@10.0.0.5:/root/orfeus-audit/orfeus-image-quality-audit.org=. Ten are
+=root@10.0.0.5:/root/orfeus-audit/orfeus-image-quality-audit.org=. Twelve are
 fixed below, each with a real/cold-render regression test added in the same
-commit. Four are deliberately deferred -- not because they are not real, but
-because fixing them well needs either architecture this repo does not have
-yet, or real-photo verification this session could not do responsibly at
-2 AM. Shipping a half-verified fix to the renderer's core pipeline has burned
-this project before (see =orfeus-cpu-waste-review.md= / the memory on a
-mutation-testing near-miss in this exact area); this status file exists so
-that risk is visible instead of silent.
+commit. Two (F05/F06) are deliberately deferred -- not because they are not
+real, but because fixing them well needs real-photo verification this
+session could not do responsibly at 2 AM. Shipping a half-verified fix to
+the renderer's core pipeline has burned this project before (see
+=orfeus-cpu-waste-review.md= / the memory on a mutation-testing near-miss in
+this exact area); this status file exists so that risk is visible instead
+of silent.
 
 * Fixed, with tests
 
@@ -78,6 +78,43 @@ that risk is visible instead of silent.
   required a *non-nil* needed region, so zooming out far enough that the
   whole frame was wanted again (needed = nil) could never trigger a
   refresh. Both fixed.
+- F12 (a full-dimension window misread as the whole frame) -- =808bb28=.
+  The GUI used to infer "is this actually a window" from whether the
+  delivered file's larger pixel dimension came within 98% of the render
+  bound -- ambiguous by construction, since a genuinely narrow window that
+  keeps one whole dimension of the frame (a portrait crop at full height,
+  say) looks identical on that axis. Fixed properly, per the audit's own
+  suggestion: the native renderer now reports back whether it actually
+  narrowed to a window (`finish`'s own `window.is_some()` check, already
+  computed for a different reason, now surfaced through both
+  `orfeus_raw_render_v3` and `orfeus_raw_render_rgb_v1` as a new
+  `out_narrowed` parameter, ABI bumped to 11) and the GUI trusts that
+  directly instead of guessing from pixel sizes. A cache-hit preview (no
+  fresh render this tick) keeps trusting the originally-requested region,
+  since nothing has changed since whatever render first produced it.
+- F14 (the film-base eyedropper ignores graph geometry) -- =4def346=. A
+  click to sample a negative's film base mapped through the preview's own
+  pan/zoom into a normalized coordinate and sampled the raw decode directly
+  there, reversing none of the graph's own crop, rotate or flip between the
+  raw decode and the display -- after a horizontal flip, displayed x=0.1
+  read original x=0.1 instead of 0.9. Fixed by walking the graph's own
+  crop/rotate/flip nodes in order (`graph-geometry-steps`) and reversing
+  each exactly, last node first: the crop step mirrors `rotate_crop_image`'s
+  own source-sampling formula pixel for pixel (verified against a
+  hand-computed 90-degree case, and that the test actually catches a sign
+  error in that formula, not just that something changes), rotate and flip
+  are pure axis permutations needing no pixel dimensions at all. A new
+  native query (`orfeus_raw_oriented_dimensions_v1`, ABI 12) answers the
+  raw decode's own oriented pixel size without a full render, verified
+  against a real orientation=6 photo. The pan-centre clamp mismatch the
+  audit also named (drawing clamps, sampling did not) is fixed alongside,
+  reusing the same clamp the visible-frame-rect calculation already applies.
+  Scoped to crop/rotate/flip, matching every other fix tonight's judgement
+  about what is safe to ship without a real-photo check: lens optics
+  distortion has no simple closed-form inverse and is not reversed, which
+  in practice rarely matters here since the node this feeds (negative /
+  colour-subtract) is used on scanned film, graphs that essentially never
+  carry an optics node at all.
 
 * Deferred, documented, not fixed
 
@@ -131,65 +168,6 @@ a real photograph to check it against (see the neural-noise-sigma memory's
 naturally with F05, since both touch the same denoise internals; worth
 designing and fixing together with real verification photos in hand, not
 tonight.
-
-** F12: a window that fills one whole frame dimension is misread as the whole frame
-
-Both the file-preview and live-preview publication paths discard the
-requested viewport whenever the delivered image's larger dimension reaches
-98% of the render bound, on the theory that a renderer that silently
-ignored the viewport would look exactly like this. But a genuinely narrow
-window that happens to keep one full dimension -- the audit's own example: a
-portrait frame, an 80%-width by full-height crop -- reaches the bound on
-that one axis too, and gets the same false "secretly the whole frame"
-verdict, clearing its region and placing/zooming the view as if it covered
-everything.
-
-*Why not fixed*: the robust fix is what the audit itself names -- have the
-renderer report back the actual frame and viewport geometry it used,
-explicitly, rather than inferring it from the output's pixel dimensions,
-which are fundamentally ambiguous between these two cases. That is a wire-
-protocol change (the render-frame struct `native.lisp` and the Rust FFI
-boundary both touch), not a same-night heuristic tweak. A pure Lisp-side
-heuristic repair was considered -- comparing the delivered size against what
-the *requested region's own aspect* should have produced, instead of
-against the bound alone -- but doing that correctly needs the photo's own
-oriented frame aspect at the exact point this check runs, which is not
-reliably available there without borrowing a helper (`crop-frame-aspect`)
-built for a different call site and context; wiring that in without
-confidence was judged riskier than leaving the known, explained gap. P2 in
-the audit's own ranking (a conditional geometry problem, not corrupted image
-content), which weighed into deferring it over the P1 items above.
-
-** F14: the film-base eyedropper ignores graph geometry
-
-Clicking the preview to sample a negative's film base maps the click through
-the preview's own fit/zoom/pan into a normalized frame coordinate, then
-samples the raw decoded image there directly; the native sampler only
-corrects for EXIF orientation. Neither step reverses whatever the graph
-itself did -- crop, flip, quarter-turn, straightening angle, or lens
-optics -- between the raw decode and what is actually on screen. After a
-horizontal flip, for instance, a click at displayed x=0.1 should read
-original x=0.9 and instead reads original x=0.1: the picked RGB values can
-come from the wrong part of the photograph entirely, silently wrong in every
-negative conversion that follows.
-
-*Why not fixed*: this repo already has `rect-through-geometry` /
-`downstream-geometry`, which correctly reverses rotate and flip nodes
-*downstream* of a given node (used by the crop-centre picker) -- but the
-eyedropper's problem is upstream of the sampled node: crop's own rect and
-straightening angle, any number of rotate/flip nodes, and potentially lens
-optics distortion, between the raw decode and the node being sampled. That
-is new infrastructure (walking and inverting an arbitrary geometric prefix,
-not just one crop's downstream turns), and optics distortion in particular
-has no simple closed-form inverse to fall back on. Getting a partial version
-of this subtly wrong -- reversing flip and rotate but mishandling the crop
-offset, say -- would be worse than the current, clearly-documented gap,
-because it would look fixed while still silently sampling the wrong pixel
-sometimes. In practice the node this feeds (negative / colour-subtract) is
-used on scanned film, which typically has no optics node in its graph at
-all, so a crop+rotate+flip-only reversal would cover the overwhelmingly
-common case -- but it still needs its own careful implementation and a real
-scanned-negative test, not a late-night patch.
 
 * Noted, not actioned
 
