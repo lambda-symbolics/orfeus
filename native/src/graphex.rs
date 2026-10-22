@@ -1005,6 +1005,74 @@ fn rotate_crop_image(
     ))
 }
 
+/// How much the graph's own geometry nodes narrow or turn what a bounded
+/// render decodes, before any of OPS has actually run.
+///
+/// Returns the total quarter-turns clockwise every `NODE_ROTATE` in OPS
+/// contributes, mod 4, and the width and height fraction every `NODE_CROP`
+/// narrows its own input by, composed across every crop present (a second
+/// crop narrows what the first one already narrowed, so these multiply
+/// rather than taking only the last one). A crop's own straightening angle
+/// is not accounted for here -- the shrink that takes is usually a few
+/// percent, and this is a sizing heuristic, not the geometry itself.
+fn graph_output_geometry(ops: &[GraphOp]) -> (u32, f32, f32) {
+    let mut quarter_turns = 0u32;
+    let mut crop_width = 1.0_f32;
+    let mut crop_height = 1.0_f32;
+    for op in ops {
+        match op.kind {
+            NODE_ROTATE => {
+                quarter_turns = (quarter_turns + op.params[0] as u32) % 4;
+            }
+            NODE_CROP => {
+                crop_width *= op.params[2].clamp(0.0, 1.0);
+                crop_height *= op.params[3].clamp(0.0, 1.0);
+            }
+            _ => {}
+        }
+    }
+    (quarter_turns, crop_width, crop_height)
+}
+
+/// The oriented-decode size bound that makes a render of OPS, bounded to
+/// MAX_WIDTH by MAX_HEIGHT at its own final output, decode with enough
+/// resolution and the right axis assignment to actually meet that bound.
+///
+/// MAX_WIDTH and MAX_HEIGHT describe what the graph is meant to deliver
+/// after everything in OPS runs, not the oriented decode this narrows
+/// before OPS ever sees it: an odd total of graph quarter-turns swaps which
+/// axis the two bounds actually constrain, on top of the swap
+/// `native_downscale_bounds` already makes for ORIENTATION, and a crop
+/// narrows what reaches the rest of the graph, so the decode needs to be
+/// inflated by its width/height fraction to still have that many pixels
+/// left over once the crop runs. Zero in either of MAX_WIDTH or MAX_HEIGHT
+/// still means unbounded on that axis throughout.
+fn export_decode_bounds(
+    orientation: u16,
+    max_width: u32,
+    max_height: u32,
+    ops: &[GraphOp],
+) -> (u32, u32) {
+    let (quarter_turns, crop_width_fraction, crop_height_fraction) = graph_output_geometry(ops);
+    let (export_max_width, export_max_height) = if quarter_turns % 2 == 1 {
+        (max_height, max_width)
+    } else {
+        (max_width, max_height)
+    };
+    let inflate = |bound: u32, fraction: f32| -> u32 {
+        if bound > 0 && fraction > 0.0 && fraction < 1.0 {
+            ((bound as f32) / fraction).ceil() as u32
+        } else {
+            bound
+        }
+    };
+    render::native_downscale_bounds(
+        orientation,
+        inflate(export_max_width, crop_width_fraction),
+        inflate(export_max_height, crop_height_fraction),
+    )
+}
+
 /// Executes OPS over SOURCE, returning the final display-domain image.
 ///
 /// The source and every intermediate stays scene-linear until either a film
@@ -2741,7 +2809,7 @@ fn render_graph_frame(
     profile_stage!("decoded-source");
     reporter.report("scaling\0", 0.2);
     let (native_max_width, native_max_height) =
-        render::native_downscale_bounds(decoded.orientation, frame.max_width, frame.max_height);
+        export_decode_bounds(decoded.orientation, frame.max_width, frame.max_height, &ops);
     let bounded = native_max_width > 0 || native_max_height > 0;
     // SAFETY: The caller promises a null or NUL-terminated lens name.
     let named_lens =
@@ -3868,6 +3936,101 @@ mod tests {
             "input above the white point stays clipped"
         );
         assert!(apply_curve_value(&lut, srgb_decode_value(0.2)) > srgb_decode_value(0.2));
+    }
+
+    #[test]
+    fn graph_output_geometry_combines_rotates_and_composes_crops() {
+        let op = |kind: u32, params: &[f32]| GraphOp {
+            kind,
+            input_a: 0,
+            input_b: usize::MAX,
+            params: params.to_vec(),
+            text: None,
+        };
+        assert_eq!(graph_output_geometry(&[]), (0, 1.0, 1.0));
+        assert_eq!(
+            graph_output_geometry(&[op(NODE_ROTATE, &[1.0])]),
+            (1, 1.0, 1.0)
+        );
+        // Two quarter-turns, from one node or two, come back even.
+        assert_eq!(
+            graph_output_geometry(&[op(NODE_ROTATE, &[2.0])]),
+            (2, 1.0, 1.0)
+        );
+        assert_eq!(
+            graph_output_geometry(&[op(NODE_ROTATE, &[1.0]), op(NODE_ROTATE, &[1.0])]),
+            (2, 1.0, 1.0)
+        );
+        assert_eq!(
+            graph_output_geometry(&[op(NODE_ROTATE, &[3.0]), op(NODE_ROTATE, &[2.0])]),
+            (1, 1.0, 1.0)
+        );
+        // A crop's own width/height fraction; two crops compose by product,
+        // each narrowing what the one before it already narrowed.
+        assert_eq!(
+            graph_output_geometry(&[op(NODE_CROP, &[0.0, 0.0, 0.5, 0.5, 0.0])]),
+            (0, 0.5, 0.5)
+        );
+        let (_, width, height) = graph_output_geometry(&[
+            op(NODE_CROP, &[0.0, 0.0, 0.5, 0.8, 0.0]),
+            op(NODE_CROP, &[0.0, 0.0, 0.5, 0.5, 0.0]),
+        ]);
+        assert!((width - 0.25).abs() < 1.0e-6, "crops did not compose: {width}");
+        assert!((height - 0.4).abs() < 1.0e-6, "crops did not compose: {height}");
+    }
+
+    #[test]
+    fn export_decode_bounds_swaps_for_a_graph_quarter_turn() {
+        // The audit's own reproduction: a 4000x3000, EXIF-orientation-1
+        // source bounded to 1600x1200, with a graph quarter-turn. Before the
+        // fix this decoded straight at 1600x1200 and the turn then handed
+        // back 1200x1600, exceeding the requested height.
+        let op = GraphOp {
+            kind: NODE_ROTATE,
+            input_a: 0,
+            input_b: usize::MAX,
+            params: vec![1.0],
+            text: None,
+        };
+        let (width, height) = export_decode_bounds(1, 1600, 1200, std::slice::from_ref(&op));
+        assert_eq!(
+            (width, height),
+            (1200, 1600),
+            "the decode bound must swap so the turn lands back inside 1600x1200"
+        );
+    }
+
+    #[test]
+    fn export_decode_bounds_inflates_for_a_graph_crop() {
+        // The audit's own reproduction: a half-width, half-height graph crop
+        // bounded to 1600x1200 used to narrow to 1600x1200 before the crop
+        // ran, delivering only 800x600 -- less than the source could supply.
+        let op = GraphOp {
+            kind: NODE_CROP,
+            input_a: 0,
+            input_b: usize::MAX,
+            params: vec![0.0, 0.0, 0.5, 0.5, 0.0],
+            text: None,
+        };
+        let (width, height) = export_decode_bounds(1, 1600, 1200, std::slice::from_ref(&op));
+        assert_eq!(
+            (width, height),
+            (3200, 2400),
+            "the decode bound must inflate so the crop still reaches 1600x1200"
+        );
+    }
+
+    #[test]
+    fn export_decode_bounds_leaves_an_unbounded_axis_alone() {
+        let op = GraphOp {
+            kind: NODE_CROP,
+            input_a: 0,
+            input_b: usize::MAX,
+            params: vec![0.0, 0.0, 0.5, 0.5, 0.0],
+            text: None,
+        };
+        let (width, height) = export_decode_bounds(1, 0, 0, std::slice::from_ref(&op));
+        assert_eq!((width, height), (0, 0), "zero must stay unbounded, not inflate from zero");
     }
 
     #[test]
