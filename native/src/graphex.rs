@@ -1640,9 +1640,20 @@ fn crop_viewport_from(
         (image.height, image.width)
     };
     // The window in oriented pixels, grown by the halo and clipped to the
-    // frame. Rounded outwards so the requested region is always covered.
-    let left = ((rect[0] * frame_width as f32).floor() as isize - halo as isize).max(0) as usize;
-    let top = ((rect[1] * frame_height as f32).floor() as isize - halo as isize).max(0) as usize;
+    // frame. Rounded outwards so the requested region is always covered,
+    // and the origin rounded down to an even pixel on top of that: the
+    // chroma pooling and the neural network's own pixel-unshuffle both
+    // group pixels into 2x2 blocks counting from the window's local (0, 0),
+    // so an odd absolute origin paired a different set of source pixels
+    // into each block than a whole-frame render does, and reconstructed a
+    // window's fine chroma detail wrong (confirmed: two-pixel isoluminant
+    // stripes that survive a whole-frame render intact dropped to zero
+    // cropped at an odd origin). An even origin keeps local and absolute
+    // parity the same, which is all those two passes actually need.
+    let left = (((rect[0] * frame_width as f32).floor() as isize - halo as isize).max(0) as usize)
+        & !1;
+    let top = (((rect[1] * frame_height as f32).floor() as isize - halo as isize).max(0) as usize)
+        & !1;
     let right = (((rect[0] + rect[2]) * frame_width as f32).ceil() as usize + halo)
         .min(frame_width);
     let bottom = (((rect[1] + rect[3]) * frame_height as f32).ceil() as usize + halo)
@@ -3235,6 +3246,80 @@ mod tests {
                          by {difference}"
                     );
                 }
+            }
+        }
+    }
+
+    /// A flat-luminance image whose Cr alternates +-AMPLITUDE every PERIOD
+    /// columns and whose Cb is zero everywhere -- the audit's own
+    /// adversarial pattern for F06: an ordinary noisy scene's phase error is
+    /// too small to tell apart from the chroma filter's own smoothing, but
+    /// this pattern's chroma either survives a window intact or collapses
+    /// outright depending on whether the window's 2x2 pooling grid lines up
+    /// with the whole frame's.
+    fn isoluminant_stripe_scene(width: usize, height: usize, period: usize) -> RgbImage {
+        let base = 0.4_f32;
+        let amplitude = 0.2_f32;
+        let mut data = Vec::with_capacity(width * height * 3);
+        for _ in 0..height {
+            for x in 0..width {
+                let delta = if (x / period) % 2 == 0 { amplitude } else { -amplitude };
+                let r = base + delta;
+                let g = base - (0.2126 / 0.7152) * delta;
+                let b = base;
+                data.extend_from_slice(&[r, g, b]);
+            }
+        }
+        RgbImage { width, height, data }
+    }
+
+    #[test]
+    fn a_window_at_an_odd_origin_keeps_the_whole_frames_own_chroma_pooling_phase() {
+        // The audit's own reproduction: an odd requested left edge used to
+        // shift which source pixels the chroma split and reconstruction
+        // paired into each 2x2 block, against what a whole-frame render of
+        // the same data pairs -- collapsing a two-pixel isoluminant stripe
+        // to nothing at some origins while a whole-frame render keeps it
+        // intact. The window's own origin is now rounded down to an even
+        // pixel before anything narrows, so the two must now agree to the
+        // same tight tolerance the other node kinds already do in
+        // A_WINDOWED_RENDER_MATCHES_THE_WHOLE_ONE.
+        let ops = parse_graph(
+            &GraphBuilder::new()
+                .node(NODE_NOISE_REDUCTION, 0, -1, &[0.05, 0.0, 1.0], None)
+                .build(),
+        )
+        .unwrap();
+        let graph_context = context(5);
+        for period in [1, 2] {
+            let scene = isoluminant_stripe_scene(320, 240, period);
+            let whole = execute_graph(&ops, scene.clone(), &graph_context).unwrap();
+            // An odd requested left edge, well away from the frame border so
+            // the halo never clips: the audit's own x=49.
+            for rect in [[49.0 / 320.0, 0.0, 100.0 / 320.0, 1.0]] {
+                let window =
+                    execute_graph_windowed(&ops, scene.clone(), &graph_context, rect).unwrap();
+                let left = (rect[0] * whole.width as f32).floor() as usize;
+                let top = (rect[1] * whole.height as f32).floor() as usize;
+                let expected = render::crop_rect(
+                    &whole,
+                    left,
+                    top,
+                    window.width.min(whole.width - left),
+                    window.height.min(whole.height - top),
+                );
+                assert_eq!(
+                    (window.width, window.height),
+                    (expected.width, expected.height),
+                    "period {period} rect {rect:?} came back the wrong size"
+                );
+                let difference = max_difference(&window, &expected);
+                assert!(
+                    difference < 1.0e-6,
+                    "period {period} rect {rect:?} differs by {difference}: an odd \
+                     origin dropped the window's own chroma pooling out of phase \
+                     with the whole frame's"
+                );
             }
         }
     }
