@@ -234,6 +234,102 @@ corner, which is as wrong as it can get."
               ;; A mirror undoes itself, so it needs no separate inverse.
               (:mirror (rect-mirrored rect (second step) (third step))))))))
 
+(defun graph-geometry-steps (graph)
+  "Return GRAPH's crop, rotate and flip nodes, in the order the graph
+applies them, as (:crop LEFT TOP WIDTH HEIGHT ANGLE), (:rotate TURNS) or
+(:mirror HORIZONTAL VERTICAL) steps -- everything between the raw decode
+and GRAPH's own display output that moves where a point lands. Bypassed
+nodes contribute nothing, matching what they actually render as. NIL when
+GRAPH is not a processing graph, or its node chain is not simple, as
+GRAPH-FORWARD-CHAIN."
+  (and (typep graph 'orfeus:processing-graph)
+       (let ((chain (graph-forward-chain graph 0)))
+         (loop for node in chain
+               for kind = (orfeus:graph-node-kind node)
+               for params = (orfeus:graph-node-params node)
+               unless (orfeus:graph-node-bypassed-p node)
+                 append (case kind
+                          (:crop
+                           (list (list :crop
+                                       (getf params :left 0.0)
+                                       (getf params :top 0.0)
+                                       (getf params :width 1.0)
+                                       (getf params :height 1.0)
+                                       (getf params :angle 0.0))))
+                          (:rotate
+                           (list (list :rotate (getf params :quarter-turns 0))))
+                          (:flip
+                           (list (list :mirror (getf params :horizontal)
+                                       (getf params :vertical))))
+                          (t '()))))))
+
+(defun point-through-crop-backward (x y left top width height angle
+                                    frame-width frame-height)
+  "Map normalized point X, Y in a crop node's own output back to where it
+came from in its FRAME-WIDTH by FRAME-HEIGHT input.
+
+The inverse of what `rotate_crop_image` in native/src/graphex.rs samples
+when it develops the crop, so the two agree: that function reads each
+output pixel from a source position computed exactly this way, which is
+already the direction a reversal needs. LEFT, TOP, WIDTH, HEIGHT and ANGLE
+are the crop node's own parameters, ANGLE in degrees clockwise."
+  (let* ((frame-width (float frame-width 1d0))
+         (frame-height (float frame-height 1d0))
+         (x0 (fround (* left frame-width)))
+         (y0 (fround (* top frame-height)))
+         (target-width (fround (* width frame-width)))
+         (target-height (fround (* height frame-height)))
+         (center-x (/ frame-width 2d0))
+         (center-y (/ frame-height 2d0))
+         (radians (* (float angle 1d0) (/ pi 180d0)))
+         (cosine (cos radians))
+         (sine (sin radians))
+         (offset-x (- (+ x0 (* x target-width)) center-x))
+         (offset-y (- (+ y0 (* y target-height)) center-y))
+         (source-x (+ center-x (* cosine offset-x) (* sine offset-y)))
+         (source-y (+ center-y (- (* sine offset-x)) (* cosine offset-y))))
+    (values (/ source-x frame-width) (/ source-y frame-height))))
+
+(defun point-through-rotate-backward (x y turns)
+  "Map normalized point X, Y in a rotate node's own output back to its
+input, TURNS being clockwise quarter turns as the node stores them."
+  (ecase (mod (round turns) 4)
+    (0 (values x y))
+    (1 (values y (- 1d0 x)))
+    (2 (values (- 1d0 x) (- 1d0 y)))
+    (3 (values (- 1d0 y) x))))
+
+(defun point-through-flip (x y horizontal vertical)
+  "Map normalized point X, Y across a flip node -- its own inverse, since a
+mirror undoes itself."
+  (values (if horizontal (- 1d0 x) x)
+          (if vertical (- 1d0 y) y)))
+
+(defun raw-point-for-display-point (graph x y frame-width frame-height)
+  "Map normalized point X, Y in GRAPH's own display output back to where it
+came from in the raw decode's FRAME-WIDTH by FRAME-HEIGHT oriented frame,
+reversing every crop, rotate and flip node GRAPH applies, last to first.
+
+Every crop reads FRAME-WIDTH by FRAME-HEIGHT as its own input size: real
+graphs carry at most one, before any rotate or flip, so this never needs
+to track a narrower size partway through. The point comes back unchanged
+when GRAPH carries no such node, or GRAPH-GEOMETRY-STEPS cannot answer for
+it at all."
+  (let ((steps (graph-geometry-steps graph)))
+    (dolist (step (reverse steps) (values x y))
+      (ecase (first step)
+        (:crop
+         (destructuring-bind (left top width height angle) (rest step)
+           (multiple-value-setq (x y)
+             (point-through-crop-backward x y left top width height angle
+                                          frame-width frame-height))))
+        (:rotate
+         (multiple-value-setq (x y)
+           (point-through-rotate-backward x y (second step))))
+        (:mirror
+         (multiple-value-setq (x y)
+           (point-through-flip x y (second step) (third step))))))))
+
 (defparameter *flip-choices*
   '(("None" nil nil)
     ("Left to right" t nil)
@@ -4971,8 +5067,14 @@ behind is memory. Best effort; returns how many directories went."
                                             :blue (channel :blue))
                    (lightfast:redraw swatch)))))
            (sample-base-at (canvas x y)
-             ;; The eyedropper: map the click through the current fit and pan
-             ;; to normalized image coordinates, then sample linear color.
+             ;; The eyedropper: map the click through the current fit and
+             ;; pan to a normalized DISPLAY coordinate -- clamped the same
+             ;; way the drawing itself clamps its pan, so a centre dragged
+             ;; past the edge samples what is actually on screen -- then
+             ;; reverses whatever crop, rotate and flip the graph applies
+             ;; between the raw decode and that display, since the native
+             ;; sampler reads the raw file directly and corrects for EXIF
+             ;; orientation alone.
              (let ((node pick-color-node)
                    (job (selected-job))
                    (path (preview-path-for-canvas canvas)))
@@ -4982,15 +5084,33 @@ behind is memory. Best effort; returns how many directories went."
                  (multiple-value-bind (scaled-width scaled-height)
                      (preview-scaled-size canvas path preview-zoom)
                    (when scaled-width
-                     (let* ((normalized-x
-                              (+ preview-center-x
-                                 (/ (- x (/ (lightfast:widget-width canvas) 2d0))
-                                    scaled-width)))
+                     (let* ((canvas-width (lightfast:widget-width canvas))
+                            (canvas-height (lightfast:widget-height canvas))
+                            (visible-width (min 1d0 (/ canvas-width scaled-width)))
+                            (visible-height (min 1d0 (/ canvas-height scaled-height)))
+                            (clamped-center-x
+                              (min (- 1d0 (/ visible-width 2))
+                                   (max (/ visible-width 2) preview-center-x)))
+                            (clamped-center-y
+                              (min (- 1d0 (/ visible-height 2))
+                                   (max (/ visible-height 2) preview-center-y)))
+                            (normalized-x
+                              (max 0d0 (min 1d0
+                                            (+ clamped-center-x
+                                               (/ (- x (/ canvas-width 2d0))
+                                                  scaled-width)))))
                             (normalized-y
-                              (+ preview-center-y
-                                 (/ (- y (/ (lightfast:widget-height canvas)
-                                            2d0))
-                                    scaled-height))))
+                              (max 0d0 (min 1d0
+                                            (+ clamped-center-y
+                                               (/ (- y (/ canvas-height 2d0))
+                                                  scaled-height))))))
+                       (let ((frame (orfeus:photo-oriented-dimensions
+                                     (photo-job-input-path job))))
+                         (when frame
+                           (multiple-value-setq (normalized-x normalized-y)
+                             (raw-point-for-display-point
+                              (current-settings) normalized-x normalized-y
+                              (car frame) (cdr frame)))))
                        (handler-case
                            (let ((color (orfeus:sample-photo-linear-color
                                          (photo-job-input-path job)

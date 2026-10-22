@@ -7228,6 +7228,29 @@ pub(crate) fn as_shot_kelvin(input: &Path) -> Result<Option<f32>, Error> {
     Ok(super::color::as_shot_kelvin(&raw.color_matrix, raw.wb_coeffs))
 }
 
+/// INPUT's own oriented pixel dimensions -- width and height after its EXIF
+/// orientation turns the sensor's own axes, matching what `orient` and the
+/// renderer's own `DecodedRaw` width/height represent once turned.
+///
+/// Reuses whatever decode the cache already holds -- a photograph on
+/// screen has already answered this -- and develops the frame on a cache
+/// miss rather than reading width and height from file metadata alone:
+/// an unusual crop or a pixel-shift composite can disagree with what the
+/// renderer actually produces, and this exists so a caller never has to
+/// guess that on its own.
+pub(crate) fn oriented_dimensions(input: &Path, cache_mode: u32) -> Result<(usize, usize), Error> {
+    if !matches!(cache_mode, CACHE_NONE | CACHE_USE) {
+        return Err(Error::InvalidArgument("unsupported decode cache mode"));
+    }
+    let (decoded, _) =
+        decoded_for_render_with_identity(input, cache_mode, false, Demosaic::default(), false)?;
+    Ok(if (5..=8).contains(&decoded.orientation) {
+        (decoded.height, decoded.width)
+    } else {
+        (decoded.width, decoded.height)
+    })
+}
+
 /// One frame developed as far as camera RGB: demosaiced (or binned) and
 /// scaled so the sensor's white level is 1.0 in every channel, before white
 /// balance and the camera matrix. That is the one place every channel clips at

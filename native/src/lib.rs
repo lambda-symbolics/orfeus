@@ -505,11 +505,13 @@ where
 /// frame rather than delivering the whole of it -- a caller cannot
 /// reliably recover this from the delivered pixel dimensions alone, since
 /// a genuine window that keeps one whole dimension of the frame is the
-/// same size as that frame on that axis. Every remaining earlier entry
-/// point is unchanged.
+/// same size as that frame on that axis. Version 12 adds
+/// `orfeus_raw_oriented_dimensions_v1`, which answers a photograph's own
+/// oriented pixel dimensions without rendering it. Every remaining
+/// earlier entry point is unchanged.
 #[unsafe(no_mangle)]
 pub extern "C" fn orfeus_bridge_abi_version() -> u32 {
-    11
+    12
 }
 
 /// Write a 64-bit perceptual signature of the image at PATH.
@@ -757,6 +759,43 @@ pub unsafe extern "C" fn orfeus_raw_as_shot_kelvin_v1(
             }
             let input = path_from_c(input_path)?;
             *kelvin = render::as_shot_kelvin(input)?.unwrap_or(0.0);
+            Ok(())
+        })
+    }
+}
+
+/// Report INPUT's own oriented pixel dimensions: width and height after its
+/// EXIF orientation turns the sensor's own axes, matching what the renderer
+/// delivers once oriented.
+///
+/// Reuses whatever decode the cache already holds; a cache miss develops
+/// the frame, so this can cost as much as an ordinary render the first time
+/// a photograph is asked about, same as the frame's own decode would.
+///
+/// # Safety
+///
+/// `input_path` must be a readable NUL-terminated path, `out_width` and
+/// `out_height` writable, and the error buffer, when non-null, writable
+/// for its stated capacity.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn orfeus_raw_oriented_dimensions_v1(
+    input_path: *const c_char,
+    cache_mode: u32,
+    out_width: *mut u32,
+    out_height: *mut u32,
+    error_buffer: *mut c_char,
+    error_capacity: usize,
+) -> i32 {
+    // SAFETY: Pointer validation and dereferences remain inside the boundary.
+    unsafe {
+        ffi_result(error_buffer, error_capacity, || {
+            if out_width.is_null() || out_height.is_null() {
+                return Err(Error::InvalidArgument("output pointer is null"));
+            }
+            let input = path_from_c(input_path)?;
+            let (width, height) = render::oriented_dimensions(input, cache_mode)?;
+            *out_width = width as u32;
+            *out_height = height as u32;
             Ok(())
         })
     }
@@ -1285,7 +1324,7 @@ mod tests {
 
     #[test]
     fn reports_current_abi_version() {
-        assert_eq!(orfeus_bridge_abi_version(), 11);
+        assert_eq!(orfeus_bridge_abi_version(), 12);
         assert_eq!(orfeus_raw_render_capabilities_v1(), 1 | 2 | 4 | 16 | 32);
     }
 

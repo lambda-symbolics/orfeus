@@ -940,6 +940,37 @@ too old to answer reports."
           (let ((value (cffi:mem-ref kelvin :float)))
             (when (plusp value) value)))))))
 
+(defcfun ("orfeus_raw_oriented_dimensions_v1" %raw-oriented-dimensions-v1) :int32
+  (input-path :string)
+  (cache-mode :uint32)
+  (out-width :pointer)
+  (out-height :pointer)
+  (error-buffer :pointer)
+  (error-capacity :size))
+
+(defun native-oriented-dimensions (input-pathname &key (cache-p t))
+  "Return INPUT-PATHNAME's own oriented pixel dimensions, or NIL.
+
+Width and height after the file's EXIF orientation turns the sensor's own
+axes, matching what a render of it delivers once oriented -- the frame a
+graph's crop, rotate and flip nodes, and whatever a preview shows on
+screen, all measure themselves against. NIL from a bridge too old to
+answer, the same as any other failure here."
+  (native-library-load)
+  (when (< (native-bridge-version) 12)
+    (return-from native-oriented-dimensions nil))
+  (with-foreign-object (out-width :uint32)
+    (with-foreign-object (out-height :uint32)
+      (with-foreign-pointer (error-buffer *native-error-buffer-size*)
+        (let ((status (with-native-float-traps
+                        (%raw-oriented-dimensions-v1
+                         (namestring input-pathname) (if cache-p 1 0)
+                         out-width out-height
+                         error-buffer *native-error-buffer-size*))))
+          (when (zerop status)
+            (values (cffi:mem-ref out-width :uint32)
+                    (cffi:mem-ref out-height :uint32))))))))
+
 (defcfun ("orfeus_image_signature_v1" %image-signature-v1) :int32
   (path :string)
   (signature :pointer)

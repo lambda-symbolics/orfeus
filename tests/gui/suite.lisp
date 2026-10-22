@@ -1388,6 +1388,127 @@ diagonally opposite corner — as wrong as a crop can be."
       (check (same (orfeus/gui::rect-through-geometry rect '()) rect)
              "An empty geometry moved the rectangle"))))
 
+(defun test-eyedropper-reverses-graph-geometry ()
+  "The film-base eyedropper's own point reversal, each piece checked
+against what the native renderer actually does: NODE_ROTATE's and
+NODE_FLIP's exact pixel permutations (see `quarter_turn_image` and
+`apply_flip` in native/src/graphex.rs and native/src/render.rs), and
+ROTATE_CROP_IMAGE's own source-sampling formula for a crop with an angle."
+  (flet ((near (a b) (< (abs (- a b)) 1d-9)))
+    ;; A turn sends the rotated output's own corners back to the input
+    ;; corners a clockwise turn would have sent there: one turn clockwise
+    ;; takes the input's top-left to the output's top-right (per
+    ;; QUARTER-TURNS-ROTATE-CLOCKWISE-AND-LOSE-NOTHING in
+    ;; native/src/graphex.rs), so reversing one turn must send the output's
+    ;; own top-left back to the input's bottom-left.
+    (multiple-value-bind (x y) (orfeus/gui::point-through-rotate-backward 0d0 0d0 1)
+      (check (and (near x 0d0) (near y 1d0))
+             "one turn back did not send the output's top-left to the input's bottom-left"))
+    (multiple-value-bind (x y) (orfeus/gui::point-through-rotate-backward 0.3d0 0.4d0 2)
+      (check (and (near x 0.7d0) (near y 0.6d0))
+             "a half turn back did not move to the opposite corner"))
+    (multiple-value-bind (x y) (orfeus/gui::point-through-rotate-backward 0.3d0 0.4d0 0)
+      (check (and (near x 0.3d0) (near y 0.4d0)) "no turn moved the point"))
+    ;; A turn of 1 then 3 (or 3 then 1) is the identity, each undoing the
+    ;; other's own permutation.
+    (multiple-value-bind (x y) (orfeus/gui::point-through-rotate-backward 0.3d0 0.4d0 1)
+      (multiple-value-bind (x y) (orfeus/gui::point-through-rotate-backward x y 3)
+        (check (and (near x 0.3d0) (near y 0.4d0))
+               "turn 1 then turn 3 did not return to the start")))
+
+    ;; A flip is its own inverse.
+    (multiple-value-bind (x y) (orfeus/gui::point-through-flip 0.3d0 0.4d0 t nil)
+      (check (and (near x 0.7d0) (near y 0.4d0)) "a horizontal flip missed its own axis"))
+    (multiple-value-bind (x y) (orfeus/gui::point-through-flip 0.3d0 0.4d0 nil t)
+      (check (and (near x 0.3d0) (near y 0.6d0)) "a vertical flip missed its own axis"))
+
+    ;; A level crop (angle zero) is the ordinary crop-rect inverse.
+    (multiple-value-bind (x y)
+        (orfeus/gui::point-through-crop-backward 0.5d0 0.5d0 0.2d0 0.1d0 0.5d0 0.4d0 0.0d0
+                                                 1000d0 800d0)
+      (check (and (near x 0.45d0) (near y 0.3d0))
+             "a level crop's centre sample did not land on its own rectangle's centre"))
+
+    ;; A crop centred on the frame's own centre samples that same centre
+    ;; back regardless of its angle: rotating about the frame's centre
+    ;; leaves the centre point fixed.
+    (dolist (angle '(0.0d0 12.0d0 -30.0d0 170.0d0))
+      (multiple-value-bind (x y)
+          (orfeus/gui::point-through-crop-backward 0.5d0 0.5d0 0.25d0 0.25d0 0.5d0 0.5d0 angle
+                                                   1000d0 800d0)
+        (check (and (near x 0.5d0) (near y 0.5d0))
+               (format nil "angle ~A moved a frame-centred crop's own centre sample" angle))))
+
+    ;; An angled, off-centre crop's own centre sample must actually move
+    ;; with the angle, or the rotation term is doing nothing.
+    (multiple-value-bind (x0 y0)
+        (orfeus/gui::point-through-crop-backward 0.5d0 0.5d0 0.1d0 0.1d0 0.3d0 0.3d0 0.0d0
+                                                 1000d0 800d0)
+      (multiple-value-bind (x1 y1)
+          (orfeus/gui::point-through-crop-backward 0.5d0 0.5d0 0.1d0 0.1d0 0.3d0 0.3d0 20.0d0
+                                                   1000d0 800d0)
+        (check (not (and (near x0 x1) (near y0 y1)))
+               "a 20 degree angle did not move an off-centre crop's own centre sample")))
+
+    ;; A hand-worked case pinning down the rotation's exact sign, not just
+    ;; that it moves something: a square frame, a top-left-quadrant crop,
+    ;; and a round 90 degree angle where sine and cosine are exact. The
+    ;; crop's own output top-left corner sits at frame offset (-500, -500)
+    ;; from the frame's centre; turned 90 degrees clockwise (sin=1, cos=0)
+    ;; that reads source (0, 1000) exactly -- the frame's own bottom-left
+    ;; corner. A sign error in either rotation term answers (0, 0) instead.
+    (multiple-value-bind (x y)
+        (orfeus/gui::point-through-crop-backward 0d0 0d0 0d0 0d0 0.5d0 0.5d0 90d0 1000d0 1000d0)
+      (check (and (near x 0.0d0) (near y 1.0d0))
+             (format nil "a 90 degree crop rotation answered (~A, ~A), not (0, 1)" x y)))
+
+    ;; GRAPH-GEOMETRY-STEPS: a crop, a bypassed rotate (skipped), a real
+    ;; rotate and a flip, in order; a colour node contributes nothing.
+    (let* ((crop (orfeus:make-graph-node
+                  :id 1 :kind :crop :inputs '(0)
+                  :params (list :left 0.1d0 :top 0.1d0 :width 0.8d0 :height 0.8d0
+                                :angle 0.0d0)))
+           (bypassed-rotate (orfeus:make-graph-node
+                             :id 2 :kind :rotate :inputs '(1)
+                             :params (list :quarter-turns 2) :bypassed-p t))
+           (color (orfeus:make-graph-node :id 3 :kind :negative :inputs '(2)
+                                          :params (list 0.5d0 0.5d0 0.5d0 2.2d0 1.0d0)))
+           (rotate (orfeus:make-graph-node
+                    :id 4 :kind :rotate :inputs '(3)
+                    :params (list :quarter-turns 1)))
+           (flip (orfeus:make-graph-node
+                  :id 5 :kind :flip :inputs '(4)
+                  :params (list :horizontal t :vertical nil)))
+           (graph (orfeus:make-processing-graph
+                   :nodes (list crop bypassed-rotate color rotate flip)
+                   :output 5)))
+      (check (equal (orfeus/gui::graph-geometry-steps graph)
+                    '((:crop 0.1d0 0.1d0 0.8d0 0.8d0 0.0d0)
+                      (:rotate 1)
+                      (:mirror t nil)))
+             "graph-geometry-steps missed, kept a bypassed node, or misordered the steps")
+
+      ;; RAW-POINT-FOR-DISPLAY-POINT composes all three, last node first:
+      ;; undo the flip, then the turn, then the crop.
+      (multiple-value-bind (x y)
+          (orfeus/gui::raw-point-for-display-point graph 0.5d0 0.5d0 1000d0 800d0)
+        ;; The crop is centred on the frame's own centre and the angle is
+        ;; zero, and the turn and flip both fix the centre point too, so
+        ;; the whole chain's own centre sample must land exactly there.
+        (check (and (near x 0.5d0) (near y 0.5d0))
+               "the composed reversal moved the centre sample"))
+
+      ;; A graph with no geometry at all leaves the point untouched.
+      (let ((flat (orfeus:make-processing-graph
+                   :nodes (list (orfeus:make-graph-node
+                                 :id 1 :kind :exposure :inputs '(0)
+                                 :params (list :exposure 0.5d0)))
+                   :output 1)))
+        (multiple-value-bind (x y)
+            (orfeus/gui::raw-point-for-display-point flat 0.3d0 0.4d0 1000d0 800d0)
+          (check (and (near x 0.3d0) (near y 0.4d0))
+                 "a graph with no geometry moved the point"))))))
+
 (defun test-export-filename-overrides-the-automatic-name ()
   "A name typed for a single export pins the file, and clearing it lets go.
 
@@ -2545,6 +2666,7 @@ would silently ignore whatever the Destination field said."
   (test-viewport-render-bound)
   (test-draft-preview-covers-the-view)
   (test-crop-rect-follows-downstream-geometry)
+  (test-eyedropper-reverses-graph-geometry)
   (test-export-filename-overrides-the-automatic-name)
   (test-curve-spline-shapes)
   (test-preset-bulk-application)

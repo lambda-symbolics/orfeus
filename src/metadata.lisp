@@ -353,6 +353,29 @@ temperature control asks for it whenever the selection changes."
               (ignore-errors (native-as-shot-kelvin pathname)))
         cached)))
 
+(defvar *photo-oriented-dimensions-cache*
+  (make-hash-table :test #'equal #+sbcl :synchronized #+sbcl t)
+  "Oriented (WIDTH . HEIGHT) pixel dimensions keyed by path and write date.")
+
+(defun photo-oriented-dimensions (pathname)
+  "Return PATHNAME's own oriented pixel dimensions as (WIDTH . HEIGHT), or NIL.
+
+Width and height after the file's EXIF orientation turns the sensor's own
+axes -- the frame a graph's crop, rotate and flip nodes, and whatever a
+preview shows on screen, all measure themselves against, unlike
+PHOTO-DIMENSIONS, which does not turn for it. Memoized: an interactive
+gesture over the preview should not repeat a native call for every pixel
+it moves across, even one this cheap in practice."
+  (let* ((key (cons (namestring (pathname pathname))
+                    (ignore-errors (file-write-date pathname))))
+         (cached (gethash key *photo-oriented-dimensions-cache* :missing)))
+    (if (eq cached :missing)
+        (setf (gethash key *photo-oriented-dimensions-cache*)
+              (multiple-value-bind (width height)
+                  (ignore-errors (native-oriented-dimensions pathname))
+                (and width (cons width height))))
+        cached)))
+
 (defvar *photo-signature-cache*
   (make-hash-table :test #'equal #+sbcl :synchronized #+sbcl t)
   "Image signatures keyed by the file read and its write date.")

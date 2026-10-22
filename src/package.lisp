@@ -61,6 +61,7 @@
    #:output-file-exists
    #:photo-capture-description
    #:photo-dimensions
+   #:photo-oriented-dimensions
    #:photo-extract-embedded-preview
    #:photo-embedded-preview
    #:photo-lens-description
