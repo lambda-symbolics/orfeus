@@ -154,7 +154,15 @@ buffer, with no JPEG or file on the path.")
     ("16:9" . (16 . 9))
     ("9:16" . (9 . 16))
     ("2:1" . (2 . 1))
-    ("1:2" . (1 . 2)))
+    ("1:2" . (1 . 2))
+    ;; Panoramic film formats, named rather than left as bare ratios since
+    ;; nobody reaches for "2.708:1" by the number: the Hasselblad XPan /
+    ;; Fujifilm TX-1's 24x65mm frame on 35mm film, and the Fuji G617/GX617's
+    ;; 6x17cm frame on 120 (a 56x168mm image area, four exposures a roll).
+    ("XPan (65:24)" . (65 . 24))
+    ("XPan (24:65)" . (24 . 65))
+    ("6x17 (3:1)" . (3 . 1))
+    ("6x17 (1:3)" . (1 . 3)))
   "Crop aspect ratios offered in the Node panel, as width to height.
 
 Both orientations of each ratio are listed rather than offering a swap: a

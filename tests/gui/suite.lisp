@@ -1247,8 +1247,21 @@ fields still gets the whole frame back."
     (check (string= "3:2" (orfeus/gui::crop-aspect-label
                            (orfeus/gui::crop-aspect-for-label "3:2")))
            "A ratio did not round trip through its label")
+    ;; The two panoramic film formats: the XPan's 24x65mm frame and the Fuji
+    ;; 6x17's 56x168mm one, both named rather than offered as bare ratios.
+    (check (< (abs (- 65/24 (orfeus/gui::crop-aspect-ratio
+                             (orfeus/gui::crop-aspect-for-label "XPan (65:24)")
+                             frame-width frame-height)))
+              1.0d-6)
+           "XPan (65:24) was not 65 to 24")
+    (check (< (abs (- 3 (orfeus/gui::crop-aspect-ratio
+                         (orfeus/gui::crop-aspect-for-label "6x17 (3:1)")
+                         frame-width frame-height)))
+              1.0d-6)
+           "6x17 (3:1) was not 3 to 1")
     ;; Reshaping keeps the centre, hits the ratio exactly, and never grows.
-    (dolist (label '("Original" "1:1" "3:2" "2:3" "16:9"))
+    (dolist (label '("Original" "1:1" "3:2" "2:3" "16:9"
+                      "XPan (65:24)" "XPan (24:65)" "6x17 (3:1)" "6x17 (1:3)"))
       (let ((ratio (orfeus/gui::crop-aspect-ratio
                     (orfeus/gui::crop-aspect-for-label label)
                     frame-width frame-height)))
