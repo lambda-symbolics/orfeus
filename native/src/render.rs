@@ -2641,15 +2641,22 @@ where
 {
     let center_x = (width.saturating_sub(1)) as f32 * 0.5;
     let center_y = (height.saturating_sub(1)) as f32 * 0.5;
-    let nearest_invalid = (0..height.div_ceil(step))
+    // Tracked apart from NEAREST_INVALID itself: a sample right on the outer
+    // edge has normalized distance exactly 1.0, the same value NEAREST
+    // starts at, so the distance alone cannot tell invalidity confined to
+    // the border from a wholly valid image -- only whether anything invalid
+    // was seen at all can.
+    let (found_invalid, nearest_invalid) = (0..height.div_ceil(step))
         .into_par_iter()
         .map(|sample_row| {
             let y = sample_row * step;
             let mut nearest = 1.0_f32;
+            let mut found = false;
             for x in (0..width).step_by(step) {
                 if valid_at(x, y) {
                     continue;
                 }
+                found = true;
                 let horizontal = if center_x > 0.0 {
                     (x as f32 - center_x).abs() / center_x
                 } else {
@@ -2662,10 +2669,10 @@ where
                 };
                 nearest = nearest.min(horizontal.max(vertical));
             }
-            nearest
+            (found, nearest)
         })
-        .reduce(|| 1.0_f32, f32::min);
-    if nearest_invalid < 1.0 {
+        .reduce(|| (false, 1.0_f32), |a, b| (a.0 || b.0, a.1.min(b.1)));
+    if found_invalid {
         1.005 / nearest_invalid.max(0.5)
     } else {
         1.0
@@ -9838,6 +9845,28 @@ mod tests {
             "coarse sweep {coarse} disagrees with {exact}"
         );
         assert!(coarse >= exact - 0.005, "coarse sweep cropped too little");
+    }
+
+    #[test]
+    fn lens_auto_crop_catches_invalidity_confined_to_the_outer_edge() {
+        // Invalid only on the outermost row/column: every one of those
+        // samples has normalized distance exactly 1.0 from the centre, the
+        // same value NEAREST starts at, so a scale that only compared the
+        // nearest distance against 1.0 could not tell this apart from a
+        // wholly valid image and skipped the crop entirely.
+        let width = 100;
+        let height = 80;
+        let valid = |x: usize, y: usize| x != 0 && y != 0 && x != width - 1 && y != height - 1;
+        assert_eq!(
+            1.0,
+            auto_crop_scale(width, height, 1, |_, _| true),
+            "a wholly valid image must not crop"
+        );
+        let scale = auto_crop_scale(width, height, 1, valid);
+        assert!(
+            scale > 1.0,
+            "invalidity confined to the outer edge must still crop, got {scale}"
+        );
     }
 
     #[test]
