@@ -409,31 +409,25 @@ bridge invokes the callback on the thread that called in, so a dynamic binding
 reaches it and there is nothing to keep alive across threads.")
 (declaim (type (or null function) *render-progress-hook*))
 
-(cffi:defcallback render-progress-trampoline :void
-    ((context :pointer) (name :string) (fraction :float))
-  (declare (ignore context))
-  ;; Nothing may escape from here. An unwinding condition would tear through
-  ;; Rust's stack, and a status line is not worth that.
-  ;;
-  ;; This compiles with an unfixable "doing SAP to pointer coercion" note on
-  ;; NAME. Confirmed structural, not a body-code choice, by four different
-  ;; real attempts: NAME as a raw :POINTER converted by hand instead of
-  ;; CFFI's own :STRING sugar (the note just moved to the manual
-  ;; conversion); a locally lowered SPEED policy (no effect -- not
-  ;; speed-gated); SB-EXT:MUFFLE-CONDITIONS SB-EXT:COMPILER-NOTE declared in
-  ;; this body (no effect -- the coercion is part of binding a :STRING
-  ;; parameter in DEFCALLBACK's own macroexpansion, a scope no declaration
-  ;; placed in the body reaches); and extracting the whole body to a plain
-  ;; function (no effect, same reason). Eliminating it for good would mean
-  ;; abandoning CFFI's :STRING callback-parameter type for this one callback
-  ;; and hand-marshaling the C string via raw SB-ALIEN/SB-SYS primitives --
-  ;; a real rewrite of this FFI boundary for a cost note with no behavioral
-  ;; stake (a progress callback invoked a handful of times per render), not
-  ;; attempted.
-  (ignore-errors
-    (let ((hook *render-progress-hook*))
-      (when hook
-        (funcall (the function hook) name fraction)))))
+;; Wrapped in its own LOCALLY, not a declaration inside the callback body: a
+;; MUFFLE-CONDITIONS placed in the body doesn't reach the "doing SAP to
+;; pointer coercion" note on NAME, since that coercion is part of
+;; DEFCALLBACK's own macroexpansion binding a :STRING parameter, outside the
+;; body's own lexical scope. Four other things were tried first and didn't
+;; touch it: NAME as a raw :POINTER converted by hand instead of CFFI's own
+;; :STRING sugar (the note just moved to the manual conversion); a locally
+;; lowered SPEED policy; the same MUFFLE-CONDITIONS declared in the body
+;; instead of out here; and extracting the whole body to a plain function.
+(locally (declare (sb-ext:muffle-conditions sb-ext:compiler-note))
+  (cffi:defcallback render-progress-trampoline :void
+      ((context :pointer) (name :string) (fraction :float))
+    (declare (ignore context))
+    ;; Nothing may escape from here. An unwinding condition would tear
+    ;; through Rust's stack, and a status line is not worth that.
+    (ignore-errors
+      (let ((hook *render-progress-hook*))
+        (when hook
+          (funcall (the function hook) name fraction))))))
 
 (defun graph-node-program-parameters (node)
   "Return NODE's packed parameter list and its optional string payload."
