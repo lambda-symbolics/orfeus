@@ -85,15 +85,28 @@ impl Frame {
     }
 }
 
-/// Where each part of a frame lies relative to the reference: a shift per tile
-/// of a grid, eased between tile centres.
+/// Where each part of a frame lies relative to the reference: a rigid
+/// PLACEMENT (turn, scale and shift) plus a per-tile residual on top of it,
+/// eased between tile centres.
+///
+/// The residual, not the total displacement, is what is smoothed and
+/// interpolated: a rigid rotation's own displacement already varies exactly
+/// linearly across the frame by construction, so a median of neighbouring
+/// *residuals* can suppress a bad match without also distorting the rotation
+/// itself the way a median of neighbouring *total* displacements did, and
+/// clamping a residual past the outer tile centres leaves PLACEMENT's own
+/// continuous, exact prediction there instead of repeating the outermost
+/// tile's total displacement past where it was actually measured.
 #[derive(Debug)]
 struct Field {
+    placement: Placement,
     across: usize,
     down: usize,
     tile_width: f32,
     tile_height: f32,
-    shifts: Vec<(f32, f32)>,
+    /// Each tile's own measured displacement minus PLACEMENT's prediction at
+    /// that tile's centre.
+    residuals: Vec<(f32, f32)>,
 }
 
 impl Field {
@@ -103,18 +116,21 @@ impl Field {
         let (x0, y0) = (fx.floor() as usize, fy.floor() as usize);
         let (x1, y1) = ((x0 + 1).min(self.across - 1), (y0 + 1).min(self.down - 1));
         let (tx, ty) = (fx - x0 as f32, fy - y0 as f32);
-        let at = |column: usize, row: usize| self.shifts[row * self.across + column];
+        let at = |column: usize, row: usize| self.residuals[row * self.across + column];
         let blend = |a: (f32, f32), b: (f32, f32), t: f32| {
             (a.0 * (1.0 - t) + b.0 * t, a.1 * (1.0 - t) + b.1 * t)
         };
-        let (dx, dy) = blend(blend(at(x0, y0), at(x1, y0), tx), blend(at(x0, y1), at(x1, y1), tx), ty);
-        (x + dx, y + dy)
+        let (rx, ry) = blend(blend(at(x0, y0), at(x1, y0), tx), blend(at(x0, y1), at(x1, y1), tx), ty);
+        let (px, py) = self.placement.map(x, y);
+        (px + rx, py + ry)
     }
 
+    /// The mean of the per-tile residuals on top of PLACEMENT's own overall
+    /// shift -- a diagnostic figure, not the rigid turn itself.
     fn mean_shift(&self) -> (f32, f32) {
-        let count = self.shifts.len() as f32;
-        let (x, y) = self.shifts.iter().fold((0.0, 0.0), |(x, y), (dx, dy)| (x + dx, y + dy));
-        (x / count, y / count)
+        let count = self.residuals.len() as f32;
+        let (x, y) = self.residuals.iter().fold((0.0, 0.0), |(x, y), (dx, dy)| (x + dx, y + dy));
+        (self.placement.tx + x / count, self.placement.ty + y / count)
     }
 }
 
@@ -712,7 +728,14 @@ impl Guide {
             .unwrap_or_else(|| Placement::shift(shift.0 as f32, shift.1 as f32));
         let (across, down) = (16_usize, 12_usize);
         let fine = grid(across as isize, down as isize);
-        let shifts: Vec<(f32, f32)> = fine
+        // Each tile's own residual against OVERALL's prediction at its
+        // centre, not its total displacement: OVERALL already accounts for
+        // the frame's rigid turn and shift exactly, so what is left to
+        // measure, smooth and interpolate per tile is only how far a real
+        // match misses that prediction -- parallax, a moving subject, or
+        // noise, all of which should be small and not vary smoothly with
+        // position the way the rigid turn's own displacement does.
+        let residuals: Vec<(f32, f32)> = fine
             .par_iter()
             .map(|region| {
                 let (cx, cy) = centre(region);
@@ -731,9 +754,9 @@ impl Guide {
                         if (found.0 - predicted.0).abs() <= 16.0
                             && (found.1 - predicted.1).abs() <= 16.0 =>
                     {
-                        found
+                        (found.0 - predicted.0, found.1 - predicted.1)
                     }
-                    _ => predicted,
+                    _ => (0.0, 0.0),
                 }
             })
             .collect();
@@ -751,7 +774,7 @@ impl Guide {
                     for dx in -1..=1 {
                         let (c, r) = (column + dx, row + dy);
                         if c >= 0 && r >= 0 && (c as usize) < across && (r as usize) < down {
-                            let (x, y) = shifts[r as usize * across + c as usize];
+                            let (x, y) = residuals[r as usize * across + c as usize];
                             xs.push(x);
                             ys.push(y);
                         }
@@ -761,11 +784,12 @@ impl Guide {
             })
             .collect();
         Field {
+            placement: overall,
             across,
             down,
             tile_width: (width / across as isize) as f32,
             tile_height: (height / down as isize) as f32,
-            shifts: smoothed,
+            residuals: smoothed,
         }
     }
 
@@ -1052,13 +1076,21 @@ fn merge(frames: &[Frame]) -> Vec<[f32; 3]> {
             if weight > 1.0e-6 {
                 total.map(|value| value / weight)
             } else {
-                // Clipped in every frame: the shortest frame's clipped value is
-                // still the brightest honest answer.
+                // Clipped in every frame: the shortest frame's clipped value
+                // is still the brightest honest answer, but only together
+                // with its own exposure. A warp rejects a border every
+                // bilinear neighbour has to lie inside the frame for, and
+                // the reference's own raw pixel stands in there instead --
+                // that pixel belongs with the reference's own exposure, not
+                // the shortest frame's, or the stand-in is normalized by an
+                // exposure it was never shot at.
                 let frame = &frames[shortest];
-                let pixel = frame
-                    .at(x as isize, y as isize)
-                    .unwrap_or(frames[0].pixels[index]);
-                pixel.map(|value| value / frame.exposure)
+                match frame.at(x as isize, y as isize) {
+                    Some(pixel) => pixel.map(|value| value / frame.exposure),
+                    None => frames[0]
+                        .pixels[index]
+                        .map(|value| value / frames[0].exposure),
+                }
             }
         })
         .collect()
@@ -1193,6 +1225,109 @@ mod tests {
     }
 
     #[test]
+    fn field_map_reproduces_a_rigid_rotation_exactly_near_the_edge() {
+        // The audit's own reproduction: a 0.5 degree rotation on a
+        // 5184x3888 frame, the production 16x12 grid, exact (noise-free)
+        // tile-centre matches throughout -- so every tile's true residual
+        // against the rigid placement is exactly zero -- checked at (32,
+        // 1944), close to the left edge at mid-height. Before the fix, even
+        // this noise-free case lost 3.95 pixels there: the median and the
+        // clamped interpolation operated on each tile's *total*
+        // displacement, which a rotation varies linearly with position, so
+        // smoothing and clamping that quantity distorted the rotation
+        // itself. The residual that is actually smoothed and clamped now is
+        // uniformly zero in this noise-free case, so the fixed path must
+        // reproduce the rigid placement exactly, and the old path -- built
+        // the same way inline here, for a direct before/after comparison --
+        // must still show close to that same 3.95 pixel error.
+        let (width, height) = (5184.0_f32, 3888.0_f32);
+        let (center_x, center_y) = (width / 2.0, height / 2.0);
+        let angle = 0.5_f32.to_radians();
+        let (a, b) = (angle.cos(), angle.sin());
+        let placement = Placement {
+            a,
+            b,
+            tx: center_x - a * center_x + b * center_y,
+            ty: center_y - b * center_x - a * center_y,
+        };
+        let (across, down) = (16_usize, 12_usize);
+        let (tile_width, tile_height) = (width / across as f32, height / down as f32);
+        let centre = |column: usize, row: usize| {
+            (
+                (column as f32 + 0.5) * tile_width,
+                (row as f32 + 0.5) * tile_height,
+            )
+        };
+        // Exact tile-centre matches: each tile's own true total displacement
+        // under PLACEMENT, with no measurement noise at all.
+        let total_displacement = |column: usize, row: usize| {
+            let (cx, cy) = centre(column, row);
+            let (px, py) = placement.map(cx, cy);
+            (px - cx, py - cy)
+        };
+        let median = |values: &mut Vec<f32>| {
+            values.sort_by(f32::total_cmp);
+            values[values.len() / 2]
+        };
+        let smoothed_neighbourhood = |values: &dyn Fn(usize, usize) -> (f32, f32), column: usize, row: usize| {
+            let (mut xs, mut ys) = (Vec::new(), Vec::new());
+            for dy in -1..=1_isize {
+                for dx in -1..=1_isize {
+                    let (c, r) = (column as isize + dx, row as isize + dy);
+                    if c >= 0 && r >= 0 && (c as usize) < across && (r as usize) < down {
+                        let (x, y) = values(c as usize, r as usize);
+                        xs.push(x);
+                        ys.push(y);
+                    }
+                }
+            }
+            (median(&mut xs), median(&mut ys))
+        };
+
+        // The old path: median-smoothed *total* displacements, clamped at
+        // the outer tile centres with no rigid placement underneath at all.
+        let old_shifts: Vec<(f32, f32)> = (0..down)
+            .flat_map(|row| (0..across).map(move |column| (column, row)))
+            .map(|(column, row)| smoothed_neighbourhood(&total_displacement, column, row))
+            .collect();
+        let old_field = Field {
+            placement: Placement::shift(0.0, 0.0),
+            across,
+            down,
+            tile_width,
+            tile_height,
+            residuals: old_shifts,
+        };
+        let (true_x, true_y) = placement.map(32.0, 1944.0);
+        let (old_x, old_y) = old_field.map(32.0, 1944.0);
+        let old_error = ((old_x - true_x).powi(2) + (old_y - true_y).powi(2)).sqrt();
+        assert!(
+            (old_error - 3.95).abs() < 0.1,
+            "the old path's own error moved from the audit's reported 3.95px to {old_error}"
+        );
+
+        // The fixed path: every tile's residual against PLACEMENT's own
+        // prediction is exactly zero in this noise-free case, so the median
+        // of all-zero neighbourhoods is zero everywhere, and the field must
+        // reproduce the rigid rotation exactly, including at the edge.
+        let residuals = vec![(0.0, 0.0); across * down];
+        let fixed_field = Field {
+            placement,
+            across,
+            down,
+            tile_width,
+            tile_height,
+            residuals,
+        };
+        let (fixed_x, fixed_y) = fixed_field.map(32.0, 1944.0);
+        let fixed_error = ((fixed_x - true_x).powi(2) + (fixed_y - true_y).powi(2)).sqrt();
+        assert!(
+            fixed_error < 1.0e-3,
+            "the fixed path must reproduce the rigid rotation exactly, got error {fixed_error}"
+        );
+    }
+
+    #[test]
     fn a_bracket_recovers_highlights_cleans_shadows_and_leaves_no_ghost() {
         let (width, height) = (96, 64);
         // Deep shadow on the left rising to four times the white level on the
@@ -1246,6 +1381,42 @@ mod tests {
         assert!(
             merged_rms < reference * 0.5,
             "shadow noise {merged_rms} against the reference's {reference}"
+        );
+    }
+
+    #[test]
+    fn a_fallback_pixel_keeps_its_own_exposure() {
+        // Every pixel of every frame clipped, so every weight is exactly
+        // zero and the fallback runs everywhere -- deterministic, with no
+        // dependence on the agreement machinery's own thresholds. The short
+        // frame (0.25x) has no pixel at all at the test position, as a warp
+        // leaves at a border every bilinear neighbour has to be inside the
+        // frame for; the reference's own raw pixel stands in there, and it
+        // must come back divided by the reference's own exposure, not the
+        // short frame's.
+        let (width, height) = (16, 16);
+        let reference = Frame {
+            width,
+            height,
+            pixels: vec![[0.99, 0.99, 0.99]; width * height],
+            exposure: 1.0,
+            gain: 1.0,
+        };
+        let test_index = (height / 2) * width + width / 2;
+        let mut short_pixels = vec![[0.99, 0.99, 0.99]; width * height];
+        short_pixels[test_index] = [f32::NAN, f32::NAN, f32::NAN];
+        let short = Frame {
+            width,
+            height,
+            pixels: short_pixels,
+            exposure: 0.25,
+            gain: 1.0,
+        };
+        let merged = merge(&[reference, short]);
+        assert!(
+            (merged[test_index][0] - 0.99).abs() < 1.0e-6,
+            "fallback pixel {} did not match the reference's own exposure (expected 0.99)",
+            merged[test_index][0]
         );
     }
 
