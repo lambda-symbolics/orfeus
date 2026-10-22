@@ -1974,15 +1974,24 @@ behind is memory. Best effort; returns how many directories went."
              (when before-canvas (lightfast:redraw before-canvas))
              (when after-canvas (lightfast:redraw after-canvas)))
            (reset-preview-view ()
-             (let ((was-native preview-native-p))
+             ;; A fresh request is needed whenever the picture on screen is
+             ;; not already the whole, unwindowed frame: coming back from
+             ;; native 1:1, yes, but just as much from an ordinary wheel zoom
+             ;; that narrowed to a window while PREVIEW-NATIVE-P stayed nil
+             ;; the whole time. Left alone, resetting zoom and centre without
+             ;; asking for the full frame again just redraws that same
+             ;; cropped window at the fitted scale.
+             (let ((needs-refresh (or preview-native-p
+                                      before-preview-region
+                                      after-preview-region)))
                (setf preview-zoom 1d0
                      preview-center-x .5d0
                      preview-center-y .5d0
                      preview-native-p nil)
                (native-view-reset native-view)
-               ;; Coming back from 1:1 drops to a canvas-sized render, which is
-               ;; a cache hit if this photo has been fitted before.
-               (when was-native
+               ;; A canvas-sized render is a cache hit if this photo has been
+               ;; fitted before.
+               (when needs-refresh
                  (discard-gui-tasks queue :after)
                  (enqueue-preview nil)))
              (redraw-previews)
@@ -2120,7 +2129,16 @@ behind is memory. Best effort; returns how many directories went."
                (when (and job (not (live-view-p)))
                  (let ((needed (viewport-request))
                        (current (or requested-viewport-region after-preview-region)))
-                   (when (and needed current (not (region-covers-view-p current)))
+                   ;; NEEDED nil means the whole frame is wanted now (zoomed
+                   ;; out past where a window still helps); that is as much a
+                   ;; change from a CURRENT window as a window that no longer
+                   ;; covers the view is, and skipping it the same way the
+                   ;; ordinary case does left a zoomed-out view showing a
+                   ;; stale cropped render instead of the frame it zoomed out
+                   ;; to see all of.
+                   (when (if needed
+                             (and current (not (region-covers-view-p current)))
+                             current)
                      (setf requested-viewport-region needed)
                      (discard-gui-tasks queue :after)
                      (enqueue-render queue :after job
