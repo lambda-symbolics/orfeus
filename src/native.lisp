@@ -414,6 +414,22 @@ reaches it and there is nothing to keep alive across threads.")
   (declare (ignore context))
   ;; Nothing may escape from here. An unwinding condition would tear through
   ;; Rust's stack, and a status line is not worth that.
+  ;;
+  ;; This compiles with an unfixable "doing SAP to pointer coercion" note on
+  ;; NAME. Confirmed structural, not a body-code choice, by four different
+  ;; real attempts: NAME as a raw :POINTER converted by hand instead of
+  ;; CFFI's own :STRING sugar (the note just moved to the manual
+  ;; conversion); a locally lowered SPEED policy (no effect -- not
+  ;; speed-gated); SB-EXT:MUFFLE-CONDITIONS SB-EXT:COMPILER-NOTE declared in
+  ;; this body (no effect -- the coercion is part of binding a :STRING
+  ;; parameter in DEFCALLBACK's own macroexpansion, a scope no declaration
+  ;; placed in the body reaches); and extracting the whole body to a plain
+  ;; function (no effect, same reason). Eliminating it for good would mean
+  ;; abandoning CFFI's :STRING callback-parameter type for this one callback
+  ;; and hand-marshaling the C string via raw SB-ALIEN/SB-SYS primitives --
+  ;; a real rewrite of this FFI boundary for a cost note with no behavioral
+  ;; stake (a progress callback invoked a handful of times per render), not
+  ;; attempted.
   (ignore-errors
     (let ((hook *render-progress-hook*))
       (when hook
