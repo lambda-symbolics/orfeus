@@ -1070,10 +1070,21 @@ fn graph_reaches_a_sharpener(ops: &[GraphOp], from_index: usize) -> bool {
 /// pixels entering the node did not. This is the general shape of that
 /// waste, applied once for negative, dehaze, sensor noise, and the
 /// sharpener's own preparation, rather than reinvented at each one.
+///
+/// REGION and DEPENDENCY are the two things equal UPSTREAM ops cannot speak
+/// for. UPSTREAM is graph structure -- the same ops can still produce
+/// different pixels when the viewport narrows to a different window, which
+/// nothing about the key otherwise records, so a pan used to hand back
+/// another window's measurement wholesale. DEPENDENCY covers whatever the
+/// current node's own parameters change about the measurement itself (the
+/// sharpener's radius, the negative's picked base) as opposed to parameters
+/// a cache hit is supposed to survive (amount, threshold, gamma, balance).
 struct NodeMeasurement<T> {
     key: PrefixKey,
     index: usize,
     upstream: Vec<GraphOp>,
+    region: (usize, usize, usize, usize),
+    dependency: Vec<u32>,
     value: Arc<T>,
 }
 
@@ -1085,14 +1096,24 @@ const NODE_MEASUREMENT_CAPACITY: usize = 4;
 
 /// Returns CACHE's entry for INDEX in OPS under CACHE_KEY, computing it with
 /// COMPUTE when nothing before INDEX has changed since the last time this
-/// cache_key and index were asked for -- regardless of how far INDEX's own
-/// node's parameters, or anything after it, have moved. Without a cache_key
-/// (no interactive session to cache against) COMPUTE just runs every time.
+/// cache_key, index, REGION and DEPENDENCY were asked for -- regardless of
+/// how far any of INDEX's own node's other parameters, or anything after it,
+/// have moved. Without a cache_key (no interactive session to cache against)
+/// COMPUTE just runs every time.
+///
+/// REGION is the window actually being measured -- origin and size, in the
+/// oriented frame the node sees -- so a pan to a different window, or to a
+/// window of a different size, never reuses another window's measurement.
+/// DEPENDENCY is whatever else the measurement depends on besides the pixels
+/// upstream of INDEX: pass the bit patterns of the current node's own
+/// parameters that feed the measurement itself, empty when none do.
 fn node_measurement_cached<T>(
     cache: &Mutex<Vec<NodeMeasurement<T>>>,
     cache_key: Option<&PrefixKey>,
     index: usize,
     ops: &[GraphOp],
+    region: (usize, usize, usize, usize),
+    dependency: &[u32],
     compute: impl FnOnce() -> T,
 ) -> Arc<T> {
     let Some(cache_key) = cache_key else {
@@ -1102,7 +1123,11 @@ fn node_measurement_cached<T>(
     {
         let mut cache = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(position) = cache.iter().position(|entry| {
-            &entry.key == cache_key && entry.index == index && entry.upstream == upstream
+            &entry.key == cache_key
+                && entry.index == index
+                && entry.region == region
+                && entry.dependency == dependency
+                && entry.upstream == upstream
         }) {
             let value = Arc::clone(&cache[position].value);
             let entry = cache.remove(position);
@@ -1112,6 +1137,10 @@ fn node_measurement_cached<T>(
     }
     let value = Arc::new(compute());
     let mut cache = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    // One slot per (key, index): whatever else was cached for this node under
+    // this session -- a different region, a different dependency, a
+    // different upstream -- is now stale, since a live session has exactly
+    // one current upstream, window and set of node parameters at a time.
     cache.retain(|entry| !(&entry.key == cache_key && entry.index == index));
     cache.insert(
         0,
@@ -1119,6 +1148,8 @@ fn node_measurement_cached<T>(
             key: cache_key.clone(),
             index,
             upstream: upstream.to_vec(),
+            region,
+            dependency: dependency.to_vec(),
             value: Arc::clone(&value),
         },
     );
@@ -1888,6 +1919,8 @@ fn execute_graph_into(
                         cache_key.as_ref(),
                         index,
                         ops,
+                        (window_origin.0, window_origin.1, image.width, image.height),
+                        &[],
                         || render::measure_sensor_noise(&image),
                     );
                 }
@@ -1925,6 +1958,8 @@ fn execute_graph_into(
                     cache_key.as_ref(),
                     index,
                     ops,
+                    (window_origin.0, window_origin.1, image.width, image.height),
+                    &picked.map(f32::to_bits),
                     || render::measure_negative(&image, picked),
                 );
                 render::apply_negative_measured(&mut image, &measure, op.params[3], op.params[4]);
@@ -1960,6 +1995,8 @@ fn execute_graph_into(
                         cache_key.as_ref(),
                         index,
                         ops,
+                        (window_origin.0, window_origin.1, image.width, image.height),
+                        &[],
                         || render::prepare_dehaze(&image),
                     );
                     if let Some(prepared) = prepared.as_ref() {
@@ -2029,6 +2066,8 @@ fn execute_graph_into(
                         cache_key.as_ref(),
                         index,
                         ops,
+                        (window_origin.0, window_origin.1, image.width, image.height),
+                        &[radius.to_bits()],
                         || render::prepare_sharpen(&image, radius, sensor.as_ref()),
                     );
                     if let Some(prepared) = prepared.as_ref() {
@@ -4105,14 +4144,15 @@ mod tests {
             text: None,
         });
         let index = 1;
+        let region = (0, 0, 10, 10);
 
-        let first = node_measurement_cached(&cache, Some(&key), index, &ops, compute(11));
+        let first = node_measurement_cached(&cache, Some(&key), index, &ops, region, &[], compute(11));
         assert_eq!(*first, 11);
         assert_eq!(calls.get(), 1);
 
         // Only this node's own params moved (modelled here by nothing at all
         // changing upstream of INDEX): the cached value comes back, uncalled.
-        let second = node_measurement_cached(&cache, Some(&key), index, &ops, compute(99));
+        let second = node_measurement_cached(&cache, Some(&key), index, &ops, region, &[], compute(99));
         assert_eq!(*second, 11, "a cache hit still ran compute");
         assert_eq!(calls.get(), 1, "compute ran again though nothing upstream changed");
 
@@ -4120,15 +4160,39 @@ mod tests {
         // what the old upstream measured.
         let mut changed = ops.clone();
         changed[0].params[2] = 0.5;
-        let third = node_measurement_cached(&cache, Some(&key), index, &changed, compute(22));
+        let third = node_measurement_cached(&cache, Some(&key), index, &changed, region, &[], compute(22));
         assert_eq!(*third, 22, "a changed upstream still returned the stale value");
         assert_eq!(calls.get(), 2);
 
         // No cache_key at all (no interactive session to cache against):
         // always computed fresh.
-        let fourth = node_measurement_cached(&cache, None, index, &ops, compute(33));
+        let fourth = node_measurement_cached(&cache, None, index, &ops, region, &[], compute(33));
         assert_eq!(*fourth, 33);
         assert_eq!(calls.get(), 3);
+
+        // A different region -- a pan to another window -- must not reuse
+        // what the first window measured, even though nothing about UPSTREAM
+        // or the node's own params changed. One slot per (key, index): this
+        // also replaces whatever was cached for the old region, the same way
+        // a changed upstream already replaced the very first entry above.
+        let other_region = (10, 0, 10, 10);
+        let fifth =
+            node_measurement_cached(&cache, Some(&key), index, &ops, other_region, &[], compute(44));
+        assert_eq!(*fifth, 44, "a different region returned another window's value");
+        assert_eq!(calls.get(), 4);
+
+        // A different dependency -- the sharpener's radius, the negative's
+        // picked base -- must not reuse what a different value measured.
+        let sixth =
+            node_measurement_cached(&cache, Some(&key), index, &ops, region, &[7], compute(55));
+        assert_eq!(*sixth, 55, "a different dependency returned a stale value");
+        assert_eq!(calls.get(), 5);
+
+        // That dependency's own value is now the one cached under this key.
+        let seventh =
+            node_measurement_cached(&cache, Some(&key), index, &ops, region, &[7], compute(77));
+        assert_eq!(*seventh, 55, "a cache hit still ran compute");
+        assert_eq!(calls.get(), 5);
     }
 
     #[test]
@@ -4251,6 +4315,102 @@ mod tests {
             assert!(
                 max_difference(&cached, &cold) == 0.0,
                 "crop {crop_width} gamma {gamma} differs from a cold render"
+            );
+        }
+    }
+
+    #[test]
+    fn panning_does_not_reuse_another_windows_sharpen_preparation() {
+        let ops = parse_graph(
+            &GraphBuilder::new()
+                .node(NODE_SHARPEN, 0, -1, &[1.0, 1.5, 2.0], None)
+                .build(),
+        )
+        .unwrap();
+        let graph_context = context(5);
+        let key = test_prefix_key("pan-sharpen-test", &graph_context);
+        let first_rect = [0.1_f32, 0.1, 0.3, 0.3];
+        let second_rect = [0.6_f32, 0.6, 0.3, 0.3];
+        execute_graph_windowed_cached(
+            &ops,
+            noisy_scene(320, 240),
+            &graph_context,
+            first_rect,
+            key.clone(),
+        )
+        .unwrap();
+        let panned = execute_graph_windowed_cached(
+            &ops,
+            noisy_scene(320, 240),
+            &graph_context,
+            second_rect,
+            key,
+        )
+        .unwrap();
+        let cold =
+            execute_graph_windowed(&ops, noisy_scene(320, 240), &graph_context, second_rect).unwrap();
+        assert!(
+            max_difference(&panned, &cold) == 0.0,
+            "panning reused another window's sharpen preparation"
+        );
+    }
+
+    #[test]
+    fn sharpen_radius_and_negative_base_changes_invalidate_their_measurements() {
+        let sharpen_program = |radius: f32| {
+            parse_graph(
+                &GraphBuilder::new()
+                    .node(NODE_SHARPEN, 0, -1, &[0.8, radius, 2.0], None)
+                    .build(),
+            )
+            .unwrap()
+        };
+        let graph_context = context(5);
+        let key = test_prefix_key("sharpen-radius-test", &graph_context);
+        for radius in [0.7, 2.8, 0.7, 1.4] {
+            let ops = sharpen_program(radius);
+            let cached = execute_graph_cached(
+                &ops,
+                Arc::new(noisy_scene(320, 240)),
+                &graph_context,
+                Some(key.clone()),
+            )
+            .unwrap();
+            let cold = execute_graph(&ops, noisy_scene(320, 240), &graph_context).unwrap();
+            assert!(
+                max_difference(&cached, &cold) == 0.0,
+                "radius {radius} differs from a cold render"
+            );
+        }
+
+        let negative_program = |base: [f32; 3]| {
+            parse_graph(
+                &GraphBuilder::new()
+                    .node(
+                        NODE_NEGATIVE,
+                        0,
+                        -1,
+                        &[base[0], base[1], base[2], 2.2, 1.0],
+                        None,
+                    )
+                    .build(),
+            )
+            .unwrap()
+        };
+        let key = test_prefix_key("negative-base-test", &graph_context);
+        for base in [[0.5, 0.3, 0.2], [0.7, 0.4, 0.25], [0.5, 0.3, 0.2]] {
+            let ops = negative_program(base);
+            let cached = execute_graph_cached(
+                &ops,
+                Arc::new(noisy_scene(320, 240)),
+                &graph_context,
+                Some(key.clone()),
+            )
+            .unwrap();
+            let cold = execute_graph(&ops, noisy_scene(320, 240), &graph_context).unwrap();
+            assert!(
+                max_difference(&cached, &cold) == 0.0,
+                "base {base:?} differs from a cold render"
             );
         }
     }
