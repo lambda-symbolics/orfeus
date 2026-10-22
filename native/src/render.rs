@@ -2436,8 +2436,22 @@ pub(crate) fn cpu_noise_reduction(image: &mut RgbImage, luma: f32, chroma: f32, 
                         + plane[bottom * half_width + right] * horizontal;
                     above * (1.0 - vertical) + below * vertical
                 };
-                pixel[0] = *yy + sample(&cr);
-                pixel[2] = *yy + sample(&cb);
+                // The full-resolution residual this pixel actually had,
+                // against the same undenoised luma the split measured it
+                // against, blended toward the filtered half-resolution
+                // reconstruction by CHROMA_STRENGTH rather than replaced by
+                // it outright: at zero strength this must be identity, and
+                // the half/quarter-resolution round trip the filtered
+                // residual took is real information loss a vanishing
+                // strength has no business still paying for.
+                let original_luma =
+                    0.2126 * pixel[0] + 0.7152 * pixel[1] + 0.0722 * pixel[2];
+                let original_cr = pixel[0] - original_luma;
+                let original_cb = pixel[2] - original_luma;
+                let blended_cr = original_cr + (sample(&cr) - original_cr) * chroma_strength;
+                let blended_cb = original_cb + (sample(&cb) - original_cb) * chroma_strength;
+                pixel[0] = *yy + blended_cr;
+                pixel[2] = *yy + blended_cb;
                 pixel[1] = (*yy - 0.2126 * pixel[0] - 0.0722 * pixel[2]) / 0.7152;
             }
         });
@@ -9273,7 +9287,13 @@ mod tests {
             }
         }
         let before = flat_patch_chroma_rms(&image);
-        apply_noise_reduction(&mut image, 0.0, 0.6, 1.0);
+        // Full strength: the filtered reconstruction is no longer blended
+        // down toward the original chroma at a lower strength (see
+        // `vanishing_chroma_strength_approaches_identity_instead_of_the_filtered_floor`),
+        // so a partial strength no longer removes as much on its own as it
+        // used to -- that was the bug. At 1.0 the blend is exactly the
+        // filtered result, same as before that fix.
+        apply_noise_reduction(&mut image, 0.0, 1.0, 1.0);
         let after = flat_patch_chroma_rms(&image);
         assert!(
             after < before * 0.35,
@@ -9309,6 +9329,93 @@ mod tests {
         let noisy = (before.data[0] - before.data[2]).abs();
         let reduced = (image.data[0] - image.data[2]).abs();
         assert!(reduced < noisy * 0.8, "chroma noise was not reduced");
+    }
+
+    /// A flat-luminance image whose Cr alternates +-AMPLITUDE every PERIOD
+    /// columns and whose Cb is zero everywhere, so chroma RMS reads off one
+    /// channel directly and luminance never confounds it.
+    fn isoluminant_stripe_image(
+        width: usize,
+        height: usize,
+        period: usize,
+        amplitude: f32,
+    ) -> RgbImage {
+        let base = 0.4_f32;
+        let mut data = Vec::with_capacity(width * height * 3);
+        for _ in 0..height {
+            for x in 0..width {
+                let delta = if (x / period) % 2 == 0 {
+                    amplitude
+                } else {
+                    -amplitude
+                };
+                // Chosen so 0.2126*r + 0.7152*g + 0.0722*b == base exactly,
+                // whatever delta is: only the red/green split carries it.
+                let r = base + delta;
+                let g = base - (0.2126 / 0.7152) * delta;
+                let b = base;
+                data.extend_from_slice(&[r, g, b]);
+            }
+        }
+        RgbImage {
+            width,
+            height,
+            data,
+        }
+    }
+
+    /// RMS of each pixel's own red-channel chroma residual against its own
+    /// luminance -- exactly AMPLITUDE for an untouched `isoluminant_stripe_image`.
+    fn chroma_rms(image: &RgbImage) -> f32 {
+        let sum_squares: f32 = image
+            .data
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .map(|pixel| {
+                let luma = 0.2126 * pixel[0] + 0.7152 * pixel[1] + 0.0722 * pixel[2];
+                (pixel[0] - luma).powi(2)
+            })
+            .sum();
+        (sum_squares / (image.width * image.height) as f32).sqrt()
+    }
+
+    #[test]
+    fn vanishing_chroma_strength_approaches_identity_instead_of_the_filtered_floor() {
+        // The audit's own reproduction: at any positive strength the chroma
+        // reconstruction used to come entirely from the half-resolution
+        // filtered planes, discarding the real full-resolution chroma even
+        // when the requested strength was negligible.
+        for period in [1, 2] {
+            let amplitude = 0.2;
+            let mut untouched = isoluminant_stripe_image(64, 48, period, amplitude);
+            apply_noise_reduction(&mut untouched, 0.0, 0.0, 1.0);
+            assert!(
+                (chroma_rms(&untouched) - amplitude).abs() < 1.0e-5,
+                "period {period}: zero strength must be exact identity, got {}",
+                chroma_rms(&untouched)
+            );
+
+            let mut vanishing = isoluminant_stripe_image(64, 48, period, amplitude);
+            apply_noise_reduction(&mut vanishing, 0.0, 1.0e-6, 1.0);
+            let rms = chroma_rms(&vanishing);
+            assert!(
+                rms > amplitude * 0.99,
+                "period {period}: a vanishing strength ({rms}) must stay near identity \
+                 ({amplitude}), not collapse to the filtered floor"
+            );
+        }
+
+        // At real strength the stripe -- adversarial, single/double-pixel
+        // period -- is still actually suppressed, so the blend did not just
+        // disable chroma denoising outright.
+        let mut strong = isoluminant_stripe_image(64, 48, 1, 0.2);
+        apply_noise_reduction(&mut strong, 0.0, 1.0, 1.0);
+        assert!(
+            chroma_rms(&strong) < 0.1,
+            "full strength must still suppress an adversarial stripe, got {}",
+            chroma_rms(&strong)
+        );
     }
 
     #[test]
