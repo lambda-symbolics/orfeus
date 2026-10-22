@@ -7233,9 +7233,13 @@ impl DevelopedFrame {
     pub(crate) fn into_decoded(self) -> Result<DecodedRaw, Error> {
         let as_shot_kelvin =
             super::color::as_shot_kelvin(&self.color_matrix, self.white_balance);
-        let linear_srgb =
-            intermediate_to_linear_srgb(self.developed, &self.color_matrix, self.white_balance)
-                .map_err(Error::Color)?;
+        let linear_srgb = intermediate_to_linear_srgb(
+            self.developed,
+            &self.color_matrix,
+            self.white_balance,
+            as_shot_kelvin,
+        )
+        .map_err(Error::Color)?;
         let metadata = self.metadata;
         Ok(DecodedRaw {
             width: linear_srgb.width,

@@ -88,6 +88,110 @@ fn preferred_matrix(
         })
 }
 
+/// The fixed correlated colour temperature a calibration illuminant names, for
+/// the CIE/EXIF standard illuminants every camera in rawler's own database is
+/// calibrated against (confirmed by inspection: every `data/cameras/*.toml`
+/// entry defines exactly `A` and `D65`). Qualitative EXIF illuminants
+/// (`Daylight`, `Tungsten`, `Shade`, the fluorescent variants, `Unknown`) name
+/// no single temperature and are deliberately not covered here -- a matrix
+/// filed under one of those falls back to `preferred_matrix` rather than being
+/// guessed into a blend.
+fn illuminant_kelvin(illuminant: Illuminant) -> Option<f32> {
+    match illuminant {
+        Illuminant::A => Some(2856.0),
+        Illuminant::B => Some(4874.0),
+        Illuminant::C => Some(6774.0),
+        Illuminant::D50 => Some(5003.0),
+        Illuminant::D55 => Some(5503.0),
+        Illuminant::D65 => Some(6504.0),
+        Illuminant::D75 => Some(7504.0),
+        _ => None,
+    }
+}
+
+/// The camera matrix to use at TARGET_KELVIN, blending between whichever of
+/// the file's calibration illuminants have a known fixed temperature.
+///
+/// A camera ships one matrix per calibration illuminant (every camera in
+/// rawler's database: one for `A`, 2856 K tungsten, and one for `D65`, 6504 K
+/// daylight) because a single matrix is only accurate near the light it was
+/// measured under. `preferred_matrix`'s old behaviour -- always `D65` -- was
+/// fine exactly at daylight and silently wrong everywhere else, worst for a
+/// warm as-shot white balance nowhere near either calibration point: a
+/// tungsten-lit room shot "as shot" got the daylight matrix regardless.
+///
+/// Follows the DNG spec's own method: interpolate linearly in mired (1,000,000
+/// / kelvin, the scale on which a lighting designer's own colour-correction
+/// gels are rated) between the two bracketing illuminants, clamped to the
+/// calibrated range rather than extrapolated past it -- a 10,000 K scene gets
+/// the D65 matrix outright, not a worse one extrapolated beyond it by however
+/// far 10,000 K overshoots 6504 K.
+fn blended_matrix(
+    matrices: &HashMap<Illuminant, FlatColorMatrix>,
+    target_kelvin: Option<f32>,
+) -> Result<(Illuminant, std::borrow::Cow<'_, FlatColorMatrix>), ColorError> {
+    let mut known: Vec<(Illuminant, f32, &FlatColorMatrix)> = matrices
+        .iter()
+        .filter_map(|(illuminant, matrix)| {
+            illuminant_kelvin(*illuminant).map(|kelvin| (*illuminant, kelvin, matrix))
+        })
+        .collect();
+    known.sort_by(|a, b| a.1.total_cmp(&b.1));
+
+    let target = match target_kelvin {
+        Some(target) if target.is_finite() && target > 0.0 && known.len() >= 2 => target,
+        _ => {
+            let (illuminant, matrix) = preferred_matrix(matrices)?;
+            return Ok((illuminant, std::borrow::Cow::Borrowed(matrix)));
+        }
+    };
+
+    // Clamp to the calibrated range -- the lowest-kelvin (warmest, highest
+    // mired) and highest-kelvin (coolest, lowest mired) illuminants on file.
+    let (cool_illuminant, cool_kelvin, cool_matrix) = known[known.len() - 1];
+    let (warm_illuminant, warm_kelvin, warm_matrix) = known[0];
+    if target <= warm_kelvin {
+        return Ok((warm_illuminant, std::borrow::Cow::Borrowed(warm_matrix)));
+    }
+    if target >= cool_kelvin {
+        return Ok((cool_illuminant, std::borrow::Cow::Borrowed(cool_matrix)));
+    }
+    // Between two calibration points: find the bracketing pair (adjacent in
+    // the sorted list, since TARGET is strictly between the array's own ends
+    // at this point) and blend by mired distance.
+    let pair = known
+        .windows(2)
+        .find(|pair| target >= pair[0].1 && target <= pair[1].1)
+        .expect("target is within the sorted range checked above");
+    let (low_illuminant, low_kelvin, low_matrix) = pair[0];
+    let (_high_illuminant, high_kelvin, high_matrix) = pair[1];
+    if low_matrix.len() != high_matrix.len() {
+        // A camera file with mismatched channel counts across illuminants
+        // would be a data error, not something to guess a blend for.
+        let (illuminant, matrix) = preferred_matrix(matrices)?;
+        return Ok((illuminant, std::borrow::Cow::Borrowed(matrix)));
+    }
+    let low_mired = 1.0e6 / low_kelvin;
+    let high_mired = 1.0e6 / high_kelvin;
+    let target_mired = 1.0e6 / target;
+    // WARM_WEIGHT is how much of the lower-kelvin (warmer) illuminant's
+    // matrix the blend carries; 1.0 at LOW_KELVIN, 0.0 at HIGH_KELVIN.
+    let warm_weight = ((target_mired - high_mired) / (low_mired - high_mired)).clamp(0.0, 1.0);
+    let blended: FlatColorMatrix = low_matrix
+        .iter()
+        .zip(high_matrix.iter())
+        .map(|(warm, cool)| warm_weight * warm + (1.0 - warm_weight) * cool)
+        .collect();
+    // The reported illuminant is informational only (used in error messages
+    // downstream); name whichever calibration point the blend leans toward.
+    let reported = if warm_weight >= 0.5 {
+        low_illuminant
+    } else {
+        pair[1].0
+    };
+    Ok((reported, std::borrow::Cow::Owned(blended)))
+}
+
 fn camera_to_srgb<const N: usize>(
     illuminant: Illuminant,
     flat: &[f32],
@@ -316,20 +420,24 @@ fn flatten_triples<const N: usize>(pixels: Vec<[f32; N]>) -> Vec<f32> {
 
 /// Converts demosaiced camera channels to white-balanced, unclipped linear sRGB.
 ///
-/// A valid D65 camera matrix is required because Orfeus's MVP output transform
-/// is D65 sRGB and does not yet implement chromatic adaptation between camera
-/// calibration illuminants. Missing or non-finite camera white balance falls
-/// back to unity, matching rawler's safe unavailable-metadata behavior. The
-/// transform deliberately performs no gamut or highlight clipping.
+/// The camera matrix is `blended_matrix`'s pick for AS_SHOT_KELVIN -- the two
+/// calibration illuminants interpolated by mired distance when the as-shot
+/// temperature falls between them, clamped to the calibrated range otherwise.
+/// A valid matrix is still required; Orfeus's output transform is D65 sRGB
+/// regardless of which camera matrix feeds it. Missing or non-finite camera
+/// white balance falls back to unity, matching rawler's safe
+/// unavailable-metadata behavior. The transform deliberately performs no
+/// gamut or highlight clipping.
 pub(crate) fn intermediate_to_linear_srgb(
     intermediate: Intermediate,
     matrices: &HashMap<Illuminant, FlatColorMatrix>,
     white_balance: [f32; 4],
+    as_shot_kelvin: Option<f32>,
 ) -> Result<LinearSrgbImage, ColorError> {
-    let (illuminant, flat) = preferred_matrix(matrices)?;
+    let (illuminant, flat) = blended_matrix(matrices, as_shot_kelvin)?;
     match intermediate {
         Intermediate::ThreeColor(pixels) => {
-            let matrix = camera_to_srgb::<3>(illuminant, flat)?;
+            let matrix = camera_to_srgb::<3>(illuminant, &flat)?;
             let white_balance = usable_white_balance::<3>(&white_balance)?;
             Ok(LinearSrgbImage {
                 width: pixels.width,
@@ -338,7 +446,7 @@ pub(crate) fn intermediate_to_linear_srgb(
             })
         }
         Intermediate::FourColor(pixels) => {
-            let matrix = camera_to_srgb::<4>(illuminant, flat)?;
+            let matrix = camera_to_srgb::<4>(illuminant, &flat)?;
             let white_balance = usable_white_balance::<4>(&white_balance)?;
             Ok(LinearSrgbImage {
                 width: pixels.width,
@@ -377,8 +485,8 @@ mod tests {
         let result = intermediate_to_linear_srgb(
             Intermediate::ThreeColor(pixels),
             &matrices(Illuminant::D65, matrix),
-            [1.0; 4],
-        )
+            [1.0; 4], None,
+            )
         .unwrap();
 
         close(result.data[0], 2.0);
@@ -395,8 +503,8 @@ mod tests {
         intermediate_to_linear_srgb(
             Intermediate::ThreeColor(Color2D::<f32, 3>::new_with(vec![pixel], 1, 1)),
             &matrices(Illuminant::D65, passthrough_matrix()),
-            white_balance,
-        )
+            white_balance, None,
+            )
         .unwrap()
         .data
     }
@@ -467,8 +575,8 @@ mod tests {
         let result = intermediate_to_linear_srgb(
             Intermediate::ThreeColor(pixels),
             &matrices(Illuminant::D65, matrix),
-            [2.0, 1.0, 0.5, f32::NAN],
-        )
+            [2.0, 1.0, 0.5, f32::NAN], None,
+            )
         .unwrap();
         for (actual, expected) in result.data.into_iter().zip([0.5, 0.5, 0.375]) {
             close(actual, expected);
@@ -486,7 +594,7 @@ mod tests {
             let result = intermediate_to_linear_srgb(
                 Intermediate::ThreeColor(pixels),
                 &matrices(Illuminant::D65, matrix.clone()),
-                white_balance,
+                white_balance, None,
             )
             .unwrap();
             for (actual, expected) in result.data.into_iter().zip([0.25, 0.5, 0.75]) {
@@ -505,7 +613,9 @@ mod tests {
         let mut available = matrices(Illuminant::A, vec![1.0; 9]);
         available.insert(Illuminant::D65, identity_camera);
         let result =
-            intermediate_to_linear_srgb(Intermediate::ThreeColor(pixels), &available, [1.0; 4])
+            intermediate_to_linear_srgb(Intermediate::ThreeColor(pixels), &available, [1.0; 4],
+            None,
+            )
                 .unwrap();
         for (actual, expected) in result.data.into_iter().zip([0.2, 0.4, 0.6]) {
             close(actual, expected);
@@ -522,8 +632,8 @@ mod tests {
         let result = intermediate_to_linear_srgb(
             Intermediate::FourColor(pixels),
             &matrices(Illuminant::D65, matrix),
-            [1.0; 4],
-        )
+            [1.0; 4], None,
+            )
         .unwrap();
         assert_eq!(result.data.len(), 3);
         assert!(result.data.iter().all(|value| value.is_finite()));
@@ -537,7 +647,8 @@ mod tests {
             intermediate_to_linear_srgb(
                 Intermediate::ThreeColor(pixels()),
                 &HashMap::new(),
-                [1.0; 4]
+                [1.0; 4],
+            None,
             )
             .unwrap_err(),
             ColorError::MissingMatrix
@@ -545,8 +656,8 @@ mod tests {
         let missing_d65 = intermediate_to_linear_srgb(
             Intermediate::ThreeColor(pixels()),
             &matrices(Illuminant::A, vec![1.0; 9]),
-            [1.0; 4],
-        )
+            [1.0; 4], None,
+            )
         .unwrap_err();
         assert_eq!(
             missing_d65,
@@ -562,7 +673,8 @@ mod tests {
             intermediate_to_linear_srgb(
                 Intermediate::ThreeColor(pixels()),
                 &matrices(Illuminant::D65, vec![1.0; 8]),
-                [1.0; 4]
+                [1.0; 4],
+            None,
             ),
             Err(ColorError::InvalidMatrixLength { .. })
         ));
@@ -570,7 +682,8 @@ mod tests {
             intermediate_to_linear_srgb(
                 Intermediate::ThreeColor(pixels()),
                 &matrices(Illuminant::D65, vec![f32::NAN; 9]),
-                [1.0; 4]
+                [1.0; 4],
+            None,
             )
             .unwrap_err(),
             ColorError::NonFiniteMatrix {
@@ -587,7 +700,8 @@ mod tests {
                         .flat_map(|row| row.iter().copied())
                         .collect(),
                 ),
-                [1.0, 0.0, 1.0, 1.0]
+                [1.0, 0.0, 1.0, 1.0],
+            None,
             )
             .unwrap_err(),
             ColorError::InvalidWhiteBalance { channels: 3 }
@@ -596,12 +710,134 @@ mod tests {
             intermediate_to_linear_srgb(
                 Intermediate::ThreeColor(pixels()),
                 &matrices(Illuminant::D65, vec![0.0; 9]),
-                [1.0; 4]
+                [1.0; 4],
+            None,
             )
             .unwrap_err(),
             ColorError::DegenerateMatrix {
                 illuminant: Illuminant::D65
             }
         );
+    }
+
+    /// A's first row splits evenly between its own and the next XYZ
+    /// component, rather than scaling it -- `normalize` divides every row by
+    /// its own sum, so a pure scale factor (row sum changed, shape the same)
+    /// washes out completely and the two matrices would survive the pipeline
+    /// indistinguishable. A reshaped row survives it and gives a probe pixel
+    /// something to actually tell apart. D65 stays the identity-shaped
+    /// `passthrough_matrix`.
+    fn warm_cool_matrices() -> HashMap<Illuminant, Vec<f32>> {
+        let mut matrices = matrices(Illuminant::A, vec![0.5, 0.5, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]);
+        matrices.insert(Illuminant::D65, passthrough_matrix());
+        matrices
+    }
+
+    // A non-neutral probe: every matrix here is row-normalized so (1,1,1)
+    // renders as (1,1,1)-ish regardless of which one is used -- that is the
+    // normalization's whole job -- so a neutral pixel cannot tell two
+    // candidate matrices apart. An off-neutral camera reading can.
+    const PROBE_PIXEL: [f32; 3] = [1.0, 0.3, 0.1];
+
+    fn probe_red(target_kelvin: Option<f32>) -> f32 {
+        intermediate_to_linear_srgb(
+            Intermediate::ThreeColor(Color2D::<f32, 3>::new_with(vec![PROBE_PIXEL], 1, 1)),
+            &warm_cool_matrices(),
+            [1.0; 4],
+            target_kelvin,
+        )
+        .unwrap()
+        .data[0]
+    }
+
+    /// What the red probe reads through one matrix alone -- `camera_to_srgb`'s
+    /// own row-normalize-then-invert is not linear in the input matrix, so
+    /// this is computed fresh (via that same function, bypassing
+    /// `blended_matrix`/`preferred_matrix` and the D65-availability check
+    /// neither is relevant to here) rather than assumed. Works for either
+    /// calibration point in `warm_cool_matrices`, given that point's own flat
+    /// matrix.
+    fn pure_red(illuminant: Illuminant, flat: &[f32]) -> f32 {
+        let matrix = camera_to_srgb::<3>(illuminant, flat).unwrap();
+        matrix[0]
+            .iter()
+            .zip(PROBE_PIXEL)
+            .map(|(coefficient, channel)| coefficient * channel)
+            .sum()
+    }
+
+    fn pure_a_red() -> f32 {
+        pure_red(Illuminant::A, &[0.5, 0.5, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0])
+    }
+
+    fn pure_d65_red() -> f32 {
+        pure_red(Illuminant::D65, &passthrough_matrix())
+    }
+
+    #[test]
+    fn blend_at_the_warm_calibration_point_uses_it_exactly() {
+        close(probe_red(Some(2856.0)), pure_a_red());
+    }
+
+    #[test]
+    fn blend_at_the_cool_calibration_point_uses_it_exactly() {
+        close(probe_red(Some(6504.0)), pure_d65_red());
+    }
+
+    #[test]
+    fn blend_clamps_below_the_warm_point_instead_of_extrapolating() {
+        // 1500 K is warmer than A's own 2856 K calibration point; clamping
+        // means this reads identically to asking for A's point exactly,
+        // not a further extrapolation past it.
+        close(probe_red(Some(1500.0)), pure_a_red());
+    }
+
+    #[test]
+    fn blend_clamps_above_the_cool_point_instead_of_extrapolating() {
+        // The case this fix does NOT change: a scene cooler than D65 (a
+        // warm manual white balance reading high because the actual light
+        // is cooler than daylight) has no third, cooler calibration point to
+        // blend toward, so it keeps using D65 exactly, same as before.
+        close(probe_red(Some(10_000.0)), pure_d65_red());
+    }
+
+    #[test]
+    fn blend_interpolates_strictly_between_the_two_points() {
+        // Exactly halfway between A and D65 in mired (not in kelvin): mired
+        // 1e6/2856 and 1e6/6504 average to 1e6/midpoint_kelvin. The blend is
+        // linear in the matrix entries, but `camera_to_srgb`'s own
+        // normalize-then-invert is not linear in its input matrix, so this
+        // checks the genuinely verifiable property -- a real blend, neither
+        // endpoint -- rather than a magic number derived through that
+        // nonlinear step.
+        let a_mired = 1.0e6 / 2856.0_f64;
+        let d65_mired = 1.0e6 / 6504.0_f64;
+        let midpoint_kelvin = (1.0e6 / ((a_mired + d65_mired) / 2.0)) as f32;
+        let blended = probe_red(Some(midpoint_kelvin));
+        let (a, d65) = (pure_a_red(), pure_d65_red());
+        let (lo, hi) = (a.min(d65), a.max(d65));
+        assert!(
+            blended > lo + 1.0e-4 && blended < hi - 1.0e-4,
+            "expected {blended} strictly between the pure A ({a}) and pure D65 ({d65}) readings"
+        );
+    }
+
+    #[test]
+    fn blend_ignores_an_unknown_target_kelvin_and_keeps_preferring_d65() {
+        close(probe_red(None), pure_d65_red());
+    }
+
+    #[test]
+    fn blend_uses_the_sole_matrix_regardless_of_target_kelvin_when_only_one_is_known() {
+        // No second calibrated illuminant to blend toward: even a target far
+        // from D65 must not change anything, let alone error.
+        let result = intermediate_to_linear_srgb(
+            Intermediate::ThreeColor(Color2D::<f32, 3>::new_with(vec![[1.0, 1.0, 1.0]], 1, 1)),
+            &matrices(Illuminant::D65, passthrough_matrix()),
+            [1.0; 4],
+            Some(2856.0),
+        )
+        .unwrap();
+        close(result.data[0], 1.0);
     }
 }
