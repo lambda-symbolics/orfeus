@@ -1,0 +1,200 @@
+#+title: Image-quality audit (2026-10-22): status
+#+date: 2026-10-22
+
+Astra audited commit =5a3feb4= and found 14 findings (F01-F14), full text at
+=root@10.0.0.5:/root/orfeus-audit/orfeus-image-quality-audit.org=. Ten are
+fixed below, each with a real/cold-render regression test added in the same
+commit. Four are deliberately deferred -- not because they are not real, but
+because fixing them well needs either architecture this repo does not have
+yet, or real-photo verification this session could not do responsibly at
+2 AM. Shipping a half-verified fix to the renderer's core pipeline has burned
+this project before (see =orfeus-cpu-waste-review.md= / the memory on a
+mutation-testing near-miss in this exact area); this status file exists so
+that risk is visible instead of silent.
+
+* Fixed, with tests
+
+- F01/F02 (measurement cache correctness) -- =fb1bd77=. The sharpen/negative/
+  dehaze/sensor-noise measurement caches were keyed only by graph structure,
+  never by which region of the frame or which of the node's own parameters
+  (radius, picked base) produced the cached value. A pan, or a radius/base
+  change alone, could hand back another window's or another radius's stale
+  measurement. Fixed by adding REGION and DEPENDENCY to the cache key.
+- F03 (manual straightening) -- =19cc6e3=. A crop angle changed through the
+  GUI, or any rect+angle a caller supplies the native renderer, could extend
+  past the source frame once turned; `bilinear`'s own edge clamp then
+  repeated the nearest source pixel across the gap instead of refusing.
+  Fixed in both places: the GUI now re-fits the stored rect through
+  `crop-rect-within-turned-frame` on every angle edit, and the native
+  `rotate_crop_image` now shrinks any rect handed to it the same way before
+  sampling, so a project file or preset from before this fix is also safe.
+- F04 (chroma denoise discontinuity) -- =b54845b=. Any positive chroma
+  strength replaced the full-resolution chroma with the reconstructed
+  half-resolution version outright; the downsample/upsample loss did not
+  scale with strength at all, so strength 0.000001 looked like strength 1.
+  Fixed by blending the reconstruction toward the original full-resolution
+  residual by strength, exact identity at zero. *Real-photo-visible side
+  effect*: partial chroma-denoise strengths are now genuinely gentler than
+  before this fix, including the shipped default (0.45) -- this needs a
+  real-photo recalibration pass like the past denoise-tuning rounds, not
+  attempted tonight.
+- F07 (viewport halo too small for two stacked denoisers) -- in the F01/F02
+  commit. The halo only ever reserved the larger of the edge-aware and
+  neural reaches, `max`, even though both now run in sequence when both
+  amounts are positive. Fixed to sum the two reaches when both apply.
+- F08 (export size bounds ignore graph geometry) -- =f9dc1e8=. The decode's
+  own downscale bound was computed from the EXIF orientation alone, before
+  the graph's own quarter-turn and crop nodes were known, so a quarter-turn
+  after a bounded decode could exceed the requested bound on the other axis,
+  and a crop after one needlessly threw away resolution the crop could have
+  used. Fixed by swapping the bound for an odd total of graph quarter-turns
+  and inflating it by the crop's own narrowing fraction before deciding how
+  large to decode.
+- F09 (lens autocrop misses edge-confined invalidity) -- =c11c53a=. The
+  nearest-invalid distance starts at 1.0, same as a sample right on the
+  outer edge, so invalidity confined to the border was indistinguishable
+  from a wholly valid image. Fixed by tracking whether anything invalid was
+  seen at all, separately from how far away it was.
+- F10/F11 (bracket merge) -- =0dd160d=.
+  - F10: the clipped-everywhere fallback could take the reference frame's
+    raw pixel (when the shortest frame has none at this position -- a warp
+    rejects a border every bilinear neighbour has to be inside the frame
+    for) but still divide by the shortest frame's own exposure, a mismatched
+    pixel/exposure pairing. Fixed to pair each fallback pixel with its own
+    matching exposure.
+  - F11: the fitted rigid rotation was turned into per-tile *total*
+    displacement, which a rotation varies linearly with position by
+    construction, then median-filtered and clamped as if it were locally
+    constant -- distorting the rotation itself, worst near the edges (3.95
+    pixels of error reproduced exactly from the audit's own numbers, in the
+    new test). Fixed by keeping the rigid placement as the base transform
+    and only smoothing/clamping the residual against it, which is genuinely
+    small and non-trending in the noise-free case, and bounded noise
+    otherwise.
+- F13 (Fit Preview / zoom-out can keep a stale window) -- =06759d0=. Two
+  related gaps: `reset-preview-view` only asked for a fresh render when
+  coming back from native 1:1 zoom, not when an ordinary wheel zoom had
+  already narrowed to a window; and the viewport refresher's own condition
+  required a *non-nil* needed region, so zooming out far enough that the
+  whole frame was wanted again (needed = nil) could never trigger a
+  refresh. Both fixed.
+
+* Deferred, documented, not fixed
+
+** F05: viewport denoising measures noise from the window, not the frame
+
+The neural denoiser's per-position weight (and, by the same construction,
+the sharpener's noise gate) normalizes against the *loudest noise this call
+was given*, measured from whatever `image` is at that point in the pipeline
+-- which, once a viewport has narrowed, is the window alone, not the whole
+frame. A clean patch shown on screen can become its own "noisiest" region,
+pushing the denoiser's effective strength there well past what a whole-frame
+(export) render of the same pixels would use. Confirmed structurally; the
+audit's own repro (30x difference in requested network sigma) was not
+independently re-run tonight.
+
+*Why not fixed*: a correct fix needs the compact, position-independent
+noise-vs-brightness fit (`SensorNoise`, and an analogous fit for the neural
+weight) measured from the *whole frame* at the exact moment a render
+narrows -- `execute_graph_into` already has the whole frame in hand right
+there, before it is cropped into the window -- then carried forward and
+reused instead of re-measured from the window. That is a real, scoped fix
+(the fit itself is small and position-independent, so none of F06's phase
+concerns apply to it), but it touches the single most intricate function in
+the native renderer, including its interactive checkpoint/resume cache, and
+needs to be demand-driven (only measured when a sharpener or neural NR is
+actually reachable) the same way the existing sensor-noise measurement
+already is, or it reintroduces the exact CPU cost the "demand-driven
+sensor-noise" fix in the CPU-waste review removed. Not something to rush at
+night without a real interactive A/B against an export.
+
+** F06: odd viewport origins shift the 2x2 chroma/neural pooling grid
+
+Chroma pooling (the half-resolution split/reconstruct in `cpu_noise_
+reduction`) and the neural network's pixel-unshuffle both group pixels into
+2x2 blocks starting from the window's own local (0, 0), not from the window's
+absolute position in the oriented frame. A window with an odd origin on
+either axis therefore pairs different source pixels into each block than a
+whole-frame render would, which the audit reproduced as isoluminant chroma
+detail dropping to zero at an odd crop origin that survives intact in a
+whole-frame render of the same data.
+
+*Why not fixed*: the real fix needs the window's own absolute origin
+threaded through as a phase offset into five separate pieces of 2x2-grouping
+index arithmetic across two files -- the chroma split, its blur guide, and
+the reconstruction in `render.rs`, plus the pixel-unshuffle and pixel-shuffle
+in `nn.rs` -- all of which have to agree with each other for a pixel to land
+in the one block it belongs in. This is exactly the kind of pixel-level
+index surgery that has previously gone subtly wrong in this codebase without
+a real photograph to check it against (see the neural-noise-sigma memory's
+"wrong-first-attempt... caught by a real-photo A/B before shipping"). Pairs
+naturally with F05, since both touch the same denoise internals; worth
+designing and fixing together with real verification photos in hand, not
+tonight.
+
+** F12: a window that fills one whole frame dimension is misread as the whole frame
+
+Both the file-preview and live-preview publication paths discard the
+requested viewport whenever the delivered image's larger dimension reaches
+98% of the render bound, on the theory that a renderer that silently
+ignored the viewport would look exactly like this. But a genuinely narrow
+window that happens to keep one full dimension -- the audit's own example: a
+portrait frame, an 80%-width by full-height crop -- reaches the bound on
+that one axis too, and gets the same false "secretly the whole frame"
+verdict, clearing its region and placing/zooming the view as if it covered
+everything.
+
+*Why not fixed*: the robust fix is what the audit itself names -- have the
+renderer report back the actual frame and viewport geometry it used,
+explicitly, rather than inferring it from the output's pixel dimensions,
+which are fundamentally ambiguous between these two cases. That is a wire-
+protocol change (the render-frame struct `native.lisp` and the Rust FFI
+boundary both touch), not a same-night heuristic tweak. A pure Lisp-side
+heuristic repair was considered -- comparing the delivered size against what
+the *requested region's own aspect* should have produced, instead of
+against the bound alone -- but doing that correctly needs the photo's own
+oriented frame aspect at the exact point this check runs, which is not
+reliably available there without borrowing a helper (`crop-frame-aspect`)
+built for a different call site and context; wiring that in without
+confidence was judged riskier than leaving the known, explained gap. P2 in
+the audit's own ranking (a conditional geometry problem, not corrupted image
+content), which weighed into deferring it over the P1 items above.
+
+** F14: the film-base eyedropper ignores graph geometry
+
+Clicking the preview to sample a negative's film base maps the click through
+the preview's own fit/zoom/pan into a normalized frame coordinate, then
+samples the raw decoded image there directly; the native sampler only
+corrects for EXIF orientation. Neither step reverses whatever the graph
+itself did -- crop, flip, quarter-turn, straightening angle, or lens
+optics -- between the raw decode and what is actually on screen. After a
+horizontal flip, for instance, a click at displayed x=0.1 should read
+original x=0.9 and instead reads original x=0.1: the picked RGB values can
+come from the wrong part of the photograph entirely, silently wrong in every
+negative conversion that follows.
+
+*Why not fixed*: this repo already has `rect-through-geometry` /
+`downstream-geometry`, which correctly reverses rotate and flip nodes
+*downstream* of a given node (used by the crop-centre picker) -- but the
+eyedropper's problem is upstream of the sampled node: crop's own rect and
+straightening angle, any number of rotate/flip nodes, and potentially lens
+optics distortion, between the raw decode and the node being sampled. That
+is new infrastructure (walking and inverting an arbitrary geometric prefix,
+not just one crop's downstream turns), and optics distortion in particular
+has no simple closed-form inverse to fall back on. Getting a partial version
+of this subtly wrong -- reversing flip and rotate but mishandling the crop
+offset, say -- would be worse than the current, clearly-documented gap,
+because it would look fixed while still silently sampling the wrong pixel
+sometimes. In practice the node this feeds (negative / colour-subtract) is
+used on scanned film, which typically has no optics node in its graph at
+all, so a crop+rotate+flip-only reversal would cover the overwhelmingly
+common case -- but it still needs its own careful implementation and a real
+scanned-negative test, not a late-night patch.
+
+* Noted, not actioned
+
+Astra's "additional quality consideration": JPEG export always encodes
+4:2:0 chroma subsampling, even at quality 100, which is a deliberate
+encoding choice rather than a bug, and a 4:4:4 option would need MCU
+dimension and striped-encoding changes in =native/src/jpeg.rs=, not just a
+sampling-factor flag. Left as a possible future feature, not a defect.
