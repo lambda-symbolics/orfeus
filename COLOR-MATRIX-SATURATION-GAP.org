@@ -1,0 +1,105 @@
+#+title: Default-render saturation gap vs. the camera's own JPEG
+#+date: 2026-10-22
+
+* The problem
+
+Orfeus's default (no-LUT) render is supposed to track the OM-1's own Natural
+picture-mode JPEG closely, with better noise reduction and added sharpness as
+the only intended differences. It mostly does, but there is a real,
+measured saturation gap, and *the gap changes sign* depending on which
+camera calibration matrix the shot's as-shot white balance lands on. A flat
+global correction cannot fix this; it would make one side better and the
+other side worse.
+
+* What was measured
+
+** Illuminant-A end (warm, clamped below ~2856 K)
+
+A controlled 30-shot test (=/root/project/wb-test=, PA223244-273, fixed 2800
+K base WB, swept the amber-blue and green-magenta fine-tune axes -7..+7) put
+every single frame's as-shot-kelvin estimate between 2193 K and 2922 K --
+almost entirely below the 2856 K illuminant-A calibration point, so every
+frame used the same clamped A matrix. On the red and orange patches (the
+only ones with high enough chroma for a trustworthy hue/saturation read),
+the camera's own JPEG measured **~1.22x more saturated than Orfeus**,
+consistently across all 15 steps of both axes (four independent
+measurements: 1.22, 1.21, 1.26, 1.22).
+
+Three more ordinary Auto-WB photos (=/root/project/sd-card-picks=,
+PA012072/PA042241/PA102561) replicated the same direction at whole-frame
+granularity: camera 1.11-1.18x more saturated than Orfeus (smaller than the
+patch numbers because a whole-frame average dilutes with low-chroma
+background).
+
+** D65 end (clamped above ~6504 K)
+
+Two real photos that started this whole investigation -- =PA132792= (7800 K
+manual dial, as-shot-kelvin estimate already measured at ~9911 K) and
+=PA022163= (12000 K manual dial) -- both clamp to the D65 matrix. Both come
+back the *opposite* direction: Orfeus reads **0.82-0.84x** of the camera's
+saturation, i.e. Orfeus is *more* saturated than the camera there, not less.
+
+Checked for an exposure-brightness confound first (a brighter render reads
+less saturated in HSB independent of real chroma, which could fake either
+direction): one ordinary file had a large brightness gap and was excluded as
+unreliable, but the rest all had small (<4-point) brightness gaps, so the
+sign flip is real.
+
+* Why it wasn't just fixed with a global saturation gain
+
+A flat +~20% saturation boost in the always-on tone-mapping stage
+(=tone::tone_pixel= in =native/src/tone.rs=) would have closed the gap on
+the ordinary/illuminant-A side while making the exact D65-clamped photo that
+started this investigation (=PA132792=) measurably *worse* -- pushing its
+ratio further from 1.0, not closer. That is backwards from the goal, so it
+was not shipped.
+
+* What a real fix needs
+
+A correction that varies with which matrix (or more precisely, the
+interpolation blend weight computed in =color.rs='s =blended_matrix=) the
+shot lands on -- boosting saturation near the A end, cutting it near/past the
+D65 end -- rather than a single constant. Fitting that properly needs more
+waypoints than the two extremes on hand; right now there is real data for
+~2200-2900 K (A-clamped) and ~9900-12000+ K (D65-clamped, estimated), but
+*nothing* in between and nothing confirming the shape near D65 itself. There
+is also a real architecture question: the blend weight lives in camera/XYZ
+space in =color.rs=; the saturation correction would need to apply in
+=tone.rs=, several pipeline stages downstream, so plumbing that value
+through is itself part of the fix.
+
+* Shooting plan for the next round
+
+Same approach as the wb-test shoot: one fixed indoor scene with the same
+handful of saturated subjects (a red one, an orange one, a green one --
+reusing the wall/blanket/curtain/box subjects from =wb-test= is fine),
+fixed framing, fixed exposure, no clipping. The difference this time:
+dial the **base Kelvin** directly across a wide range (not the amber-blue/
+green-magenta fine-tune axis, which was already swept at a single base),
+fine-tune axes left at 0 throughout.
+
+Suggested waypoints (manual WB, Kelvin mode, picture mode Natural,
+contrast 0 as always):
+
+- 2500 K -- just below illuminant A, for overlap with the existing data
+- 2856 K -- exactly illuminant A
+- 3500 K, 4300 K -- inside the interpolation band, currently unsampled
+- 5000 K -- interpolation band, near the middle
+- 5700 K -- interpolation band, close to D65
+- 6504 K -- exactly D65
+- 7500 K, 8500 K -- just past D65, filling the gap before the existing 7800/
+  12000 K data
+- 10000 K, 12000 K -- past D65, for overlap with the existing extremes
+
+That is 11 frames, about the same amount of shooting as the wb-test round.
+Keep the same patch coordinates/subjects so the new data is directly
+comparable to what is already measured, and note the room lighting's actual
+color temperature same as before (doesn't need to match any waypoint,
+just needs to stay fixed across all 11 frames).
+
+Once that lands: render all 11 through the bare default graph, sample the
+same patches, compute camera/Orfeus saturation ratio per frame, and plot
+ratio against as-shot-kelvin estimate (not dialed Kelvin). That should show
+the actual shape of the gap across the full range -- and in particular,
+whether it crosses 1.0 smoothly somewhere inside the interpolation band, or
+jumps at the clamp boundaries.
