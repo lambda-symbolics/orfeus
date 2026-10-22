@@ -829,19 +829,107 @@ fn crop_image(image: &RgbImage, rect: [f32; 4]) -> Result<RgbImage, Error> {
     })
 }
 
-/// Rotates the image by SENSOR-ANGLE degrees about the rectangle's center,
-/// then extracts the rectangle — one bilinear sampling pass.
-fn rotate_crop_image(
-    image: &RgbImage,
+/// Shrinks RECT about its own centre until the frame, turned by ANGLE
+/// degrees about its own centre, still covers every corner of it.
+///
+/// LEFT TOP WIDTH HEIGHT are fractions of IMAGE_WIDTH by IMAGE_HEIGHT. A
+/// corner the turned frame does not reach would otherwise have
+/// `rotate_crop_image` sample past the source edge, which `bilinear` then
+/// clamps to the nearest source pixel rather than refusing — the clamp
+/// itself is deliberate and shared with ordinary lens-correction sampling,
+/// so the fix belongs here, keeping the rectangle valid before any sampling
+/// happens, mirroring the GUI's own `crop-rect-within-turned-frame` (see
+/// `src/gui/model.lisp`) so every caller reaching this render gets the same
+/// guarantee, not only a crop angle edited interactively.
+fn shrink_rect_to_turned_frame(
     rect: [f32; 4],
-    sensor_angle: f32,
-) -> Result<RgbImage, Error> {
+    image_width: f32,
+    image_height: f32,
+    angle_degrees: f32,
+) -> [f32; 4] {
+    if angle_degrees == 0.0 {
+        return rect;
+    }
     let [left, top, width, height] = rect;
-    let x0 = ((left * image.width as f32).round() as usize).min(image.width - 1);
-    let y0 = ((top * image.height as f32).round() as usize).min(image.height - 1);
-    let target_width = ((width * image.width as f32).round() as usize).clamp(1, image.width - x0);
-    let target_height =
-        ((height * image.height as f32).round() as usize).clamp(1, image.height - y0);
+    let radians = angle_degrees.to_radians();
+    let (sin, cos) = radians.sin_cos();
+    let center_x = image_width * (left + width * 0.5 - 0.5);
+    let center_y = image_height * (top + height * 0.5 - 0.5);
+    let half_width = image_width * width * 0.5;
+    let half_height = image_height * height * 0.5;
+    let mut scale = f32::MAX;
+    // Each corner is centre + scale * half-diagonal; it sits inside the
+    // turned frame when both its projections onto the frame's turned axes
+    // stay within the half extents, a linear bound on scale per corner and
+    // axis, of which the tightest wins.
+    for (offset_x, offset_y) in [
+        (half_width, half_height),
+        (half_width, -half_height),
+        (-half_width, half_height),
+        (-half_width, -half_height),
+    ] {
+        for (axis_x, axis_y, limit) in [
+            // A one-pixel margin on each limit, since X0/Y0 and the target
+            // dimensions are independently rounded to whole pixels right
+            // after this: a rectangle shrunk to exactly the continuous
+            // boundary can still round outward on both its origin and its
+            // size, oversampling by up to a pixel after that discretizing.
+            (cos, sin, (image_width * 0.5 - 1.0).max(0.0)),
+            (-sin, cos, (image_height * 0.5 - 1.0).max(0.0)),
+        ] {
+            let center = center_x * axis_x + center_y * axis_y;
+            let reach = offset_x * axis_x + offset_y * axis_y;
+            if reach > 1.0e-6 {
+                scale = scale.min((limit - center) / reach);
+            } else if reach < -1.0e-6 {
+                scale = scale.min((-limit - center) / reach);
+            }
+        }
+    }
+    if !(scale < 1.0) {
+        return rect;
+    }
+    // A centre the turned frame does not even reach cannot be shrunk
+    // towards; start over from the middle of the frame instead. The middle
+    // always has room, so this recurses once at most.
+    if scale < 0.05 && (left + width * 0.5 - 0.5).abs() > 1.0e-6 {
+        return shrink_rect_to_turned_frame(
+            [0.5 - width * 0.5, 0.5 - height * 0.5, width, height],
+            image_width,
+            image_height,
+            angle_degrees,
+        );
+    }
+    let scale = scale.max(0.0);
+    let new_width = width * scale;
+    let new_height = height * scale;
+    [
+        left + width * 0.5 - new_width * 0.5,
+        top + height * 0.5 - new_height * 0.5,
+        new_width,
+        new_height,
+    ]
+}
+
+/// Rotates IMAGE by SENSOR_ANGLE about its own centre, sampling exactly the
+/// X0,Y0,TARGET_WIDTH by TARGET_HEIGHT window — one bilinear sampling pass.
+///
+/// No footprint check: a window extending past where the turned frame
+/// covers samples its nearest source edge instead, the same clamp ordinary
+/// lens-correction sampling relies on. `rotate_crop_image` is the one caller
+/// that may reach real pixels with this, after shrinking its rectangle to
+/// where the turned frame actually covers it; this is also the whole-frame,
+/// uncropped turn a test compares cropped pieces against, which samples past
+/// the edge everywhere but the centre by construction and is not meant to be
+/// a delivered render.
+fn rotate_image_window(
+    image: &RgbImage,
+    x0: usize,
+    y0: usize,
+    target_width: usize,
+    target_height: usize,
+    sensor_angle: f32,
+) -> RgbImage {
     let x0 = x0 as f32;
     let y0 = y0 as f32;
     // Turned about the middle of the frame, not the middle of the rectangle.
@@ -879,7 +967,42 @@ fn rotate_crop_image(
                 }
             }
         });
-    Ok(output)
+    output
+}
+
+/// Rotates the image by SENSOR-ANGLE degrees about the rectangle's center,
+/// then extracts the rectangle — one bilinear sampling pass.
+///
+/// RECT is shrunk about its own centre first, when the turned frame does not
+/// already cover it: left alone, a corner past the source edge would sample
+/// the nearest source pixel there instead, repeated across the whole missing
+/// area (`rotate_image_window`'s own clamp, shared with lens-correction
+/// sampling and deliberately not the thing to change here).
+fn rotate_crop_image(
+    image: &RgbImage,
+    rect: [f32; 4],
+    sensor_angle: f32,
+) -> Result<RgbImage, Error> {
+    let rect = shrink_rect_to_turned_frame(
+        rect,
+        image.width as f32,
+        image.height as f32,
+        sensor_angle,
+    );
+    let [left, top, width, height] = rect;
+    let x0 = ((left * image.width as f32).round() as usize).min(image.width - 1);
+    let y0 = ((top * image.height as f32).round() as usize).min(image.height - 1);
+    let target_width = ((width * image.width as f32).round() as usize).clamp(1, image.width - x0);
+    let target_height =
+        ((height * image.height as f32).round() as usize).clamp(1, image.height - y0);
+    Ok(rotate_image_window(
+        image,
+        x0,
+        y0,
+        target_width,
+        target_height,
+        sensor_angle,
+    ))
 }
 
 /// Executes OPS over SOURCE, returning the final display-domain image.
@@ -3025,15 +3148,29 @@ mod tests {
     fn a_tilted_crop_is_a_crop_of_the_tilted_frame() {
         let scene = noisy_scene(160, 120);
         for angle in [3.0_f32, -7.5, 12.0] {
-            let whole = rotate_crop_image(&scene, [0.0, 0.0, 1.0, 1.0], angle).unwrap();
+            // The whole turned frame at its own full size, not a crop of it:
+            // no non-square frame at a nonzero angle can stay fully covered
+            // by its own un-shrunk extent, so `rotate_crop_image` itself
+            // would now shrink a [0,0,1,1] rect rather than hand back
+            // something smeared at its corners.
+            let whole = rotate_image_window(&scene, 0, 0, scene.width, scene.height, angle);
             for rect in [
                 [0.25_f32, 0.25, 0.5, 0.5],
                 [0.1, 0.3, 0.4, 0.4],
                 [0.45, 0.05, 0.5, 0.6],
             ] {
                 let direct = rotate_crop_image(&scene, rect, angle).unwrap();
-                let left = (rect[0] * whole.width as f32).round() as usize;
-                let top = (rect[1] * whole.height as f32).round() as usize;
+                // `direct` may itself be a shrunk-to-fit version of RECT, not
+                // RECT verbatim; compare against the piece of the whole
+                // frame at the geometry it was actually delivered at.
+                let fit = shrink_rect_to_turned_frame(
+                    rect,
+                    scene.width as f32,
+                    scene.height as f32,
+                    angle,
+                );
+                let left = (fit[0] * whole.width as f32).round() as usize;
+                let top = (fit[1] * whole.height as f32).round() as usize;
                 let expected = render::crop_rect(
                     &whole,
                     left,
@@ -3259,8 +3396,64 @@ mod tests {
 
     #[test]
     fn rotated_crop_clamps_dimensions_at_the_source_bounds() {
+        // This rectangle's own centre sits exactly on the frame's edge (left
+        // 0.9 + half its width 0.1 = 1.0) before any rotation is even
+        // considered, so no shrink about that centre can bring it back
+        // inside once the turn pushes it further out; the valid-footprint
+        // guard recentres a rectangle of the same size in the frame's
+        // middle instead of the old behaviour of clamping its extracted
+        // corner down to a sliver.
         let cropped = rotate_crop_image(&gradient_image(), [0.9, 0.9, 0.2, 0.2], 3.0).unwrap();
-        assert_eq!((cropped.width, cropped.height), (2, 2));
+        assert_eq!((cropped.width, cropped.height), (5, 3));
+    }
+
+    #[test]
+    fn rotated_crop_never_samples_past_the_source_edge() {
+        // The audit's own reproduction: a full-frame crop at a visible angle
+        // used to leave its corners extruding the source's own edge pixels
+        // across the gap, since nothing shrank the rectangle for the turn.
+        let image = gradient_image();
+        let angle = 10.0_f32;
+        let rect = [0.0_f32, 0.0, 1.0, 1.0];
+        let shrunk =
+            shrink_rect_to_turned_frame(rect, image.width as f32, image.height as f32, angle);
+        assert!(
+            shrunk[2] < rect[2] && shrunk[3] < rect[3],
+            "a full-frame crop turned 10 degrees must shrink to stay covered, got {shrunk:?}"
+        );
+
+        let cropped = rotate_crop_image(&image, rect, angle).unwrap();
+
+        // Replicate rotate_crop_image's own corner-to-source mapping exactly,
+        // and check every corner of what it actually produced lands inside
+        // the source -- not a reimplementation of the fix, a check on it.
+        let center_x = image.width as f32 * 0.5;
+        let center_y = image.height as f32 * 0.5;
+        let radians = angle.to_radians();
+        let (sin, cos) = radians.sin_cos();
+        let [left, top, _, _] = shrunk;
+        let x0 = (left * image.width as f32).round().min(image.width as f32 - 1.0);
+        let y0 = (top * image.height as f32).round().min(image.height as f32 - 1.0);
+        for &(row, column) in &[
+            (0.0, 0.0),
+            (0.0, (cropped.width - 1) as f32),
+            ((cropped.height - 1) as f32, 0.0),
+            ((cropped.height - 1) as f32, (cropped.width - 1) as f32),
+        ] {
+            let offset_y = y0 + row + 0.5 - center_y;
+            let offset_x = x0 + column + 0.5 - center_x;
+            let source_x = center_x + cos * offset_x + sin * offset_y - 0.5;
+            let source_y = center_y - sin * offset_x + cos * offset_y - 0.5;
+            let epsilon = 1.0e-3;
+            assert!(
+                source_x >= -epsilon && source_x <= image.width as f32 - 1.0 + epsilon,
+                "corner ({row}, {column}) sampled x={source_x}, past the source edge"
+            );
+            assert!(
+                source_y >= -epsilon && source_y <= image.height as f32 - 1.0 + epsilon,
+                "corner ({row}, {column}) sampled y={source_y}, past the source edge"
+            );
+        }
     }
 
     #[test]

@@ -2589,13 +2589,29 @@ behind is memory. Best effort; returns how many directories went."
                                             "Crop centred")))))))))
            (set-crop-node-angle (node angle)
              ;; The preview shows the straightening, so an angle change is a
-             ;; change to the picture and not merely to the overlay.
+             ;; change to the picture and not merely to the overlay. A
+             ;; steeper angle can turn the rectangle past what the turned
+             ;; frame covers, so it is re-fit the same way a fresh, placed, or
+             ;; resized crop already is -- left alone, a corner past the
+             ;; source edge would just repeat the nearest source pixel there
+             ;; instead of being kept inside the frame.
              (handler-case
-                 (progn
-                   (gui-model-set-node-params model node (list :angle angle))
-                   (when after-canvas (lightfast:redraw after-canvas))
-                   (schedule-edited-preview)
-                   (set-status (format nil "Crop angle ~,1F deg" angle)))
+                 (let ((params (orfeus:graph-node-params node)))
+                   (multiple-value-bind (left top width height)
+                       (crop-rect-within-turned-frame
+                        (float (getf params :left 0.0) 1d0)
+                        (float (getf params :top 0.0) 1d0)
+                        (float (getf params :width 1.0) 1d0)
+                        (float (getf params :height 1.0) 1d0)
+                        angle
+                        :aspect (crop-frame-aspect node))
+                     (gui-model-set-node-params
+                      model node
+                      (list :left left :top top :width width :height height
+                            :angle angle))
+                     (when after-canvas (lightfast:redraw after-canvas))
+                     (schedule-edited-preview)
+                     (set-status (format nil "Crop angle ~,1F deg" angle))))
                (error (condition)
                  (set-status (princ-to-string condition)))))
            (begin-crop-drag (canvas x y)
