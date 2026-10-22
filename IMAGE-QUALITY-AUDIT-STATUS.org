@@ -2,12 +2,12 @@
 #+date: 2026-10-22
 
 Astra audited commit =5a3feb4= and found 14 findings (F01-F14), full text at
-=root@10.0.0.5:/root/orfeus-audit/orfeus-image-quality-audit.org=. Twelve are
-fixed below, each with a real/cold-render regression test added in the same
-commit. Two (F05/F06) are deliberately deferred -- not because they are not
-real, but because fixing them well needs real-photo verification this
-session could not do responsibly at 2 AM. Shipping a half-verified fix to
-the renderer's core pipeline has burned this project before (see
+=root@10.0.0.5:/root/orfeus-audit/orfeus-image-quality-audit.org=. Thirteen
+are fixed below, each with a real/cold-render regression test added in the
+same commit. One (F05) is deliberately deferred -- not because it is not
+real, but because fixing it well needs real-photo verification this session
+could not do responsibly at 2 AM. Shipping a half-verified fix to the
+renderer's core pipeline has burned this project before (see
 =orfeus-cpu-waste-review.md= / the memory on a mutation-testing near-miss in
 this exact area); this status file exists so that risk is visible instead
 of silent.
@@ -115,6 +115,36 @@ of silent.
   in practice rarely matters here since the node this feeds (negative /
   colour-subtract) is used on scanned film, graphs that essentially never
   carry an optics node at all.
+- F06 (odd viewport origins shift the 2x2 chroma/neural pooling grid) --
+  =9591e64=. Chroma pooling (the half-resolution split/reconstruct in
+  =cpu_noise_reduction=) and the neural network's pixel-unshuffle both group
+  pixels into 2x2 blocks starting from the window's own local (0, 0), not
+  from the window's absolute position in the oriented frame. A window with
+  an odd origin on either axis therefore paired different source pixels
+  into each block than a whole-frame render would, reproduced as isoluminant
+  chroma detail (a two-pixel-period stripe pattern) dropping to zero at an
+  odd crop origin that survives intact in a whole-frame render of the same
+  data. The fix turned out far simpler than the original plan of threading a
+  phase offset through five separate pieces of 2x2-grouping index
+  arithmetic across =render.rs= and =nn.rs=: =crop_viewport_from= now rounds
+  the window's own absolute origin down to the nearest even pixel before
+  anything narrows, so local and absolute parity always agree and the
+  existing pooling/unshuffle code -- which only ever assumed that -- needs
+  no changes at all. The halo-trimming that already runs afterwards absorbs
+  the up-to-one-extra-pixel this rounding can add, for free. *Verified*: a
+  period-2 isoluminant-stripe window at an odd origin differed from the
+  matching whole-frame crop by ~0.0034 before the fix and exactly 0 after it
+  (confirmed by reverting the fix against the tightened test and watching it
+  fail at that same measured value). A related but separate finding from
+  writing this test: period-1 stripes are phase-invariant under any 2x2
+  grouping (the audit's own choice of period 2 is why it is the pattern that
+  actually discriminates). *Known, accepted gap*: the "unoriented" branch of
+  =crop_viewport_from=, reached only when narrowing happens before EXIF
+  orientation is applied, does not get the same guarantee -- its final
+  origin goes through an independent orient/un-orient round trip after this
+  fix's rounding is already spent. Architecturally very rare: every default
+  graph includes an =:optics= node, which both requires an oriented frame
+  and is itself one of =plan_viewport='s own barrier-triggering kinds.
 
 * Deferred, documented, not fixed
 
@@ -144,30 +174,6 @@ actually reachable) the same way the existing sensor-noise measurement
 already is, or it reintroduces the exact CPU cost the "demand-driven
 sensor-noise" fix in the CPU-waste review removed. Not something to rush at
 night without a real interactive A/B against an export.
-
-** F06: odd viewport origins shift the 2x2 chroma/neural pooling grid
-
-Chroma pooling (the half-resolution split/reconstruct in `cpu_noise_
-reduction`) and the neural network's pixel-unshuffle both group pixels into
-2x2 blocks starting from the window's own local (0, 0), not from the window's
-absolute position in the oriented frame. A window with an odd origin on
-either axis therefore pairs different source pixels into each block than a
-whole-frame render would, which the audit reproduced as isoluminant chroma
-detail dropping to zero at an odd crop origin that survives intact in a
-whole-frame render of the same data.
-
-*Why not fixed*: the real fix needs the window's own absolute origin
-threaded through as a phase offset into five separate pieces of 2x2-grouping
-index arithmetic across two files -- the chroma split, its blur guide, and
-the reconstruction in `render.rs`, plus the pixel-unshuffle and pixel-shuffle
-in `nn.rs` -- all of which have to agree with each other for a pixel to land
-in the one block it belongs in. This is exactly the kind of pixel-level
-index surgery that has previously gone subtly wrong in this codebase without
-a real photograph to check it against (see the neural-noise-sigma memory's
-"wrong-first-attempt... caught by a real-photo A/B before shipping"). Pairs
-naturally with F05, since both touch the same denoise internals; worth
-designing and fixing together with real verification photos in hand, not
-tonight.
 
 * Noted, not actioned
 
