@@ -2,15 +2,9 @@
 #+date: 2026-10-22
 
 Astra audited commit =5a3feb4= and found 14 findings (F01-F14), full text at
-=root@10.0.0.5:/root/orfeus-audit/orfeus-image-quality-audit.org=. Thirteen
-are fixed below, each with a real/cold-render regression test added in the
-same commit. One (F05) is deliberately deferred -- not because it is not
-real, but because fixing it well needs real-photo verification this session
-could not do responsibly at 2 AM. Shipping a half-verified fix to the
-renderer's core pipeline has burned this project before (see
-=orfeus-cpu-waste-review.md= / the memory on a mutation-testing near-miss in
-this exact area); this status file exists so that risk is visible instead
-of silent.
+=root@10.0.0.5:/root/orfeus-audit/orfeus-image-quality-audit.org=. All
+fourteen are fixed below, each with a real/cold-render regression test added
+in the same commit.
 
 * Fixed, with tests
 
@@ -145,35 +139,39 @@ of silent.
   fix's rounding is already spent. Architecturally very rare: every default
   graph includes an =:optics= node, which both requires an oriented frame
   and is itself one of =plan_viewport='s own barrier-triggering kinds.
-
-* Deferred, documented, not fixed
-
-** F05: viewport denoising measures noise from the window, not the frame
-
-The neural denoiser's per-position weight (and, by the same construction,
-the sharpener's noise gate) normalizes against the *loudest noise this call
-was given*, measured from whatever `image` is at that point in the pipeline
--- which, once a viewport has narrowed, is the window alone, not the whole
-frame. A clean patch shown on screen can become its own "noisiest" region,
-pushing the denoiser's effective strength there well past what a whole-frame
-(export) render of the same pixels would use. Confirmed structurally; the
-audit's own repro (30x difference in requested network sigma) was not
-independently re-run tonight.
-
-*Why not fixed*: a correct fix needs the compact, position-independent
-noise-vs-brightness fit (`SensorNoise`, and an analogous fit for the neural
-weight) measured from the *whole frame* at the exact moment a render
-narrows -- `execute_graph_into` already has the whole frame in hand right
-there, before it is cropped into the window -- then carried forward and
-reused instead of re-measured from the window. That is a real, scoped fix
-(the fit itself is small and position-independent, so none of F06's phase
-concerns apply to it), but it touches the single most intricate function in
-the native renderer, including its interactive checkpoint/resume cache, and
-needs to be demand-driven (only measured when a sharpener or neural NR is
-actually reachable) the same way the existing sensor-noise measurement
-already is, or it reintroduces the exact CPU cost the "demand-driven
-sensor-noise" fix in the CPU-waste review removed. Not something to rush at
-night without a real interactive A/B against an export.
+- F05 (viewport denoising measures noise from the window, not the frame) --
+  =5624bed=. The neural denoiser's per-position weight normalizes against the
+  *loudest noise this call was given*, measured from whatever `image` is at
+  that point in the pipeline -- which, once a viewport has narrowed, is the
+  window alone, not the whole frame. A clean patch shown on screen could
+  become its own "noisiest" region, pushing the denoiser's effective strength
+  there well past what a whole-frame (export) render of the same pixels
+  would use. Fixed by measuring a new, position-independent `NeuralNoiseFloor`
+  fit (the same brightness-binned shape `SensorNoise` already uses, in the
+  network's own sRGB-encoded domain) from the whole frame at the exact moment
+  `execute_graph_into` narrows -- the whole frame is already in hand there,
+  right before `crop_to_viewport`/`crop_viewport_from` consume it -- and
+  carrying it forward to the denoise node instead of re-measuring from the
+  window. `SensorNoise` (the sharpener's own gate) is now measured the same
+  way, for consistency and because it turns panning from "re-measure the
+  window's own noise on every tick" into a cache hit against the unchanged
+  whole frame behind it -- a real, if less dramatic, win: unlike the neural
+  floor, `SensorNoise`'s per-brightness-bin quartile fit has no single
+  frame-wide "loudest" reference to be misled by, so a scene engineered to
+  reproduce the neural floor's bug (half genuinely noisy, half flat, both at
+  the same brightness) left the sharpener's own gate reading identically
+  whether measured from the window or the whole frame -- confirmed by
+  reverting the fix and watching that specific comparison keep passing, which
+  is why no end-to-end regression test for that half of the fix shipped (a
+  test that cannot fail is not a test). Demand-driven like the existing
+  sensor-noise measurement, walking forward from the narrow point through any
+  reachable denoise node the same way `graph_reaches_a_sharpener` already
+  does, so nothing is read off the whole frame unless a reachable node would
+  actually use it -- and never carried past the first denoise node it
+  reaches, since a second, chained one must read its own already-denoised
+  input instead. *Verified*: a window kept entirely inside an otherwise noisy
+  frame's flat half differed from a whole-frame crop of the same pixels by
+  ~0.0051 before the fix and exactly 0 after it.
 
 * Noted, not actioned
 
