@@ -1250,6 +1250,68 @@ fn graph_reaches_a_sharpener(ops: &[GraphOp], from_index: usize) -> bool {
     false
 }
 
+/// Whether a reading taken at REGISTER, before OPS narrows away from it,
+/// would still reach a denoise node whose own gate -- the same one its match
+/// arm already applies -- would otherwise have to read it back out of the
+/// window alone. Scanning stops at the first denoise node reached: that node
+/// is the reading's only consumer, so nothing downstream of it (in
+/// particular a second, chained denoise node, which must measure its own,
+/// already-once-denoised input instead) ever needs to see it.
+///
+/// Only `NODE_WHITE_BALANCE` carries a live register forward here, not the
+/// fuller list `sensor_noise_carries_through` uses for the *sharpener's*
+/// reading: every other kind in that list (optics, crop, rotate, flip) is
+/// exactly what `plan_viewport`'s own barrier search already requires to
+/// precede REGISTER's own narrowing, so none of them can occur at or after
+/// it in the first place.
+fn window_needs_sensor_noise(ops: &[GraphOp], register: usize, barrier: usize) -> bool {
+    let mut live = vec![register];
+    for (index, op) in ops.iter().enumerate().skip(barrier) {
+        if !(live.contains(&op.input_a) || live.contains(&op.input_b)) {
+            continue;
+        }
+        if op.kind == NODE_NOISE_REDUCTION {
+            return (op.params[0] > 0.0 || op.params[1] > 0.0) && graph_reaches_a_sharpener(ops, index);
+        }
+        if op.kind == NODE_WHITE_BALANCE {
+            live.push(index + 1);
+        }
+    }
+    false
+}
+
+/// The same question for the neural denoiser's own per-position weight,
+/// needed whenever a reachable denoise node's neural amount is positive at
+/// all -- unlike the sharpener's reading, nothing downstream of the denoise
+/// node itself ever reads this one, since it is consumed inside the same
+/// node that measures it reachable.
+fn window_needs_neural_floor(ops: &[GraphOp], register: usize, barrier: usize) -> bool {
+    let mut live = vec![register];
+    for (index, op) in ops.iter().enumerate().skip(barrier) {
+        if !(live.contains(&op.input_a) || live.contains(&op.input_b)) {
+            continue;
+        }
+        if op.kind == NODE_NOISE_REDUCTION {
+            return op.params[1] > 0.0;
+        }
+        if op.kind == NODE_WHITE_BALANCE {
+            live.push(index + 1);
+        }
+    }
+    false
+}
+
+/// Whether a window-entry reading (sensor noise or the neural floor) carries
+/// forward from OP's input register to its own output: only a plain
+/// per-pixel gain sits between where narrowing can measure and the denoise
+/// node that reads it (see `window_needs_sensor_noise`'s doc comment for why
+/// the geometric kinds never need to be named here), and the denoise node
+/// itself is deliberately excluded -- its own reading is spent the moment it
+/// is read, not forwarded to whatever it produces.
+fn window_entry_carries_through(kind: u32) -> bool {
+    kind == NODE_WHITE_BALANCE
+}
+
 /// A value a node measures from its own input, cached against the exact ops
 /// that produced that input.
 ///
@@ -1356,6 +1418,72 @@ fn negative_measurement_cache() -> &'static Mutex<Vec<NodeMeasurement<render::Ne
 fn sensor_noise_measurement_cache() -> &'static Mutex<Vec<NodeMeasurement<Option<render::SensorNoise>>>> {
     static CACHE: OnceLock<Mutex<Vec<NodeMeasurement<Option<render::SensorNoise>>>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Whole-frame readings taken right as a render narrows (F05): keyed by the
+/// barrier's own index rather than the denoise node's, and by the whole
+/// frame's own dimensions rather than the window's, so panning -- which
+/// moves the window but never the frame behind it -- keeps reusing the same
+/// entry instead of re-measuring on every tick, the opposite of what keying
+/// by the window itself would have done.
+fn window_entry_sensor_measurement_cache()
+-> &'static Mutex<Vec<NodeMeasurement<Option<render::SensorNoise>>>> {
+    static CACHE: OnceLock<Mutex<Vec<NodeMeasurement<Option<render::SensorNoise>>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn window_entry_neural_floor_measurement_cache()
+-> &'static Mutex<Vec<NodeMeasurement<Option<render::NeuralNoiseFloor>>>> {
+    static CACHE: OnceLock<Mutex<Vec<NodeMeasurement<Option<render::NeuralNoiseFloor>>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Reads whatever F05 needs off WHOLE before it narrows into the window at
+/// REGISTER: the sensor's own detail-band noise for a reachable sharpener's
+/// gate, and the neural denoiser's own analogous floor -- both read here,
+/// from the frame nothing has narrowed out of yet, instead of re-measured
+/// later from whatever the window alone contains, which can make an
+/// otherwise clean patch read as its own noisiest corner (confirmed: a
+/// window's own reading of a flat, isoluminant test frame differs from the
+/// frame's by exactly the ratio of how much noisier the rest of the frame
+/// is). Demand-driven like every other measurement this executor caches:
+/// nothing is read from WHOLE unless OPS, scanned from BARRIER, actually
+/// reaches a node that would use it.
+fn window_entry_noise(
+    ops: &[GraphOp],
+    register: usize,
+    barrier: usize,
+    whole: &RgbImage,
+    cache_key: Option<&PrefixKey>,
+) -> (Option<render::SensorNoise>, Option<render::NeuralNoiseFloor>) {
+    let region = (0, 0, whole.width, whole.height);
+    let sensor = if window_needs_sensor_noise(ops, register, barrier) {
+        *node_measurement_cached(
+            window_entry_sensor_measurement_cache(),
+            cache_key,
+            barrier,
+            ops,
+            region,
+            &[],
+            || render::measure_sensor_noise(whole),
+        )
+    } else {
+        None
+    };
+    let neural_floor = if window_needs_neural_floor(ops, register, barrier) {
+        *node_measurement_cached(
+            window_entry_neural_floor_measurement_cache(),
+            cache_key,
+            barrier,
+            ops,
+            region,
+            &[],
+            || render::measure_neural_noise_floor(&whole.data, whole.width, whole.height),
+        )
+    } else {
+        None
+    };
+    (sensor, neural_floor)
 }
 
 fn sharpen_prepared_cache() -> &'static Mutex<Vec<NodeMeasurement<Option<render::SharpenPrepared>>>> {
@@ -1900,6 +2028,12 @@ fn execute_graph_into(
     let mut domains = vec![Domain::Linear; count + 1];
     let mut oriented = vec![false; count + 1];
     let mut sensors: Vec<Option<render::SensorNoise>> = vec![None; count + 1];
+    // F05: whatever `window_entry_noise` reads off a frame right as it
+    // narrows, kept apart from SENSORS above (which a sharpener reads
+    // regardless of source) so it is never mistaken for an upstream denoise
+    // node's own, already-spent reading -- see `window_entry_carries_through`.
+    let mut window_entry_sensor: Vec<Option<render::SensorNoise>> = vec![None; count + 1];
+    let mut window_entry_neural_floor: Vec<Option<render::NeuralNoiseFloor>> = vec![None; count + 1];
     let mut film_ordinal = 0_u64;
     match resume {
         Some((_, snapshots)) => {
@@ -1922,6 +2056,15 @@ fn execute_graph_into(
                     let image = match narrow_at {
                         Some((rect, halo, register)) if register == snapshot.register => {
                             let whole = &*snapshot.image;
+                            let (sensor, neural_floor) = window_entry_noise(
+                                ops,
+                                register,
+                                boundary,
+                                whole,
+                                cache_key.as_ref(),
+                            );
+                            window_entry_sensor[register] = sensor;
+                            window_entry_neural_floor[register] = neural_floor;
                             window_frame = Some(if is_oriented || context.orientation < 5 {
                                 (whole.width, whole.height)
                             } else {
@@ -2008,6 +2151,10 @@ fn execute_graph_into(
             } else {
                 (whole.height, whole.width)
             });
+            let (sensor, neural_floor) =
+                window_entry_noise(ops, op.input_a, index, &whole, cache_key.as_ref());
+            window_entry_sensor[op.input_a] = sensor;
+            window_entry_neural_floor[op.input_a] = neural_floor;
             let (window, origin, inner) = crop_to_viewport(
                 whole,
                 *rect,
@@ -2061,6 +2208,13 @@ fn execute_graph_into(
                 kind if sensor_noise_carries_through(kind) => sensors[op.input_a],
                 _ => None,
             };
+            // F05's own whole-frame readings forward only as far as the
+            // denoise node that is their one consumer; see
+            // `window_entry_carries_through`.
+            if window_entry_carries_through(op.kind) {
+                window_entry_sensor[slot] = window_entry_sensor[op.input_a];
+                window_entry_neural_floor[slot] = window_entry_neural_floor[op.input_a];
+            }
             image
         } else {
             take(&mut registers, &mut uses, slot)?
@@ -2134,15 +2288,28 @@ fn execute_graph_into(
                 // the last measurement instead of paying for it again on
                 // every tick.
                 if (edge > 0.0 || neural > 0.0) && graph_reaches_a_sharpener(ops, index) {
-                    sensors[slot] = *node_measurement_cached(
-                        sensor_noise_measurement_cache(),
-                        cache_key.as_ref(),
-                        index,
-                        ops,
-                        (window_origin.0, window_origin.1, image.width, image.height),
-                        &[],
-                        || render::measure_sensor_noise(&image),
-                    );
+                    // F05: a window_entry_noise reading already taken from
+                    // the whole frame, before it narrowed, beats measuring
+                    // this node's own (possibly windowed) input -- a clean
+                    // patch on screen must not get to invent its own,
+                    // falsely low noise floor just because that patch is all
+                    // of the frame a narrowed render still has in hand. None
+                    // here means no narrowing happened upstream of this node
+                    // at all, so IMAGE already is the whole frame and
+                    // measuring it directly is exactly as correct as before
+                    // this fix existed.
+                    sensors[slot] = match window_entry_sensor[op.input_a] {
+                        Some(measured) => Some(measured),
+                        None => *node_measurement_cached(
+                            sensor_noise_measurement_cache(),
+                            cache_key.as_ref(),
+                            index,
+                            ops,
+                            (window_origin.0, window_origin.1, image.width, image.height),
+                            &[],
+                            || render::measure_sensor_noise(&image),
+                        ),
+                    };
                 }
                 // Both stack rather than one replacing the other: two
                 // independent sliders that silently disabled each other was
@@ -2162,6 +2329,7 @@ fn execute_graph_into(
                         image.width,
                         image.height,
                         neural,
+                        window_entry_neural_floor[op.input_a].as_ref(),
                     )?;
                 }
             }
@@ -3324,6 +3492,77 @@ mod tests {
         }
     }
 
+    /// Loud noise on one side of the frame, none at all on the other -- so a
+    /// window kept entirely inside the quiet half can be checked against a
+    /// whole-frame render of the same pixels, and a bug that lets the quiet
+    /// half read as its own "noisiest" corner shows up as a large,
+    /// unmistakable difference rather than a marginal one.
+    fn half_noisy_half_flat_scene(width: usize, height: usize) -> RgbImage {
+        let split = width / 2;
+        let mut data = Vec::with_capacity(width * height * 3);
+        for y in 0..height {
+            for x in 0..width {
+                let base = 0.3 + 0.1 * (y as f32 / height as f32);
+                let amplitude = if x < split { 0.35 } else { 0.0 };
+                let bits = render::splitmix64((y as u64) << 32 | x as u64);
+                let noise = ((bits >> 40) as f32 / 16_777_215.0 - 0.5) * amplitude;
+                let value = (base + noise).clamp(0.0, 1.0);
+                data.extend_from_slice(&[value, value, value]);
+            }
+        }
+        RgbImage {
+            width,
+            height,
+            data,
+        }
+    }
+
+    #[test]
+    fn a_window_over_a_clean_patch_uses_the_whole_frames_own_neural_noise_floor() {
+        // F05's own reproduction: the neural denoiser's per-position weight
+        // normalizes against the loudest noise *this call* was given, which
+        // used to mean the window alone once a viewport had narrowed away
+        // from the rest of the frame. A window kept entirely inside this
+        // scene's quiet half never sees its loud half at all, so without the
+        // fix it would normalize against its own, falsely low "noisiest"
+        // reading there and denoise far more aggressively than a whole-frame
+        // render of the exact same pixels does.
+        let width = 256;
+        let height = 128;
+        let scene = half_noisy_half_flat_scene(width, height);
+        let ops = parse_graph(
+            &GraphBuilder::new()
+                .node(NODE_NOISE_REDUCTION, 0, -1, &[0.0, 0.8, 1.0], None)
+                .build(),
+        )
+        .unwrap();
+        let graph_context = context(5);
+        let whole = execute_graph(&ops, scene.clone(), &graph_context).unwrap();
+        // Well inside the quiet (right) half, clear of the seam.
+        let rect = [0.7, 0.0, 0.2, 1.0];
+        let window = execute_graph_windowed(&ops, scene.clone(), &graph_context, rect).unwrap();
+        let left = (rect[0] * whole.width as f32).floor() as usize;
+        let expected = render::crop_rect(
+            &whole,
+            left,
+            0,
+            window.width.min(whole.width - left),
+            window.height,
+        );
+        assert_eq!(
+            (window.width, window.height),
+            (expected.width, expected.height),
+            "window came back the wrong size"
+        );
+        let difference = max_difference(&window, &expected);
+        assert!(
+            difference < 1.0e-6,
+            "window differs from a whole-frame crop by {difference}: a clean \
+             patch alone was denoised differently than the same patch in a \
+             whole-frame render"
+        );
+    }
+
     #[test]
     fn a_full_height_window_still_reports_itself_as_narrowed() {
         // The audit's own reproduction: a window that happens to keep one
@@ -3570,6 +3809,7 @@ mod tests {
             reference.width,
             reference.height,
             0.0,
+            None,
         )
         .unwrap();
         render::apply_tonal_equalizer(&mut reference, [0.3, 0.0, 0.0, -0.2, 0.0, 0.0, 0.1], false);
@@ -3603,6 +3843,7 @@ mod tests {
             reference.width,
             reference.height,
             0.35,
+            None,
         )
         .unwrap();
         to_display(&mut reference);

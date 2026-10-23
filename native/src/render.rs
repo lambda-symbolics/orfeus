@@ -797,50 +797,48 @@ pub(crate) fn measure_sensor_noise(image: &RgbImage) -> Option<SensorNoise> {
     Some(SensorNoise { power: noise.power })
 }
 
-/// Builds the per-position noise WEIGHT the neural denoiser's own input
-/// domain needs, each in 0..1 relative to the noisiest brightness this frame
-/// measures anywhere -- one value per 2x2 block of real pixels, matching the
-/// single shared noise-level plane its pixel-unshuffled input already carries
-/// across all four of a block's channels.
+/// The brightness-binned noise floor behind the neural denoiser's own
+/// per-position weight: position-independent, like `SensorNoise`, but fit in
+/// sRGB-encoded units -- the domain `apply_neural_noise_reduction` already
+/// encodes every pixel into before handing them to the network -- rather
+/// than by reusing `SensorNoise`'s own fit. That fit is tied throughout to
+/// the square root of linear brightness (its bin placement in
+/// `noise_bin`/`interpolate_bins`, and its `scaled` exposure-gain formula,
+/// both assume it); converting a sigma out of that domain into this one
+/// would need an unverified derivative conversion, and measuring fresh here
+/// in the domain this is actually for avoids that risk entirely.
 ///
-/// Relative, not an absolute sigma, on purpose: an earlier version of this
-/// returned the measured sigma directly, and feeding that straight in (scaled
-/// only by the user's own strength) made the network *weaker* almost
-/// everywhere than the single flat sigma it replaced, including in the
-/// noisiest real corner of a 2026-10-19 PEN-F test photo shot through tinted
-/// glass -- confirmed by rendering that exact frame both ways and measuring a
-/// sky patch and a shaded, textured patch before and after. The reason: this
-/// measurement deliberately reads the noise *floor*, the same envelope fit
-/// `SensorNoise` uses for the sharpener, which explicitly excludes real
-/// texture from counting as noise (a textured patch's own detail inflates a
-/// naive reading of it, which is exactly what the fit is built to resist).
-/// That is correct for what it measures, but it is a smaller number than the
-/// flat sigma a user turning the strength slider to maximum expects to reach
-/// in the worst part of their photograph, and strength had no way to ask for
-/// more. Normalizing every position against this frame's own noisiest bin
-/// restores that: at strength 1.0 the noisiest measured brightness reaches
-/// exactly the old flat ceiling, same as before, while a cleaner position
-/// scales down from there instead of being forced to match it -- spatially
-/// adaptive without taking away the headroom the slider used to offer.
-///
-/// Measured directly in sRGB-encoded units -- the domain
-/// `apply_neural_noise_reduction` already encodes every pixel into before
-/// handing them to the network -- rather than by reusing `SensorNoise`'s own
-/// fit. That fit is tied throughout to the square root of linear brightness
-/// (its bin placement in `noise_bin`/`interpolate_bins`, and its `scaled`
-/// exposure-gain formula, both assume it); converting a sigma out of that
-/// domain into this one would need an unverified derivative conversion, and
-/// measuring fresh here in the domain this is actually for avoids that risk
-/// entirely. None when the frame is too small to measure -- the caller falls
-/// back to a flat weight of 1.0 everywhere, reproducing the old flat sigma
-/// exactly.
-pub(crate) fn measure_neural_noise_weight(
+/// Being position-independent is what lets a caller measure this once from a
+/// whole frame and reuse it for a narrower window cut from the same data
+/// (see `neural_noise_weight_plane`): a viewport narrowing to a clean patch
+/// must not let that patch invent its own, falsely low "noisiest" reference.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct NeuralNoiseFloor {
+    power: [f32; NOISE_BINS],
+}
+
+impl NeuralNoiseFloor {
+    fn power_at(&self, brightness: f32) -> f32 {
+        interpolate_bins(&self.power, brightness)
+    }
+
+    /// The reference every position's weight normalizes against: this
+    /// frame's own loudest measured brightness. Always positive -- the only
+    /// constructor, `measure_neural_noise_floor`, refuses to return a floor
+    /// otherwise.
+    fn reference(&self) -> f32 {
+        self.power.iter().cloned().fold(0.0_f32, f32::max).sqrt()
+    }
+}
+
+/// Measures DATA's own `NeuralNoiseFloor`. None when DATA is too small, or
+/// too flat, to read -- the caller falls back to a flat weight of 1.0
+/// everywhere, reproducing the old flat sigma exactly.
+pub(crate) fn measure_neural_noise_floor(
     data: &[f32],
     width: usize,
     height: usize,
-    half_width: usize,
-    half_height: usize,
-) -> Option<Vec<f32>> {
+) -> Option<NeuralNoiseFloor> {
     if width < 8 || height < 8 {
         return None;
     }
@@ -864,11 +862,57 @@ pub(crate) fn measure_neural_noise_weight(
             }
         });
     let noise = fine_band_noise_by_bin(&detail, &luma, width, height);
-    let loudest = noise.power.iter().cloned().fold(0.0_f32, f32::max);
-    if !(loudest > 0.0) {
+    if !(noise.power.iter().cloned().fold(0.0_f32, f32::max) > 0.0) {
         return None;
     }
-    let reference = loudest.sqrt();
+    Some(NeuralNoiseFloor { power: noise.power })
+}
+
+/// Builds the per-position noise WEIGHT the neural denoiser's own input
+/// domain needs from an already-measured FLOOR, each in 0..1 relative to
+/// FLOOR's own reference -- one value per 2x2 block of real pixels in DATA,
+/// matching the single shared noise-level plane its pixel-unshuffled input
+/// already carries across all four of a block's channels.
+///
+/// Relative, not an absolute sigma, on purpose: an earlier version of this
+/// returned the measured sigma directly, and feeding that straight in (scaled
+/// only by the user's own strength) made the network *weaker* almost
+/// everywhere than the single flat sigma it replaced, including in the
+/// noisiest real corner of a 2026-10-19 PEN-F test photo shot through tinted
+/// glass -- confirmed by rendering that exact frame both ways and measuring a
+/// sky patch and a shaded, textured patch before and after. The reason: this
+/// measurement deliberately reads the noise *floor*, the same envelope fit
+/// `SensorNoise` uses for the sharpener, which explicitly excludes real
+/// texture from counting as noise (a textured patch's own detail inflates a
+/// naive reading of it, which is exactly what the fit is built to resist).
+/// That is correct for what it measures, but it is a smaller number than the
+/// flat sigma a user turning the strength slider to maximum expects to reach
+/// in the worst part of their photograph, and strength had no way to ask for
+/// more. Normalizing every position against FLOOR's own reference restores
+/// that: at strength 1.0 the noisiest measured brightness reaches exactly the
+/// old flat ceiling, same as before, while a cleaner position scales down
+/// from there instead of being forced to match it -- spatially adaptive
+/// without taking away the headroom the slider used to offer.
+///
+/// DATA need not be the same image FLOOR was measured from: a window cropped
+/// from a frame FLOOR already describes gets its block brightnesses read
+/// from DATA, but normalized against FLOOR's own reference rather than
+/// inventing a new one from whatever the window alone happens to show.
+pub(crate) fn neural_noise_weight_plane(
+    floor: &NeuralNoiseFloor,
+    data: &[f32],
+    width: usize,
+    height: usize,
+    half_width: usize,
+    half_height: usize,
+) -> Vec<f32> {
+    let luma: Vec<f32> = data
+        .as_chunks::<3>()
+        .0
+        .par_iter()
+        .map(|pixel| 0.2126 * pixel[0] + 0.7152 * pixel[1] + 0.0722 * pixel[2])
+        .collect();
+    let reference = floor.reference();
     let mut weight = vec![0.0_f32; half_width * half_height];
     weight.par_iter_mut().enumerate().for_each(|(index, value)| {
         let (half_y, half_x) = (index / half_width, index % half_width);
@@ -879,9 +923,23 @@ pub(crate) fn measure_neural_noise_weight(
                 + luma[y0 * width + x1]
                 + luma[y1 * width + x0]
                 + luma[y1 * width + x1]);
-        *value = (noise.power_at(block_luma).max(0.0).sqrt() / reference).clamp(0.0, 1.0);
+        *value = (floor.power_at(block_luma).max(0.0).sqrt() / reference).clamp(0.0, 1.0);
     });
-    Some(weight)
+    weight
+}
+
+/// Measures DATA's own floor and immediately builds the weight plane from
+/// it -- what every caller used before a whole-frame floor measured earlier
+/// in the pipeline could be supplied instead (see `neural_noise_weight_plane`).
+pub(crate) fn measure_neural_noise_weight(
+    data: &[f32],
+    width: usize,
+    height: usize,
+    half_width: usize,
+    half_height: usize,
+) -> Option<Vec<f32>> {
+    let floor = measure_neural_noise_floor(data, width, height)?;
+    Some(neural_noise_weight_plane(&floor, data, width, height, half_width, half_height))
 }
 
 /// One brightness bin's reading of a band's noise: the power measured there,

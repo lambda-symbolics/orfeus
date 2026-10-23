@@ -802,11 +802,20 @@ fn best_tile_size(half_width: usize, half_height: usize) -> usize {
 /// doc comment for the full account. Pixels are processed in the sRGB-encoded
 /// [0, 1] range the network was trained on; energy outside that range
 /// (unclipped highlights, gamut excursions) passes through unchanged.
+///
+/// FLOOR, when given, is a noise floor already measured elsewhere (typically
+/// from the whole frame a viewport has since narrowed away from -- see the
+/// graph executor's own F05 fix) and is used in place of measuring DATA's
+/// own: a window cropped to a clean patch must not get to invent its own,
+/// falsely low "noisiest" reference just because that patch is all it can
+/// see of the frame. None measures DATA itself, exactly as before FLOOR
+/// existed.
 pub(crate) fn apply_neural_noise_reduction(
     data: &mut [f32],
     width: usize,
     height: usize,
     strength: f32,
+    floor: Option<&super::render::NeuralNoiseFloor>,
 ) -> Result<(), Error> {
     if strength <= 0.0 || width < 2 || height < 2 {
         return Ok(());
@@ -838,11 +847,16 @@ pub(crate) fn apply_neural_noise_reduction(
 
     let strength = strength.min(1.0);
     let ceiling = strength * MAX_NETWORK_SIGMA;
-    let sigma_plane: Vec<f32> =
-        match super::render::measure_neural_noise_weight(data, width, height, half_width, half_height) {
-            Some(weight) => weight.into_iter().map(|weight| weight * ceiling).collect(),
-            None => vec![ceiling; half_plane],
-        };
+    let weight = match floor {
+        Some(floor) => Some(super::render::neural_noise_weight_plane(
+            floor, data, width, height, half_width, half_height,
+        )),
+        None => super::render::measure_neural_noise_weight(data, width, height, half_width, half_height),
+    };
+    let sigma_plane: Vec<f32> = match weight {
+        Some(weight) => weight.into_iter().map(|weight| weight * ceiling).collect(),
+        None => vec![ceiling; half_plane],
+    };
 
     let started = std::time::Instant::now();
     let tile = best_tile_size(half_width, half_height);
@@ -1198,8 +1212,8 @@ mod tests {
         let mut image = noisy_gray_patch(width, height);
         let mut second = image.clone();
         let before = luma_rms(&image, 0.35);
-        apply_neural_noise_reduction(&mut image, width, height, 0.8).unwrap();
-        apply_neural_noise_reduction(&mut second, width, height, 0.8).unwrap();
+        apply_neural_noise_reduction(&mut image, width, height, 0.8, None).unwrap();
+        apply_neural_noise_reduction(&mut second, width, height, 0.8, None).unwrap();
         let after = luma_rms(&image, 0.35);
         assert!(
             after < before * 0.45,
@@ -1221,7 +1235,7 @@ mod tests {
                 }
             }
         }
-        apply_neural_noise_reduction(&mut image, width, height, 0.6).unwrap();
+        apply_neural_noise_reduction(&mut image, width, height, 0.6, None).unwrap();
         let row = height / 2;
         let dark = image[(row * width + width / 2 - 4) * 3];
         let bright = image[(row * width + width / 2 + 4) * 3];
@@ -1274,7 +1288,7 @@ mod tests {
         };
         let before_dark = rms_against_base(&image, true);
         let before_bright = rms_against_base(&image, false);
-        apply_neural_noise_reduction(&mut image, width, height, 0.8).unwrap();
+        apply_neural_noise_reduction(&mut image, width, height, 0.8, None).unwrap();
         let after_dark = rms_against_base(&image, true);
         let after_bright = rms_against_base(&image, false);
         let dark_ratio = after_dark / before_dark;
@@ -1300,7 +1314,7 @@ mod tests {
         let mut image = noisy_gray_patch(width, height);
         image[0] = 3.5;
         image[1] = -0.2;
-        apply_neural_noise_reduction(&mut image, width, height, 0.5).unwrap();
+        apply_neural_noise_reduction(&mut image, width, height, 0.5, None).unwrap();
         assert!(image[0] > 2.5, "unclipped highlight was crushed");
         let neighbor_green = image[2 * 3 + 1];
         assert!(
@@ -1316,7 +1330,7 @@ mod tests {
         let width = 33;
         let height = 21;
         let mut image = noisy_gray_patch(width, height);
-        apply_neural_noise_reduction(&mut image, width, height, 0.4).unwrap();
+        apply_neural_noise_reduction(&mut image, width, height, 0.4, None).unwrap();
         assert_eq!(image.len(), width * height * 3);
         assert!(image.iter().all(|value| value.is_finite()));
     }
@@ -1327,7 +1341,7 @@ mod tests {
         let height = 16;
         let mut image = noisy_gray_patch(width, height);
         let reference = image.clone();
-        apply_neural_noise_reduction(&mut image, width, height, 0.0).unwrap();
+        apply_neural_noise_reduction(&mut image, width, height, 0.0, None).unwrap();
         assert_eq!(image, reference);
     }
 }
