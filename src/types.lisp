@@ -18,7 +18,7 @@
     :chromatic-aberration-correction-p :chromatic-aberration-source
     :lens-distortion :lens-profile :lens-focal-length :demosaic
     :lut-path :lut-strength :grain-amount :grain-size
-    :grain-highlight-retention :irradiation-amount)
+    :grain-highlight-retention :irradiation-amount :adjacency-amount)
   "Keys accepted in processing setting S-expressions.")
 
 (defparameter *demosaic-methods* '(:rcd :ppg)
@@ -107,7 +107,17 @@ the optics node, the front of the pipeline; the source itself has no panel.")
   ;; this does not model). 0 is an exact no-op; see APPLY-IRRADIATION in
   ;; native/src/render.rs. Unmeasured -- a starting point for comparison
   ;; against real film scans, not fit to any.
-  (irradiation-amount 0.0))
+  (irradiation-amount 0.0)
+  ;; A thin, self-limiting edge-contrast boost from local developer
+  ;; exhaustion during development (the adjacency effect) -- strongest in
+  ;; the midtones and weaker toward both shadows and highlights, the same
+  ;; development-activity shape GRAIN-HIGHLIGHT-RETENTION's own measured
+  ;; hump already models, since both are driven by the same chemistry. 0 is
+  ;; an exact no-op; see APPLY-ADJACENCY-EFFECT in native/src/render.rs.
+  ;; Distinct from SHARPEN-AMOUNT, which is tuned to match a camera's own
+  ;; digital sharpening rather than any stock's chemistry. Unmeasured -- a
+  ;; starting point for comparison against real film scans, not fit to any.
+  (adjacency-amount 0.0))
 
 (defparameter *grade-stages*
   '((:white-balance (:white-balance-temperature :white-balance-tint))
@@ -120,7 +130,7 @@ the optics node, the front of the pipeline; the source itself has no panel.")
               :chromatic-aberration-correction-p :chromatic-aberration-source
               :lens-distortion :lens-profile :lens-focal-length :demosaic))
     (:film (:lut-path :lut-strength :grain-amount :grain-size
-            :grain-highlight-retention :irradiation-amount)))
+            :grain-highlight-retention :irradiation-amount :adjacency-amount)))
   "The fixed processing pipeline as named stages over setting keys.
 Together the stages partition *PROCESSING-SETTING-KEYS*; frontends present
 them as a copyable node chain.")
@@ -137,7 +147,7 @@ them as a copyable node chain.")
     :lens-distortion 0.0 :lens-profile nil :lens-focal-length nil
     :demosaic :rcd
     :lut-path nil :lut-strength 0.0 :grain-amount 0.0 :grain-size 1.0
-    :grain-highlight-retention 1.0 :irradiation-amount 0.0)
+    :grain-highlight-retention 1.0 :irradiation-amount 0.0 :adjacency-amount 0.0)
   "Setting values under which every stage passes pixels through unchanged.")
 
 (defun grade-stage-keys (stage)

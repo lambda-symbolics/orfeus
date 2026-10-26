@@ -556,7 +556,8 @@ override semantics."
     (:grain-size #'orfeus:processing-settings-grain-size)
     (:grain-highlight-retention
      #'orfeus:processing-settings-grain-highlight-retention)
-    (:irradiation-amount #'orfeus:processing-settings-irradiation-amount)))
+    (:irradiation-amount #'orfeus:processing-settings-irradiation-amount)
+    (:adjacency-amount #'orfeus:processing-settings-adjacency-amount)))
 
 (defun gui-model-setting (model key)
   "Read one effective setting from MODEL.
@@ -619,7 +620,9 @@ downstream node of that stage, otherwise the stage's identity value."
     (:grain-highlight-retention
      (setf (orfeus:processing-settings-grain-highlight-retention settings) value))
     (:irradiation-amount
-     (setf (orfeus:processing-settings-irradiation-amount settings) value)))
+     (setf (orfeus:processing-settings-irradiation-amount settings) value))
+    (:adjacency-amount
+     (setf (orfeus:processing-settings-adjacency-amount settings) value)))
   value)
 
 (defun gui-boolean-value (value)

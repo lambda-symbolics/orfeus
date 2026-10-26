@@ -923,6 +923,19 @@ plist."
     (and (= 0.0 (fifth (orfeus::graph-node-program-parameters bare)))
          (= 0.4 (fifth (orfeus::graph-node-program-parameters glowing))))))
 
+(defun film-adjacency-amount-encodes-and-defaults-p ()
+  "A film node's adjacency amount reaches the native program as its own,
+sixth parameter, defaulting to zero when the key is absent."
+  (let* ((graph (default-processing-graph))
+         (bare (graph-insert-node graph (processing-graph-output graph) :film
+                                  :params '(:grain-amount 0.2)))
+         (textured (graph-insert-node graph (processing-graph-output graph)
+                                      :film
+                                      :params '(:grain-amount 0.2
+                                                :adjacency-amount 0.6))))
+    (and (= 0.0 (sixth (orfeus::graph-node-program-parameters bare)))
+         (= 0.6 (sixth (orfeus::graph-node-program-parameters textured))))))
+
 (defun graph-domain-placement-p ()
   "Display-space tracking, and the insertion point derived from it.
 
@@ -3116,6 +3129,8 @@ renderer is told about them."
              (graph-curves-p))
       (check "a film node's irradiation amount encodes and defaults to zero"
              (film-irradiation-amount-encodes-and-defaults-p))
+      (check "a film node's adjacency amount encodes and defaults to zero"
+             (film-adjacency-amount-encodes-and-defaults-p))
       (check "photo graphs round trip as project version 4"
              (photo-graph-round-trip-p))
       (check "graphs serialize to the native program format"

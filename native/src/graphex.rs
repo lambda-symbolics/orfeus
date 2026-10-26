@@ -273,7 +273,7 @@ fn param_arity(kind: u32) -> Result<ParamArity, Error> {
         NODE_NOISE_REDUCTION => ParamArity::Exact(3), // edge-aware, neural, detail
         NODE_TONE => ParamArity::Exact(7),          // blacks..whites
         NODE_OPTICS => ParamArity::Exact(4),        // distortion?, strength, fringing source, manual
-        NODE_FILM => ParamArity::Exact(5), // lut strength, grain amount, size, highlight retention, irradiation
+        NODE_FILM => ParamArity::Exact(6), // lut strength, grain amount, size, highlight retention, irradiation, adjacency
         NODE_BLEND => ParamArity::Exact(1),         // opacity toward input B
         NODE_COLOR_SUBTRACT => ParamArity::Exact(3), // picked colour, per channel
         NODE_CROP => ParamArity::Exact(5),          // left, top, width, height, angle
@@ -508,6 +508,7 @@ fn validate_param(kind: u32, index: usize, value: f32) -> Result<(), Error> {
         (NODE_FILM, 2) => (0.25..=16.0).contains(&value),
         (NODE_FILM, 3) => (0.0..=1.0).contains(&value),
         (NODE_FILM, 4) => (0.0..=1.0).contains(&value),
+        (NODE_FILM, 5) => (0.0..=1.0).contains(&value),
         (NODE_BLEND, 0) => (0.0..=1.0).contains(&value),
         (NODE_COLOR_SUBTRACT, _) => (0.0..=4.0).contains(&value),
         (NODE_CROP, 0) | (NODE_CROP, 1) => (0.0..=1.0).contains(&value),
@@ -1510,11 +1511,14 @@ fn default_snapshot_boundary(ops: &[GraphOp]) -> StagePoint {
 ///
 /// Ops are compared whole, with one exception: when the first difference is a
 /// film node whose LUT, its strength and its irradiation are unchanged, only
-/// grain differs, so a stage 1 checkpoint inside that node is still valid.
-/// Irradiation has to be named here too, not just the LUT: it runs before the
-/// checkpoint (see the `NODE_FILM` match arm), so its result is already baked
-/// into the snapshot a stage 1 resume reuses, and a drag of its own amount
-/// would otherwise keep replaying that stale snapshot forever.
+/// grain or the adjacency effect differs, so a stage 1 checkpoint inside
+/// that node is still valid. Irradiation has to be named here too, not just
+/// the LUT: it runs before the checkpoint (see the `NODE_FILM` match arm),
+/// so its result is already baked into the snapshot a stage 1 resume reuses,
+/// and a drag of its own amount would otherwise keep replaying that stale
+/// snapshot forever. The adjacency effect runs after the checkpoint, same as
+/// grain, so it needs no entry here -- a drag of it already gets exactly the
+/// fast resume this check exists to give grain.
 fn resume_limit(previous: &[GraphOp], current: &[GraphOp]) -> StagePoint {
     let common = common_prefix_length(previous, current);
     if let (Some(before), Some(after)) = (previous.get(common), current.get(common))
@@ -1729,10 +1733,25 @@ pub(crate) fn plan_viewport(ops: &[GraphOp]) -> Option<ViewportPlan> {
             NODE_DUST => render::dust_reach(op.params[0]),
             NODE_CLARITY => render::clarity_reach(op.params[1]),
             NODE_SOFTNESS => render::softness_reach(op.params[1]),
-            // Irradiation's own radius is fixed, not user-tunable, so the
-            // only thing worth checking is whether the stock's amount is
+            // Irradiation and the adjacency effect are two filters in a row
+            // within this one node, not an either/or, same as the noise
+            // reduction node above -- their reaches add rather than pick
+            // one. Both radii are fixed, not user-tunable, so the only
+            // thing worth checking is whether the stock's own amount is
             // zero -- true of every film stock but the handful that set it.
-            NODE_FILM if op.params[4] > 0.0 => render::irradiation_reach(),
+            NODE_FILM => {
+                let irradiation_reach = if op.params[4] > 0.0 {
+                    render::irradiation_reach()
+                } else {
+                    0
+                };
+                let adjacency_reach = if op.params[5] > 0.0 {
+                    render::adjacency_reach()
+                } else {
+                    0
+                };
+                irradiation_reach + adjacency_reach
+            }
             _ => 0,
         };
     }
@@ -2561,6 +2580,15 @@ fn execute_graph_into(
                             .ok_or(Error::Render("film stage register vanished".into()))?;
                     }
                 }
+                // Runs on every entry, stage 1 resume included, same as grain
+                // below: unlike irradiation, which is baked into the stage 1
+                // snapshot above, this is meant to resume exactly like a
+                // grain-amount drag already does. Before grain, not after --
+                // grain's own texture is not a compositional edge and must
+                // not be read as one here.
+                if op.params[5] > 0.0 {
+                    render::apply_adjacency_effect(&mut image, op.params[5]);
+                }
                 if op.params[1] > 0.0 {
                     render::apply_grain(
                         &mut image,
@@ -3286,7 +3314,7 @@ mod tests {
         let path_text = path.to_string_lossy().into_owned();
         let ops = parse_graph(
             &GraphBuilder::new()
-                .node(NODE_FILM, 0, -1, &[1.0, 0.0, 1.0, 1.0, 0.0], Some(&path_text))
+                .node(NODE_FILM, 0, -1, &[1.0, 0.0, 1.0, 1.0, 0.0, 0.0], Some(&path_text))
                 .build(),
         )
         .unwrap();
@@ -3354,7 +3382,7 @@ mod tests {
             &GraphBuilder::new()
                 .node(NODE_EXPOSURE, 0, -1, &[0.4], None)
                 .node(NODE_TONE, 1, -1, &[0.2, 0.1, 0.0, -0.1, 0.0, 0.1, 0.0], None)
-                .node(NODE_FILM, 2, -1, &[0.0, 0.4, 2.0, 1.0, 0.0], None)
+                .node(NODE_FILM, 2, -1, &[0.0, 0.4, 2.0, 1.0, 0.0, 0.0], None)
                 .build(),
         )
         .unwrap();
@@ -3363,7 +3391,7 @@ mod tests {
                 .node(NODE_EXPOSURE, 0, -1, &[0.4], None)
                 .node(NODE_NOISE_REDUCTION, 1, -1, &[0.6, 0.0, 1.0], None)
                 .node(NODE_TONE, 2, -1, &[0.2, 0.1, 0.0, -0.1, 0.0, 0.1, 0.0], None)
-                .node(NODE_FILM, 3, -1, &[0.0, 0.4, 2.0, 1.0, 0.0], None)
+                .node(NODE_FILM, 3, -1, &[0.0, 0.4, 2.0, 1.0, 0.0, 0.0], None)
                 .build(),
         )
         .unwrap();
@@ -3375,7 +3403,7 @@ mod tests {
                 .node(NODE_EXPOSURE, 0, -1, &[0.4], None)
                 .node(NODE_CLARITY, 1, -1, &[0.5, 12.0], None)
                 .node(NODE_TONE, 2, -1, &[0.2, 0.1, 0.0, -0.1, 0.0, 0.1, 0.0], None)
-                .node(NODE_FILM, 3, -1, &[0.0, 0.4, 2.0, 1.0, 0.0], None)
+                .node(NODE_FILM, 3, -1, &[0.0, 0.4, 2.0, 1.0, 0.0, 0.0], None)
                 .build(),
         )
         .unwrap();
@@ -3384,7 +3412,7 @@ mod tests {
                 .node(NODE_EXPOSURE, 0, -1, &[0.4], None)
                 .node(NODE_VIGNETTE, 1, -1, &[-0.6, 0.4, 0.6, 0.2], None)
                 .node(NODE_TONE, 2, -1, &[0.2, 0.1, 0.0, -0.1, 0.0, 0.1, 0.0], None)
-                .node(NODE_FILM, 3, -1, &[0.0, 0.4, 2.0, 1.0, 0.0], None)
+                .node(NODE_FILM, 3, -1, &[0.0, 0.4, 2.0, 1.0, 0.0, 0.0], None)
                 .build(),
         )
         .unwrap();
@@ -3617,7 +3645,7 @@ mod tests {
         let scene = spot_near_an_edge_scene(width, height, spot_x);
         let ops = parse_graph(
             &GraphBuilder::new()
-                .node(NODE_FILM, 0, -1, &[0.0, 0.0, 1.0, 1.0, 1.0], None)
+                .node(NODE_FILM, 0, -1, &[0.0, 0.0, 1.0, 1.0, 1.0, 0.0], None)
                 .build(),
         )
         .unwrap();
@@ -3643,6 +3671,73 @@ mod tests {
             difference < 1.0e-6,
             "window differs from a whole-frame crop by {difference}: irradiation's \
              glow did not cross into the window the same way a whole-frame render's did"
+        );
+    }
+
+    /// A step edge at a fixed position, close enough to a window's own edge,
+    /// in the test below, that the adjacency effect's own small neighbourhood
+    /// read has to cross it.
+    fn step_edge_scene_at(
+        width: usize,
+        height: usize,
+        edge_x: usize,
+        low: f32,
+        high: f32,
+    ) -> RgbImage {
+        let mut data = vec![0.0_f32; width * height * 3];
+        for y in 0..height {
+            for x in 0..width {
+                let value = if x < edge_x { low } else { high };
+                let i = (y * width + x) * 3;
+                data[i..i + 3].copy_from_slice(&[value, value, value]);
+            }
+        }
+        RgbImage {
+            width,
+            height,
+            data,
+        }
+    }
+
+    #[test]
+    fn a_windowed_render_with_the_adjacency_effect_matches_the_whole_one() {
+        // Same concern as irradiation's own viewport test: the adjacency
+        // effect reads a small neighbourhood around every pixel it writes,
+        // so an edge sitting just outside a window -- but within the reach
+        // `adjacency_reach` now reserves for it -- has to develop exactly
+        // the way a whole-frame render would.
+        let width = 240;
+        let height = 80;
+        let edge_x = 98; // just outside the window below, within its halo
+        let scene = step_edge_scene_at(width, height, edge_x, 0.2, 0.3);
+        let ops = parse_graph(
+            &GraphBuilder::new()
+                .node(NODE_FILM, 0, -1, &[0.0, 0.0, 1.0, 1.0, 0.0, 1.0], None)
+                .build(),
+        )
+        .unwrap();
+        let graph_context = context(5);
+        let whole = execute_graph(&ops, scene.clone(), &graph_context).unwrap();
+        let rect = [100.0 / width as f32, 0.0, 100.0 / width as f32, 1.0];
+        let window = execute_graph_windowed(&ops, scene.clone(), &graph_context, rect).unwrap();
+        let left = (rect[0] * whole.width as f32).floor() as usize;
+        let expected = render::crop_rect(
+            &whole,
+            left,
+            0,
+            window.width.min(whole.width - left),
+            window.height,
+        );
+        assert_eq!(
+            (window.width, window.height),
+            (expected.width, expected.height),
+            "window came back the wrong size"
+        );
+        let difference = max_difference(&window, &expected);
+        assert!(
+            difference < 1.0e-6,
+            "window differs from a whole-frame crop by {difference}: the adjacency \
+             effect did not cross into the window the same way a whole-frame render's did"
         );
     }
 
@@ -3773,7 +3868,7 @@ mod tests {
             for (index, kind) in ops.iter().enumerate() {
                 let params: &[f32] = match *kind {
                     NODE_TONE => &[0.0; 7],
-                    NODE_FILM => &[0.0, 0.0, 1.0, 1.0, 0.0],
+                    NODE_FILM => &[0.0, 0.0, 1.0, 1.0, 0.0, 0.0],
                     NODE_NOISE_REDUCTION => &[0.5, 0.0, 1.0],
                     NODE_CROP => &[0.1, 0.1, 0.8, 0.8, 0.0],
                     NODE_OPTICS => &[1.0, 1.0, 0.0, 0.0],
@@ -3874,7 +3969,7 @@ mod tests {
                     &[0.3, 0.0, 0.0, -0.2, 0.0, 0.0, 0.1],
                     None,
                 )
-                .node(NODE_FILM, 4, -1, &[0.0, 0.25, 1.0, 1.0, 0.0], None)
+                .node(NODE_FILM, 4, -1, &[0.0, 0.25, 1.0, 1.0, 0.0, 0.0], None)
                 .build(),
         )
         .unwrap();
@@ -3944,14 +4039,14 @@ mod tests {
     fn first_film_seed_does_not_depend_on_node_slot() {
         let direct = parse_graph(
             &GraphBuilder::new()
-                .node(NODE_FILM, 0, -1, &[0.0, 0.25, 1.0, 1.0, 0.0], None)
+                .node(NODE_FILM, 0, -1, &[0.0, 0.25, 1.0, 1.0, 0.0, 0.0], None)
                 .build(),
         )
         .unwrap();
         let preceded = parse_graph(
             &GraphBuilder::new()
                 .node(NODE_EXPOSURE, 0, -1, &[0.0], None)
-                .node(NODE_FILM, 1, -1, &[0.0, 0.25, 1.0, 1.0, 0.0], None)
+                .node(NODE_FILM, 1, -1, &[0.0, 0.25, 1.0, 1.0, 0.0, 0.0], None)
                 .build(),
         )
         .unwrap();
@@ -3964,14 +4059,14 @@ mod tests {
     fn inert_film_does_not_advance_the_grain_seed() {
         let direct = parse_graph(
             &GraphBuilder::new()
-                .node(NODE_FILM, 0, -1, &[0.0, 0.25, 1.0, 1.0, 0.0], None)
+                .node(NODE_FILM, 0, -1, &[0.0, 0.25, 1.0, 1.0, 0.0, 0.0], None)
                 .build(),
         )
         .unwrap();
         let preceded = parse_graph(
             &GraphBuilder::new()
-                .node(NODE_FILM, 0, -1, &[0.0, 0.0, 1.0, 1.0, 0.0], None)
-                .node(NODE_FILM, 1, -1, &[0.0, 0.25, 1.0, 1.0, 0.0], None)
+                .node(NODE_FILM, 0, -1, &[0.0, 0.0, 1.0, 1.0, 0.0, 0.0], None)
+                .node(NODE_FILM, 1, -1, &[0.0, 0.25, 1.0, 1.0, 0.0, 0.0], None)
                 .build(),
         )
         .unwrap();
@@ -4104,8 +4199,8 @@ mod tests {
         assert!(
             parse_graph(
                 &GraphBuilder::new()
-                    .node(NODE_FILM, 0, -1, &[0.0, 0.3, 1.0, 1.0, 0.0], None)
-                    .node(NODE_FILM, 1, -1, &[0.0, 0.1, 2.0, 1.0, 0.0], None)
+                    .node(NODE_FILM, 0, -1, &[0.0, 0.3, 1.0, 1.0, 0.0, 0.0], None)
+                    .node(NODE_FILM, 1, -1, &[0.0, 0.1, 2.0, 1.0, 0.0, 0.0], None)
                     .build(),
             )
             .is_ok()
@@ -4140,7 +4235,7 @@ mod tests {
             assert!(
                 parse_graph(
                     &GraphBuilder::new()
-                        .node(NODE_FILM, 0, -1, &[0.0, 0.3, 1.0, 1.0, 0.0], None)
+                        .node(NODE_FILM, 0, -1, &[0.0, 0.3, 1.0, 1.0, 0.0, 0.0], None)
                         .node(kind, 1, -1, params, None)
                         .build(),
                 )
@@ -4184,7 +4279,7 @@ mod tests {
                 matches!(
                     parse_graph(
                         &GraphBuilder::new()
-                            .node(NODE_FILM, 0, -1, &[0.0, 0.3, 1.0, 1.0, 0.0], None)
+                            .node(NODE_FILM, 0, -1, &[0.0, 0.3, 1.0, 1.0, 0.0, 0.0], None)
                             .node(kind, 1, -1, params, None)
                             .build(),
                     ),
@@ -4196,7 +4291,7 @@ mod tests {
         assert!(matches!(
             parse_graph(
                 &GraphBuilder::new()
-                    .node(NODE_FILM, 0, -1, &[0.0, 0.3, 1.0, 1.0, 0.0], None)
+                    .node(NODE_FILM, 0, -1, &[0.0, 0.3, 1.0, 1.0, 0.0, 0.0], None)
                     .node(NODE_BLEND, 0, 1, &[0.5], None)
                     .build(),
             ),
@@ -4602,7 +4697,7 @@ mod tests {
         // Rotation reframes, so it counts as geometry: optics maps against the
         // frame it was measured on. It is domain-agnostic like a crop.
         let program = GraphBuilder::new()
-            .node(NODE_FILM, 0, -1, &[0.0, 0.0, 1.0, 1.0, 0.0], None)
+            .node(NODE_FILM, 0, -1, &[0.0, 0.0, 1.0, 1.0, 0.0, 0.0], None)
             .node(NODE_ROTATE, 1, -1, &[1.0], None)
             .build();
         assert!(parse_graph(&program).is_ok(), "rotate may follow film");
@@ -4722,7 +4817,7 @@ mod tests {
     fn grain_program(grain: f32) -> Vec<u8> {
         GraphBuilder::new()
             .node(NODE_EXPOSURE, 0, -1, &[0.4], None)
-            .node(NODE_FILM, 1, -1, &[0.0, grain, 1.0, 1.0, 0.0], None)
+            .node(NODE_FILM, 1, -1, &[0.0, grain, 1.0, 1.0, 0.0, 0.0], None)
             .build()
     }
 
@@ -4763,7 +4858,7 @@ mod tests {
         let strengthened = parse_graph(
             &GraphBuilder::new()
                 .node(NODE_EXPOSURE, 0, -1, &[0.4], None)
-                .node(NODE_FILM, 1, -1, &[0.5, 0.7, 1.0, 1.0, 0.0], None)
+                .node(NODE_FILM, 1, -1, &[0.5, 0.7, 1.0, 1.0, 0.0, 0.0], None)
                 .build(),
         )
         .unwrap();
@@ -4797,12 +4892,45 @@ mod tests {
         let program = |irradiation: f32| {
             GraphBuilder::new()
                 .node(NODE_EXPOSURE, 0, -1, &[0.4], None)
-                .node(NODE_FILM, 1, -1, &[0.0, 0.0, 1.0, 1.0, irradiation], None)
+                .node(NODE_FILM, 1, -1, &[0.0, 0.0, 1.0, 1.0, irradiation, 0.0], None)
                 .build()
         };
         let first = parse_graph(&program(0.0)).unwrap();
         let second = parse_graph(&program(0.8)).unwrap();
         assert_eq!(resume_limit(&first, &second), (1, STAGE_ENTRY));
+        let source = gradient_image();
+        execute_graph_cached(&first, Arc::new(source.clone()), &context(7), Some(key.clone()))
+            .unwrap();
+        let resumed =
+            execute_graph_cached(&second, Arc::new(source.clone()), &context(7), Some(key))
+                .unwrap();
+        let cold = execute_graph(&second, source, &context(7)).unwrap();
+        assert_eq!(max_difference(&resumed, &cold), 0.0);
+    }
+
+    #[test]
+    fn an_adjacency_edit_resumes_inside_the_film_node_like_a_grain_edit() {
+        // Opposite concern from irradiation's own test: the adjacency effect
+        // runs AFTER the STAGE_FILM_GRAIN checkpoint, same as grain, so an
+        // edit to it must still be treated as "only grain differs" --
+        // RESUME_LIMIT must not demand a full stage-entry recompute for it,
+        // and a resumed render must still match a cold one exactly.
+        let key = test_prefix_key("adjacency-stage-test", &context(7));
+        {
+            let mut cache = prefix_cache()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            cache.retain(|(held, _)| held.input_path != "adjacency-stage-test");
+        }
+        let program = |adjacency: f32| {
+            GraphBuilder::new()
+                .node(NODE_EXPOSURE, 0, -1, &[0.4], None)
+                .node(NODE_FILM, 1, -1, &[0.0, 0.0, 1.0, 1.0, 0.0, adjacency], None)
+                .build()
+        };
+        let first = parse_graph(&program(0.0)).unwrap();
+        let second = parse_graph(&program(0.8)).unwrap();
+        assert_eq!(resume_limit(&first, &second), (1, STAGE_FILM_GRAIN));
         let source = gradient_image();
         execute_graph_cached(&first, Arc::new(source.clone()), &context(7), Some(key.clone()))
             .unwrap();
@@ -5499,9 +5627,9 @@ mod tests {
         assert!(
             parse_graph(
                 &GraphBuilder::new()
-                    .node(NODE_FILM, 0, -1, &[0.0, 0.2, 1.0, 1.0, 0.0], None)
+                    .node(NODE_FILM, 0, -1, &[0.0, 0.2, 1.0, 1.0, 0.0, 0.0], None)
                     .node(NODE_CROP, 1, -1, &[0.0, 0.0, 0.5, 0.5, 0.0], None)
-                    .node(NODE_FILM, 2, -1, &[0.0, 0.1, 1.0, 1.0, 0.0], None)
+                    .node(NODE_FILM, 2, -1, &[0.0, 0.1, 1.0, 1.0, 0.0, 0.0], None)
                     .build(),
             )
             .is_ok()
@@ -5511,7 +5639,7 @@ mod tests {
         assert!(
             parse_graph(
                 &GraphBuilder::new()
-                    .node(NODE_FILM, 0, -1, &[0.0, 0.2, 1.0, 1.0, 0.0], None)
+                    .node(NODE_FILM, 0, -1, &[0.0, 0.2, 1.0, 1.0, 0.0, 0.0], None)
                     .node(NODE_CROP, 1, -1, &[0.0, 0.0, 0.5, 0.5, 0.0], None)
                     .node(NODE_TONE, 2, -1, &[0.0; 7], None)
                     .build(),
@@ -5523,7 +5651,7 @@ mod tests {
         assert!(
             parse_graph(
                 &GraphBuilder::new()
-                    .node(NODE_FILM, 0, -1, &[0.0, 0.2, 1.0, 1.0, 0.0], None)
+                    .node(NODE_FILM, 0, -1, &[0.0, 0.2, 1.0, 1.0, 0.0, 0.0], None)
                     .node(NODE_CROP, 1, -1, &[0.0, 0.0, 0.5, 0.5, 0.0], None)
                     .node(NODE_EXPOSURE, 2, -1, &[0.5], None)
                     .build(),
@@ -5557,8 +5685,8 @@ mod tests {
     fn film_grain_lands_in_display_space_with_per_node_seeds() {
         let ops = parse_graph(
             &GraphBuilder::new()
-                .node(NODE_FILM, 0, -1, &[0.0, 0.5, 1.0, 1.0, 0.0], None)
-                .node(NODE_FILM, 1, -1, &[0.0, 0.25, 2.0, 1.0, 0.0], None)
+                .node(NODE_FILM, 0, -1, &[0.0, 0.5, 1.0, 1.0, 0.0, 0.0], None)
+                .node(NODE_FILM, 1, -1, &[0.0, 0.25, 2.0, 1.0, 0.0, 0.0], None)
                 .build(),
         )
         .unwrap();

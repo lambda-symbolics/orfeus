@@ -8939,7 +8939,13 @@ behind is memory. Best effort; returns how many directories went."
                                             node-page)))
              (lightfast:set-tooltip
               field
-              "A small glow around the brightest highlights, from light scattering sideways within the emulsion -- distinct from halation, which this does not model"))))
+              "A small glow around the brightest highlights, from light scattering sideways within the emulsion -- distinct from halation, which this does not model"))
+           (let ((field (make-number-field :adjacency-amount
+                                            "Adjacency" 0 1 0.05 236
+                                            node-page)))
+             (lightfast:set-tooltip
+              field
+              "A thin edge-contrast boost from local developer exhaustion, strongest in the midtones -- distinct from sharpening, which this does not replace"))))
         (build-group
          :blend
          (lambda ()

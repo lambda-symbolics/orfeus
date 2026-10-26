@@ -245,6 +245,7 @@
    #:processing-settings-grain-size
    #:processing-settings-grain-highlight-retention
    #:processing-settings-irradiation-amount
+   #:processing-settings-adjacency-amount
    #:processing-settings-lens-correction-p
    #:processing-settings-lens-correction-strength
    #:processing-settings-lut-path

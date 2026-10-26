@@ -6419,6 +6419,90 @@ pub(crate) fn apply_irradiation(image: &mut RgbImage, amount: f32, radius: f32) 
         });
 }
 
+/// The adjacency effect's own blur radius, stated for the photograph --
+/// short, since the developer-diffusion distance it stands in for is itself
+/// short, and distinct from the sharpening radius, which is tuned to match a
+/// camera's own JPEG sharpening rather than any particular film stock's
+/// chemistry.
+pub(crate) const ADJACENCY_RADIUS: f32 = 1.0;
+
+/// How far an edge's own detail may push before the effect's saturating
+/// response stops giving more for more, in linear brightness units. Real
+/// adjacency effects are chemically self-limiting -- a finite amount of
+/// developer and bromide to diffuse across a boundary -- unlike a plain
+/// unsharp mask's gain, which keeps growing with contrast until an explicit
+/// clamp cuts it off. Unmeasured -- a starting point for comparison against
+/// real scans, not fit to any.
+const ADJACENCY_SATURATION_SCALE: f32 = 0.08;
+
+/// How far ADJACENCY_RADIUS's blur reads around a pixel it writes.
+pub(crate) fn adjacency_reach() -> usize {
+    ((3.0 * ADJACENCY_RADIUS).ceil() as usize).clamp(1, SHARPEN_MAX_REACH)
+}
+
+/// Lays down the adjacency effect: a thin, self-limiting edge-contrast boost
+/// from local developer exhaustion during development -- a dense area's own
+/// development draws down the developer and raises the bromide (a
+/// restrainer) right at its own edge, so a sharp boundary develops a little
+/// differently right at the line than either side alone would. Strongest in
+/// the midtones and weaker toward both shadows and highlights, reusing
+/// `grain_shape_measured_hump` directly rather than inventing a new curve:
+/// grain clumping and the adjacency effect are both driven by the same
+/// underlying quantity, how actively a given exposure is developing, so the
+/// same measured shape describes both.
+///
+/// Distinct from `apply_sharpen_prepared`, which is tuned to match a
+/// camera's own digital sharpening -- a brightness-flat, linearly-gained
+/// boost clamped only at its final, fairly generous halo allowance -- not
+/// any particular film stock's chemistry. This has no noise-floor gate (the
+/// image reaching the film node has already been denoised and sharpened), a
+/// short, fixed, not user-tunable radius, and a saturating rather than
+/// linear-then-clamped response to the edge's own contrast. Also, unlike
+/// sharpening, it reads linear brightness rather than its square root:
+/// sharpening works in the square root to keep a linear unsharp mask from
+/// spending most of its correction on the brightest pixels, but that same
+/// compression inflates a shadow edge's own encoded detail well past a
+/// highlight edge's of the same linear size -- which would fight the hump's
+/// own shadow/highlight attenuation instead of leaving it as the only thing
+/// deciding where this effect is strongest.
+///
+/// Runs before grain is laid down, not after: grain's own texture is not a
+/// compositional edge, and must not be read as one here.
+pub(crate) fn apply_adjacency_effect(image: &mut RgbImage, amount: f32) {
+    if amount <= 0.0 || image.width < 3 || image.height < 3 {
+        return;
+    }
+    let (width, height) = (image.width, image.height);
+    let luma: Vec<f32> = image
+        .data
+        .as_chunks::<3>()
+        .0
+        .par_iter()
+        .map(|pixel| (0.2126 * pixel[0] + 0.7152 * pixel[1] + 0.0722 * pixel[2]).max(0.0))
+        .collect();
+    let kernel = gaussian_kernel(ADJACENCY_RADIUS);
+    let mut blurred = vec![0.0_f32; width * height];
+    gaussian_blur(&luma, &mut blurred, width, height, &kernel);
+    image
+        .data
+        .par_chunks_mut(3)
+        .enumerate()
+        .for_each(|(index, pixel)| {
+            let luma_value = luma[index];
+            if luma_value <= 1.0e-5 {
+                return;
+            }
+            let detail = luma_value - blurred[index];
+            let saturated =
+                ADJACENCY_SATURATION_SCALE * (detail / ADJACENCY_SATURATION_SCALE).tanh();
+            let hump = grain_shape_measured_hump(luma_value.clamp(0.0, 1.0));
+            let gain = (luma_value + amount * hump * saturated).max(0.0) / luma_value;
+            for channel in pixel.iter_mut() {
+                *channel *= gain;
+            }
+        });
+}
+
 fn encode_to<W: Write + Seek>(
     image: &RgbImage,
     writer: W,
@@ -11398,6 +11482,74 @@ mod tests {
             bright_glow > midtone_glow * 3.0,
             "a near-white highlight's glow ({bright_glow}) was not clearly \
              stronger than a middling patch's ({midtone_glow}) of the same size"
+        );
+    }
+
+    fn step_edge_scene(width: usize, height: usize, low: f32, high: f32) -> RgbImage {
+        let mut data = vec![0.0_f32; width * height * 3];
+        for y in 0..height {
+            for x in 0..width {
+                let value = if x < width / 2 { low } else { high };
+                let i = (y * width + x) * 3;
+                data[i..i + 3].copy_from_slice(&[value, value, value]);
+            }
+        }
+        RgbImage {
+            width,
+            height,
+            data,
+        }
+    }
+
+    fn adjacency_effect_at_edge(low: f32, high: f32) -> f32 {
+        let mut image = step_edge_scene(32, 32, low, high);
+        let before = image.data[(16 * 32 + 16) * 3];
+        apply_adjacency_effect(&mut image, 1.0);
+        (image.data[(16 * 32 + 16) * 3] - before).abs()
+    }
+
+    #[test]
+    fn adjacency_amount_zero_is_a_no_op() {
+        let mut image = step_edge_scene(32, 32, 0.2, 0.3);
+        let before = image.data.clone();
+        apply_adjacency_effect(&mut image, 0.0);
+        assert_eq!(image.data, before);
+    }
+
+    #[test]
+    fn adjacency_effect_peaks_in_the_midtones() {
+        // Development activity -- the shared driver behind both grain's own
+        // measured hump and the adjacency effect -- peaks around the
+        // lower-midtones and falls toward both shadows and highlights,
+        // unlike APPLY_SHARPEN_PREPARED's own brightness-flat gain. The
+        // same 0.1 contrast step placed at three brightness levels has to
+        // show a clearly stronger effect in the midtones than at either
+        // extreme.
+        let shadow = adjacency_effect_at_edge(0.0, 0.1);
+        let midtone = adjacency_effect_at_edge(0.2, 0.3);
+        let highlight = adjacency_effect_at_edge(0.85, 0.95);
+        assert!(
+            midtone > shadow * 1.3 && midtone > highlight * 1.3,
+            "midtone effect {midtone} was not clearly above shadow {shadow} \
+             or highlight {highlight}"
+        );
+    }
+
+    #[test]
+    fn adjacency_effect_is_self_limiting() {
+        // A plain unsharp mask's gain keeps growing with contrast; this
+        // saturates, the way a finite amount of developer and bromide to
+        // diffuse across a boundary would. Same centre brightness (the
+        // hump's own peak) both times, so only the contrast differs: five
+        // times the step must not produce anywhere near five times the
+        // effect.
+        let moderate = adjacency_effect_at_edge(0.2, 0.3); // delta 0.1
+        let steep = adjacency_effect_at_edge(0.0, 0.5); // delta 0.5
+        assert!(
+            steep < moderate * 3.0,
+            "a five-times steeper edge produced a {:.2}x larger effect \
+             ({steep} vs {moderate}): not meaningfully self-limiting",
+            steep / moderate
         );
     }
 
