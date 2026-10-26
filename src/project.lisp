@@ -123,7 +123,8 @@ frontend keep undo snapshots."
     ((:exposure :white-balance-tint :noise-reduction :lut-strength
       :grain-amount :grain-size)
      (realp value))
-    ((:neural-noise-reduction :detail :grain-highlight-retention)
+    ((:neural-noise-reduction :detail :grain-highlight-retention
+      :irradiation-amount)
      (and (realp value) (<= 0 value 1)))
     (:sharpen-amount
      (and (realp value) (<= 0 value 3)))
@@ -199,7 +200,8 @@ frontend keep undo snapshots."
         :grain-amount (processing-settings-grain-amount settings)
         :grain-size (processing-settings-grain-size settings)
         :grain-highlight-retention
-        (processing-settings-grain-highlight-retention settings)))
+        (processing-settings-grain-highlight-retention settings)
+        :irradiation-amount (processing-settings-irradiation-amount settings)))
 
 (defun sexp->processing-settings (sexp)
   (processing-plist-validate sexp)
@@ -414,7 +416,9 @@ frontend keep undo snapshots."
                 (setf (processing-settings-grain-size result) value))
                (:grain-highlight-retention
                 (setf (processing-settings-grain-highlight-retention result)
-                      value))))
+                      value))
+               (:irradiation-amount
+                (setf (processing-settings-irradiation-amount result) value))))
     result))
 
 (defun settings-apply-stage-bypass (settings disabled-stages)

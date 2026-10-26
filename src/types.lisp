@@ -18,7 +18,7 @@
     :chromatic-aberration-correction-p :chromatic-aberration-source
     :lens-distortion :lens-profile :lens-focal-length :demosaic
     :lut-path :lut-strength :grain-amount :grain-size
-    :grain-highlight-retention)
+    :grain-highlight-retention :irradiation-amount)
   "Keys accepted in processing setting S-expressions.")
 
 (defparameter *demosaic-methods* '(:rcd :ppg)
@@ -99,7 +99,15 @@ the optics node, the front of the pipeline; the source itself has no panel.")
   ;; native/src/render.rs. An experimentation knob, not a verdict: which end
   ;; (or what in between) actually matches a given stock is for real film
   ;; scans to settle.
-  (grain-highlight-retention 1.0))
+  (grain-highlight-retention 1.0)
+  ;; A small, colour-neutral glow around a frame's own brightest highlights:
+  ;; irradiation, light scattering sideways within the emulsion itself, as
+  ;; distinct from halation (Cinestill's red halo, from light bouncing off
+  ;; the film base through whichever colour layer sits closest to it, which
+  ;; this does not model). 0 is an exact no-op; see APPLY-IRRADIATION in
+  ;; native/src/render.rs. Unmeasured -- a starting point for comparison
+  ;; against real film scans, not fit to any.
+  (irradiation-amount 0.0))
 
 (defparameter *grade-stages*
   '((:white-balance (:white-balance-temperature :white-balance-tint))
@@ -112,7 +120,7 @@ the optics node, the front of the pipeline; the source itself has no panel.")
               :chromatic-aberration-correction-p :chromatic-aberration-source
               :lens-distortion :lens-profile :lens-focal-length :demosaic))
     (:film (:lut-path :lut-strength :grain-amount :grain-size
-            :grain-highlight-retention)))
+            :grain-highlight-retention :irradiation-amount)))
   "The fixed processing pipeline as named stages over setting keys.
 Together the stages partition *PROCESSING-SETTING-KEYS*; frontends present
 them as a copyable node chain.")
@@ -129,7 +137,7 @@ them as a copyable node chain.")
     :lens-distortion 0.0 :lens-profile nil :lens-focal-length nil
     :demosaic :rcd
     :lut-path nil :lut-strength 0.0 :grain-amount 0.0 :grain-size 1.0
-    :grain-highlight-retention 1.0)
+    :grain-highlight-retention 1.0 :irradiation-amount 0.0)
   "Setting values under which every stage passes pixels through unchanged.")
 
 (defun grade-stage-keys (stage)

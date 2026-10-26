@@ -6348,6 +6348,77 @@ pub(crate) fn apply_grain(
         });
 }
 
+/// Irradiation's own blur radius, stated for the photograph like the
+/// sharpening radius -- small, since it is light scattering sideways within
+/// the emulsion a highlight itself exposed, not a reflection bouncing back
+/// off the whole far side of the film base the way halation does.
+pub(crate) const IRRADIATION_RADIUS: f32 = 3.0;
+
+/// How sharply a pixel's own brightness decides how much it feeds the glow,
+/// before blurring: real irradiation only shows near genuine, close-to-clipped
+/// highlights (a lit window, a white sweater in hard light), not general
+/// midtone exposure, so only brightness within reach of white contributes at
+/// all. Unmeasured -- a starting point for comparison against real scans, not
+/// fit to any.
+const IRRADIATION_HIGHLIGHT_GAMMA: f32 = 5.0;
+
+/// How much of the blurred highlight mass AMOUNT 1.0 adds back at its own
+/// brightest point. Kept well under 1.0 so even the top of the slider stays
+/// the "tiny bit of glow" real stock shows rather than a bloom filter.
+const IRRADIATION_MAX_CONTRIBUTION: f32 = 0.12;
+
+/// How far IRRADIATION_RADIUS's blur reads around a pixel it writes, an
+/// upper bound valid for any reduction since it is computed from the
+/// stated-for-the-photograph radius rather than whatever a particular
+/// render scales it down to.
+pub(crate) fn irradiation_reach() -> usize {
+    ((3.0 * IRRADIATION_RADIUS).ceil() as usize).clamp(1, SHARPEN_MAX_REACH)
+}
+
+/// Lays a small, colour-neutral glow around a frame's own brightest
+/// highlights: irradiation, light scattering sideways within the emulsion
+/// itself as silver halide grains absorb and re-scatter it. Distinct from
+/// halation, which needs light to reach the film base and bounce back
+/// through whichever colour layer sits closest to it (Cinestill's red halo
+/// specifically, from stripping the remjet anti-halation backing that would
+/// otherwise catch it) -- irradiation needs no base reflection at all, so an
+/// intact anti-halation layer does not suppress it, and it has no reason to
+/// favour one colour channel over another, since it is simply the light that
+/// already exposed a highlight spreading a little further than it should
+/// within the same layers. AMOUNT in [0, 1] is the stock's own glow strength
+/// (0 is an exact no-op); RADIUS is in render pixels, already scaled for
+/// whatever size this render is.
+pub(crate) fn apply_irradiation(image: &mut RgbImage, amount: f32, radius: f32) {
+    if amount <= 0.0 {
+        return;
+    }
+    let (width, height) = (image.width, image.height);
+    let mass: Vec<f32> = image
+        .data
+        .as_chunks::<3>()
+        .0
+        .par_iter()
+        .map(|pixel| {
+            let luma = (0.2126 * pixel[0] + 0.7152 * pixel[1] + 0.0722 * pixel[2]).clamp(0.0, 1.0);
+            luma.powf(IRRADIATION_HIGHLIGHT_GAMMA)
+        })
+        .collect();
+    let kernel = gaussian_kernel(radius);
+    let mut blurred = vec![0.0_f32; width * height];
+    gaussian_blur(&mass, &mut blurred, width, height, &kernel);
+    let scale = amount * IRRADIATION_MAX_CONTRIBUTION;
+    image
+        .data
+        .par_chunks_mut(3)
+        .zip(blurred.par_iter())
+        .for_each(|(pixel, glow)| {
+            let add = scale * glow;
+            pixel[0] = (pixel[0] + add).clamp(0.0, 1.0);
+            pixel[1] = (pixel[1] + add).clamp(0.0, 1.0);
+            pixel[2] = (pixel[2] + add).clamp(0.0, 1.0);
+        });
+}
+
 fn encode_to<W: Write + Seek>(
     image: &RgbImage,
     writer: W,
@@ -11245,6 +11316,88 @@ mod tests {
         assert!(
             retained_stddev > measured_stddev * 1.3,
             "retention 1.0 stddev {retained_stddev} was not clearly above retention 0.0's {measured_stddev}"
+        );
+    }
+
+    #[test]
+    fn irradiation_amount_zero_is_a_no_op() {
+        let mut image = spot_scene(48, 48);
+        let before = image.data.clone();
+        apply_irradiation(&mut image, 0.0, 3.0);
+        assert_eq!(image.data, before);
+    }
+
+    /// A single bright square on a mid-grey field, far from every edge -- a
+    /// stand-in for a lit window or a white sweater in an otherwise ordinary
+    /// scene.
+    fn spot_scene(width: usize, height: usize) -> RgbImage {
+        let mut data = vec![0.3_f32; width * height * 3];
+        let (cx, cy, half) = (width / 2, height / 2, 3);
+        for y in cy - half..=cy + half {
+            for x in cx - half..=cx + half {
+                let i = (y * width + x) * 3;
+                data[i..i + 3].copy_from_slice(&[1.0, 1.0, 1.0]);
+            }
+        }
+        RgbImage { width, height, data }
+    }
+
+    #[test]
+    fn irradiation_is_colour_neutral() {
+        // Distinct from halation, which is wavelength-selective by
+        // construction (Cinestill's red halo specifically comes from the red
+        // layer sitting closest to the base): irradiation is light scattering
+        // within whichever layer a highlight itself exposed, so it must add
+        // the same amount to every channel, not tint what it touches.
+        let mut image = spot_scene(48, 48);
+        apply_irradiation(&mut image, 1.0, 3.0);
+        let edge = (48 / 2 + 6) * 48 + 48 / 2; // just past the bright square
+        let (r, g, b) = (image.data[edge * 3], image.data[edge * 3 + 1], image.data[edge * 3 + 2]);
+        assert!((r - g).abs() < 1.0e-6 && (g - b).abs() < 1.0e-6, "glow was not neutral: {r} {g} {b}");
+    }
+
+    #[test]
+    fn irradiation_spreads_a_bright_spot_into_its_darker_surroundings() {
+        let mut image = spot_scene(48, 48);
+        let before = image.data.clone();
+        apply_irradiation(&mut image, 1.0, 3.0);
+        let edge = (48 / 2 + 6) * 48 + 48 / 2;
+        assert!(
+            image.data[edge * 3] > before[edge * 3] + 1.0e-4,
+            "a pixel just past the bright spot did not brighten: {} vs {}",
+            image.data[edge * 3],
+            before[edge * 3]
+        );
+    }
+
+    #[test]
+    fn irradiation_favours_genuine_highlights_over_midtones() {
+        // The same local contrast (0.1 above a 0.3 field), but one source
+        // patch is a near-white 1.0 and the other a middling 0.4 -- real
+        // irradiation only shows near genuine highlights, not any old edge.
+        let make = |spot: f32| {
+            let (width, height) = (48, 48);
+            let mut data = vec![0.3_f32; width * height * 3];
+            let (cx, cy, half) = (width / 2, height / 2, 3);
+            for y in cy - half..=cy + half {
+                for x in cx - half..=cx + half {
+                    let i = (y * width + x) * 3;
+                    data[i..i + 3].copy_from_slice(&[spot, spot, spot]);
+                }
+            }
+            RgbImage { width, height, data }
+        };
+        let mut bright = make(1.0);
+        let mut midtone = make(0.4);
+        apply_irradiation(&mut bright, 1.0, 3.0);
+        apply_irradiation(&mut midtone, 1.0, 3.0);
+        let edge = (48 / 2 + 6) * 48 + 48 / 2;
+        let bright_glow = bright.data[edge * 3] - 0.3;
+        let midtone_glow = midtone.data[edge * 3] - 0.3;
+        assert!(
+            bright_glow > midtone_glow * 3.0,
+            "a near-white highlight's glow ({bright_glow}) was not clearly \
+             stronger than a middling patch's ({midtone_glow}) of the same size"
         );
     }
 

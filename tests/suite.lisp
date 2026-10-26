@@ -908,6 +908,21 @@ mixes in each word's index within its chunk and the tail is folded separately."
                nil)
            (invalid-project-data () t)))))
 
+(defun film-irradiation-amount-encodes-and-defaults-p ()
+  "A film node's irradiation amount reaches the native program as its own,
+fifth parameter, defaulting to zero when the key is absent -- the same
+fallback every other film parameter already gets from the stage's identity
+plist."
+  (let* ((graph (default-processing-graph))
+         (bare (graph-insert-node graph (processing-graph-output graph) :film
+                                  :params '(:grain-amount 0.2)))
+         (glowing (graph-insert-node graph (processing-graph-output graph)
+                                    :film
+                                    :params '(:grain-amount 0.2
+                                              :irradiation-amount 0.4))))
+    (and (= 0.0 (fifth (orfeus::graph-node-program-parameters bare)))
+         (= 0.4 (fifth (orfeus::graph-node-program-parameters glowing))))))
+
 (defun graph-domain-placement-p ()
   "Display-space tracking, and the insertion point derived from it.
 
@@ -3099,6 +3114,8 @@ renderer is told about them."
              (content-digest-is-stable-and-complete-p))
       (check "curves nodes validate, serialize, and round trip"
              (graph-curves-p))
+      (check "a film node's irradiation amount encodes and defaults to zero"
+             (film-irradiation-amount-encodes-and-defaults-p))
       (check "photo graphs round trip as project version 4"
              (photo-graph-round-trip-p))
       (check "graphs serialize to the native program format"

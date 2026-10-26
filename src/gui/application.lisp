@@ -8933,7 +8933,13 @@ behind is memory. Best effort; returns how many directories went."
                                             node-page)))
              (lightfast:set-tooltip
               field
-              "1 keeps grain visible in whites, like the shipped default; 0 fades grain toward white the way a negative's own measured granularity does"))))
+              "1 keeps grain visible in whites, like the shipped default; 0 fades grain toward white the way a negative's own measured granularity does"))
+           (let ((field (make-number-field :irradiation-amount
+                                            "Irradiation" 0 1 0.05 204
+                                            node-page)))
+             (lightfast:set-tooltip
+              field
+              "A small glow around the brightest highlights, from light scattering sideways within the emulsion -- distinct from halation, which this does not model"))))
         (build-group
          :blend
          (lambda ()

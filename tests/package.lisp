@@ -99,6 +99,7 @@
                 #:processing-settings-exposure
                 #:processing-settings-grain-amount
                 #:processing-settings-grain-highlight-retention
+                #:processing-settings-irradiation-amount
                 #:processing-settings-lens-correction-strength
                 #:processing-settings-lut-path
                 #:processing-settings-lut-strength
