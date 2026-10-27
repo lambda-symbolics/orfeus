@@ -6412,10 +6412,27 @@ pub(crate) fn apply_irradiation(image: &mut RgbImage, amount: f32, radius: f32) 
         .par_chunks_mut(3)
         .zip(blurred.par_iter())
         .for_each(|(pixel, glow)| {
-            let add = scale * glow;
-            pixel[0] = (pixel[0] + add).clamp(0.0, 1.0);
-            pixel[1] = (pixel[1] + add).clamp(0.0, 1.0);
-            pixel[2] = (pixel[2] + add).clamp(0.0, 1.0);
+            // Capped once by whichever channel has the least room left, not
+            // clamped per channel after adding the same amount to all three:
+            // a pixel that is not perfectly neutral to begin with (almost
+            // every real highlight) would otherwise have whichever channel
+            // sits closest to white clip first, tinting it toward whatever
+            // colour that channel was short of -- and two neighbouring
+            // pixels that started the exact same colour but reach this
+            // node's blurred glow by a hair's difference (one just past a
+            // thin dark edge, say) could in principle come out different
+            // hues from each other. Found and fixed while chasing a report
+            // of coloured fringing on bare branches against an overcast sky
+            // (PA263408.ORF, 2026-10-27) -- that specific fringing turned
+            // out to trace to demosaic colour-aliasing on hair-thin detail,
+            // present with irradiation off entirely, so this fix is a real,
+            // independent correctness improvement, not the explanation for
+            // what was actually seen there.
+            let headroom = 1.0 - pixel[0].max(pixel[1]).max(pixel[2]);
+            let add = (scale * glow).clamp(0.0, headroom.max(0.0));
+            pixel[0] += add;
+            pixel[1] += add;
+            pixel[2] += add;
         });
 }
 
@@ -11424,6 +11441,68 @@ mod tests {
             }
         }
         RgbImage { width, height, data }
+    }
+
+    /// A bright, slightly cool-cast background (an overcast sky) with a
+    /// single thin, neutral dark line through it (a bare branch) -- close
+    /// enough to saturation that the background's own small colour cast
+    /// sits right at the edge of clipping on its own bluest channel.
+    fn near_saturated_sky_with_a_branch_scene(
+        width: usize,
+        height: usize,
+        branch_x: usize,
+    ) -> RgbImage {
+        let (r0, g0, b0) = (0.90_f32, 0.93_f32, 0.97_f32);
+        let mut data = Vec::with_capacity(width * height * 3);
+        for _ in 0..height {
+            for x in 0..width {
+                if x == branch_x {
+                    data.extend_from_slice(&[0.05, 0.05, 0.05]);
+                } else {
+                    data.extend_from_slice(&[r0, g0, b0]);
+                }
+            }
+        }
+        RgbImage {
+            width,
+            height,
+            data,
+        }
+    }
+
+    #[test]
+    fn irradiation_does_not_tint_a_near_saturated_background_near_a_dark_edge() {
+        // A real, independent correctness gap found while investigating a
+        // report of coloured fringing (PA263408.ORF, 2026-10-27; that
+        // specific fringing turned out to be demosaic colour-aliasing on
+        // hair-thin detail, unrelated to this node): the glow this node adds
+        // is identical across channels, but clamping each channel to [0, 1]
+        // independently lets whichever channel sits closest to white clip
+        // first. A sky pixel right next to a dark branch gets a smaller
+        // blurred glow than one far from the branch (the branch's own
+        // near-zero highlight mass pulls the local blur down), so the two
+        // reach different points along that same clipping curve -- and could
+        // come out different hues, even though they started identical.
+        let (width, height) = (40, 10);
+        let branch_x = width / 2;
+        let mut image = near_saturated_sky_with_a_branch_scene(width, height, branch_x);
+        apply_irradiation(&mut image, 1.0, 3.0);
+        let row = height / 2;
+        let pixel_at = |x: usize| {
+            let i = (row * width + x) * 3;
+            (image.data[i], image.data[i + 1], image.data[i + 2])
+        };
+        let (far_r, _far_g, far_b) = pixel_at(2); // far from the branch
+        let (near_r, _near_g, near_b) = pixel_at(branch_x + 2); // just past it
+        let far_warmth = far_r - far_b;
+        let near_warmth = near_r - near_b;
+        assert!(
+            (far_warmth - near_warmth).abs() < 1.0e-6,
+            "a sky pixel beside the branch came out a different hue than one \
+             far from it: r-b was {near_warmth} beside the branch, {far_warmth} \
+             far from it -- the same originally uniform sky now visibly tints \
+             near the branch's own edge"
+        );
     }
 
     #[test]
