@@ -1128,6 +1128,36 @@ absence of it."
   (lightfast:draw-line (+ x 11) (+ y 6) (+ x 8) (+ y 9))
   (lightfast:draw-line (+ x 4) (+ y 12) (+ x 12) (+ y 12)))
 
+(defparameter *graded-badge-stripes*
+  #(#(220 90 90) #(225 150 80) #(215 200 90)
+    #(110 190 120) #(90 150 220) #(160 110 200))
+  "Red through violet, muted to sit beside this interface's other badges
+rather than shout over the picture under it.")
+
+(defun draw-graded-badge (x y)
+  "Draw the mark that says a photograph carries grading of its own: an
+override, a disabled stage, or a graph of its own -- anything that makes it
+differ from how a fresh photograph renders.
+
+A small rainbow swatch in the corner of the thumbnail: the one state this
+whole interface exists to produce, so it gets a bit of colour the other,
+quieter badges do not."
+  (lightfast:draw-color-rgb :red 24 :green 26 :blue 28)
+  (lightfast:draw-filled-rect x y 18 18)
+  (loop for index below (length *graded-badge-stripes*)
+        for stripe = (aref *graded-badge-stripes* index)
+        do (lightfast:draw-color-rgb :red (aref stripe 0) :green (aref stripe 1)
+                                     :blue (aref stripe 2))
+           (lightfast:draw-filled-rect (+ x 2 (* index 2)) (+ y 2) 2 14)))
+
+(defun photo-graded-p (job)
+  "True when JOB differs from how a fresh photograph renders: an override,
+a disabled stage, or a graph of its own."
+  (and (or (photo-job-overrides job)
+           (photo-job-disabled-stages job)
+           (photo-job-graph job))
+       t))
+
 (defun graph-view-signature (job graph selected-node)
   "Return a cheap identity of what the node graph editor should display.
 
@@ -8390,6 +8420,8 @@ behind is memory. Best effort; returns how many directories went."
                                          (+ x 6) (+ row-y 6) 88 (- row-height 12)))))
                                 (when (photo-interned-cached-p job)
                                   (draw-interned-badge (+ x 76) (+ row-y 8)))
+                                (when (photo-graded-p job)
+                                  (draw-graded-badge (+ x 6) (+ row-y 8)))
                                 (draw-burst-bar job x row-y row-height)
                                 (lightfast:draw-color-rgb :red 235 :green 235 :blue 235)
                                 (lightfast:draw-text

@@ -24,6 +24,21 @@
     (orfeus/gui:gui-model-reset-selected model)
     (check (null (orfeus:photo-job-overrides job)) "Reset did not clear overrides")))
 
+(defun test-photo-graded-p ()
+  ;; The gallery's own "has this one been touched" badge: an override, a
+  ;; disabled stage, or a graph of its own, each alone, each cleared.
+  (let ((fresh (orfeus:make-photo-job :input-path #P"one.orf")))
+    (check (not (orfeus/gui::photo-graded-p fresh)) "A fresh photograph read as graded")
+    (let ((overridden (orfeus:make-photo-job :input-path #P"one.orf"
+                                             :overrides '(:exposure 0.5))))
+      (check (orfeus/gui::photo-graded-p overridden) "An override did not read as graded"))
+    (let ((bypassed (orfeus:make-photo-job :input-path #P"one.orf"
+                                           :disabled-stages '(:film))))
+      (check (orfeus/gui::photo-graded-p bypassed) "A disabled stage did not read as graded"))
+    (let ((graphed (orfeus:make-photo-job :input-path #P"one.orf"
+                                          :graph (orfeus:default-processing-graph))))
+      (check (orfeus/gui::photo-graded-p graphed) "A graph did not read as graded"))))
+
 (defun test-lens-profile-setting-reaches-the-optics-node ()
   ;; The picker writes a profile name and a focal length as settings; on a
   ;; graph-graded photograph they have to land on the optics node, where the
@@ -2639,6 +2654,7 @@ would silently ignore whatever the Destination field said."
 (defun run-tests ()
   (test-lightfast-root-layout-and-export-validation)
   (test-model-settings)
+  (test-photo-graded-p)
   (test-lens-profile-setting-reaches-the-optics-node)
   (test-cursor-walks-past-a-marked-selection)
   (test-photographs-sort-and-keep-their-places)
