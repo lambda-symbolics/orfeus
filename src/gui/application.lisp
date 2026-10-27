@@ -1813,6 +1813,10 @@ behind is memory. Best effort; returns how many directories went."
            ;; How far an export batch has got, in photographs. A batch is one
            ;; queue task, so the queue depth says nothing about it.
            export-fraction
+           ;; Same idea for a batch of interning: copying a card's worth of
+           ;; RAWs used to block the interface outright, with nothing on
+           ;; screen saying it was even running.
+           intern-fraction
            (photo-groups (make-hash-table :test #'eq))
            ;; Which bursts the photographer has folded. Stored the way round
            ;; that makes open the default without a pass to open them: absence
@@ -3839,7 +3843,11 @@ behind is memory. Best effort; returns how many directories went."
                    known)))
            (intern-selected-photos ()
              ;; Copy each selected RAW into the private store and repoint the
-             ;; project at the copy, so the card is only needed once.
+             ;; project at the copy, so the card is only needed once. Copying
+             ;; a card's worth of RAWs blocked the whole interface until the
+             ;; last byte landed, with nothing on screen saying why -- this
+             ;; now runs on the queue's own worker, reporting through the
+             ;; same progress bar an export does.
              (let ((jobs (remove-if #'photo-interned-cached-p
                                     (gui-model-acting-jobs model))))
                (cond
@@ -3847,33 +3855,52 @@ behind is memory. Best effort; returns how many directories went."
                   (set-status "Every selected photograph is already interned"))
                  (t
                   (gui-model-checkpoint model)
-                  (let ((interned 0) (failed 0) (last-error nil))
-                    (dolist (job jobs)
-                      (handler-case
-                          (let ((was (photo-job-input-path job)))
-                            (orfeus:intern-photo-job job)
-                            (remhash was interned-photos)
-                            ;; Nothing else is invalidated: the copy holds the
-                            ;; same bytes, so it has the same content key, and
-                            ;; every preview and thumbnail already rendered for
-                            ;; this photograph stays valid. Discarding them here
-                            ;; made interning redevelop both.
-                            (incf interned))
-                        (error (condition)
-                          (incf failed)
-                          (setf last-error condition)
-                          (format *error-output*
-                                  "~&orfeus: interning ~A failed: ~A~%"
-                                  (photo-job-input-path job) condition))))
-                    (clrhash interned-photos)
-                    (redraw-thumbnails)
-                    (set-status
-                     (if (plusp failed)
-                         (format nil "Interned ~D; ~D failed: ~A"
-                                 interned failed last-error)
-                         (format nil "Interned ~D photograph~:P into ~A"
-                                 interned
-                                 (namestring (orfeus:interned-raw-directory))))))))))
+                  (let ((total (length jobs)))
+                    (enqueue-gui-task
+                     queue :intern
+                     (lambda ()
+                       (queue-event queue (list :intern-progress 0))
+                       (let ((interned 0) (failed 0) (last-error nil))
+                         (loop for job in jobs
+                               for index from 1
+                               do (queue-event
+                                   queue
+                                   (list :status nil
+                                         (format nil "Interning ~D of ~D: ~A"
+                                                 index total
+                                                 (file-namestring
+                                                  (photo-job-input-path job)))))
+                                  (handler-case
+                                      (progn (orfeus:intern-photo-job job)
+                                             ;; Nothing else is invalidated:
+                                             ;; the copy holds the same bytes,
+                                             ;; so it has the same content
+                                             ;; key, and every preview and
+                                             ;; thumbnail already rendered for
+                                             ;; this photograph stays valid.
+                                             (incf interned))
+                                    (error (condition)
+                                      (incf failed)
+                                      (setf last-error condition)
+                                      (format *error-output*
+                                              "~&orfeus: interning ~A failed: ~A~%"
+                                              (photo-job-input-path job) condition)))
+                                  (queue-event queue (list :intern-progress (/ index total)))
+                         finally
+                            (queue-event
+                             queue
+                             (list :call
+                                   (lambda ()
+                                     (clrhash interned-photos)
+                                     (redraw-thumbnails)
+                                     (set-status
+                                      (if (plusp failed)
+                                          (format nil "Interned ~D; ~D failed: ~A"
+                                                  interned failed last-error)
+                                          (format nil "Interned ~D photograph~:P into ~A"
+                                                  interned
+                                                  (namestring
+                                                   (orfeus:interned-raw-directory)))))))))))))))))
            (select-thumbnail-context-row (indices)
              ;; Right-clicking targets a photograph without opening it: the menu
              ;; acts on the row under the cursor while the preview keeps showing
@@ -7887,6 +7914,8 @@ behind is memory. Best effort; returns how many directories went."
                   (redraw-thumbnails))
                  (:export-progress
                   (setf export-fraction (second event)))
+                 (:intern-progress
+                  (setf intern-fraction (second event)))
                  (:render-stage
                   ;; Only the render the interface is waiting for; a stale one
                   ;; still finishing must not narrate over it.
@@ -7942,15 +7971,18 @@ behind is memory. Best effort; returns how many directories went."
                  (setf graph-view-state signature)
                  (sync-node-tools)
                  (when graph-canvas (lightfast:redraw graph-canvas))))
-             ;; Progress belongs to the current preview generation or export
-             ;; batch. Histogram and eviction maintenance are deliberately
-             ;; excluded so cancellation cannot inherit an old high-water mark.
+             ;; Progress belongs to the current preview generation, an export
+             ;; batch, or an intern batch. Histogram and eviction maintenance
+             ;; are deliberately excluded so cancellation cannot inherit an
+             ;; old high-water mark.
              (let* ((export-load (gui-queue-load queue :include-kinds '(:export)))
-                    (load (if (plusp export-load)
-                              export-load
-                              (gui-queue-load queue
-                                              :exclude-kinds '(:histogram :evict :export)
-                                              :generation preview-generation))))
+                    (intern-load (gui-queue-load queue :include-kinds '(:intern)))
+                    (load (cond ((plusp export-load) export-load)
+                                ((plusp intern-load) intern-load)
+                                (t (gui-queue-load
+                                    queue
+                                    :exclude-kinds '(:histogram :evict :export :intern)
+                                    :generation preview-generation)))))
                (multiple-value-bind (percent total generation)
                    (preview-progress-state load progress-total preview-generation
                                            progress-generation)
@@ -7959,15 +7991,21 @@ behind is memory. Best effort; returns how many directories went."
                  ;; A render that is reporting its own stages knows better than
                  ;; the queue does: the queue counts jobs, and one job is the
                  ;; whole wait. Its own fraction wins for as long as it lasts.
-                 ;; An export is one job too, so it goes by the photographs
-                 ;; written and the render's own stages within each.
+                 ;; An export or an intern batch is one job too, so each goes
+                 ;; by its own photographs rather than the queue's job count.
                  (when (zerop export-load)
                    (setf export-fraction nil))
+                 (when (zerop intern-load)
+                   (setf intern-fraction nil))
                  (cond ((and export-fraction (plusp export-load))
                         (setf (lightfast:value progress)
                               (format nil "~D"
                                       (max 2 (min 99 (round (* 100 export-fraction)))))))
-                       ((and render-stage (zerop export-load))
+                       ((and intern-fraction (plusp intern-load))
+                        (setf (lightfast:value progress)
+                              (format nil "~D"
+                                      (max 2 (min 99 (round (* 100 intern-fraction)))))))
+                       ((and render-stage (zerop export-load) (zerop intern-load))
                         (show-render-progress))
                        (t
                         (setf (lightfast:value progress)
