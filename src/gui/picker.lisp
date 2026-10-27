@@ -615,6 +615,12 @@ Returns the new vector and how many were new."
   ;; filled in behind it, a batch of ExifTool calls at a time so one Perl
   ;; startup is not paid per file, and the caption prefers it once it lands.
   (capture-times (make-hash-table :test #'equal))
+  ;; Pathnames a capture-date batch has already been asked for, same role as
+  ;; REQUESTED above: PICKER-REQUEST-CAPTURE-TIMES runs on every redraw of
+  ;; whatever is currently visible, and without this, scrolling back and
+  ;; forth before one slow batch finishes would queue the same files' dates
+  ;; again on every repaint instead of once.
+  (capture-times-requested (make-hash-table :test #'equal))
   (history '()) (forward '())
   (on-pick nil) (accept-label "Add"))
 
@@ -712,6 +718,12 @@ if the folder comes back."
     (loop for key being the hash-keys of requested
           unless (gethash key done)
             collect key into stale
+          finally (dolist (key stale) (remhash key requested))))
+  (let ((requested (photo-picker-capture-times-requested picker))
+        (done (photo-picker-capture-times picker)))
+    (loop for key being the hash-keys of requested
+          unless (gethash key done)
+            collect key into stale
           finally (dolist (key stale) (remhash key requested)))))
 
 ;;; Capture dates
@@ -762,17 +774,24 @@ the whole batch, and return a UNIX-seconds integer or NIL per path, in order."
                     (loop for path in paths
                           for time in times
                           do (setf (gethash path known) (or time :none))))
-                  (picker-redraw picker)))))))))
+                  (picker-redraw picker))))))
+     :front-p t)))
 
 (defun picker-request-capture-times (picker files)
   "See to it that every FILES entry's real capture date is known: already
 cached ones are left alone, the rest asked of ExifTool a batch at a time on a
-worker thread, in file order so the top of a freshly opened folder fills in
-first."
+worker thread. Called with whatever is currently visible (see
+PICKER-DRAW-GRID), the same as thumbnails, rather than a whole folder at
+once: a big batch job could tie up both of the picker's own workers reading
+files nobody is looking at yet."
   (let* ((known (photo-picker-capture-times picker))
+         (requested (photo-picker-capture-times-requested picker))
          (pending (remove-if (lambda (entry)
-                               (gethash (picker-entry-pathname entry) known))
+                               (let ((path (picker-entry-pathname entry)))
+                                 (or (gethash path known) (gethash path requested))))
                              files)))
+    (dolist (entry pending)
+      (setf (gethash (picker-entry-pathname entry) requested) t))
     (loop for start from 0 below (length pending) by *picker-date-batch-size*
           for batch = (subseq pending start
                               (min (length pending)
@@ -810,6 +829,11 @@ amber, a band or a drag badge over the top."
                 for entry = (aref entries index)
                 unless (gethash (picker-entry-pathname entry) thumbnails)
                   do (picker-request-thumbnail picker entry))
+          ;; Same idea for real capture dates: scoped to what is on screen,
+          ;; so a big card's worth of ExifTool reads never gets to compete
+          ;; with a thumbnail for one of the picker's own two workers.
+          (picker-request-capture-times
+           picker (loop for index from first to last collect (aref entries index)))
           (loop for index from first to last
                 do (multiple-value-bind (cx cy cw ch) (picker-cell-rect index scroll columns)
                      (let* ((entry (aref entries index))
@@ -909,7 +933,12 @@ and note where we came from for Back. The stash is untouched."
                 (photo-picker-folders picker) folders)
           (picker-forget-pending-requests picker)
           (picker-grid-set-entries (photo-picker-browse picker) files)
-          (picker-request-capture-times picker files)
+          ;; Real capture dates, like thumbnails, are asked for only as rows
+          ;; scroll into view (see PICKER-DRAW-GRID) -- asking ExifTool for
+          ;; every file here, before a single row has even been painted,
+          ;; used to tie up both picker workers reading hundreds of files on
+          ;; a slow card reader before either was free to lift the handful
+          ;; of thumbnails actually on screen.
           (setf (lightfast:value (photo-picker-path-input picker)) (namestring directory))
           (picker-fill-folder-browser picker)
           (picker-update-status picker)

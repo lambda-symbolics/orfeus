@@ -966,6 +966,70 @@ selection the way every desktop does, and the stash keeps each frame once."
   (check (string= "1.1 MB" (orfeus/gui::picker-size-text 1133082))
          "A megabyte did not read as one"))
 
+(defun test-picker-scopes-capture-dates-and-does-not-re-ask ()
+  "Real capture dates, like thumbnails, are fetched only for what is on
+screen (PICKER-DRAW-GRID calls PICKER-REQUEST-CAPTURE-TIMES with the visible
+range on every redraw) rather than a whole card's worth of files up front.
+PICKER-REQUEST-CAPTURE-TIMES must also not ask ExifTool for a file a second
+time while its first answer is still in flight -- a big folder redrawn
+during a scroll, before any date has landed, would otherwise queue the same
+batch again on every repaint."
+  (let* ((workers (orfeus/gui::make-gui-queue :workers 1))
+         (queue (orfeus/gui::make-gui-queue :workers 1)))
+    ;; Stopped before anything is enqueued: ENQUEUE-GUI-TASK is then a no-op,
+    ;; so what happens is exactly PICKER-REQUEST-CAPTURE-TIMES's own
+    ;; synchronous bookkeeping, not a race against a real worker thread.
+    (orfeus/gui::stop-gui-queue workers)
+    (orfeus/gui::stop-gui-queue queue)
+    (let* ((picker (orfeus/gui::%make-photo-picker :workers workers :queue queue))
+           (a (orfeus/gui::make-picker-entry "a.orf" #P"/card/a.orf"))
+           (b (orfeus/gui::make-picker-entry "b.orf" #P"/card/b.orf"))
+           (c (orfeus/gui::make-picker-entry "c.orf" #P"/card/c.orf"))
+           (requested (orfeus/gui::photo-picker-capture-times-requested picker))
+           (symbol 'orfeus/gui::picker-request-capture-time-batch)
+           (original (symbol-function symbol))
+           (batches '()))
+      (check (zerop (hash-table-count requested)) "A fresh picker had dates already requested")
+      (unwind-protect
+           (progn
+             (setf (symbol-function symbol)
+                   (lambda (picker batch)
+                     (declare (ignore picker))
+                     (push (mapcar #'orfeus/gui::picker-entry-name batch) batches)))
+             ;; Only what is visible (A and B) is asked for.
+             (orfeus/gui::picker-request-capture-times picker (list a b))
+             (check (equal '(("a.orf" "b.orf")) batches)
+                    "The visible files were not batched together: ~S" batches)
+             (check (= 2 (hash-table-count requested))
+                    "The visible files were not marked requested")
+             (check (not (gethash (orfeus/gui::picker-entry-pathname c) requested))
+                    "A file never shown was marked requested")
+             ;; A redraw during a scroll, before either date has come back,
+             ;; must not re-batch A or B -- only the newly visible C.
+             (orfeus/gui::picker-request-capture-times picker (list a b c))
+             (check (equal '(("c.orf") ("a.orf" "b.orf")) batches)
+                    "An in-flight request was asked for again: ~S" batches)
+             (check (= 3 (hash-table-count requested))
+                    "The newly visible file was not marked requested"))
+        (setf (symbol-function symbol) original))
+      ;; Once ExifTool's real answer is known, it stops counting as pending
+      ;; too, the same as THUMBNAILS does against its own cache.
+      (setf (gethash (orfeus/gui::picker-entry-pathname a)
+                      (orfeus/gui::photo-picker-capture-times picker))
+            :none)
+      (let ((batches '()))
+        (unwind-protect
+             (progn
+               (setf (symbol-function symbol)
+                     (lambda (picker batch)
+                       (declare (ignore picker))
+                       (push (mapcar #'orfeus/gui::picker-entry-name batch) batches)))
+               (orfeus/gui::picker-request-capture-times picker (list a b))
+               (check (null batches)
+                      "A file with a known date, or one still pending, was asked for again: ~S"
+                      batches))
+          (setf (symbol-function symbol) original))))))
+
 (defun test-photographs-sort-and-keep-their-places ()
   "The filmstrip sorts by capture time, name or rating, defaulting to the order
 the card was shot in, and a sort leaves the cursor and the marks on the
@@ -2661,6 +2725,7 @@ would silently ignore whatever the Destination field said."
   (test-a-turned-crop-stays-inside-the-frame)
   (test-crop-sizing-keeps-the-crop-level-correct)
   (test-the-picker-decides-without-a-window)
+  (test-picker-scopes-capture-dates-and-does-not-re-ask)
   (test-session-settings-and-recent-projects)
   (test-display-copies-are-let-go-when-nothing-shows-them)
   (test-stale-session-directories-are-swept)
