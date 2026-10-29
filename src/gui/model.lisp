@@ -1165,9 +1165,15 @@ lands. Returns the node, or NIL when nothing was done."
 renders as the merge of all of them. BRACKETS lists lists of photo jobs in shot
 order. A bracket is left alone when any of its frames has left the project or
 already stands for a bracket, or when the photographer unfolded it before.
-Each folded photograph nobody had graded gets the camera's HDR look to start
-from: the stronger one for five frames or more. One undo step for the lot;
-returns how many brackets were folded, and the jobs that left the project."
+
+A folded photograph starts ungraded, like any other fresh import: the merge
+itself already recovers the bracket's dynamic range from real exposures, so
+stacking the camera's single-frame HDR tone curve on top of that only
+flattened the result -- Lukáš turns that node down by hand on every bracket
+he grades, which is the tell that the old default (seeding :HDR1/:HDR2 here,
+same as a genuine OM-1 HDR shot) was fighting the merge rather than helping
+it. One undo step for the lot; returns how many brackets were folded, and the
+jobs that left the project."
   (let* ((project (gui-model-project model))
          (unmerged (orfeus:project-unmerged project))
          (foldable
@@ -1190,9 +1196,6 @@ returns how many brackets were folded, and the jobs that left the project."
           (let ((reference (first jobs)))
             (orfeus:photo-job-set-bracket
              reference (mapcar #'photo-job-input-path jobs))
-            (let ((*inside-model-edit* t))
-              (gui-model-seed-hdr-node model reference
-                                       (if (>= (length jobs) 5) :hdr2 :hdr1)))
             (dolist (job (rest jobs))
               (push (cons job reference) folded))))
         (setf (project-photos project)

@@ -190,8 +190,10 @@ than the preview had photographs, under the wrong thumbnails."
            "A fitted view kept its sensor-sized frame")))
 
 (defun test-brackets-fold-unfold-and-undo ()
-  "A detected bracket folds into its first frame, which then stands for it and
-gets the camera's HDR look; unfolding puts the frames back and keeps them back;
+  "A detected bracket folds into its first frame, which then stands for it,
+starting ungraded like any fresh import -- the merge already recovers the
+bracket's dynamic range, so no tone-curve node is seeded on top of it (see
+GUI-MODEL-FOLD-BRACKETS); unfolding puts the frames back and keeps them back;
 both are undoable, and the renderer follows every step."
   (let* ((jobs (loop for name in '("b1" "b2" "b3" "b4" "b5" "lone")
                      collect (orfeus:make-photo-job
@@ -212,9 +214,8 @@ both are undoable, and the renderer follows every step."
                   "The cursor did not move to the photograph standing for its frame")
            (check (= 5 (length (orfeus:bracket-frames (orfeus:photo-job-input-path reference))))
                   "The renderer was not told about the bracket")
-           (check (find :hdr (orfeus:processing-graph-nodes (orfeus:photo-job-graph reference))
-                        :key #'orfeus:graph-node-kind)
-                  "A folded bracket got no HDR node")
+           (check (null (orfeus:photo-job-graph reference))
+                  "A folded bracket was graded instead of starting plain")
            (orfeus/gui:gui-model-unfold-bracket model reference)
            (check (= 6 (length (orfeus:project-photos project)))
                   "Unfolding did not put the frames back")
