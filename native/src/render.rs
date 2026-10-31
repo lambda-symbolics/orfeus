@@ -367,8 +367,9 @@ fn mat_mul(left: [[f32; 3]; 3], right: [[f32; 3]; 3]) -> [[f32; 3]; 3] {
 
 /// Chromatically adapts linear sRGB from the requested source white to D65.
 /// Camera WB remains rawler's camera-aware default when Kelvin is zero; tint is
-/// then a small working-space green/magenta adaptation around D65. A nonzero
-/// Kelvin deliberately disables camera WB and adapts the camera-matrix result.
+/// then a small working-space green/magenta adaptation around the frame's own
+/// neutral (AS_SHOT when it is known, D65 otherwise). A nonzero Kelvin
+/// deliberately disables camera WB and adapts the camera-matrix result.
 /// Adapts the image as if its neutral had been lit at KELVIN rather than at the
 /// temperature the camera balanced for.
 ///
@@ -378,6 +379,15 @@ fn mat_mul(left: [[f32; 3]; 3], right: [[f32; 3]; 3]) -> [[f32; 3]; 3] {
 /// decoration. Adapting to D65 instead — which is what this did — meant every
 /// temperature except 6504 K shifted the picture the moment the control was
 /// touched, from a value that had nothing to do with the photograph.
+///
+/// Tint alone used to have the same disease: with Kelvin left at zero, the
+/// pre-tint point sat at D65 regardless of AS_SHOT, so a frame shot under
+/// anything else jumped by the whole D65-to-AS_SHOT gap the instant tint left
+/// zero, before tint's own small nudge ever got a say — a discontinuity, not a
+/// control. Anchoring the pre-tint point at AS_SHOT when it is known closes
+/// that gap: zero tint is still the exact identity (the early return below
+/// never changes), and a small tint now reads as a small, continuous move
+/// around the frame's own neutral, the way the Kelvin axis already behaves.
 pub(crate) fn apply_white_adaptation(
     image: &mut RgbImage,
     kelvin: f32,
@@ -388,7 +398,10 @@ pub(crate) fn apply_white_adaptation(
         return;
     }
     let (x, mut y) = if kelvin == 0.0 {
-        (0.3127, 0.3290)
+        match as_shot {
+            Some(as_shot) => kelvin_xy(as_shot),
+            None => (0.3127, 0.3290),
+        }
     } else {
         kelvin_xy(kelvin)
     };
@@ -8561,6 +8574,46 @@ mod tests {
         assert!(magenta.data[0] + magenta.data[2] > magenta.data[1] * 2.0);
         assert!(green.data[1] * 2.0 > green.data[0] + green.data[2]);
         assert!((magenta.data[1] - green.data[1]).abs() > 0.1);
+    }
+
+    #[test]
+    fn tint_without_kelvin_moves_around_the_frames_own_neutral_not_d65() {
+        // A frame balanced deep in tungsten/fluorescent territory, far from
+        // D65 (6504 K): the gap is over 2500 K, big enough to swamp a small
+        // tint nudge entirely if tint's pre-adjustment point were still
+        // pinned to D65 instead of this frame's own AS_SHOT, as it once was.
+        let as_shot = 3800.0;
+        let base = RgbImage {
+            width: 1,
+            height: 1,
+            data: vec![0.5, 0.5, 0.5],
+        };
+        let mut untouched = base.clone();
+        apply_white_adaptation(&mut untouched, 0.0, 0.0, Some(as_shot));
+        // Zero tint is the exact identity regardless of AS_SHOT: the early
+        // return never runs the adaptation at all.
+        assert_eq!(untouched.data, base.data);
+        let mut small_tint = base.clone();
+        apply_white_adaptation(&mut small_tint, 0.0, 1.0, Some(as_shot));
+        // A tint of 1 (out of the panel's -20..20 range) should move the
+        // picture by a small, continuous amount -- nothing like the
+        // several-tenths swing the D65-to-3800K gap itself would cause if
+        // tint's own small move were riding on top of that gap.
+        for (moved, base) in small_tint.data.iter().zip(&untouched.data) {
+            assert!(
+                (moved - base).abs() < 0.05,
+                "a tint of 1 moved a channel by {}, far more than its own \
+                 small nudge should -- tint is pinned to D65 again, not \
+                 anchored at AS_SHOT",
+                (moved - base).abs()
+            );
+        }
+        // And the small nudge still points the documented direction: more
+        // tint still pulls toward magenta, exactly as it does with no known
+        // AS_SHOT at all.
+        let mut bigger_tint = base.clone();
+        apply_white_adaptation(&mut bigger_tint, 0.0, 20.0, Some(as_shot));
+        assert!(bigger_tint.data[0] + bigger_tint.data[2] > bigger_tint.data[1] * 2.0);
     }
 
     fn flat_patch_luma_rms(image: &RgbImage, expected: f32) -> f32 {
